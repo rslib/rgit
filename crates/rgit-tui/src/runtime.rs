@@ -8,7 +8,7 @@ use ratatui::DefaultTerminal;
 use rgit_git::{GitBackend, GitError, RepoStatus};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::{App, Effect, Leader, Msg, Mutation, update};
+use crate::app::{App, Effect, InfoKind, Leader, Msg, Mutation, TextOp, update};
 use crate::events::{Event, Events};
 use crate::keymap::{
     self, resolve_commit_key, resolve_confirm_key, resolve_help_key, resolve_key,
@@ -294,8 +294,23 @@ async fn run_msg(
             Effect::Refresh => spawn_read(app, msg_tx, |b| b.status()),
             Effect::CopyToClipboard(text) => copy_to_clipboard(&text),
             Effect::Mutate(mutation) => {
-                spawn_read(app, msg_tx, move |b| {
-                    apply_mutation(b, &mutation).and_then(|()| b.status())
+                // Extend rewrites HEAD like an amend, so it auto-restacks the
+                // stacked children too (when enabled); other mutations do not.
+                let restack_after =
+                    app.auto_restack() && matches!(mutation, crate::app::Mutation::Extend);
+                let backend = app.backend();
+                let tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let status = (|| -> Result<RepoStatus, GitError> {
+                        apply_mutation(&*backend, &mutation)?;
+                        if restack_after {
+                            if let Some(note) = auto_restack_note(&*backend)? {
+                                let _ = tx.send(Msg::AutoRestackNote(note));
+                            }
+                        }
+                        backend.status()
+                    })();
+                    let _ = tx.send(Msg::Refreshed(Box::new(status)));
                 });
             }
             Effect::Commit { amend } => commit_flow(app, events, terminal, msg_tx, amend).await?,
@@ -470,6 +485,76 @@ async fn run_msg(
                     if let Ok(remotes) = backend.remotes() {
                         let _ = msg_tx.send(Msg::RemotesLoaded(remotes));
                     }
+                });
+            }
+            Effect::LoadSmartlog => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(entries) = backend.smartlog() {
+                        let _ = msg_tx.send(Msg::SmartlogLoaded(entries));
+                    }
+                });
+            }
+            Effect::LoadOplog => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(entries) = backend.oplog() {
+                        let _ = msg_tx.send(Msg::OplogLoaded(entries));
+                    }
+                });
+            }
+            Effect::LoadStack => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(parents) = backend.stack_parents() {
+                        let current = backend.status().ok().and_then(|s| s.head.branch);
+                        let _ = msg_tx.send(Msg::StackLoaded { parents, current });
+                    }
+                });
+            }
+            Effect::UndoTimes(n) => {
+                spawn_read(app, msg_tx, move |b| {
+                    for _ in 0..n {
+                        b.undo()?;
+                    }
+                    b.status()
+                });
+            }
+            Effect::RunText(op) => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = match op {
+                        TextOp::FlowInit(preset) => {
+                            rgit_git::workflow::init(backend.as_ref(), &preset)
+                        }
+                        TextOp::FlowStart(name) => {
+                            rgit_git::workflow::start(backend.as_ref(), &name)
+                        }
+                        TextOp::FlowFinish => rgit_git::workflow::finish(backend.as_ref()),
+                        TextOp::WorkspaceNew(name) => {
+                            rgit_git::workspace::create(backend.as_ref(), &name)
+                        }
+                        TextOp::StackNew(name) => backend.stack_new(&name),
+                    };
+                    let _ = msg_tx.send(Msg::TextResult(result.map_err(|e| e.to_string())));
+                });
+            }
+            Effect::LoadInfo { title, kind } => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let text = match kind {
+                        InfoKind::FlowStatus => rgit_git::workflow::status(backend.as_ref()),
+                        InfoKind::Workspaces => rgit_git::workspace::list(backend.as_ref()),
+                    };
+                    let _ = msg_tx.send(Msg::InfoLoaded {
+                        title: title.to_owned(),
+                        text: text.map_err(|e| e.to_string()),
+                    });
                 });
             }
             Effect::LoadWorktrees => {
@@ -762,7 +847,7 @@ async fn op_console(
             force_with_lease,
             set_upstream,
         } => backend.push(force, force_with_lease, set_upstream, &report),
-        ConsoleOp::Merge(rev) => backend.merge(&rev, &report),
+        ConsoleOp::Merge(rev) => backend.merge(&rev, false, &report),
         ConsoleOp::RebaseOnto(rev) => backend.rebase_onto(&rev, &report),
     })
     .await;
@@ -833,15 +918,50 @@ async fn commit_flow(
     }
 
     app.loading = true;
-    spawn_read(app, msg_tx, move |b| {
-        if amend {
-            b.amend(&message)
-        } else {
-            b.commit(&message)
-        }
-        .and_then(|()| b.status())
+    // After an amend (or reword), the current commit's oid changes, so any
+    // branch stacked on it needs to move. Restack automatically (when enabled)
+    // and note what happened, following jj/Sapling; a conflict is non-blocking.
+    let backend = app.backend();
+    let auto_restack = app.auto_restack();
+    let tx = msg_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let status = (|| -> Result<RepoStatus, GitError> {
+            if amend {
+                backend.amend(&message)?;
+                if auto_restack {
+                    if let Some(note) = auto_restack_note(&*backend)? {
+                        let _ = tx.send(Msg::AutoRestackNote(note));
+                    }
+                }
+            } else {
+                backend.commit(&message)?;
+            }
+            backend.status()
+        })();
+        let _ = tx.send(Msg::Refreshed(Box::new(status)));
     });
     Ok(())
+}
+
+/// Restack the stacked branches after an amend and describe what moved, or
+/// `None` when there was nothing stacked to restack.
+fn auto_restack_note(backend: &dyn GitBackend) -> Result<Option<String>, GitError> {
+    Ok(restack_note(&backend.restack()?))
+}
+
+/// A one-line toast summary of a restack outcome, or `None` when nothing moved.
+fn restack_note(outcome: &rgit_git::RestackOutcome) -> Option<String> {
+    if outcome.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !outcome.restacked.is_empty() {
+        parts.push(format!("restacked {}", outcome.restacked.len()));
+    }
+    if !outcome.conflicted.is_empty() {
+        parts.push(format!("conflicts: {}", outcome.conflicted.join(", ")));
+    }
+    Some(format!("auto-restack ({})", parts.join("; ")))
 }
 
 fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), GitError> {
@@ -872,8 +992,8 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::CheckoutBranch(name) => backend.checkout_branch(name),
         Mutation::CreateBranch(name) => backend.create_branch(name),
         Mutation::CheckoutDetached(name) => backend.checkout_detached(name),
-        Mutation::StashPush => backend.stash_push(),
-        Mutation::StashPushMessage(msg) => backend.stash_push_message(msg),
+        Mutation::StashPush => backend.stash_push().map(drop),
+        Mutation::StashPushMessage(msg) => backend.stash_push_message(msg).map(drop),
         Mutation::StashPop(index) => backend.stash_pop(*index),
         Mutation::StashApply(index) => backend.stash_apply(*index),
         Mutation::StashDrop(index) => backend.stash_drop(*index),
@@ -886,7 +1006,10 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::RebaseAbort => backend.rebase_abort(),
         Mutation::RebaseContinue => backend.rebase_continue(),
         Mutation::RebaseSkip => backend.rebase_skip(),
-        Mutation::Undo => backend.undo(),
+        Mutation::Undo => backend.undo().map(drop),
+        Mutation::Redo => backend.redo().map(drop),
+        Mutation::Absorb => backend.absorb().map(drop),
+        Mutation::Restack => backend.restack().map(drop),
         Mutation::Bisect(args) => backend.bisect(args).map(drop),
         Mutation::Reset { rev, mode } => backend.reset(rev, *mode),
         Mutation::CherryPick(rev) => backend.cherry_pick(rev),
@@ -1026,7 +1149,26 @@ fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::base64_encode;
+    use super::{base64_encode, restack_note};
+    use rgit_git::RestackOutcome;
+
+    #[test]
+    fn restack_note_summarizes_moves_and_conflicts() {
+        assert_eq!(restack_note(&RestackOutcome::default()), None);
+        let moved = RestackOutcome {
+            restacked: vec!["a -> main".into(), "b -> a".into()],
+            conflicted: vec![],
+        };
+        assert_eq!(restack_note(&moved).as_deref(), Some("auto-restack (restacked 2)"));
+        let mixed = RestackOutcome {
+            restacked: vec!["a -> main".into()],
+            conflicted: vec!["b".into()],
+        };
+        assert_eq!(
+            restack_note(&mixed).as_deref(),
+            Some("auto-restack (restacked 1; conflicts: b)")
+        );
+    }
 
     #[test]
     fn base64_matches_rfc4648_vectors() {

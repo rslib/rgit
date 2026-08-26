@@ -42,8 +42,14 @@ enum Fail {
 /// Whether the terminal can render the rich (raw-mode, ANSI) widgets. A `dumb`
 /// or unset `TERM` gets the plain line-mode prompts instead. Resolved once.
 fn capable() -> bool {
+    use std::io::IsTerminal;
     static CAPABLE: OnceLock<bool> = OnceLock::new();
-    *CAPABLE.get_or_init(|| matches!(std::env::var("TERM"), Ok(t) if !t.is_empty() && t != "dumb"))
+    // The rich widgets render to stderr, so require it to be a TTY too (not just
+    // a capable TERM), or escape sequences leak into a redirected stderr.
+    *CAPABLE.get_or_init(|| {
+        matches!(std::env::var("TERM"), Ok(t) if !t.is_empty() && t != "dumb")
+            && stderr().is_terminal()
+    })
 }
 
 /// Read one line from stdin for line-mode prompts; `None` on EOF or error.
@@ -403,6 +409,9 @@ pub fn multiselect<T>(prompt: &str, items: Vec<Item<T>>) -> Result<Vec<T>, Cance
 /// Pick indices with the rich widget when the terminal supports it, else fall
 /// back to the line-mode prompt.
 fn list_indices<T>(prompt: &str, items: &[Item<T>], multi: bool) -> Result<Vec<usize>, Cancelled> {
+    if items.is_empty() {
+        return Err(Cancelled);
+    }
     if capable() {
         match run_list(prompt, items, multi) {
             Ok(v) => return Ok(v),
@@ -424,7 +433,11 @@ fn list_line<T>(prompt: &str, items: &[Item<T>], multi: bool) -> Result<Vec<usiz
     }
     loop {
         if multi {
-            let _ = write!(err, "numbers (1-{}, space separated), or enter for none: ", items.len());
+            let _ = write!(
+                err,
+                "numbers (1-{}, space separated), or enter for none: ",
+                items.len()
+            );
         } else {
             let _ = write!(err, "number (1-{}) or text: ", items.len());
         }
@@ -663,7 +676,12 @@ fn input_rich(prompt: &str, validate: &dyn Fn(&str) -> Result<(), String>) -> Re
             }
             Nav::Enter => match validate(&value) {
                 Ok(()) => {
-                    screen.finish(prompt, g.done, SUCCESS, span(value.clone(), Style::fg(SUCCESS)));
+                    screen.finish(
+                        prompt,
+                        g.done,
+                        SUCCESS,
+                        span(value.clone(), Style::fg(SUCCESS)),
+                    );
                     return Ok(value);
                 }
                 Err(e) => error = Some(e),

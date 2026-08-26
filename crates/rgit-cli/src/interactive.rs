@@ -24,7 +24,10 @@ pub fn pick_branch(backend: &Arc<dyn GitBackend>, prompt: &str) -> anyhow::Resul
     if branches.is_empty() {
         anyhow::bail!("no local branches");
     }
-    let items = branches.into_iter().map(|b| Item::new(b.clone(), b)).collect();
+    let items = branches
+        .into_iter()
+        .map(|b| Item::new(b.clone(), b))
+        .collect();
     prompt::select(prompt, items).map_err(err)
 }
 
@@ -71,7 +74,10 @@ pub fn multiselect_branches(
     if branches.is_empty() {
         anyhow::bail!("no other branches");
     }
-    let items = branches.into_iter().map(|b| Item::new(b.clone(), b)).collect();
+    let items = branches
+        .into_iter()
+        .map(|b| Item::new(b.clone(), b))
+        .collect();
     prompt::multiselect(prompt, items).map_err(err)
 }
 

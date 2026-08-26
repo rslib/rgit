@@ -41,6 +41,9 @@ pub enum Command {
         /// Walk every ref, not just HEAD.
         #[arg(long)]
         all: bool,
+        /// Keep only commits whose author name/email contains this.
+        #[arg(long)]
+        author: Option<String>,
     },
     /// Diffstat of the staged changes, or between two revisions.
     Diff {
@@ -129,6 +132,9 @@ pub enum Command {
     Pull,
     /// Push the current branch to its upstream.
     Push {
+        /// Overwrite the remote branch unconditionally (dangerous).
+        #[arg(long, conflicts_with = "force_with_lease")]
+        force: bool,
         /// Overwrite the remote branch only if it still matches our tracking ref.
         #[arg(long)]
         force_with_lease: bool,
@@ -145,6 +151,9 @@ pub enum Command {
     Merge {
         /// The branch or revision to merge (prompted for if omitted).
         rev: Option<String>,
+        /// Always create a merge commit, even if a fast-forward is possible.
+        #[arg(long = "no-ff")]
+        no_ff: bool,
     },
     /// Rebase onto a revision, or continue/skip/abort an in-progress rebase.
     Rebase {
@@ -163,8 +172,16 @@ pub enum Command {
         #[arg(long)]
         abort: bool,
     },
-    /// Undo the last HEAD move, preserving uncommitted work.
+    /// Undo the last operation from the op-log, restoring HEAD and the working
+    /// tree (recovers uncommitted work). Set RGIT_OPLOG=0 to disable the op-log.
     Undo,
+    /// Redo the operation most recently undone.
+    Redo,
+    /// Show the operation log (the undo stack), newest first.
+    Oplog,
+    /// Smartlog: your local/draft commits and the trunk they branch from.
+    #[command(visible_alias = "sl")]
+    Smartlog,
     /// Run a git bisect subcommand: `start <bad> <good>`, `good`, `bad`, `reset`.
     Bisect {
         /// Arguments passed to `git bisect`.
@@ -173,10 +190,10 @@ pub enum Command {
     },
     /// Reset HEAD to a revision (default mixed).
     Reset {
-        /// The revision to reset to.
-        rev: String,
+        /// The revision to reset to (prompted for if omitted on a terminal).
+        rev: Option<String>,
         /// Move HEAD only, keep the index and working tree.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "hard")]
         soft: bool,
         /// Reset the index and working tree too (discards changes).
         #[arg(long)]
@@ -217,6 +234,27 @@ pub enum Command {
         #[command(subcommand)]
         cmd: Option<WorktreeCmd>,
     },
+    /// Copy-on-write workspaces: instant, isolated, block-sharing clones of the
+    /// whole repo (code, build, .git) for parallel work (no subcommand lists).
+    Workspace {
+        #[command(subcommand)]
+        cmd: Option<WorkspaceCmd>,
+    },
+    /// Branching workflows: pick a preset (gitflow, github, gitlab, trunk,
+    /// release-flow); start/finish/release then follow its rules.
+    Flow {
+        #[command(subcommand)]
+        cmd: FlowCmd,
+    },
+    /// Stacked branches: chain branches and restack descendants after edits
+    /// (no subcommand lists the current stack).
+    Stack {
+        #[command(subcommand)]
+        cmd: Option<StackCmd>,
+    },
+    /// Fold each pending change into the stacked commit that last touched those
+    /// lines (blame-routed fixups + autosquash).
+    Absorb,
     /// Remove all untracked files and directories.
     Clean,
     /// Remove a tracked path from the index and working tree.
@@ -365,6 +403,64 @@ pub enum WorktreeCmd {
     },
 }
 
+/// Subcommands for stacked branches.
+#[derive(clap::Subcommand)]
+pub enum StackCmd {
+    /// Create a new branch stacked on the current one.
+    New {
+        /// The new branch name.
+        name: String,
+    },
+    /// List the stack containing the current branch.
+    List,
+    /// Rebase every descendant onto its parent's new tip.
+    Restack,
+}
+
+/// Subcommands for branching workflows.
+#[derive(clap::Subcommand)]
+pub enum FlowCmd {
+    /// Set the active workflow: gitflow, github, gitlab, trunk, release-flow.
+    Init {
+        /// The workflow preset name.
+        preset: String,
+    },
+    /// Start a feature branch per the active workflow.
+    Start {
+        /// The feature name.
+        name: String,
+    },
+    /// Finish the current feature (local merge, or push + PR per the workflow).
+    Finish,
+    /// Start a release (or finish it with --finish).
+    Release {
+        /// The release version.
+        version: String,
+        /// Finish the release instead of starting it.
+        #[arg(long)]
+        finish: bool,
+    },
+    /// Show the active workflow and its policy.
+    Status,
+}
+
+/// Subcommands for CoW workspaces.
+#[derive(clap::Subcommand)]
+pub enum WorkspaceCmd {
+    /// Create a copy-on-write clone of the repo on a new branch.
+    New {
+        /// The workspace name (also the new branch name).
+        name: String,
+    },
+    /// List this repo's workspaces.
+    List,
+    /// Remove a workspace.
+    Remove {
+        /// The workspace name.
+        name: String,
+    },
+}
+
 /// Run a subcommand and return its compact output. When `interactive`, a
 /// missing required argument is prompted for; otherwise it errors. `Mcp` is
 /// handled by the caller (it takes over the process), so it is unreachable here.
@@ -386,11 +482,9 @@ pub fn run(
     };
     Ok(match command {
         Command::Status => render::status(&backend.status()?),
-        Command::Log { limit, all } => render::log(&backend.log(&LogOptions {
-            limit,
-            all,
-            author: None,
-        })?),
+        Command::Log { limit, all, author } => {
+            render::log(&backend.log(&LogOptions { limit, all, author })?)
+        }
         Command::Diff { from, to, patch } => match (from, to) {
             (Some(from), Some(to)) => diff_out(&backend.diff_refs(&from, &to)?, patch),
             (Some(rev), None) => diff_out(&backend.diff_refs(&rev, "HEAD")?, patch),
@@ -446,10 +540,11 @@ pub fn run(
         Command::Fetch => net(interactive, "fetch", |r| backend.fetch(r))?,
         Command::Pull => net(interactive, "pull", |r| backend.pull(r))?,
         Command::Push {
+            force,
             force_with_lease,
             set_upstream,
         } => net(interactive, "push", |r| {
-            backend.push(false, force_with_lease, set_upstream, r)
+            backend.push(force, force_with_lease, set_upstream, r)
         })?,
         Command::Checkout { rev } => {
             let rev = resolve(rev, "a branch or revision", &|| {
@@ -465,11 +560,11 @@ pub fn run(
                 backend.checkout_detached(&rev)
             })
         }
-        Command::Merge { rev } => {
+        Command::Merge { rev, no_ff } => {
             let rev = resolve(rev, "a revision to merge", &|| {
                 crate::interactive::pick_branch(backend, "Merge which branch?")
             })?;
-            net(interactive, "merge", |r| backend.merge(&rev, r))?
+            net(interactive, "merge", |r| backend.merge(&rev, no_ff, r))?
         }
         Command::Rebase {
             onto,
@@ -506,13 +601,18 @@ pub fn run(
                 net(interactive, "rebase", |r| backend.rebase_onto(&onto, r))?
             }
         }
-        Command::Undo => ok(backend.undo()),
-        Command::Bisect { args } => match backend.bisect(&args) {
-            Ok(out) if out.is_empty() => "ok".to_owned(),
-            Ok(out) => out,
-            Err(e) => e.to_string(),
-        },
+        Command::Undo => format!("undid {}", backend.undo()?),
+        Command::Redo => format!("redid {}", backend.redo()?),
+        Command::Oplog => render::oplog(&backend.oplog()?),
+        Command::Smartlog => render::smartlog(&backend.smartlog()?),
+        Command::Bisect { args } => {
+            let out = backend.bisect(&args)?;
+            if out.is_empty() { "ok".to_owned() } else { out }
+        }
         Command::Reset { rev, soft, hard } => {
+            let rev = resolve(rev, "a revision to reset to", &|| {
+                crate::interactive::pick_commit(backend, "Reset to which commit?")
+            })?;
             let mode = match (soft, hard) {
                 (true, _) => ResetMode::Soft,
                 (_, true) => ResetMode::Hard,
@@ -569,10 +669,10 @@ pub fn run(
             Some(BranchCmd::Rename { old, new }) => ok(backend.rename_branch(&old, &new)),
         },
         Command::Stash { cmd } => match cmd {
-            None | Some(StashCmd::Push { message: None }) => ok(backend.stash_push()),
+            None | Some(StashCmd::Push { message: None }) => ok_msg(backend.stash_push()),
             Some(StashCmd::Push {
                 message: Some(message),
-            }) => ok(backend.stash_push_message(&message)),
+            }) => ok_msg(backend.stash_push_message(&message)),
             Some(StashCmd::Pop { index }) => ok(backend.stash_pop(stash_index(
                 backend,
                 index,
@@ -608,6 +708,26 @@ pub fn run(
             None => render::remotes(&backend.remotes()?),
             Some(RemoteCmd::Add { name, url }) => ok(backend.add_remote(&name, &url)),
             Some(RemoteCmd::Remove { name }) => ok(backend.remove_remote(&name)),
+        },
+        Command::Flow { cmd } => match cmd {
+            FlowCmd::Init { preset } => rgit_git::workflow::init(backend.as_ref(), &preset)?,
+            FlowCmd::Start { name } => rgit_git::workflow::start(backend.as_ref(), &name)?,
+            FlowCmd::Finish => rgit_git::workflow::finish(backend.as_ref())?,
+            FlowCmd::Release { version, finish } => {
+                rgit_git::workflow::release(backend.as_ref(), &version, finish)?
+            }
+            FlowCmd::Status => rgit_git::workflow::status(backend.as_ref())?,
+        },
+        Command::Stack { cmd } => match cmd.unwrap_or(StackCmd::List) {
+            StackCmd::New { name } => crate::stack::new(backend, &name)?,
+            StackCmd::List => crate::stack::list(backend)?,
+            StackCmd::Restack => crate::stack::restack(backend)?,
+        },
+        Command::Absorb => backend.absorb()?,
+        Command::Workspace { cmd } => match cmd.unwrap_or(WorkspaceCmd::List) {
+            WorkspaceCmd::New { name } => rgit_git::workspace::create(backend.as_ref(), &name)?,
+            WorkspaceCmd::List => rgit_git::workspace::list(backend.as_ref())?,
+            WorkspaceCmd::Remove { name } => rgit_git::workspace::remove(backend.as_ref(), &name)?,
         },
         Command::Worktree { cmd } => match cmd {
             None => render::worktrees(&backend.worktrees()?),
@@ -659,6 +779,14 @@ fn stash_index(
 fn ok(r: Result<(), GitError>) -> String {
     match r {
         Ok(()) => "ok".to_owned(),
+        Err(e) => e.to_string(),
+    }
+}
+
+/// Like [`ok`], but prints the operation's own success line instead of "ok".
+fn ok_msg(r: Result<String, GitError>) -> String {
+    match r {
+        Ok(msg) => msg,
         Err(e) => e.to_string(),
     }
 }

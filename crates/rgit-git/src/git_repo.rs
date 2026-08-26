@@ -43,9 +43,21 @@ impl Git2Backend {
         })
     }
 
+    /// Snapshot the current state into the operation log before a destructive
+    /// operation, so it can be undone. Best-effort: a snapshot failure is logged
+    /// but never blocks the operation. Takes and releases the repo lock, so call
+    /// it before the operation acquires its own lock (the mutex is not
+    /// reentrant).
+    fn snap(&self, label: &str) {
+        let repo = self.repo.lock().expect("repo mutex");
+        if let Err(e) = crate::oplog::snapshot(&repo, label) {
+            tracing::warn!(target: "rgit_git", "oplog snapshot failed: {e}");
+        }
+    }
+
     /// Run a `git` CLI command in the working directory, returning its stdout on
     /// success or its stderr as a `Cli` error. Used only for the few operations
-    /// libgit2 cannot do (undo, rebase continue/skip, bisect).
+    /// libgit2 cannot do (rebase continue/skip, bisect).
     fn run_git(&self, args: &[&str], env: &[(&str, &str)]) -> Result<String, GitError> {
         let mut cmd = std::process::Command::new("git");
         cmd.args(args).current_dir(&self.workdir);
@@ -69,6 +81,19 @@ impl Git2Backend {
     }
 }
 
+/// Reload libgit2's cached index from disk. libgit2 keeps one index instance per
+/// `Repository`, so a long-lived backend that runs alongside plain `git` (add /
+/// checkout / reset) would otherwise read and write a stale snapshot. A forced
+/// read is used, not a soft one: git can leave the index file "racily clean"
+/// (rewritten within the same second) so a soft read may miss the change. This
+/// is safe only where there are no unwritten in-memory index changes - i.e. at
+/// the entry of an operation, NOT mid-merge/rebase where the in-memory index
+/// holds conflict state not yet on disk.
+fn sync_index(repo: &Repository) -> Result<(), GitError> {
+    repo.index()?.read(true)?;
+    Ok(())
+}
+
 impl GitBackend for Git2Backend {
     fn workdir(&self) -> &Path {
         &self.workdir
@@ -76,6 +101,8 @@ impl GitBackend for Git2Backend {
 
     fn status(&self) -> Result<RepoStatus, GitError> {
         let mut repo = self.repo.lock().expect("repo mutex");
+        // Reflect any staging done by plain `git` since the last refresh.
+        sync_index(&repo)?;
         // stash_foreach needs &mut, so collect stashes before the shared reads.
         let stashes = collect_stashes(&mut repo);
         let entries = collect_entries(&repo)?;
@@ -99,14 +126,16 @@ impl GitBackend for Git2Backend {
         })
     }
 
-    fn stash_push(&self) -> Result<(), GitError> {
+    fn stash_push(&self) -> Result<String, GitError> {
+        self.snap("stash");
         let mut repo = self.repo.lock().expect("repo mutex");
         let sig = repo.signature()?;
         repo.stash_save2(&sig, None, Some(git2::StashFlags::INCLUDE_UNTRACKED))?;
-        Ok(())
+        Ok(stash_saved_line(&repo))
     }
 
-    fn stash_push_message(&self, message: &str) -> Result<(), GitError> {
+    fn stash_push_message(&self, message: &str) -> Result<String, GitError> {
+        self.snap("stash");
         let mut repo = self.repo.lock().expect("repo mutex");
         let sig = repo.signature()?;
         repo.stash_save2(
@@ -114,22 +143,25 @@ impl GitBackend for Git2Backend {
             Some(message),
             Some(git2::StashFlags::INCLUDE_UNTRACKED),
         )?;
-        Ok(())
+        Ok(stash_saved_line(&repo))
     }
 
     fn stash_pop(&self, index: usize) -> Result<(), GitError> {
+        self.snap("stash pop");
         let mut repo = self.repo.lock().expect("repo mutex");
         repo.stash_pop(index, None)?;
         Ok(())
     }
 
     fn stash_apply(&self, index: usize) -> Result<(), GitError> {
+        self.snap("stash apply");
         let mut repo = self.repo.lock().expect("repo mutex");
         repo.stash_apply(index, None)?;
         Ok(())
     }
 
     fn stash_drop(&self, index: usize) -> Result<(), GitError> {
+        self.snap("stash drop");
         let mut repo = self.repo.lock().expect("repo mutex");
         repo.stash_drop(index)?;
         Ok(())
@@ -190,6 +222,85 @@ impl GitBackend for Git2Backend {
             });
         }
         Ok(entries)
+    }
+
+    fn smartlog(&self) -> Result<Vec<crate::SmartlogEntry>, GitError> {
+        use std::collections::HashMap;
+        let repo = self.repo.lock().expect("repo mutex");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Map each local branch tip to its name(s), and collect the tips.
+        let mut labels: HashMap<git2::Oid, Vec<String>> = HashMap::new();
+        let mut tips: Vec<git2::Oid> = Vec::new();
+        for branch in repo.branches(Some(BranchType::Local))? {
+            let (branch, _) = branch?;
+            if let Some(oid) = branch.get().target() {
+                if let Ok(Some(name)) = branch.name() {
+                    labels.entry(oid).or_default().push(name.to_owned());
+                }
+                tips.push(oid);
+            }
+        }
+
+        let trunk = detect_trunk(&repo);
+        let head_oid = repo
+            .head()
+            .ok()
+            .and_then(|h| h.peel_to_commit().ok())
+            .map(|c| c.id());
+
+        let entry = |commit: &git2::Commit, is_head: bool, is_trunk: bool| crate::SmartlogEntry {
+            short_id: commit
+                .as_object()
+                .short_id()
+                .ok()
+                .and_then(|b| b.as_str().ok().map(str::to_owned))
+                .unwrap_or_default(),
+            summary: commit
+                .summary()
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .to_owned(),
+            author: commit.author().name().unwrap_or("?").to_owned(),
+            when: relative_age(commit.time().seconds(), now),
+            refs: labels.get(&commit.id()).cloned().unwrap_or_default(),
+            is_head,
+            is_trunk,
+            change_id: commit.message().ok().and_then(crate::change_id::extract),
+        };
+
+        // Commits on local branches but not on the trunk: your draft work.
+        let mut walk = repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TIME)?;
+        for oid in &tips {
+            let _ = walk.push(*oid);
+        }
+        if let Some(t) = trunk {
+            let _ = walk.hide(t);
+        }
+
+        let mut out = Vec::new();
+        for oid in walk {
+            let oid = oid?;
+            if Some(oid) == trunk {
+                continue;
+            }
+            let commit = repo.find_commit(oid)?;
+            out.push(entry(&commit, Some(oid) == head_oid, false));
+            if out.len() >= 200 {
+                break;
+            }
+        }
+        // The trunk tip as the base your work diverges from.
+        if let Some(t) = trunk {
+            let commit = repo.find_commit(t)?;
+            out.push(entry(&commit, Some(t) == head_oid, true));
+        }
+        Ok(out)
     }
 
     fn commit_details(&self, rev: &str) -> Result<crate::CommitDetails, GitError> {
@@ -258,6 +369,7 @@ impl GitBackend for Git2Backend {
 
     fn stage_all(&self) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         let mut index = repo.index()?;
         index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
         index.write()?;
@@ -266,6 +378,7 @@ impl GitBackend for Git2Backend {
 
     fn unstage_all(&self) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         match repo.head() {
             Ok(head_ref) => {
                 let target = head_ref.peel(ObjectType::Commit)?;
@@ -283,6 +396,7 @@ impl GitBackend for Git2Backend {
 
     fn stage_file(&self, path: &str) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         let mut index = repo.index()?;
         let rel = Path::new(path);
         if self.workdir.join(path).exists() {
@@ -296,6 +410,7 @@ impl GitBackend for Git2Backend {
 
     fn unstage_file(&self, path: &str) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         match repo.head() {
             Ok(head_ref) => {
                 let target = head_ref.peel(ObjectType::Commit)?;
@@ -313,6 +428,7 @@ impl GitBackend for Git2Backend {
 
     fn stage_hunk(&self, path: &str, new_start: u32) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         let mut dopts = DiffOptions::new();
         dopts.pathspec(path);
         let diff = repo.diff_index_to_workdir(None, Some(&mut dopts))?;
@@ -321,6 +437,7 @@ impl GitBackend for Git2Backend {
 
     fn unstage_hunk(&self, path: &str, new_start: u32) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         let head_tree = repo.head()?.peel_to_tree()?;
         let mut dopts = DiffOptions::new();
         dopts.pathspec(path);
@@ -334,6 +451,7 @@ impl GitBackend for Git2Backend {
 
     fn stage_lines(&self, path: &str, new_start: u32, lines: &[usize]) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         let mut dopts = DiffOptions::new();
         dopts.pathspec(path);
         let diff = repo.diff_index_to_workdir(None, Some(&mut dopts))?;
@@ -348,6 +466,7 @@ impl GitBackend for Git2Backend {
 
     fn unstage_lines(&self, path: &str, new_start: u32, lines: &[usize]) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         let head_tree = repo.head()?.peel_to_tree()?;
         let mut dopts = DiffOptions::new();
         dopts.pathspec(path);
@@ -394,6 +513,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn checkout_detached(&self, rev: &str) -> Result<(), GitError> {
+        self.snap("checkout");
         let repo = self.repo.lock().expect("repo mutex");
         let commit = repo.revparse_single(rev)?.peel_to_commit()?;
         repo.checkout_tree(commit.as_object(), Some(CheckoutBuilder::new().safe()))?;
@@ -429,43 +549,43 @@ impl GitBackend for Git2Backend {
     }
 
     fn rebase_onto(&self, rev: &str, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
+        self.snap("rebase");
         let repo = self.repo.lock().expect("repo mutex");
-        let onto = repo.revparse_single(rev)?.peel_to_commit()?;
-        let upstream = repo.find_annotated_commit(onto.id())?;
-        let mut rebase = repo.rebase(None, Some(&upstream), None, None)?;
-        let sig = repo.signature()?;
-        while let Some(op) = rebase.next() {
-            let op = op?;
-            // git prints "Applying: <subject>" for each replayed commit.
-            if let Some(summary) = repo
-                .find_commit(op.id())
-                .ok()
-                .and_then(|c| c.summary().ok().flatten().map(str::to_owned))
-            {
-                report(OpProgress::Line(format!("Applying: {summary}")));
-            }
-            if repo.index()?.has_conflicts() {
-                rebase.abort()?;
-                report(OpProgress::Line(
-                    "CONFLICT: rebase hit a conflict and was aborted".to_owned(),
-                ));
-                return Err(GitError::Conflict(
-                    "rebase hit a conflict and was aborted".into(),
-                ));
-            }
-            rebase.commit(None, &sig, None)?;
+        let target = repo.revparse_single(rev)?.peel_to_commit()?;
+        let upstream = repo.find_annotated_commit(target.id())?;
+        run_rebase(&repo, &upstream, None, report)
+    }
+
+    fn rebase_range(
+        &self,
+        upstream: &str,
+        onto: &str,
+        report: &dyn Fn(OpProgress),
+    ) -> Result<(), GitError> {
+        self.snap("restack");
+        let repo = self.repo.lock().expect("repo mutex");
+        let upstream_oid = repo.revparse_single(upstream)?.peel_to_commit()?.id();
+        let onto_oid = repo.revparse_single(onto)?.peel_to_commit()?.id();
+        let upstream = repo.find_annotated_commit(upstream_oid)?;
+        let onto = repo.find_annotated_commit(onto_oid)?;
+        run_rebase(&repo, &upstream, Some(&onto), report)
+    }
+
+    fn branch_tip(&self, name: &str) -> Result<Option<String>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        match repo.find_branch(name, BranchType::Local) {
+            Ok(branch) => Ok(branch.get().target().map(|oid| oid.to_string())),
+            Err(e) if e.code() == ErrorCode::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
         }
-        rebase.finish(Some(&sig))?;
-        report(OpProgress::Line(
-            "Successfully rebased and updated HEAD.".to_owned(),
-        ));
-        Ok(())
     }
 
     fn rebase_abort(&self) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
-        repo.open_rebase(None)?.abort()?;
-        Ok(())
+        // Shell out like continue/skip: `git rebase --abort` restores the
+        // pre-rebase state for both libgit2-created and CLI-started (interactive)
+        // rebases, whereas libgit2's open_rebase cannot drive a rebase the git
+        // CLI began ("interactive rebase is not supported").
+        self.run_git(&["rebase", "--abort"], &[]).map(drop)
     }
 
     fn rebase_continue(&self) -> Result<(), GitError> {
@@ -497,9 +617,173 @@ impl GitBackend for Git2Backend {
         }
     }
 
-    fn undo(&self) -> Result<(), GitError> {
-        self.run_git(&["reset", "--keep", "HEAD@{1}"], &[])
-            .map(drop)
+    fn undo(&self) -> Result<String, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        crate::oplog::undo(&repo)
+    }
+
+    fn redo(&self) -> Result<String, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        crate::oplog::redo(&repo)
+    }
+
+    fn oplog(&self) -> Result<Vec<crate::OpLogEntry>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        crate::oplog::entries(&repo)
+    }
+
+    fn absorb(&self) -> Result<String, GitError> {
+        use std::collections::{HashMap, HashSet};
+
+        self.snap("absorb");
+        // Phase 1 (read): for each changed hunk, blame its lines to find the
+        // local commit that last touched them; group hunks by that commit.
+        let (base, order, groups, hunk_count) = {
+            let repo = self.repo.lock().expect("repo mutex");
+            let head = repo.head()?.peel_to_commit()?;
+
+            // Refuse if there are staged changes: a fixup would capture them too.
+            let head_tree = head.tree()?;
+            if repo
+                .diff_tree_to_index(Some(&head_tree), None, None)?
+                .deltas()
+                .len()
+                > 0
+            {
+                return Err(GitError::Conflict(
+                    "you have staged changes; commit or unstage them before absorbing".into(),
+                ));
+            }
+
+            let trunk = detect_trunk(&repo).ok_or_else(|| {
+                GitError::Conflict("no trunk (main/master) to absorb against".into())
+            })?;
+            let base = repo.merge_base(head.id(), trunk).unwrap_or(trunk);
+
+            // Local commits (base..HEAD) - the mutable absorb targets.
+            let mut walk = repo.revwalk()?;
+            walk.push(head.id())?;
+            let _ = walk.hide(base);
+            let mutable: HashSet<git2::Oid> = walk.flatten().collect();
+            if mutable.is_empty() {
+                return Err(GitError::Conflict(
+                    "no local commits since the trunk to absorb into".into(),
+                ));
+            }
+
+            // Map each modified hunk to the commit its lines were last touched
+            // in, grouping hunks per target and keeping first-seen order. Zero
+            // context keeps distinct changes as separate hunks (so nearby edits
+            // owned by different commits do not merge into one).
+            let mut dopts = DiffOptions::new();
+            dopts.context_lines(0);
+            let diff = repo.diff_index_to_workdir(None, Some(&mut dopts))?;
+            let ndeltas = diff.deltas().count();
+            let mut order: Vec<git2::Oid> = Vec::new();
+            let mut groups: HashMap<git2::Oid, Vec<(String, u32)>> = HashMap::new();
+            let mut hunk_count = 0usize;
+            for i in 0..ndeltas {
+                let Some(patch) = git2::Patch::from_diff(&diff, i)? else {
+                    continue;
+                };
+                if patch.delta().status() != git2::Delta::Modified {
+                    continue;
+                }
+                let Some(path) = patch.delta().new_file().path() else {
+                    continue;
+                };
+                let path = path.to_string_lossy().into_owned();
+                let Ok(blame) = repo.blame_file(Path::new(&path), None) else {
+                    continue;
+                };
+                for h in 0..patch.num_hunks() {
+                    let (hunk, num_lines) = patch.hunk(h)?;
+                    // Blame the first line the hunk deletes (the changed old
+                    // line), not the hunk's leading context, which the base
+                    // commit usually owns. Pure additions fall back to the
+                    // hunk anchor.
+                    let mut line = hunk.old_start().max(1) as usize;
+                    for l in 0..num_lines {
+                        if let Ok(dl) = patch.line_in_hunk(h, l) {
+                            if dl.origin() == '-' {
+                                if let Some(no) = dl.old_lineno() {
+                                    line = no as usize;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let Some(bhunk) = blame.get_line(line) else {
+                        continue;
+                    };
+                    let target = bhunk.final_commit_id();
+                    if !mutable.contains(&target) {
+                        continue;
+                    }
+                    if !groups.contains_key(&target) {
+                        order.push(target);
+                    }
+                    groups
+                        .entry(target)
+                        .or_default()
+                        .push((path.clone(), hunk.new_start()));
+                    hunk_count += 1;
+                }
+            }
+            (base, order, groups, hunk_count)
+        };
+
+        if order.is_empty() {
+            return Ok("nothing to absorb (changes do not map to local commits)".to_owned());
+        }
+
+        // Phase 2 (write): one fixup commit per target, containing only that
+        // target's hunks (staged one at a time from a freshly recomputed diff).
+        {
+            let repo = self.repo.lock().expect("repo mutex");
+            let sig = repo
+                .signature()
+                .or_else(|_| git2::Signature::now("rgit", "rgit@localhost"))?;
+            for target in &order {
+                for (path, new_start) in &groups[target] {
+                    let mut dopts = DiffOptions::new();
+                    dopts.pathspec(path);
+                    dopts.context_lines(0);
+                    let diff = repo.diff_index_to_workdir(None, Some(&mut dopts))?;
+                    apply_one_hunk(&repo, &diff, path, *new_start)?;
+                }
+                let subject = repo
+                    .find_commit(*target)?
+                    .summary()
+                    .ok()
+                    .flatten()
+                    .unwrap_or("")
+                    .to_owned();
+                let tree = repo.find_tree(repo.index()?.write_tree()?)?;
+                let head = repo.head()?.peel_to_commit()?;
+                repo.commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    &format!("fixup! {subject}"),
+                    &tree,
+                    &[&head],
+                )?;
+            }
+        }
+        // If autosquash conflicts, abort so the repo is not left mid-rebase with
+        // the synthetic fixup commits; the op-log snapshot then fully restores.
+        if let Err(e) = self.run_git(
+            &["rebase", "-i", "--autosquash", &base.to_string()],
+            &[("GIT_SEQUENCE_EDITOR", "true"), ("GIT_EDITOR", "true")],
+        ) {
+            let _ = self.run_git(&["rebase", "--abort"], &[]);
+            return Err(e);
+        }
+        Ok(format!(
+            "absorbed {hunk_count} hunk(s) into {} commit(s)",
+            order.len()
+        ))
     }
 
     fn bisect(&self, args: &[String]) -> Result<String, GitError> {
@@ -509,11 +793,14 @@ impl GitBackend for Git2Backend {
     }
 
     fn clean(&self) -> Result<(), GitError> {
+        self.snap("clean");
         self.run_git(&["clean", "-fd"], &[]).map(drop)
     }
 
     fn remove_path(&self, path: &str) -> Result<(), GitError> {
+        self.snap("rm");
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         let mut index = repo.index()?;
         index.remove_path(Path::new(path))?;
         index.write()?;
@@ -525,7 +812,9 @@ impl GitBackend for Git2Backend {
     }
 
     fn move_path(&self, from: &str, to: &str) -> Result<(), GitError> {
+        self.snap("mv");
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         std::fs::rename(self.workdir.join(from), self.workdir.join(to))?;
         let mut index = repo.index()?;
         index.remove_path(Path::new(from))?;
@@ -551,6 +840,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn reset(&self, rev: &str, mode: ResetMode) -> Result<(), GitError> {
+        self.snap("reset");
         let repo = self.repo.lock().expect("repo mutex");
         let target = repo.revparse_single(rev)?;
         let kind = match mode {
@@ -563,6 +853,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn cherry_pick(&self, rev: &str) -> Result<(), GitError> {
+        self.snap("cherry-pick");
         let repo = self.repo.lock().expect("repo mutex");
         let source = repo.revparse_single(rev)?.peel_to_commit()?;
         repo.cherrypick(&source, None)?;
@@ -570,6 +861,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn revert(&self, rev: &str) -> Result<(), GitError> {
+        self.snap("revert");
         let repo = self.repo.lock().expect("repo mutex");
         let source = repo.revparse_single(rev)?.peel_to_commit()?;
         repo.revert(&source, None)?;
@@ -581,7 +873,8 @@ impl GitBackend for Git2Backend {
         finalize_sequenced(&repo, &repo.signature()?, &message)
     }
 
-    fn merge(&self, rev: &str, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
+    fn merge(&self, rev: &str, no_ff: bool, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
+        self.snap("merge");
         let repo = self.repo.lock().expect("repo mutex");
         let source = repo.revparse_single(rev)?.peel_to_commit()?;
         let annotated = repo.find_annotated_commit(source.id())?;
@@ -591,7 +884,7 @@ impl GitBackend for Git2Backend {
             report(OpProgress::Line("Already up to date.".to_owned()));
             return Ok(());
         }
-        if analysis.is_fast_forward() {
+        if analysis.is_fast_forward() && !no_ff {
             if let Some(old) = repo.head().ok().and_then(|h| h.target()) {
                 report(OpProgress::Line(format!(
                     "Updating {}..{}",
@@ -599,10 +892,20 @@ impl GitBackend for Git2Backend {
                     short7(source.id())
                 )));
             }
+            // Safe checkout first: refuse (rather than clobber) if the update
+            // would overwrite local uncommitted changes, like real git. Only
+            // move the branch ref once the working tree updated cleanly.
+            repo.checkout_tree(source.as_object(), Some(CheckoutBuilder::new().safe()))
+                .map_err(|_| {
+                    GitError::Conflict(
+                        "your local changes would be overwritten by the fast-forward; \
+                         commit or stash them first"
+                            .into(),
+                    )
+                })?;
             let name = repo.head()?.name().unwrap_or("HEAD").to_owned();
             repo.reference(&name, source.id(), true, "merge: fast-forward")?;
             repo.set_head(&name)?;
-            repo.checkout_head(Some(CheckoutBuilder::new().force()))?;
             report(OpProgress::Line("Fast-forward".to_owned()));
             return Ok(());
         }
@@ -648,6 +951,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn resolve_conflict(&self, path: &str, ours: bool) -> Result<(), GitError> {
+        self.snap("resolve");
         let repo = self.repo.lock().expect("repo mutex");
         let mut index = repo.index()?;
         // Find the chosen side's blob before mutating the index.
@@ -698,6 +1002,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn delete_branch(&self, name: &str) -> Result<(), GitError> {
+        self.snap("delete branch");
         let repo = self.repo.lock().expect("repo mutex");
         repo.find_branch(name, BranchType::Local)?.delete()?;
         Ok(())
@@ -762,7 +1067,30 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn config_get(&self, key: &str) -> Result<Option<String>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let cfg = repo.config()?;
+        match cfg.get_string(key) {
+            Ok(v) => Ok(Some(v)),
+            Err(e) if e.code() == ErrorCode::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn config_set(&self, key: &str, value: &str) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let mut cfg = repo.config()?;
+        cfg.set_str(key, value)?;
+        Ok(())
+    }
+
+    fn branch_exists(&self, name: &str) -> bool {
+        let repo = self.repo.lock().expect("repo mutex");
+        repo.find_branch(name, BranchType::Local).is_ok()
+    }
+
     fn rename_branch(&self, old: &str, new: &str) -> Result<(), GitError> {
+        self.snap("rename branch");
         let repo = self.repo.lock().expect("repo mutex");
         repo.find_branch(old, BranchType::Local)?
             .rename(new, false)?;
@@ -783,11 +1111,13 @@ impl GitBackend for Git2Backend {
     }
 
     fn checkout_branch(&self, name: &str) -> Result<(), GitError> {
+        self.snap("checkout");
         let repo = self.repo.lock().expect("repo mutex");
         checkout(&repo, name)
     }
 
     fn create_branch(&self, name: &str) -> Result<(), GitError> {
+        self.snap("create branch");
         let repo = self.repo.lock().expect("repo mutex");
         let head = repo.head()?.peel_to_commit()?;
         repo.branch(name, &head, false)?;
@@ -795,7 +1125,9 @@ impl GitBackend for Git2Backend {
     }
 
     fn discard_file(&self, path: &str) -> Result<(), GitError> {
+        self.snap("discard");
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         let status = repo.status_file(Path::new(path))?;
         if status.contains(Status::WT_NEW) {
             std::fs::remove_file(self.workdir.join(path))?;
@@ -809,7 +1141,9 @@ impl GitBackend for Git2Backend {
     }
 
     fn discard_hunk(&self, path: &str, new_start: u32) -> Result<(), GitError> {
+        self.snap("discard");
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         let diff = worktree_diff(&repo, path)?;
         let patch = reverse_hunk_patch(&diff, path, new_start)?;
         repo.apply(
@@ -821,7 +1155,9 @@ impl GitBackend for Git2Backend {
     }
 
     fn discard_lines(&self, path: &str, new_start: u32, lines: &[usize]) -> Result<(), GitError> {
+        self.snap("discard");
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         let diff = worktree_diff(&repo, path)?;
         let patch = partial_hunk_patch(&diff, path, new_start, lines, true)?;
         repo.apply(
@@ -841,6 +1177,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn commit(&self, message: &str) -> Result<(), GitError> {
+        self.snap("commit");
         let repo = self.repo.lock().expect("repo mutex");
         let parents = match repo.head() {
             Ok(head_ref) => vec![head_ref.peel_to_commit()?],
@@ -850,6 +1187,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn amend(&self, message: &str) -> Result<(), GitError> {
+        self.snap("amend");
         let repo = self.repo.lock().expect("repo mutex");
         make_amend(&repo, message, true)
     }
@@ -871,6 +1209,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn commit_no_verify(&self, message: &str) -> Result<(), GitError> {
+        self.snap("commit");
         let repo = self.repo.lock().expect("repo mutex");
         let parents = match repo.head() {
             Ok(head_ref) => vec![head_ref.peel_to_commit()?],
@@ -880,6 +1219,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn amend_no_verify(&self, message: &str) -> Result<(), GitError> {
+        self.snap("amend");
         let repo = self.repo.lock().expect("repo mutex");
         make_amend(&repo, message, false)
     }
@@ -898,6 +1238,7 @@ impl GitBackend for Git2Backend {
 
     fn staged_patch(&self) -> Result<String, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
         let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
         let mut opts = DiffOptions::new();
         let diff = repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))?;
@@ -1095,28 +1436,59 @@ fn short7(oid: git2::Oid) -> String {
 /// text, transfer counts, and ref updates fed to `report` as git-style output.
 /// `rejected` is set if the remote refuses a ref (libgit2 reports this through
 /// the callback but still returns success from `push`).
+/// A credential from a default `~/.ssh/<name>` private key (with its `.pub`),
+/// for when no ssh-agent is available. Passphrase-protected keys cannot be
+/// unlocked here, so they fail and the caller falls through to the next option.
+fn ssh_key_file(user: &str, name: &str) -> Result<Cred, git2::Error> {
+    let home = std::env::var("HOME").map_err(|_| git2::Error::from_str("HOME is not set"))?;
+    let private = PathBuf::from(home).join(".ssh").join(name);
+    if !private.exists() {
+        return Err(git2::Error::from_str("no such default ssh key"));
+    }
+    let public = private.with_extension("pub");
+    Cred::ssh_key(user, public.exists().then_some(&public), &private, None)
+}
+
 fn remote_callbacks<'a>(
     report: &'a dyn Fn(OpProgress),
     rejected: &'a std::sync::atomic::AtomicBool,
 ) -> RemoteCallbacks<'a> {
     let mut cb = RemoteCallbacks::new();
-    cb.credentials(|url, username, allowed| {
+    // libgit2 re-invokes this on every auth failure, so a callback that keeps
+    // returning the same credential loops forever (the push appears to hang).
+    // Count attempts and return an error once the options are exhausted so the
+    // operation fails cleanly instead. `ssh_attempts` counts only real SSH_KEY
+    // requests, not the separate USERNAME lookup libgit2 does first.
+    let mut ssh_attempts = 0usize;
+    let mut pass_tried = false;
+    cb.credentials(move |url, username, allowed| {
+        if allowed.contains(CredentialType::USERNAME) {
+            return Cred::username(username.unwrap_or("git"));
+        }
         if allowed.contains(CredentialType::SSH_KEY) {
-            if let Some(user) = username {
-                return Cred::ssh_key_from_agent(user);
-            }
+            let user = username.unwrap_or("git");
+            ssh_attempts += 1;
+            return match ssh_attempts {
+                1 => Cred::ssh_key_from_agent(user),
+                2 => ssh_key_file(user, "id_ed25519"),
+                3 => ssh_key_file(user, "id_rsa"),
+                _ => Err(git2::Error::from_str(
+                    "ssh authentication failed: no usable key in the agent or ~/.ssh \
+                     (unlock your key with ssh-add, or use an https remote)",
+                )),
+            };
         }
         if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) {
-            if let Ok(config) = git2::Config::open_default() {
-                return Cred::credential_helper(&config, url, username);
+            if pass_tried {
+                return Err(git2::Error::from_str(
+                    "authentication failed: the credential helper had no valid credentials",
+                ));
             }
+            pass_tried = true;
+            let config = git2::Config::open_default()?;
+            return Cred::credential_helper(&config, url, username);
         }
-        if allowed.contains(CredentialType::USERNAME) {
-            if let Some(user) = username {
-                return Cred::username(user);
-            }
-        }
-        Cred::default()
+        Err(git2::Error::from_str("no supported authentication method"))
     });
     // The remote's own progress text (`remote: Counting objects...`).
     cb.sideband_progress(move |data| {
@@ -1178,10 +1550,18 @@ fn make_commit(
     check_empty: bool,
     verify: bool,
 ) -> Result<(), GitError> {
+    // Refresh from disk first: a plain `git add` since the backend last touched
+    // the index must not be lost by the hook machinery writing the stale cached
+    // index back out.
+    sync_index(repo)?;
+
     let mut msg = message.to_owned();
     if verify {
         run_commit_hooks(repo, &mut msg)?;
     }
+    // After the commit-msg hook (which a Gerrit setup may use to add its own
+    // Change-Id), stamp one if none is present so the change has a stable id.
+    let msg = crate::change_id::ensure(&msg);
 
     let mut index = repo.index()?;
     let tree_oid = index.write_tree()?;
@@ -1244,15 +1624,43 @@ fn commit_report(repo: &Repository) -> Vec<String> {
     out
 }
 
+/// The git-style line git prints after `git stash`: `Saved working directory
+/// and index state WIP on <branch>: <short-oid> <subject>`. Stash does not move
+/// HEAD, so the base commit it reports is the current HEAD.
+fn stash_saved_line(repo: &Repository) -> String {
+    let Ok(head) = repo.head() else {
+        return "Saved working directory and index state".to_owned();
+    };
+    let branch = head.shorthand().unwrap_or("HEAD");
+    let (short, subject) = match head.peel_to_commit() {
+        Ok(commit) => {
+            let short = commit
+                .as_object()
+                .short_id()
+                .ok()
+                .and_then(|b| b.as_str().ok().map(str::to_owned))
+                .unwrap_or_default();
+            (short, commit.summary().ok().flatten().unwrap_or("").to_owned())
+        }
+        Err(_) => (String::new(), String::new()),
+    };
+    format!("Saved working directory and index state WIP on {branch}: {short} {subject}")
+}
+
 /// Rewrite HEAD from the index, keeping its parents. Runs the commit hooks when
 /// `verify` is set.
 fn make_amend(repo: &Repository, message: &str, verify: bool) -> Result<(), GitError> {
     let head = repo.head()?.peel_to_commit()?;
+    let old_msg = head.message().unwrap_or("").to_owned();
     let mut msg = message.to_owned();
     if verify {
         run_commit_hooks(repo, &mut msg)?;
     }
+    // Amend rewrites the commit; carry the original change id forward so the
+    // logical change keeps its identity even though the oid changes.
+    let msg = crate::change_id::preserve(&old_msg, &msg);
 
+    sync_index(repo)?;
     let mut index = repo.index()?;
     let tree = repo.find_tree(index.write_tree()?)?;
     let sig = repo.signature()?;
@@ -1323,6 +1731,68 @@ fn apply_one_hunk(
 
 /// Check out the local branch `name`, updating the worktree and HEAD. A safe
 /// checkout errors rather than clobbering conflicting local changes.
+/// Drive a libgit2 rebase to completion, reporting git-style progress and
+/// aborting on the first conflict. `onto` is `None` for a plain rebase onto
+/// `upstream`, or `Some` for a three-point `--onto` rebase.
+fn run_rebase(
+    repo: &Repository,
+    upstream: &git2::AnnotatedCommit,
+    onto: Option<&git2::AnnotatedCommit>,
+    report: &dyn Fn(OpProgress),
+) -> Result<(), GitError> {
+    let mut rebase = repo.rebase(None, Some(upstream), onto, None)?;
+    let sig = repo.signature()?;
+    while let Some(op) = rebase.next() {
+        let op = op?;
+        if let Some(summary) = repo
+            .find_commit(op.id())
+            .ok()
+            .and_then(|c| c.summary().ok().flatten().map(str::to_owned))
+        {
+            report(OpProgress::Line(format!("Applying: {summary}")));
+        }
+        if repo.index()?.has_conflicts() {
+            rebase.abort()?;
+            report(OpProgress::Line(
+                "CONFLICT: rebase hit a conflict and was aborted".to_owned(),
+            ));
+            return Err(GitError::Conflict(
+                "rebase hit a conflict and was aborted".into(),
+            ));
+        }
+        rebase.commit(None, &sig, None)?;
+    }
+    rebase.finish(Some(&sig))?;
+    report(OpProgress::Line(
+        "Successfully rebased and updated HEAD.".to_owned(),
+    ));
+    Ok(())
+}
+
+/// The commit the smartlog treats as the trunk: HEAD's upstream if it has one,
+/// else the first existing local `main`/`master`/`develop`/`trunk`.
+fn detect_trunk(repo: &Repository) -> Option<git2::Oid> {
+    if let Ok(head) = repo.head() {
+        if let Ok(name) = head.shorthand() {
+            if let Ok(local) = repo.find_branch(name, BranchType::Local) {
+                if let Ok(up) = local.upstream() {
+                    if let Some(oid) = up.get().target() {
+                        return Some(oid);
+                    }
+                }
+            }
+        }
+    }
+    for name in ["main", "master", "develop", "trunk"] {
+        if let Ok(branch) = repo.find_branch(name, BranchType::Local) {
+            if let Some(oid) = branch.get().target() {
+                return Some(oid);
+            }
+        }
+    }
+    None
+}
+
 fn checkout(repo: &Repository, name: &str) -> Result<(), GitError> {
     let refname = format!("refs/heads/{name}");
     let object = repo.revparse_single(&refname)?;

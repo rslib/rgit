@@ -230,6 +230,55 @@ impl Default for LogOptions {
     }
 }
 
+/// One entry in the operation log (undo stack), newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpLogEntry {
+    /// The operation that produced the state after this snapshot, e.g. `commit`.
+    pub label: String,
+    /// Where HEAD was: a branch name, or `detached <sha>`.
+    pub head: String,
+    /// A short relative age like `2h`.
+    pub when: String,
+    /// Short id of the snapshot commit.
+    pub short_id: String,
+}
+
+/// One commit in the smartlog: your local/draft commits plus the trunk tip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmartlogEntry {
+    pub short_id: String,
+    pub summary: String,
+    pub author: String,
+    /// A short relative age like `2h`.
+    pub when: String,
+    /// Branch names pointing at this commit (local, and the trunk marker).
+    pub refs: Vec<String>,
+    /// Whether HEAD is here.
+    pub is_head: bool,
+    /// Whether this is the trunk tip (the base your work diverges from).
+    pub is_trunk: bool,
+    /// The commit's stable change id, if it carries one. Unlike the oid, this
+    /// survives amend and rebase, so it identifies the logical change.
+    pub change_id: Option<String>,
+}
+
+/// The result of a restack. A conflict on one branch no longer aborts the whole
+/// operation: the branch is left untouched at its old base for the user to
+/// resolve, and the rest of the stack still moves.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestackOutcome {
+    /// Human lines like `feature -> main` for each branch that was rebased.
+    pub restacked: Vec<String>,
+    /// Branches whose rebase hit a conflict; skipped and left at their old base.
+    pub conflicted: Vec<String>,
+}
+
+impl RestackOutcome {
+    pub fn is_empty(&self) -> bool {
+        self.restacked.is_empty() && self.conflicted.is_empty()
+    }
+}
+
 /// A commit in the log view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry {

@@ -109,11 +109,13 @@ pub trait GitBackend: Send + Sync {
     /// Create a branch at HEAD and check it out.
     fn create_branch(&self, name: &str) -> Result<(), GitError>;
 
-    /// Stash the working tree and index (including untracked files).
-    fn stash_push(&self) -> Result<(), GitError>;
+    /// Stash the working tree and index (including untracked files). Returns the
+    /// git-style `Saved working directory and index state WIP on ...` line.
+    fn stash_push(&self) -> Result<String, GitError>;
 
-    /// Stash the working tree and index under a descriptive `message`.
-    fn stash_push_message(&self, message: &str) -> Result<(), GitError>;
+    /// Stash the working tree and index under a descriptive `message`. Returns
+    /// the git-style `Saved working directory and index state ...` line.
+    fn stash_push_message(&self, message: &str) -> Result<String, GitError>;
 
     /// Pop the stash at `index` (apply it and drop it).
     fn stash_pop(&self, index: usize) -> Result<(), GitError>;
@@ -126,6 +128,11 @@ pub trait GitBackend: Send + Sync {
 
     /// The commit log, newest first, filtered and bounded by `opts`.
     fn log(&self, opts: &crate::LogOptions) -> Result<Vec<crate::LogEntry>, GitError>;
+
+    /// A smartlog: the commits reachable from local branches but not from the
+    /// trunk (your draft work), plus the trunk tip, newest first, annotated with
+    /// branch names and HEAD/trunk markers.
+    fn smartlog(&self) -> Result<Vec<crate::SmartlogEntry>, GitError>;
 
     /// A commit's metadata and its diff against its first parent, resolved from
     /// a revision (e.g. a short id).
@@ -147,11 +154,26 @@ pub trait GitBackend: Send + Sync {
     /// `report` receives git-style progress lines (`Applying: ...`).
     fn rebase_onto(&self, rev: &str, report: &dyn Fn(crate::OpProgress)) -> Result<(), GitError>;
 
+    /// Three-point rebase: replay the current branch's commits after `upstream`
+    /// onto `onto` (i.e. `git rebase --onto <onto> <upstream>`). Used to restack
+    /// a child branch after its parent was rewritten. Aborts on conflict.
+    fn rebase_range(
+        &self,
+        upstream: &str,
+        onto: &str,
+        report: &dyn Fn(crate::OpProgress),
+    ) -> Result<(), GitError>;
+
+    /// The commit oid a local branch points at, if it exists.
+    fn branch_tip(&self, name: &str) -> Result<Option<String>, GitError>;
+
     /// Commits reachable from HEAD but not from `base`, oldest first (rebase-todo
     /// order): each `(short_id, subject)`.
     fn commits_between(&self, base: &str) -> Result<Vec<(String, String)>, GitError>;
 
-    /// Abort an in-progress rebase.
+    /// Abort an in-progress rebase, restoring the pre-rebase HEAD. Shells out to
+    /// `git` so it works for CLI-started (interactive) rebases too, which libgit2
+    /// cannot drive.
     fn rebase_abort(&self) -> Result<(), GitError>;
 
     /// Continue an in-progress rebase after resolving conflicts. Shells out to
@@ -165,9 +187,21 @@ pub trait GitBackend: Send + Sync {
     /// terminal so git can open the todo editor. Needs a TTY.
     fn rebase_interactive(&self, onto: Option<&str>) -> Result<(), GitError>;
 
-    /// Undo the last HEAD move (`reset --keep HEAD@{1}`), preserving uncommitted
-    /// work. Shells out to `git` (libgit2 has no `--keep`).
-    fn undo(&self) -> Result<(), GitError>;
+    /// Undo the last destructive operation, restoring HEAD, its branch, and the
+    /// working tree from the operation log (recovers uncommitted work too).
+    /// Returns a label of what was undone.
+    fn undo(&self) -> Result<String, GitError>;
+
+    /// Redo the operation most recently undone.
+    fn redo(&self) -> Result<String, GitError>;
+
+    /// The operation log (undo stack), newest first.
+    fn oplog(&self) -> Result<Vec<crate::OpLogEntry>, GitError>;
+
+    /// Fold each modified file's working-tree changes into the newest local
+    /// commit (since the trunk) that last touched that file, via fixup commits
+    /// and an autosquash rebase. Returns a summary.
+    fn absorb(&self) -> Result<String, GitError>;
 
     /// Run a `git bisect` subcommand (`start <bad> <good>`, `good`, `bad`,
     /// `reset`, ...). Shells out to `git` (libgit2 has no bisect).
@@ -198,10 +232,15 @@ pub trait GitBackend: Send + Sync {
     /// Revert `rev` on HEAD, committing when there are no conflicts.
     fn revert(&self, rev: &str) -> Result<(), GitError>;
 
-    /// Merge `rev` into the current branch (fast-forward or a merge commit).
-    /// `report` receives git-style progress lines (`Updating`, `Fast-forward`,
-    /// `CONFLICT ...`).
-    fn merge(&self, rev: &str, report: &dyn Fn(crate::OpProgress)) -> Result<(), GitError>;
+    /// Merge `rev` into the current branch. Fast-forwards when possible unless
+    /// `no_ff` forces a merge commit. `report` receives git-style progress lines
+    /// (`Updating`, `Fast-forward`, `CONFLICT ...`).
+    fn merge(
+        &self,
+        rev: &str,
+        no_ff: bool,
+        report: &dyn Fn(crate::OpProgress),
+    ) -> Result<(), GitError>;
 
     /// Resolve a conflicted path by taking our side (`ours`) or theirs, writing
     /// that version to the worktree and staging it.
@@ -236,4 +275,118 @@ pub trait GitBackend: Send + Sync {
 
     /// Rename a local branch.
     fn rename_branch(&self, old: &str, new: &str) -> Result<(), GitError>;
+
+    /// Read a git config value (local, then global), `None` if unset.
+    fn config_get(&self, key: &str) -> Result<Option<String>, GitError>;
+
+    /// Set a git config value in the repository's local config.
+    fn config_set(&self, key: &str, value: &str) -> Result<(), GitError>;
+
+    /// Whether a local branch of this name exists.
+    fn branch_exists(&self, name: &str) -> bool;
+
+    /// Create a new branch stacked on the current one, recording its parent and
+    /// fork point in git config.
+    fn stack_new(&self, name: &str) -> Result<String, GitError> {
+        let parent = self
+            .status()?
+            .head
+            .branch
+            .ok_or_else(|| GitError::Other("HEAD is detached; not on a branch".into()))?;
+        self.create_branch(name)?;
+        self.config_set(&format!("branch.{name}.rgit-stack-parent"), &parent)?;
+        if let Some(tip) = self.branch_tip(&parent)? {
+            self.config_set(&format!("branch.{name}.rgit-stack-base"), &tip)?;
+        }
+        Ok(format!("created {name} stacked on {parent}"))
+    }
+
+    /// Each local branch paired with its recorded stacked-branch parent, if any.
+    fn stack_parents(&self) -> Result<Vec<(String, Option<String>)>, GitError> {
+        let mut out = Vec::new();
+        for branch in self.local_branches()? {
+            let parent = self.config_get(&format!("branch.{branch}.rgit-stack-parent"))?;
+            out.push((branch, parent));
+        }
+        Ok(out)
+    }
+
+    /// Rebase every stacked branch onto its parent's current tip (parents
+    /// first), replaying only each branch's own commits. A conflict on one
+    /// branch does not abort the whole operation: that branch is left untouched
+    /// at its old base (the conflicted rebase self-aborts) and reported as
+    /// conflicted, while the rest of the stack still moves. Composed from the
+    /// other operations, so any backend gets it.
+    fn restack(&self) -> Result<crate::RestackOutcome, GitError> {
+        let parents: std::collections::HashMap<String, String> = self
+            .stack_parents()?
+            .into_iter()
+            .filter_map(|(b, p)| p.map(|p| (b, p)))
+            .collect();
+        if parents.is_empty() {
+            return Ok(crate::RestackOutcome::default());
+        }
+        let start = self.status()?.head.branch;
+
+        let mut order: Vec<String> = parents.keys().cloned().collect();
+        order.sort_by_key(|b| stack_depth(b, &parents));
+
+        let mut outcome = crate::RestackOutcome::default();
+        let result = (|| -> Result<(), GitError> {
+            for branch in &order {
+                let parent = &parents[branch];
+                let base_key = format!("branch.{branch}.rgit-stack-base");
+                let recorded = self.config_get(&base_key)?;
+                let current_tip = self.branch_tip(parent)?;
+                // A conflict self-aborts and leaves us back on `branch`; record
+                // it and carry on, so one snag does not strand the whole stack.
+                let rebased = match (recorded, &current_tip) {
+                    (Some(base), Some(tip)) if base != *tip => {
+                        self.checkout_branch(branch)?;
+                        Some(self.rebase_range(&base, parent, &|_| {}))
+                    }
+                    (None, Some(_)) => {
+                        self.checkout_branch(branch)?;
+                        Some(self.rebase_onto(parent, &|_| {}))
+                    }
+                    _ => None,
+                };
+                match rebased {
+                    None => {}
+                    Some(Ok(())) => {
+                        if let Some(tip) = &current_tip {
+                            self.config_set(&base_key, tip)?;
+                        }
+                        outcome.restacked.push(format!("{branch} -> {parent}"));
+                    }
+                    Some(Err(GitError::Conflict(_))) => outcome.conflicted.push(branch.clone()),
+                    Some(Err(e)) => return Err(e),
+                }
+            }
+            Ok(())
+        })();
+        if let Some(start) = start {
+            let _ = self.checkout_branch(&start);
+        }
+        result?;
+        Ok(outcome)
+    }
+}
+
+/// How many stacked ancestors a branch has, for ordering parents before
+/// children during a restack.
+fn stack_depth(branch: &str, parents: &std::collections::HashMap<String, String>) -> usize {
+    let mut depth = 0;
+    let mut cursor = branch;
+    while let Some(parent) = parents.get(cursor) {
+        if !parents.contains_key(parent) {
+            break;
+        }
+        depth += 1;
+        cursor = parent;
+        if depth > 1000 {
+            break;
+        }
+    }
+    depth
 }

@@ -30,11 +30,24 @@ pub struct Config {
 }
 
 /// Commit behavior.
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CommitConfig {
     /// Sign commits (`git commit -S`), honoring the user's git signing config.
     pub gpg_sign: bool,
+    /// After an amend, reword, or extend, rebase any branches stacked on the
+    /// rewritten commit onto its new tip (jj/Sapling style). On by default; set
+    /// to `false` to keep amend a purely local operation.
+    pub auto_restack: bool,
+}
+
+impl Default for CommitConfig {
+    fn default() -> Self {
+        Self {
+            gpg_sign: false,
+            auto_restack: true,
+        }
+    }
 }
 
 /// Theme selection: a named built-in palette plus per-role color overrides.
@@ -191,6 +204,15 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.ui.log_limit, 200);
         assert!(cfg.theme.name.is_none());
+        // Auto-restack is on unless explicitly disabled.
+        assert!(cfg.commit.auto_restack);
+    }
+
+    #[test]
+    fn auto_restack_can_be_disabled() {
+        let cfg: Config = toml::from_str("[commit]\nauto_restack = false\n").unwrap();
+        assert!(!cfg.commit.auto_restack);
+        assert!(!cfg.commit.gpg_sign);
     }
 
     #[test]

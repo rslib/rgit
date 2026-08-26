@@ -12,6 +12,7 @@ mod logging;
 mod mcp;
 mod prompt;
 mod render;
+mod stack;
 
 fn main() -> ! {
     logging::init();

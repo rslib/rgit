@@ -1242,14 +1242,17 @@ fn render_action_bar(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Structural keys that work the same bare in the vim profile as in magit, so
-/// their hint never needs the Space-leader prefix.
-const VIM_BARE_KEYS: &[char] = &[':', '?', '/', 'n', 'N', 'q', 'v'];
+/// Git actions whose mnemonic collides with a vim motion (or visual/yank), so in
+/// the vim profile they are reachable only through the Space leader: log (l),
+/// branch (b), refs (y), refresh (g), and revert (V, since bare V line-selects).
+/// Every other action letter is bound bare in both profiles, so its hint stays
+/// bare; only these get the leader prefix.
+const VIM_LEADER_ONLY: &[char] = &['l', 'b', 'y', 'g', 'V'];
 
 /// The chord for a single key char in the vim profile: a `␣`-prefixed leader
-/// chord for a git action, or the bare char for a motion/structural key.
+/// chord for a motion-clashing git action, or the bare char otherwise.
 fn key_chord(c: char) -> String {
-    if !VIM_BARE_KEYS.contains(&c) && crate::keymap::leader_command(c).is_some() {
+    if VIM_LEADER_ONLY.contains(&c) {
         format!("␣{c}")
     } else {
         c.to_string()
@@ -1350,6 +1353,13 @@ fn context_hints(app: &App) -> (Option<String>, Vec<(&'static str, &'static str)
             vec![("⏎", "checkout"), ("x", "delete"), ("q", "back")],
         ),
         ViewKind::Commit | ViewKind::Diff => (None, vec![("⇥", "fold"), ("q", "back")]),
+        ViewKind::Smartlog => (Some("smartlog".into()), vec![("q", "back")]),
+        ViewKind::Oplog => (
+            Some("op-log".into()),
+            vec![("⏎", "restore here"), ("q", "back")],
+        ),
+        ViewKind::Stack => (Some("stack".into()), vec![("q", "back")]),
+        ViewKind::Info => (None, vec![("q", "back")]),
         ViewKind::Blame
         | ViewKind::Remotes
         | ViewKind::Worktrees
@@ -1410,6 +1420,18 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("r", "rebase menu (onto · interactive · continue)"),
             ("m", "merge a branch"),
             ("O", "reset (soft · mixed · hard)"),
+        ],
+    ),
+    (
+        "Operations menu (o · space o)",
+        &[
+            ("u / r", "undo / redo the last operation"),
+            ("o", "op-log timeline · RET restores to that point"),
+            ("s", "smartlog (draft commits vs the trunk)"),
+            ("k / n / R", "stack: view · new branch · restack"),
+            ("a", "absorb changes into the owning commits"),
+            ("f", "workflow status (flow init/start/finish: palette)"),
+            ("w", "copy-on-write workspaces (new: palette)"),
         ],
     ),
 ];

@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use rgit_git::FileDiff;
 use rgit_git::{
-    BlameLine, CommitDetails, GitBackend, GitError, Head, LogEntry, LogOptions, RefEntry, Remote,
-    RepoState, RepoStatus, ResetMode, Worktree,
+    BlameLine, CommitDetails, GitBackend, GitError, Head, LogEntry, LogOptions, OpLogEntry,
+    RefEntry, Remote, RepoState, RepoStatus, ResetMode, SmartlogEntry, Worktree,
 };
 use rgit_model::{
     RefTarget, Section, Target, build, build_blame, build_commit, build_diff, build_log,
@@ -383,6 +383,27 @@ pub enum ViewKind {
     Review,
     Diff,
     SessionLog,
+    Smartlog,
+    Oplog,
+    Stack,
+    Info,
+}
+
+/// A backend operation that returns a status string, shown as a toast.
+#[derive(Debug, Clone)]
+pub enum TextOp {
+    FlowInit(String),
+    FlowStart(String),
+    FlowFinish,
+    WorkspaceNew(String),
+    StackNew(String),
+}
+
+/// A read-only text panel opened as the Info view.
+#[derive(Debug, Clone, Copy)]
+pub enum InfoKind {
+    FlowStatus,
+    Workspaces,
 }
 
 /// Which severities the session-log view shows, cycled with `f`.
@@ -506,6 +527,47 @@ pub enum Msg {
     StashPop,
     OpenSessionLog,
     CycleLogFilter,
+    /// Open the smartlog view.
+    OpenSmartlog,
+    SmartlogLoaded(Vec<SmartlogEntry>),
+    /// Open the operation-log (timeline) view.
+    OpenOplog,
+    OplogLoaded(Vec<OpLogEntry>),
+    /// Open the stacked-branches view.
+    OpenStack,
+    StackLoaded {
+        parents: Vec<(String, Option<String>)>,
+        current: Option<String>,
+    },
+    /// Restack every stacked branch onto its parent's new tip.
+    Restack,
+    /// A note (shown as a toast) that an amend auto-restacked its children.
+    AutoRestackNote(String),
+    /// Fold pending changes into the commits that last touched those lines.
+    Absorb,
+    /// Prompt for a workflow preset, then set it.
+    FlowInitPrompt,
+    /// Prompt for a feature name, then start it per the active workflow.
+    FlowStartPrompt,
+    /// Finish the current feature per the active workflow.
+    FlowFinish,
+    /// Open the workflow status panel.
+    OpenFlowStatus,
+    /// Prompt for a name, then create a CoW workspace.
+    WorkspaceNewPrompt,
+    /// Open the workspaces panel.
+    OpenWorkspaces,
+    /// Prompt for a name, then create a stacked branch.
+    StackNewPrompt,
+    /// Open the operations menu (undo/redo, smartlog, op-log, stack, absorb, …).
+    OperationsMenu,
+    /// Result of a text-returning backend op, shown as a toast.
+    TextResult(Result<String, String>),
+    /// A loaded read-only text panel.
+    InfoLoaded {
+        title: String,
+        text: Result<String, String>,
+    },
     BranchMenu,
     RebaseMenu,
     MergeMenu,
@@ -522,6 +584,7 @@ pub enum Msg {
     AiReview,
     AiReviewLoaded(String),
     Undo,
+    Redo,
     ShowRebaseTodo {
         base: String,
         entries: Vec<(String, String)>,
@@ -636,8 +699,14 @@ pub enum Mutation {
     RebaseAbort,
     RebaseContinue,
     RebaseSkip,
-    /// Undo the last HEAD move, keeping uncommitted work.
+    /// Undo the last operation from the op-log, keeping uncommitted work.
     Undo,
+    /// Redo the operation most recently undone.
+    Redo,
+    /// Fold pending changes into the commits that last touched those lines.
+    Absorb,
+    /// Rebase every stacked branch onto its parent's new tip.
+    Restack,
     /// A `git bisect` subcommand and its args (without the leading `bisect`).
     Bisect(Vec<String>),
     Reset {
@@ -743,6 +812,16 @@ pub enum ActionKind {
     WorktreeRemove,
     LogShow,
     LogAuthor,
+    OpUndo,
+    OpRedo,
+    OpOplog,
+    OpSmartlog,
+    OpStack,
+    OpStackNew,
+    OpRestack,
+    OpAbsorb,
+    OpFlowStatus,
+    OpWorkspaces,
 }
 
 /// A transient popup: a title, sticky argument toggles, and suffix actions that
@@ -872,6 +951,25 @@ impl Transient {
         }
     }
 
+    fn operations() -> Self {
+        Self {
+            title: "Operations".into(),
+            args: Vec::new(),
+            actions: vec![
+                action('u', "undo", ActionKind::OpUndo),
+                action('r', "redo", ActionKind::OpRedo),
+                action('o', "op-log (timeline)", ActionKind::OpOplog),
+                action('s', "smartlog", ActionKind::OpSmartlog),
+                action('k', "stack", ActionKind::OpStack),
+                action('n', "stack: new branch…", ActionKind::OpStackNew),
+                action('R', "restack", ActionKind::OpRestack),
+                action('a', "absorb", ActionKind::OpAbsorb),
+                action('f', "flow status", ActionKind::OpFlowStatus),
+                action('w', "workspaces", ActionKind::OpWorkspaces),
+            ],
+        }
+    }
+
     fn branch() -> Self {
         Self {
             title: "Branch".into(),
@@ -975,6 +1073,10 @@ pub enum PromptAction {
     LogAuthor,
     DiffRefs,
     BisectStart,
+    FlowInit,
+    FlowStart,
+    WorkspaceNew,
+    StackNew,
 }
 
 /// A minibuffer: a label, an editable input, and optional filterable candidates.
@@ -1087,6 +1189,66 @@ pub static PALETTE: &[PaletteEntry] = &[
         label: "Commit",
         keyhint: "c",
         make: || Msg::CommitMenu,
+    },
+    PaletteEntry {
+        label: "Smartlog",
+        keyhint: "",
+        make: || Msg::OpenSmartlog,
+    },
+    PaletteEntry {
+        label: "Operation log (timeline)",
+        keyhint: "",
+        make: || Msg::OpenOplog,
+    },
+    PaletteEntry {
+        label: "Stack: view",
+        keyhint: "",
+        make: || Msg::OpenStack,
+    },
+    PaletteEntry {
+        label: "Stack: new branch",
+        keyhint: "",
+        make: || Msg::StackNewPrompt,
+    },
+    PaletteEntry {
+        label: "Stack: restack",
+        keyhint: "",
+        make: || Msg::Restack,
+    },
+    PaletteEntry {
+        label: "Absorb changes",
+        keyhint: "",
+        make: || Msg::Absorb,
+    },
+    PaletteEntry {
+        label: "Flow: status",
+        keyhint: "",
+        make: || Msg::OpenFlowStatus,
+    },
+    PaletteEntry {
+        label: "Flow: init workflow",
+        keyhint: "",
+        make: || Msg::FlowInitPrompt,
+    },
+    PaletteEntry {
+        label: "Flow: start feature",
+        keyhint: "",
+        make: || Msg::FlowStartPrompt,
+    },
+    PaletteEntry {
+        label: "Flow: finish",
+        keyhint: "",
+        make: || Msg::FlowFinish,
+    },
+    PaletteEntry {
+        label: "Workspace: list",
+        keyhint: "",
+        make: || Msg::OpenWorkspaces,
+    },
+    PaletteEntry {
+        label: "Workspace: new (CoW clone)",
+        keyhint: "",
+        make: || Msg::WorkspaceNewPrompt,
     },
     PaletteEntry {
         label: "Stage all",
@@ -1229,6 +1391,11 @@ pub static PALETTE: &[PaletteEntry] = &[
         make: || Msg::Undo,
     },
     PaletteEntry {
+        label: "Redo last undone operation",
+        keyhint: "",
+        make: || Msg::Redo,
+    },
+    PaletteEntry {
         label: "Refresh",
         keyhint: "g",
         make: || Msg::Refresh,
@@ -1305,6 +1472,21 @@ pub enum Effect {
     LoadBlame(String),
     /// Load all refs, then push the refs view.
     LoadRefs,
+    /// Load the smartlog, then push the smartlog view.
+    LoadSmartlog,
+    /// Load the operation log, then push the oplog view.
+    LoadOplog,
+    /// Load the stacked-branch parents, then push the stack view.
+    LoadStack,
+    /// Undo `n` operations in sequence (op-log restore-to-cursor).
+    UndoTimes(usize),
+    /// Run a text-returning backend op (flow/workspace), toast the result.
+    RunText(TextOp),
+    /// Load a read-only text panel (flow status, workspaces).
+    LoadInfo {
+        title: &'static str,
+        kind: InfoKind,
+    },
     /// Load configured remotes, then push the remotes view.
     LoadRemotes,
     /// Load linked worktrees, then push the worktrees view.
@@ -1436,8 +1618,12 @@ pub struct App {
     log_loading: bool,
     /// The severity filter for the session-log view.
     log_filter: LogFilter,
+    /// Number of entries in the op-log view (0 = the empty placeholder row).
+    oplog_len: usize,
     /// Sign commits via git's -S when set.
     gpg_sign: bool,
+    /// Restack stacked children after an amend/reword/extend when set.
+    auto_restack: bool,
     /// Last status snapshot, for the adaptive preview pane.
     snapshot: Option<RepoStatus>,
     /// What the preview buffer currently holds, so it is rebuilt only when the
@@ -1504,7 +1690,9 @@ impl App {
             log_exhausted: false,
             log_loading: false,
             log_filter: LogFilter::All,
+            oplog_len: 0,
             gpg_sign: config.commit.gpg_sign,
+            auto_restack: config.commit.auto_restack,
             snapshot: None,
             preview_key: None,
             preview_buf: Buffer::default(),
@@ -1525,6 +1713,11 @@ impl App {
 
     pub fn backend(&self) -> Arc<dyn GitBackend> {
         self.backend.clone()
+    }
+
+    /// Whether an amend/reword/extend should restack the stacked children after.
+    pub fn auto_restack(&self) -> bool {
+        self.auto_restack
     }
 
     /// The short id of the commit under the cursor, if any.
@@ -2067,6 +2260,15 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         // `RET` is section-aware: open a commit's diff, blame a file, or check
         // out a reference.
+        Msg::Enter if app.active_kind() == ViewKind::Oplog => {
+            // Ignore Enter on the "op-log is empty" placeholder row.
+            if app.oplog_len > 0 {
+                let steps = (app.buffer().cursor() + 1).min(app.oplog_len);
+                app.pop_view();
+                app.busy = Some("restoring".into());
+                return vec![Effect::UndoTimes(steps)];
+            }
+        }
         Msg::Enter => match app.buffer().target_at_cursor() {
             Some(Target::Commit { id }) => return vec![Effect::LoadCommit(id)],
             Some(Target::File { path, .. }) => return vec![Effect::LoadBlame(path)],
@@ -2086,6 +2288,76 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             let mut buffer = Buffer::default();
             buffer.set_content(build_refs(&refs));
             app.push_view(ViewKind::Refs, buffer);
+        }
+        Msg::OpenSmartlog => return vec![Effect::LoadSmartlog],
+        Msg::SmartlogLoaded(entries) => {
+            let mut buffer = Buffer::default();
+            buffer.set_content(build_smartlog(&entries));
+            app.push_view(ViewKind::Smartlog, buffer);
+        }
+        Msg::OpenOplog => return vec![Effect::LoadOplog],
+        Msg::OplogLoaded(entries) => {
+            app.oplog_len = entries.len();
+            let mut buffer = Buffer::default();
+            buffer.set_content(build_oplog(&entries));
+            app.push_view(ViewKind::Oplog, buffer);
+        }
+        Msg::Restack => {
+            app.busy = Some("restacking".into());
+            return vec![Effect::Mutate(Mutation::Restack)];
+        }
+        Msg::Absorb => {
+            app.busy = Some("absorbing".into());
+            return vec![Effect::Mutate(Mutation::Absorb)];
+        }
+        Msg::FlowInitPrompt => revision_prompt(
+            app,
+            "Workflow (gitflow/github/gitlab/trunk/release-flow)",
+            PromptAction::FlowInit,
+        ),
+        Msg::FlowStartPrompt => revision_prompt(app, "Feature name", PromptAction::FlowStart),
+        Msg::FlowFinish => {
+            app.busy = Some("finishing".into());
+            return vec![Effect::RunText(TextOp::FlowFinish)];
+        }
+        Msg::OpenFlowStatus => {
+            return vec![Effect::LoadInfo {
+                title: "workflow",
+                kind: InfoKind::FlowStatus,
+            }];
+        }
+        Msg::WorkspaceNewPrompt => {
+            revision_prompt(app, "Workspace name", PromptAction::WorkspaceNew)
+        }
+        Msg::StackNewPrompt => {
+            revision_prompt(app, "New stacked branch name", PromptAction::StackNew)
+        }
+        Msg::OpenWorkspaces => {
+            return vec![Effect::LoadInfo {
+                title: "workspaces",
+                kind: InfoKind::Workspaces,
+            }];
+        }
+        Msg::AutoRestackNote(text) => app.push_toast(ToastKind::Success, text),
+        Msg::TextResult(Ok(text)) => {
+            app.busy = None;
+            app.push_toast(ToastKind::Success, text);
+            return vec![Effect::Refresh];
+        }
+        Msg::TextResult(Err(e)) => {
+            app.busy = None;
+            app.push_toast(ToastKind::Error, e);
+        }
+        Msg::InfoLoaded { title, text } => {
+            let mut buffer = Buffer::default();
+            buffer.set_content(build_info(&title, &text));
+            app.push_view(ViewKind::Info, buffer);
+        }
+        Msg::OpenStack => return vec![Effect::LoadStack],
+        Msg::StackLoaded { parents, current } => {
+            let mut buffer = Buffer::default();
+            buffer.set_content(build_stack(&parents, current.as_deref()));
+            app.push_view(ViewKind::Stack, buffer);
         }
         Msg::RemoteMenu => app.transient = Some(Transient::remote()),
         Msg::RemotesLoaded(remotes) => {
@@ -2159,6 +2431,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.log_filter = app.log_filter.next();
             app.refresh_session_log();
         }
+        Msg::OperationsMenu => app.transient = Some(Transient::operations()),
         Msg::BranchMenu => app.transient = Some(Transient::branch()),
         Msg::RebaseMenu => {
             let rebasing = matches!(app.state, RepoState::Rebase);
@@ -2181,11 +2454,14 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             return vec![Effect::ReviewStaged];
         }
         Msg::Undo => {
-            // reset --keep refuses to overwrite uncommitted work, so this can
-            // undo the last HEAD move (commit/amend/reset/rebase/merge/...)
-            // without losing changes.
+            // Restore the previous op-log snapshot (HEAD, branch, and the whole
+            // working tree), recovering uncommitted work too.
             app.busy = Some("undoing".into());
             return vec![Effect::Mutate(Mutation::Undo)];
+        }
+        Msg::Redo => {
+            app.busy = Some("redoing".into());
+            return vec![Effect::Mutate(Mutation::Redo)];
         }
         Msg::ShowRebaseTodo { base, entries } => {
             app.loading = false;
@@ -2728,6 +3004,18 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
     if let PromptAction::RebaseOnto = prompt.action {
         return open_op(app, ConsoleOp::RebaseOnto(value));
     }
+    // Flow/workspace ops return a status string, shown as a toast.
+    let text_op = match prompt.action {
+        PromptAction::FlowInit => Some(TextOp::FlowInit(value.clone())),
+        PromptAction::FlowStart => Some(TextOp::FlowStart(value.clone())),
+        PromptAction::WorkspaceNew => Some(TextOp::WorkspaceNew(value.clone())),
+        PromptAction::StackNew => Some(TextOp::StackNew(value.clone())),
+        _ => None,
+    };
+    if let Some(op) = text_op {
+        app.busy = Some("working".into());
+        return vec![Effect::RunText(op)];
+    }
     let mutation = match prompt.action {
         PromptAction::CheckoutBranch => Mutation::CheckoutBranch(value),
         PromptAction::CreateBranch => Mutation::CreateBranch(value),
@@ -2758,7 +3046,11 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         | PromptAction::AddWorktree
         | PromptAction::LogAuthor
         | PromptAction::DiffRefs
-        | PromptAction::BisectStart => {
+        | PromptAction::BisectStart
+        | PromptAction::FlowInit
+        | PromptAction::FlowStart
+        | PromptAction::WorkspaceNew
+        | PromptAction::StackNew => {
             return Vec::new();
         }
         PromptAction::DeleteBranch => Mutation::DeleteBranch(value),
@@ -2887,6 +3179,16 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
         ActionKind::StashPopAt => stash_at_point(app, Mutation::StashPop),
         ActionKind::StashApplyAt => stash_at_point(app, Mutation::StashApply),
         ActionKind::StashDropAt => stash_at_point(app, Mutation::StashDrop),
+        ActionKind::OpUndo => update(app, Msg::Undo),
+        ActionKind::OpRedo => update(app, Msg::Redo),
+        ActionKind::OpOplog => update(app, Msg::OpenOplog),
+        ActionKind::OpSmartlog => update(app, Msg::OpenSmartlog),
+        ActionKind::OpStack => update(app, Msg::OpenStack),
+        ActionKind::OpStackNew => update(app, Msg::StackNewPrompt),
+        ActionKind::OpRestack => update(app, Msg::Restack),
+        ActionKind::OpAbsorb => update(app, Msg::Absorb),
+        ActionKind::OpFlowStatus => update(app, Msg::OpenFlowStatus),
+        ActionKind::OpWorkspaces => update(app, Msg::OpenWorkspaces),
         ActionKind::BranchCheckout => {
             app.transient = None;
             vec![Effect::LoadBranches]
@@ -3004,6 +3306,143 @@ fn build_session_log(lines: &[crate::session_log::LogLine], filter: LogFilter) -
                 Style::Dim,
             )],
         )];
+    }
+    rows
+}
+
+fn build_smartlog(entries: &[SmartlogEntry]) -> Vec<Section> {
+    use rgit_model::{NodeKind, Section, Span, Style};
+    if entries.is_empty() {
+        return vec![Section::leaf(
+            "smartlog/empty",
+            NodeKind::Info,
+            vec![Span::new("no commits".to_owned(), Style::Dim)],
+        )];
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let (marker, mstyle) = if e.is_head {
+                ("*", Style::Added)
+            } else if e.is_trunk {
+                ("=", Style::Branch)
+            } else {
+                ("o", Style::Dim)
+            };
+            let mut spans = vec![
+                Span::new(format!("{marker} "), mstyle),
+                Span::new(format!("{} ", e.short_id), Style::Hash),
+            ];
+            if !e.refs.is_empty() {
+                spans.push(Span::new(
+                    format!("({}) ", e.refs.join(", ")),
+                    Style::Branch,
+                ));
+            }
+            spans.push(Span::new(e.summary.clone(), Style::Plain));
+            if let Some(id) = &e.change_id {
+                let short: String = id.chars().take(9).collect();
+                spans.push(Span::new(format!("  {short}"), Style::Dim));
+            }
+            spans.push(Span::new(format!("  {}", e.when), Style::Dim));
+            Section::leaf(format!("smartlog/{i}"), NodeKind::Info, spans)
+        })
+        .collect()
+}
+
+fn build_oplog(entries: &[OpLogEntry]) -> Vec<Section> {
+    use rgit_model::{NodeKind, Section, Span, Style};
+    if entries.is_empty() {
+        return vec![Section::leaf(
+            "oplog/empty",
+            NodeKind::Info,
+            vec![Span::new("op-log is empty".to_owned(), Style::Dim)],
+        )];
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let spans = vec![
+                Span::new(format!("{} ", e.short_id), Style::Hash),
+                Span::new(format!("{} ", e.label), Style::Plain),
+                Span::new(format!("({}, {})", e.head, e.when), Style::Dim),
+            ];
+            Section::leaf(format!("oplog/{i}"), NodeKind::Info, spans)
+        })
+        .collect()
+}
+
+fn build_stack(parents: &[(String, Option<String>)], current: Option<&str>) -> Vec<Section> {
+    use rgit_model::{NodeKind, Section, Span, Style};
+    use std::collections::HashMap;
+    let map: HashMap<&str, &str> = parents
+        .iter()
+        .filter_map(|(b, p)| p.as_deref().map(|p| (b.as_str(), p)))
+        .collect();
+
+    // Walk down from the current branch through its parents.
+    let mut chain = Vec::new();
+    let mut cursor = current.map(str::to_owned);
+    while let Some(branch) = cursor {
+        let parent = map.get(branch.as_str()).map(|s| s.to_string());
+        chain.push((branch.clone(), parent.clone()));
+        cursor = parent;
+    }
+    if chain.len() <= 1 && map.is_empty() {
+        return vec![Section::leaf(
+            "stack/empty",
+            NodeKind::Info,
+            vec![Span::new(
+                "no stacked branches (palette: Stack: new branch)".to_owned(),
+                Style::Dim,
+            )],
+        )];
+    }
+    chain
+        .iter()
+        .enumerate()
+        .map(|(i, (branch, parent))| {
+            let is_current = current == Some(branch.as_str());
+            let mark = if is_current { "*" } else { " " };
+            let mut spans = vec![
+                Span::new(format!("{mark} "), Style::Added),
+                Span::new(
+                    branch.clone(),
+                    if is_current {
+                        Style::Added
+                    } else {
+                        Style::Branch
+                    },
+                ),
+            ];
+            match parent {
+                Some(p) => spans.push(Span::new(format!("  (on {p})"), Style::Dim)),
+                None => spans.push(Span::new("  (base)".to_owned(), Style::Dim)),
+            }
+            Section::leaf(format!("stack/{i}"), NodeKind::Info, spans)
+        })
+        .collect()
+}
+
+fn build_info(title: &str, text: &Result<String, String>) -> Vec<Section> {
+    use rgit_model::{NodeKind, Section, Span, Style};
+    let (body, style) = match text {
+        Ok(t) => (t.clone(), Style::Plain),
+        Err(e) => (e.clone(), Style::Deleted),
+    };
+    let mut rows = vec![Section::leaf(
+        "info/title",
+        NodeKind::Info,
+        vec![Span::new(title.to_owned(), Style::SectionHeader)],
+    )];
+    for (i, line) in body.lines().enumerate() {
+        rows.push(Section::leaf(
+            format!("info/{i}"),
+            NodeKind::Info,
+            vec![Span::new(line.to_owned(), style)],
+        ));
     }
     rows
 }

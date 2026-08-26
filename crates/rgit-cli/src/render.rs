@@ -6,8 +6,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rgit_git::{
-    BlameLine, CommitDetails, FileDiff, LogEntry, RefEntry, Remote, RepoStatus, Stash, StatusEntry,
-    Worktree,
+    BlameLine, CommitDetails, FileDiff, LogEntry, RefEntry, Remote, RepoStatus, SmartlogEntry,
+    Stash, StatusEntry, Worktree,
 };
 
 static COLOR: AtomicBool = AtomicBool::new(false);
@@ -79,6 +79,70 @@ fn group(
     for e in entries {
         out.push_str(&format!("\n  {} {}", paint(code(e), color), e.path));
     }
+}
+
+/// A smartlog: your draft commits and the trunk tip, one per line, with a
+/// marker (HEAD `*`, trunk `=`, other `o`), branch labels, and age.
+/// Abbreviate a change id (`I` + 40 hex) to `I` + its first 8 hex, matching how
+/// short commit ids read, so the smartlog can show it without eating the line.
+fn short_change(id: &str) -> String {
+    id.chars().take(9).collect()
+}
+
+pub fn smartlog(entries: &[SmartlogEntry]) -> String {
+    if entries.is_empty() {
+        return "no commits".to_owned();
+    }
+    entries
+        .iter()
+        .map(|e| {
+            let (marker, color) = if e.is_head {
+                ("*", GREEN)
+            } else if e.is_trunk {
+                ("=", CYAN)
+            } else {
+                ("o", DIM)
+            };
+            let refs = if e.refs.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", e.refs.join(", "))
+            };
+            let change = match e.change_id.as_deref() {
+                Some(id) => format!("{}  ", paint(&short_change(id), DIM)),
+                None => String::new(),
+            };
+            format!(
+                "{} {}{} {}  {}{}",
+                paint(marker, color),
+                paint(&e.short_id, YELLOW),
+                paint(&refs, CYAN),
+                e.summary,
+                change,
+                paint(&e.when, DIM)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The operation log: `sha label (on branch, age)`, newest first.
+pub fn oplog(entries: &[rgit_git::OpLogEntry]) -> String {
+    if entries.is_empty() {
+        return "op-log is empty".to_owned();
+    }
+    entries
+        .iter()
+        .map(|e| {
+            format!(
+                "{} {} {}",
+                paint(&e.short_id, YELLOW),
+                e.label,
+                paint(&format!("({}, {})", e.head, e.when), DIM)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// One `sha subject` line per commit; the sha is dim.
@@ -223,6 +287,9 @@ pub fn commit_details(c: &CommitDetails) -> String {
 
 /// Blame as `sha author line` per line.
 pub fn blame(lines: &[BlameLine]) -> String {
+    if lines.is_empty() {
+        return "no lines".to_owned();
+    }
     lines
         .iter()
         .map(|b| {

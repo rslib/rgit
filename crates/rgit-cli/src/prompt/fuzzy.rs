@@ -58,7 +58,11 @@ fn score(query: &[char], text: &str) -> Option<(i32, Vec<usize>)> {
 /// Filter `items` by `query`, returning the matches sorted best-first (ties
 /// keep original order). An empty query returns all items in order.
 pub fn filter<T>(query: &str, items: &[Item<T>]) -> Vec<Match> {
-    let needle: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).map(lower).collect();
+    let needle: Vec<char> = query
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(lower)
+        .collect();
     let mut matches: Vec<Match> = items
         .iter()
         .enumerate()

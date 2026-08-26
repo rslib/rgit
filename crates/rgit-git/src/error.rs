@@ -34,6 +34,10 @@ pub enum GitError {
     #[error("{0}")]
     Conflict(String),
 
+    /// A workflow/workspace orchestration error (no workflow set, bad name, ...).
+    #[error("{0}")]
+    Other(String),
+
     #[error(transparent)]
     Git(#[from] git2::Error),
 

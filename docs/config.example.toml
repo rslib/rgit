@@ -73,6 +73,9 @@ transparent = "off"
 [commit]
 # Sign commits with git's -S (uses your git GPG/SSH signing config).
 gpg_sign = false
+# After an amend, reword, or extend, rebase branches stacked on the rewritten
+# commit onto its new tip (jj/Sapling style). Set false to keep amend local.
+auto_restack = true
 
 # Rebind any action to a different key.
 # [keys]

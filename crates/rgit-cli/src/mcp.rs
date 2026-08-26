@@ -16,8 +16,10 @@ use serde_json::{Map, Value, json};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation,
+        ListPromptsResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptMessage, Role,
+        ServerCapabilities, ServerInfo, Tool,
     },
     service::{RequestContext, RoleServer},
     transport::stdio,
@@ -64,11 +66,52 @@ impl ServerHandler for RgitMcp {
         let mut info = Implementation::from_build_env();
         info.name = "rgit".to_owned();
         info.version = env!("CARGO_PKG_VERSION").to_owned();
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(info)
-            .with_instructions(
-                "Drive a git repository. Tools mirror git subcommands; results are compact plain text, one item per line.",
-            )
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        )
+        .with_server_info(info)
+        .with_instructions(
+            "Drive a git repository. Each tool maps to a git operation; results are compact plain \
+             text, one item per line. Key flows: inspect with git_status / git_smartlog / git_log \
+             before acting; stage (git_stage / git_stage_all) then git_commit with a clear message; \
+             sync with git_fetch then git_pull or git_rebase. Every destructive tool is auto-\
+             snapshotted, so git_undo reverses the last operation (recovering uncommitted work), \
+             git_redo replays it, and git_oplog lists the history. For step-by-step playbooks, read \
+             the prompts (embedded skills): commit_changes, sync_with_remote, resolve_conflicts, \
+             safe_experiment, review_local_work, start_feature.",
+        )
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, McpError> {
+        let prompts = SKILLS
+            .iter()
+            .map(|(name, desc, _)| Prompt::new(*name, Some(*desc), None))
+            .collect();
+        Ok(ListPromptsResult::with_all_items(prompts))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, McpError> {
+        let skill = SKILLS
+            .iter()
+            .find(|(name, _, _)| *name == request.name)
+            .ok_or_else(|| {
+                McpError::invalid_params(format!("unknown prompt: {}", request.name), None)
+            })?;
+        let mut result = GetPromptResult::default();
+        result.description = Some(skill.1.to_owned());
+        result.messages = vec![PromptMessage::new_text(Role::User, skill.2)];
+        Ok(result.into())
     }
 
     async fn list_tools(
@@ -97,6 +140,83 @@ impl ServerHandler for RgitMcp {
         Ok(call.into())
     }
 }
+
+/// Embedded skills: guided, multi-step playbooks exposed as MCP prompts, so an
+/// agent can fetch the flow rather than infer it from the raw tool list. Each is
+/// `(name, one-line description, playbook body)`.
+const SKILLS: &[(&str, &str, &str)] = &[
+    (
+        "commit_changes",
+        "Review the working tree and make a clean commit.",
+        "Goal: commit the current work as one clear change.\n\
+         1. Call git_status to see what changed and whether anything is already staged.\n\
+         2. Review the actual diff with git_diff (add patch=true for the full unified patch).\n\
+         3. Stage what belongs in this commit: git_stage for one path (or a hunk/lines), or \
+         git_stage_all for everything. Keep unrelated changes out.\n\
+         4. Commit with git_commit and a concise message (imperative mood, e.g. \"fix parser off-\
+         by-one\"). This runs the repo's hooks; if a hook fails, fix and retry.\n\
+         5. Confirm with git_status (clean) and git_log (your commit on top).\n\
+         If you commit the wrong thing, git_undo restores the pre-commit state, staged changes and \
+         all.",
+    ),
+    (
+        "sync_with_remote",
+        "Bring your branch up to date with its remote.",
+        "Goal: integrate upstream changes into your branch.\n\
+         1. git_fetch to update remote-tracking refs without touching your work.\n\
+         2. git_status to see ahead/behind counts.\n\
+         3. If you are only behind (no local commits to keep linear), git_pull to fast-forward.\n\
+         4. If you have local commits, prefer git_rebase with onto set to the upstream (e.g. \
+         \"origin/main\") to keep history linear.\n\
+         5. On conflict, follow the resolve_conflicts skill, then git_rebase_continue.\n\
+         6. git_push when done (add set_upstream=true the first time).",
+    ),
+    (
+        "resolve_conflicts",
+        "Resolve a merge or rebase conflict and continue.",
+        "Goal: finish a merge/rebase that stopped on conflicts.\n\
+         1. git_status lists the conflicted paths.\n\
+         2. For each path, either edit the file to the desired result and git_stage it, or take one \
+         side wholesale with git_resolve (ours=true for your side, false for theirs).\n\
+         3. When git_status shows no remaining conflicts, continue: git_rebase_continue for a \
+         rebase, or git_commit for a merge.\n\
+         4. If it is going badly, git_rebase_abort returns to the pre-rebase state, or git_undo \
+         reverses the operation entirely.",
+    ),
+    (
+        "safe_experiment",
+        "Try a risky change with a guaranteed way back.",
+        "Goal: make a risky change knowing you can fully revert.\n\
+         Every destructive rgit operation is snapshotted first, so you do not need a manual backup.\n\
+         1. Do the change (reset, rebase, discard, checkout, etc.).\n\
+         2. If the result is wrong, git_undo restores HEAD, the branch, AND the working tree \
+         (including uncommitted edits) to the state before that operation.\n\
+         3. git_oplog shows the recent operations; git_redo replays one you undid.\n\
+         Note: this covers rgit operations only; changes made with a separate plain `git` command \
+         are not snapshotted.",
+    ),
+    (
+        "review_local_work",
+        "Understand the current state before acting.",
+        "Goal: get oriented in the repository.\n\
+         1. git_smartlog shows your local/draft commits and the trunk they branch from (marks HEAD \
+         and the trunk) - the fastest way to see your work.\n\
+         2. git_status shows uncommitted changes and the current branch.\n\
+         3. git_diff (patch=true) shows staged changes; git_log shows recent history; git_show a \
+         revision for one commit's detail.\n\
+         Start here before any change so you act on facts, not assumptions.",
+    ),
+    (
+        "start_feature",
+        "Start a new feature branch and push it.",
+        "Goal: begin isolated work on a new branch.\n\
+         1. git_smartlog / git_status to confirm a clean starting point on the trunk.\n\
+         2. git_branch_create <name> to create and switch to the feature branch.\n\
+         3. Make changes, then use the commit_changes skill to stage and commit.\n\
+         4. git_push with set_upstream=true to publish the branch and set tracking.\n\
+         5. Keep it current with the sync_with_remote skill as the trunk moves.",
+    ),
+];
 
 /// Build a tool's JSON Schema from `(field, type, required)` triples. `type` is
 /// a JSON Schema type, or `string[]`/`integer[]` for arrays.
@@ -254,8 +374,8 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_merge",
-            "Merge a revision into the current branch.",
-            &[("rev", "string", true)],
+            "Merge a revision into the current branch (no_ff forces a merge commit).",
+            &[("rev", "string", true), ("no_ff", "boolean", false)],
         ),
         tool(
             "git_rebase",
@@ -290,7 +410,78 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_undo",
-            "Undo the last HEAD move, keeping uncommitted work.",
+            "Undo the last operation from the op-log, restoring HEAD and the working tree (recovers uncommitted work).",
+            none,
+        ),
+        tool("git_redo", "Redo the operation most recently undone.", none),
+        tool(
+            "git_oplog",
+            "The operation log (undo stack), newest first.",
+            none,
+        ),
+        tool(
+            "git_smartlog",
+            "Smartlog: your local/draft commits and the trunk they branch from.",
+            none,
+        ),
+        tool(
+            "git_absorb",
+            "Fold each modified file's changes into the newest local commit that touched it (fixup + autosquash).",
+            none,
+        ),
+        tool(
+            "git_flow_init",
+            "Set the active branching workflow: gitflow, github, gitlab, trunk, or release-flow.",
+            &[("preset", "string", true)],
+        ),
+        tool(
+            "git_flow_start",
+            "Start a feature branch per the active workflow.",
+            &[("name", "string", true)],
+        ),
+        tool(
+            "git_flow_finish",
+            "Finish the current feature (local merge, or push + PR per the workflow).",
+            none,
+        ),
+        tool(
+            "git_flow_release",
+            "Start a release (or finish it with finish=true) per the active workflow.",
+            &[("version", "string", true), ("finish", "boolean", false)],
+        ),
+        tool(
+            "git_flow_status",
+            "Show the active workflow and its policy.",
+            none,
+        ),
+        tool(
+            "git_workspace_new",
+            "Create a copy-on-write clone of the repo on a new branch (parallel isolated work).",
+            &[("name", "string", true)],
+        ),
+        tool(
+            "git_workspace_list",
+            "List this repo's copy-on-write workspaces.",
+            none,
+        ),
+        tool(
+            "git_workspace_remove",
+            "Remove a copy-on-write workspace.",
+            &[("name", "string", true)],
+        ),
+        tool(
+            "git_stack_new",
+            "Create a new branch stacked on the current one.",
+            &[("name", "string", true)],
+        ),
+        tool(
+            "git_stack_list",
+            "List local branches with their stacked-branch parent.",
+            none,
+        ),
+        tool(
+            "git_stack_restack",
+            "Rebase every stacked branch onto its parent's new tip.",
             none,
         ),
         tool(
@@ -530,7 +721,7 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
                 backend.checkout_detached(rev)
             })
         }
-        "git_merge" => done(backend.merge(req("rev")?, &|_| {})),
+        "git_merge" => done(backend.merge(req("rev")?, flag("no_ff"), &|_| {})),
         "git_rebase" => done(backend.rebase_onto(req("onto")?, &|_| {})),
         "git_rebase_continue" => done(backend.rebase_continue()),
         "git_rebase_skip" => done(backend.rebase_skip()),
@@ -545,17 +736,68 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
             };
             done(backend.reset(req("rev")?, mode))
         }
-        "git_undo" => done(backend.undo()),
+        "git_undo" => backend.undo().map_err(emap),
+        "git_redo" => backend.redo().map_err(emap),
+        "git_oplog" => backend
+            .oplog()
+            .map(|e| crate::render::oplog(&e))
+            .map_err(emap),
+        "git_smartlog" => backend
+            .smartlog()
+            .map(|e| crate::render::smartlog(&e))
+            .map_err(emap),
+        "git_absorb" => backend.absorb().map_err(emap),
+
+        "git_flow_init" => rgit_git::workflow::init(backend.as_ref(), req("preset")?).map_err(emap),
+        "git_flow_start" => rgit_git::workflow::start(backend.as_ref(), req("name")?).map_err(emap),
+        "git_flow_finish" => rgit_git::workflow::finish(backend.as_ref()).map_err(emap),
+        "git_flow_release" => {
+            rgit_git::workflow::release(backend.as_ref(), req("version")?, flag("finish"))
+                .map_err(emap)
+        }
+        "git_flow_status" => rgit_git::workflow::status(backend.as_ref()).map_err(emap),
+
+        "git_workspace_new" => {
+            rgit_git::workspace::create(backend.as_ref(), req("name")?).map_err(emap)
+        }
+        "git_workspace_list" => rgit_git::workspace::list(backend.as_ref()).map_err(emap),
+        "git_workspace_remove" => {
+            rgit_git::workspace::remove(backend.as_ref(), req("name")?).map_err(emap)
+        }
+
+        "git_stack_new" => backend.stack_new(req("name")?).map_err(emap),
+        "git_stack_list" => backend
+            .stack_parents()
+            .map(|parents| {
+                let lines: Vec<String> = parents
+                    .iter()
+                    .map(|(b, p)| match p {
+                        Some(p) => format!("{b} (on {p})"),
+                        None => format!("{b} (base)"),
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    "no branches".to_owned()
+                } else {
+                    lines.join("\n")
+                }
+            })
+            .map_err(emap),
+        "git_stack_restack" => backend
+            .restack()
+            .map(|o| crate::stack::render_restack(&o))
+            .map_err(emap),
         "git_bisect" => match backend.bisect(&str_vec("args")) {
             Ok(out) if out.is_empty() => Ok("ok".to_owned()),
             Ok(out) => Ok(out),
             Err(e) => Err(e.to_string()),
         },
 
-        "git_stash_push" => done(match s("message") {
+        "git_stash_push" => match s("message") {
             Some(m) => backend.stash_push_message(m),
             None => backend.stash_push(),
-        }),
+        }
+        .map_err(emap),
         "git_stash_pop" => done(backend.stash_pop(index())),
         "git_stash_apply" => done(backend.stash_apply(index())),
         "git_stash_drop" => done(backend.stash_drop(index())),

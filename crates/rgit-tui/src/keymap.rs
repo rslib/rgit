@@ -26,6 +26,7 @@ pub enum Command {
     ResetMenu,
     CherryPick,
     Revert,
+    Operations,
     BranchMenu,
     StashMenu,
     StashPop,
@@ -65,6 +66,7 @@ impl Command {
             Command::ResetMenu => Msg::ResetMenu,
             Command::CherryPick => Msg::CherryPick,
             Command::Revert => Msg::Revert,
+            Command::Operations => Msg::OperationsMenu,
             Command::BranchMenu => Msg::BranchMenu,
             Command::StashMenu => Msg::StashMenu,
             Command::StashPop => Msg::StashPop,
@@ -105,6 +107,7 @@ impl Command {
             "reset" | "reset-menu" => Command::ResetMenu,
             "cherry-pick" => Command::CherryPick,
             "revert" => Command::Revert,
+            "operations" | "ops" => Command::Operations,
             "branch" | "branch-menu" => Command::BranchMenu,
             "stash" | "stash-menu" => Command::StashMenu,
             "stash-pop" => Command::StashPop,
@@ -146,6 +149,7 @@ const DEFAULTS: &[(char, Command)] = &[
     ('O', Command::ResetMenu),
     ('A', Command::CherryPick),
     ('V', Command::Revert),
+    ('o', Command::Operations),
     ('b', Command::BranchMenu),
     ('z', Command::StashMenu),
     ('L', Command::SessionLog),
@@ -244,9 +248,13 @@ pub fn resolve_key(key: KeyEvent) -> Option<Msg> {
     }
 }
 
-/// Normal-mode keys in the vim profile: hjkl-style motion and visual select on
-/// bare keys, with git actions living behind the Space leader (see
-/// [`leader_command`]). Structural keys (Enter, Tab, search) match the default.
+/// Normal-mode keys in the vim profile. Motion, charwise/linewise visual, and
+/// yank keep their vim meaning on bare keys; on top of that, git actions are
+/// bound directly on the letters that are NOT motions, so `s` stages and `c`
+/// commits without a leader. The handful of git actions whose mnemonic collides
+/// with a motion (log/branch/worktree/revert/refs/refresh) stay motions here and
+/// live behind the Space leader instead (see [`leader_command`]). This follows
+/// neogit's spirit without giving up rgit's full motion set or charwise select.
 pub fn resolve_vim_key(key: KeyEvent) -> Option<Msg> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     if ctrl {
@@ -261,6 +269,7 @@ pub fn resolve_vim_key(key: KeyEvent) -> Option<Msg> {
     }
     match key.code {
         KeyCode::Char(' ') => Some(Msg::LeaderOpen),
+        // Motion and visual: unchanged vim behaviour.
         KeyCode::Char('j') | KeyCode::Down => Some(Msg::CursorDown),
         KeyCode::Char('k') | KeyCode::Up => Some(Msg::CursorUp),
         KeyCode::Char('h') | KeyCode::Left => Some(Msg::ColLeft),
@@ -276,6 +285,32 @@ pub fn resolve_vim_key(key: KeyEvent) -> Option<Msg> {
         KeyCode::Char('v') => Some(Msg::ToggleCharSelect),
         KeyCode::Char('V') => Some(Msg::ToggleSelect),
         KeyCode::Char('y') => Some(Msg::Yank),
+        // Mnemonic git actions on the non-motion letters. These mirror the magit
+        // profile's letters exactly, so the same help legend is accurate for
+        // both profiles; only the motion-clashing actions (log/branch/refs/
+        // refresh/revert) differ, living behind the Space leader instead.
+        KeyCode::Char('s') => Some(Msg::Stage),
+        KeyCode::Char('S') => Some(Msg::StageAll),
+        KeyCode::Char('u') => Some(Msg::Unstage),
+        KeyCode::Char('U') => Some(Msg::UnstageAll),
+        KeyCode::Char('x') => Some(Msg::Discard),
+        KeyCode::Char('c') => Some(Msg::CommitMenu),
+        KeyCode::Char('r') => Some(Msg::RebaseMenu),
+        KeyCode::Char('m') => Some(Msg::MergeMenu),
+        KeyCode::Char('t') => Some(Msg::TagMenu),
+        KeyCode::Char('O') => Some(Msg::ResetMenu),
+        KeyCode::Char('A') => Some(Msg::CherryPick),
+        KeyCode::Char('o') => Some(Msg::OperationsMenu),
+        KeyCode::Char('z') => Some(Msg::StashMenu),
+        KeyCode::Char('p') => Some(Msg::StashPop),
+        KeyCode::Char('M') => Some(Msg::RemoteMenu),
+        KeyCode::Char('W') => Some(Msg::WorktreeMenu),
+        KeyCode::Char('d') => Some(Msg::DiffPrompt),
+        KeyCode::Char('f') => Some(Msg::Fetch),
+        KeyCode::Char('F') => Some(Msg::Pull),
+        KeyCode::Char('P') => Some(Msg::PushMenu),
+        KeyCode::Char('L') => Some(Msg::OpenSessionLog),
+        // Structural / search.
         KeyCode::Tab => Some(Msg::ToggleFold),
         KeyCode::Enter => Some(Msg::Enter),
         KeyCode::Char('/') => Some(Msg::SearchOpen),
@@ -299,6 +334,7 @@ pub fn leader_command(c: char) -> Option<Msg> {
 pub fn leader_entries() -> Vec<(char, &'static str)> {
     vec![
         ('w', "window ▸"),
+        ('o', "operations ▸"),
         ('s', "stage"),
         ('u', "unstage"),
         ('x', "discard"),
@@ -437,17 +473,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vim_bare_letters_are_motion_not_actions() {
+    fn vim_keeps_motion_and_charwise() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
-        // Space opens the leader; j/k move; a bare action letter does nothing.
+        // Motions, charwise/linewise visual, and yank keep their vim meaning.
         assert!(matches!(resolve_vim_key(key(' ')), Some(Msg::LeaderOpen)));
         assert!(matches!(resolve_vim_key(key('j')), Some(Msg::CursorDown)));
         assert!(matches!(resolve_vim_key(key('G')), Some(Msg::CursorBottom)));
-        assert!(resolve_vim_key(key('s')).is_none());
-        // The leader replays the magit letter: <Space>s stages.
-        assert!(matches!(leader_command('s'), Some(Msg::Stage)));
-        assert!(matches!(leader_command('c'), Some(Msg::CommitMenu)));
+        assert!(matches!(resolve_vim_key(key('w')), Some(Msg::ColWordForward)));
+        assert!(matches!(resolve_vim_key(key('v')), Some(Msg::ToggleCharSelect)));
+        assert!(matches!(resolve_vim_key(key('V')), Some(Msg::ToggleSelect)));
+        assert!(matches!(resolve_vim_key(key('y')), Some(Msg::Yank)));
+    }
+
+    #[test]
+    fn vim_binds_mnemonic_actions_on_non_motion_letters() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        // Non-motion letters fire git actions directly, no leader needed.
+        assert!(matches!(resolve_vim_key(key('s')), Some(Msg::Stage)));
+        assert!(matches!(resolve_vim_key(key('c')), Some(Msg::CommitMenu)));
+        assert!(matches!(resolve_vim_key(key('P')), Some(Msg::PushMenu)));
+        // Motion-clashers (log) stay motions and live behind the leader.
+        assert!(matches!(resolve_vim_key(key('l')), Some(Msg::ColRight)));
+        assert!(matches!(leader_command('l'), Some(Msg::Log)));
+        assert!(matches!(leader_command('b'), Some(Msg::BranchMenu)));
     }
 
     #[test]
