@@ -1,0 +1,11 @@
+[package]
+name = "rgit-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+git2 = { version = "0.21.0", features = ["ssh", "https", "vendored-openssl"] }
+git2-hooks = "0.7.0"
+thiserror = "2.0.20"

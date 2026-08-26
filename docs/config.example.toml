@@ -1,0 +1,82 @@
+# rgit configuration.
+#
+# Copy to one of (first that exists wins):
+#   $RGIT_CONFIG
+#   $XDG_CONFIG_HOME/rgit/config.toml
+#   ~/.config/rgit/config.toml
+#
+# Every key is optional; omitted keys keep their defaults. Unknown keys are an
+# error (so typos surface instead of being silently ignored).
+
+[theme]
+# Built-in palette: mono, catppuccin, gruvbox, nord, dracula, tokyonight,
+# rose-pine, rust, or "terminal" to adopt your terminal's own 16-color scheme.
+# Omit `name` entirely and rgit defaults to "terminal", inheriting your
+# terminal/tmux colors so it matches the rest of your setup.
+name = "rose-pine"
+
+# Per-role color overrides, "#rrggbb". Each is layered on top of the named
+# palette (or the terminal theme), so you can tweak individual roles without
+# defining a whole palette - e.g. keep rose-pine but use a warmer accent:
+#
+#   [theme]
+#   name    = "rose-pine"
+#   accent  = "#ea9a97"   # rose, instead of the default iris
+#   added   = "#95b1ac"   # a softer green for +lines
+#
+# Every role (malformed values are ignored):
+# accent         = "#c4a7e7"   # headers, keys, focus, branch glyph
+# section_header = "#c4a7e7"
+# field_label    = "#f6c177"   # Head:/Push: labels, function names
+# branch         = "#9ccfd8"   # branch/remote names, type names
+# hash           = "#f6c177"   # commit ids, numeric literals
+# dim            = "#6e6a86"   # metadata, comments, secondary text
+# added          = "#3e8fb0"   # +lines, staged, strings
+# modified       = "#f6c177"
+# deleted        = "#eb6f92"   # -lines, deleted files
+# untracked      = "#ea9a97"
+# cursor_bg      = "#44415a"   # the row under the cursor, keycaps
+# select_bg      = "#393552"   # visual selection
+
+[ui]
+# How many commits the log view walks by default.
+log_limit = 200
+# Glyph palette (three choices):
+#   "unicode" (default) - unicode symbols (fold chevrons, bars, arrows), no
+#                         nerd-font icons
+#   "nerd"              - unicode plus nerd-font file/git/section icons
+#   "ascii"             - pure ASCII text glyphs (v/> folds, +/- bars); frame
+#                         borders still use box-drawing, which every terminal has
+glyphs = "unicode"
+# Deprecated: nerd_fonts = true is equivalent to glyphs = "nerd" (used only when
+# `glyphs` is unset).
+# nerd_fonts = false
+# Accept mouse events (click-to-focus, wheel scroll).
+mouse = false
+# Render read-only diffs (commit / diff views) side by side.
+side_by_side = false
+# Which regions let the terminal background show through:
+#   "off"  (default) - paint everything solid, matching the design
+#   "body"           - solid header and action bar, see-through body
+#   "full"           - fully transparent
+transparent = "off"
+
+# Keybinding profile:
+#   "magit" (default) - single-letter actions plus emacs/readline navigation
+#   "vim"             - hjkl motion, gg/G, Ctrl-d/u, and a Space leader
+#                       (which-key) for every git action. <Space>w h/l moves
+#                       between panes; v starts a visual line selection and y
+#                       yanks it to the system clipboard via OSC 52 (inside
+#                       tmux, enable `set -g set-clipboard on`).
+# profile = "vim"
+
+[commit]
+# Sign commits with git's -S (uses your git GPG/SSH signing config).
+gpg_sign = false
+
+# Rebind any action to a different key.
+# [keys]
+# stage       = "s"
+# commit      = "c"
+# rebase_menu = "r"
+# palette     = ":"
