@@ -1089,6 +1089,96 @@ impl GitBackend for Git2Backend {
         repo.find_branch(name, BranchType::Local).is_ok()
     }
 
+    fn lanes_active(&self) -> bool {
+        let repo = self.repo.lock().expect("repo mutex");
+        crate::lanes::active(&repo)
+    }
+
+    fn lanes_init(&self) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        crate::lanes::init(&repo)
+    }
+
+    fn lanes_off(&self) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        crate::lanes::off(&repo)
+    }
+
+    fn lanes_state(&self) -> Result<crate::LanesState, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::lanes::state(&repo)
+    }
+
+    fn lane_new(&self, name: &str) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::lanes::new_lane(&repo, name)
+    }
+
+    fn lane_assign(&self, lane: &str, path: &str) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::lanes::assign(&repo, lane, path)
+    }
+
+    fn lane_assign_hunk(&self, lane: &str, path: &str, new_start: u32) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::lanes::assign_hunk(&repo, lane, path, new_start)
+    }
+
+    fn lane_unassign(&self, path: &str) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::lanes::unassign(&repo, path)
+    }
+
+    fn lane_commit(&self, lane: &str, message: &str) -> Result<String, GitError> {
+        self.snap("lane commit");
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::lanes::commit(&repo, lane, message)
+    }
+
+    fn lane_rename(&self, old: &str, new: &str) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::lanes::rename(&repo, old, new)
+    }
+
+    fn lane_delete(&self, name: &str) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::lanes::delete(&repo, name)
+    }
+
+    fn lane_push(&self, lane: &str) -> Result<String, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let branch = crate::lanes::lane_branch(&repo, lane)?;
+        if repo.find_branch(&branch, BranchType::Local).is_err() {
+            return Err(GitError::Other(format!(
+                "lane {lane} has no commits yet; commit it first"
+            )));
+        }
+        let remote = push_lane_branch(&repo, &branch, &|_| {})?;
+        Ok(format!("pushed {branch} to {remote}"))
+    }
+
+    fn lane_pr(&self, lane: &str) -> Result<String, GitError> {
+        // detect_main locks the repo, so resolve the base before we lock.
+        let base = crate::workflow::detect_main(self);
+        let repo = self.repo.lock().expect("repo mutex");
+        let branch = crate::lanes::lane_branch(&repo, lane)?;
+        if repo.find_branch(&branch, BranchType::Local).is_err() {
+            return Err(GitError::Other(format!(
+                "lane {lane} has no commits yet; commit it first"
+            )));
+        }
+        push_lane_branch(&repo, &branch, &|_| {})?;
+        Ok(crate::workflow::open_pull_request(&branch, &base))
+    }
+
     fn rename_branch(&self, old: &str, new: &str) -> Result<(), GitError> {
         self.snap("rename branch");
         let repo = self.repo.lock().expect("repo mutex");
@@ -1447,6 +1537,46 @@ fn ssh_key_file(user: &str, name: &str) -> Result<Cred, git2::Error> {
     }
     let public = private.with_extension("pub");
     Cred::ssh_key(user, public.exists().then_some(&public), &private, None)
+}
+
+/// The remote to push a lane branch to: the branch's own remote if configured,
+/// else `origin`, else the first remote.
+fn default_remote(repo: &Repository) -> Result<String, GitError> {
+    if repo.find_remote("origin").is_ok() {
+        return Ok("origin".to_owned());
+    }
+    let remotes = repo.remotes()?;
+    if let Ok(Some(name)) = remotes.get(0) {
+        return Ok(name.to_owned());
+    }
+    Err(GitError::Other("no remote configured".to_owned()))
+}
+
+/// Push a specific branch (not HEAD) to the default remote and set its upstream.
+/// Used by lanes, which never move HEAD. Returns the remote name.
+fn push_lane_branch(
+    repo: &Repository,
+    branch: &str,
+    report: &dyn Fn(OpProgress),
+) -> Result<String, GitError> {
+    let remote_name = default_remote(repo)?;
+    let mut remote = repo.find_remote(&remote_name)?;
+    if let Ok(url) = remote.url() {
+        report(OpProgress::Line(format!("To {url}")));
+    }
+    let branch_ref = format!("refs/heads/{branch}");
+    let refspec = format!("{branch_ref}:{branch_ref}");
+    let rejected = std::sync::atomic::AtomicBool::new(false);
+    let callbacks = remote_callbacks(report, &rejected);
+    let mut opts = PushOptions::new();
+    opts.remote_callbacks(callbacks);
+    remote.push(&[refspec.as_str()], Some(&mut opts))?;
+    if rejected.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(GitError::PushRejected);
+    }
+    repo.find_branch(branch, BranchType::Local)?
+        .set_upstream(Some(&format!("{remote_name}/{branch}")))?;
+    Ok(remote_name)
 }
 
 fn remote_callbacks<'a>(

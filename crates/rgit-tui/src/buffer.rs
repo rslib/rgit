@@ -414,6 +414,12 @@ impl Buffer {
         self.rows().nth(self.cursor).and_then(|r| r.target.cloned())
     }
 
+    /// The section id of the row under the cursor, for views that key their
+    /// actions off structured ids (e.g. the lanes view).
+    pub fn cursor_id(&self) -> Option<String> {
+        self.rows().nth(self.cursor).map(|r| r.id.clone())
+    }
+
     /// A lazy pre-order walk of the visible tree. The only per-call allocation
     /// is the descent stack, sized to the tree depth.
     pub fn rows(&self) -> Rows<'_> {

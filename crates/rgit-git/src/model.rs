@@ -279,6 +279,41 @@ impl RestackOutcome {
     }
 }
 
+/// A hunk of a tracked file owned by a lane, identified by a content anchor (a
+/// hash of the hunk's lines) so it survives the line-number shifts that come
+/// from editing elsewhere in the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HunkRef {
+    pub path: String,
+    pub anchor: String,
+}
+
+/// One lane: a named bucket of uncommitted changes that commits to its own
+/// branch. A path is owned either whole (in `paths`) or split into hunks (in
+/// `hunks`), never both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lane {
+    pub name: String,
+    /// The real branch this lane commits to, created lazily on first commit.
+    pub branch: String,
+    /// Whole-file ownership.
+    pub paths: Vec<String>,
+    /// Hunk-level ownership of tracked files split across lanes.
+    pub hunks: Vec<HunkRef>,
+    /// Commits this lane has made above the fork point, newest first, as
+    /// `(short_id, summary)`. Derived at read time (not persisted), for display.
+    pub commits: Vec<(String, String)>,
+}
+
+/// The lanes overlay: a fork point and the lanes assigned over it. The default
+/// lane (owning everything unassigned) is always `lanes[0]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanesState {
+    /// The commit every lane forks from.
+    pub base: String,
+    pub lanes: Vec<Lane>,
+}
+
 /// A commit in the log view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry {

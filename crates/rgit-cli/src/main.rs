@@ -8,6 +8,7 @@ use crate::cli::{Cli, Command};
 
 mod cli;
 mod interactive;
+mod lanes;
 mod logging;
 mod mcp;
 mod prompt;

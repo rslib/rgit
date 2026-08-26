@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use rgit_git::FileDiff;
 use rgit_git::{
-    BlameLine, CommitDetails, GitBackend, GitError, Head, LogEntry, LogOptions, OpLogEntry,
-    RefEntry, Remote, RepoState, RepoStatus, ResetMode, SmartlogEntry, Worktree,
+    BlameLine, CommitDetails, GitBackend, GitError, Head, LanesState, LogEntry, LogOptions,
+    OpLogEntry, RefEntry, Remote, RepoState, RepoStatus, ResetMode, SmartlogEntry, Worktree,
 };
 use rgit_model::{
     RefTarget, Section, Target, build, build_blame, build_commit, build_diff, build_log,
@@ -386,6 +386,7 @@ pub enum ViewKind {
     Smartlog,
     Oplog,
     Stack,
+    Lanes,
     Info,
 }
 
@@ -397,6 +398,19 @@ pub enum TextOp {
     FlowFinish,
     WorkspaceNew(String),
     StackNew(String),
+}
+
+/// A lane mutation run from the lanes view, reported and then reloaded.
+#[derive(Debug, Clone)]
+pub enum LaneOp {
+    New(String),
+    Assign { lane: String, path: String },
+    Unassign(String),
+    Commit { lane: String, message: String },
+    Rename { old: String, new: String },
+    Delete(String),
+    Push(String),
+    Pr(String),
 }
 
 /// A read-only text panel opened as the Info view.
@@ -543,6 +557,28 @@ pub enum Msg {
     Restack,
     /// A note (shown as a toast) that an amend auto-restacked its children.
     AutoRestackNote(String),
+    /// Open the lanes view.
+    OpenLanes,
+    /// The lanes state finished loading; (re)build the lanes view.
+    LanesLoaded(LanesState),
+    /// A one-line result of a lane operation, shown as a toast.
+    LaneNotice(String),
+    /// Prompt for a new lane name.
+    LaneNewPrompt,
+    /// Prompt for the lane to assign the file under the cursor to.
+    LaneAssignPrompt,
+    /// Return the file under the cursor to the default lane.
+    LaneUnassignAtCursor,
+    /// Prompt for a commit message for the lane the cursor is in.
+    LaneCommitPrompt,
+    /// Prompt for a new name for the lane the cursor is in.
+    LaneRenamePrompt,
+    /// Delete the lane the cursor is in.
+    LaneDeleteAtCursor,
+    /// Push the branch of the lane the cursor is in.
+    LanePushAtCursor,
+    /// Push and open a PR for the lane the cursor is in.
+    LanePrAtCursor,
     /// Fold pending changes into the commits that last touched those lines.
     Absorb,
     /// Prompt for a workflow preset, then set it.
@@ -822,6 +858,7 @@ pub enum ActionKind {
     OpAbsorb,
     OpFlowStatus,
     OpWorkspaces,
+    OpLanes,
 }
 
 /// A transient popup: a title, sticky argument toggles, and suffix actions that
@@ -966,6 +1003,7 @@ impl Transient {
                 action('a', "absorb", ActionKind::OpAbsorb),
                 action('f', "flow status", ActionKind::OpFlowStatus),
                 action('w', "workspaces", ActionKind::OpWorkspaces),
+                action('l', "lanes", ActionKind::OpLanes),
             ],
         }
     }
@@ -1077,6 +1115,13 @@ pub enum PromptAction {
     FlowStart,
     WorkspaceNew,
     StackNew,
+    LaneNew,
+    /// Assign `pending_lane_path` to the lane named by the prompt value.
+    LaneAssign,
+    /// Commit `pending_lane` with the message from the prompt value.
+    LaneCommit,
+    /// Rename `pending_lane` to the prompt value.
+    LaneRename,
 }
 
 /// A minibuffer: a label, an editable input, and optional filterable candidates.
@@ -1478,6 +1523,10 @@ pub enum Effect {
     LoadOplog,
     /// Load the stacked-branch parents, then push the stack view.
     LoadStack,
+    /// Load the lanes state, then (re)build the lanes view.
+    LoadLanes,
+    /// Run a lane operation, toast the result, then reload the lanes view.
+    LaneOp(LaneOp),
     /// Undo `n` operations in sequence (op-log restore-to-cursor).
     UndoTimes(usize),
     /// Run a text-returning backend op (flow/workspace), toast the result.
@@ -1624,6 +1673,10 @@ pub struct App {
     gpg_sign: bool,
     /// Restack stacked children after an amend/reword/extend when set.
     auto_restack: bool,
+    /// The lane targeted by a pending lane-commit prompt.
+    pending_lane: Option<String>,
+    /// The path targeted by a pending lane-assign prompt.
+    pending_lane_path: Option<String>,
     /// Last status snapshot, for the adaptive preview pane.
     snapshot: Option<RepoStatus>,
     /// What the preview buffer currently holds, so it is rebuilt only when the
@@ -1693,6 +1746,8 @@ impl App {
             oplog_len: 0,
             gpg_sign: config.commit.gpg_sign,
             auto_restack: config.commit.auto_restack,
+            pending_lane: None,
+            pending_lane_path: None,
             snapshot: None,
             preview_key: None,
             preview_buf: Buffer::default(),
@@ -2339,6 +2394,63 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }];
         }
         Msg::AutoRestackNote(text) => app.push_toast(ToastKind::Success, text),
+        Msg::OpenLanes => return vec![Effect::LoadLanes],
+        Msg::LanesLoaded(state) => {
+            let content = build_lanes(&state);
+            if app.active_kind() == ViewKind::Lanes {
+                app.buffer_mut().set_content(content);
+            } else {
+                let mut buffer = Buffer::default();
+                buffer.set_content(content);
+                app.push_view(ViewKind::Lanes, buffer);
+            }
+        }
+        Msg::LaneNotice(text) => {
+            let kind = if text.starts_with("error") {
+                ToastKind::Error
+            } else {
+                ToastKind::Success
+            };
+            app.push_toast(kind, text);
+        }
+        Msg::LaneNewPrompt => revision_prompt(app, "New lane name", PromptAction::LaneNew),
+        Msg::LaneAssignPrompt => match file_at_cursor(app) {
+            Some((_lane, path)) => {
+                app.pending_lane_path = Some(path);
+                revision_prompt(app, "Assign to lane", PromptAction::LaneAssign)
+            }
+            None => app.push_toast(ToastKind::Error, "move onto a file first".into()),
+        },
+        Msg::LaneUnassignAtCursor => match file_at_cursor(app) {
+            Some((_lane, path)) => return vec![Effect::LaneOp(LaneOp::Unassign(path))],
+            None => app.push_toast(ToastKind::Error, "move onto a file first".into()),
+        },
+        Msg::LaneCommitPrompt => match lane_at_cursor(app) {
+            Some(lane) => {
+                app.pending_lane = Some(lane);
+                revision_prompt(app, "Commit message", PromptAction::LaneCommit)
+            }
+            None => app.push_toast(ToastKind::Error, "move onto a lane first".into()),
+        },
+        Msg::LaneRenamePrompt => match lane_at_cursor(app) {
+            Some(lane) => {
+                app.pending_lane = Some(lane);
+                revision_prompt(app, "Rename lane to", PromptAction::LaneRename)
+            }
+            None => app.push_toast(ToastKind::Error, "move onto a lane first".into()),
+        },
+        Msg::LaneDeleteAtCursor => match lane_at_cursor(app) {
+            Some(lane) => return vec![Effect::LaneOp(LaneOp::Delete(lane))],
+            None => app.push_toast(ToastKind::Error, "move onto a lane first".into()),
+        },
+        Msg::LanePushAtCursor => match lane_at_cursor(app) {
+            Some(lane) => return vec![Effect::LaneOp(LaneOp::Push(lane))],
+            None => app.push_toast(ToastKind::Error, "move onto a lane first".into()),
+        },
+        Msg::LanePrAtCursor => match lane_at_cursor(app) {
+            Some(lane) => return vec![Effect::LaneOp(LaneOp::Pr(lane))],
+            None => app.push_toast(ToastKind::Error, "move onto a lane first".into()),
+        },
         Msg::TextResult(Ok(text)) => {
             app.busy = None;
             app.push_toast(ToastKind::Success, text);
@@ -3004,6 +3116,29 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
     if let PromptAction::RebaseOnto = prompt.action {
         return open_op(app, ConsoleOp::RebaseOnto(value));
     }
+    // Lane operations run and then reload the lanes view.
+    match prompt.action {
+        PromptAction::LaneNew => return vec![Effect::LaneOp(LaneOp::New(value))],
+        PromptAction::LaneAssign => {
+            if let Some(path) = app.pending_lane_path.take() {
+                return vec![Effect::LaneOp(LaneOp::Assign { lane: value, path })];
+            }
+            return Vec::new();
+        }
+        PromptAction::LaneCommit => {
+            if let Some(lane) = app.pending_lane.take() {
+                return vec![Effect::LaneOp(LaneOp::Commit { lane, message: value })];
+            }
+            return Vec::new();
+        }
+        PromptAction::LaneRename => {
+            if let Some(old) = app.pending_lane.take() {
+                return vec![Effect::LaneOp(LaneOp::Rename { old, new: value })];
+            }
+            return Vec::new();
+        }
+        _ => {}
+    }
     // Flow/workspace ops return a status string, shown as a toast.
     let text_op = match prompt.action {
         PromptAction::FlowInit => Some(TextOp::FlowInit(value.clone())),
@@ -3050,7 +3185,11 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         | PromptAction::FlowInit
         | PromptAction::FlowStart
         | PromptAction::WorkspaceNew
-        | PromptAction::StackNew => {
+        | PromptAction::StackNew
+        | PromptAction::LaneNew
+        | PromptAction::LaneAssign
+        | PromptAction::LaneCommit
+        | PromptAction::LaneRename => {
             return Vec::new();
         }
         PromptAction::DeleteBranch => Mutation::DeleteBranch(value),
@@ -3189,6 +3328,7 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
         ActionKind::OpAbsorb => update(app, Msg::Absorb),
         ActionKind::OpFlowStatus => update(app, Msg::OpenFlowStatus),
         ActionKind::OpWorkspaces => update(app, Msg::OpenWorkspaces),
+        ActionKind::OpLanes => update(app, Msg::OpenLanes),
         ActionKind::BranchCheckout => {
             app.transient = None;
             vec![Effect::LoadBranches]
@@ -3374,6 +3514,92 @@ fn build_oplog(entries: &[OpLogEntry]) -> Vec<Section> {
         .collect()
 }
 
+/// The lanes view: a foldable section per lane listing the files and hunks it
+/// owns. Section ids encode the lane and path so the view's keys can act on the
+/// item under the cursor (`lanes/lane/<name>`, `lanes/file/<name>/<path>`).
+fn build_lanes(state: &LanesState) -> Vec<Section> {
+    use rgit_model::{NodeKind, Section, Span, Style};
+    state
+        .lanes
+        .iter()
+        .map(|lane| {
+            let header = vec![
+                Span::new(format!("{} ", lane.name), Style::Branch),
+                Span::new(format!("[{}]", lane.branch), Style::Dim),
+            ];
+            let mut children: Vec<Section> = Vec::new();
+            for (short, summary) in &lane.commits {
+                children.push(Section::leaf(
+                    format!("lanes/commit/{}/{}", lane.name, short),
+                    NodeKind::Info,
+                    vec![
+                        Span::new(format!("{short} "), Style::Hash),
+                        Span::new(summary.clone(), Style::Dim),
+                    ],
+                ));
+            }
+            for path in &lane.paths {
+                children.push(Section::leaf(
+                    format!("lanes/file/{}/{}", lane.name, path),
+                    NodeKind::Info,
+                    vec![Span::new(path.clone(), Style::Plain)],
+                ));
+            }
+            for h in &lane.hunks {
+                let short: String = h.anchor.chars().take(7).collect();
+                children.push(Section::leaf(
+                    format!("lanes/hunk/{}/{}", lane.name, h.path),
+                    NodeKind::Info,
+                    vec![
+                        Span::new(h.path.clone(), Style::Plain),
+                        Span::new(format!("  (hunk {short})"), Style::Dim),
+                    ],
+                ));
+            }
+            if children.is_empty() {
+                children.push(Section::leaf(
+                    format!("lanes/empty/{}", lane.name),
+                    NodeKind::Info,
+                    vec![Span::new("(no files)".to_owned(), Style::Dim)],
+                ));
+            }
+            Section::branch(
+                format!("lanes/lane/{}", lane.name),
+                NodeKind::Info,
+                header,
+                children,
+            )
+        })
+        .collect()
+}
+
+/// The lane name for the row under the cursor, from its `lanes/.../<name>/...`
+/// section id (lane header, file, or hunk row).
+fn lane_at_cursor(app: &App) -> Option<String> {
+    let id = app.buffer().cursor_id()?;
+    lane_of_id(&id).map(str::to_owned)
+}
+
+/// The `(lane, path)` for a file row under the cursor, if the cursor is on one.
+fn file_at_cursor(app: &App) -> Option<(String, String)> {
+    let id = app.buffer().cursor_id()?;
+    let (lane, path) = file_of_id(&id)?;
+    Some((lane.to_owned(), path.to_owned()))
+}
+
+/// The lane name in a `lanes/<kind>/<name>[/...]` section id.
+fn lane_of_id(id: &str) -> Option<&str> {
+    let mut parts = id.split('/');
+    (parts.next()? == "lanes").then_some(())?;
+    let _kind = parts.next()?;
+    parts.next()
+}
+
+/// The `(lane, path)` in a `lanes/file/<name>/<path>` section id.
+fn file_of_id(id: &str) -> Option<(&str, &str)> {
+    id.strip_prefix("lanes/file/")?.split_once('/')
+}
+
 fn build_stack(parents: &[(String, Option<String>)], current: Option<&str>) -> Vec<Section> {
     use rgit_model::{NodeKind, Section, Span, Style};
     use std::collections::HashMap;
@@ -3520,6 +3746,53 @@ fn refreshed(app: &mut App, result: RefreshResult) -> Vec<Effect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_lanes_encodes_lane_and_path_in_section_ids() {
+        use rgit_git::{HunkRef, Lane};
+        let state = LanesState {
+            base: "abc".into(),
+            lanes: vec![
+                Lane {
+                    name: "default".into(),
+                    branch: "main".into(),
+                    paths: vec!["src/a.rs".into()],
+                    hunks: vec![],
+                    commits: vec![],
+                },
+                Lane {
+                    name: "feat".into(),
+                    branch: "feat".into(),
+                    paths: vec![],
+                    hunks: vec![HunkRef {
+                        path: "b.rs".into(),
+                        anchor: "deadbeef".into(),
+                    }],
+                    commits: vec![("abc1234".into(), "did a thing".into())],
+                },
+            ],
+        };
+        let mut buffer = Buffer::default();
+        buffer.set_content(build_lanes(&state));
+        let ids: Vec<String> = buffer.rows().map(|r| r.id.clone()).collect();
+        assert!(ids.contains(&"lanes/lane/default".to_owned()));
+        assert!(ids.contains(&"lanes/file/default/src/a.rs".to_owned()));
+        assert!(ids.contains(&"lanes/lane/feat".to_owned()));
+        assert!(ids.contains(&"lanes/hunk/feat/b.rs".to_owned()));
+    }
+
+    #[test]
+    fn lane_and_file_ids_parse_back() {
+        assert_eq!(lane_of_id("lanes/lane/default"), Some("default"));
+        assert_eq!(lane_of_id("lanes/file/feat/src/a.rs"), Some("feat"));
+        assert_eq!(lane_of_id("lanes/hunk/feat/b.rs"), Some("feat"));
+        assert_eq!(lane_of_id("status/0"), None);
+        assert_eq!(
+            file_of_id("lanes/file/feat/src/deep/a.rs"),
+            Some(("feat", "src/deep/a.rs"))
+        );
+        assert_eq!(file_of_id("lanes/lane/feat"), None);
+    }
 
     #[test]
     fn palette_fuzzy_matches_as_subsequence() {

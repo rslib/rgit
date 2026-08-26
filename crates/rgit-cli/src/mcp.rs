@@ -485,6 +485,65 @@ fn tools() -> Vec<Tool> {
             none,
         ),
         tool(
+            "git_lanes_list",
+            "List the lanes and the uncommitted files each owns.",
+            none,
+        ),
+        tool(
+            "git_lanes_init",
+            "Enter lanes mode: record the fork point and a default lane.",
+            none,
+        ),
+        tool(
+            "git_lanes_off",
+            "Leave lanes mode (lane branches are kept).",
+            none,
+        ),
+        tool(
+            "git_lanes_new",
+            "Create a new lane that commits to a same-named branch.",
+            &[("name", "string", true)],
+        ),
+        tool(
+            "git_lanes_assign",
+            "Assign a worktree path to a lane, or a single hunk with `hunk` set to its new-file start line.",
+            &[
+                ("lane", "string", true),
+                ("path", "string", true),
+                ("hunk", "number", false),
+            ],
+        ),
+        tool(
+            "git_lanes_unassign",
+            "Return a path to the default lane.",
+            &[("path", "string", true)],
+        ),
+        tool(
+            "git_lanes_commit",
+            "Commit a lane's owned changes to its branch.",
+            &[("lane", "string", true), ("message", "string", true)],
+        ),
+        tool(
+            "git_lanes_rename",
+            "Rename a lane and its branch.",
+            &[("old", "string", true), ("new", "string", true)],
+        ),
+        tool(
+            "git_lanes_delete",
+            "Delete a lane (its changes return to default; its branch is kept).",
+            &[("name", "string", true)],
+        ),
+        tool(
+            "git_lanes_push",
+            "Push a lane's branch to the remote and set its upstream.",
+            &[("lane", "string", true)],
+        ),
+        tool(
+            "git_lanes_pr",
+            "Push a lane's branch and open a pull/merge request via gh/glab.",
+            &[("lane", "string", true)],
+        ),
+        tool(
             "git_bisect",
             "Run a `git bisect` subcommand (e.g. [\"start\",\"<bad>\",\"<good>\"], [\"good\"], [\"bad\"], [\"reset\"]).",
             &[("args", "string[]", true)],
@@ -787,6 +846,59 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
             .restack()
             .map(|o| crate::stack::render_restack(&o))
             .map_err(emap),
+        "git_lanes_list" => backend
+            .lanes_state()
+            .map(|state| {
+                let mut lines = Vec::new();
+                for lane in &state.lanes {
+                    lines.push(format!("{} [{}]", lane.name, lane.branch));
+                    for (short, summary) in &lane.commits {
+                        lines.push(format!("  * {short} {summary}"));
+                    }
+                    for path in &lane.paths {
+                        lines.push(format!("  {path}"));
+                    }
+                    for h in &lane.hunks {
+                        let short: String = h.anchor.chars().take(7).collect();
+                        lines.push(format!("  {} (hunk {short})", h.path));
+                    }
+                }
+                if lines.is_empty() {
+                    "no lanes".to_owned()
+                } else {
+                    lines.join("\n")
+                }
+            })
+            .map_err(emap),
+        "git_lanes_init" => backend.lanes_init().map(|()| "lanes on".to_owned()).map_err(emap),
+        "git_lanes_off" => backend.lanes_off().map(|()| "lanes off".to_owned()).map_err(emap),
+        "git_lanes_new" => backend
+            .lane_new(req("name")?)
+            .map(|()| "ok".to_owned())
+            .map_err(emap),
+        "git_lanes_assign" => match hunk {
+            Some(new_start) => backend.lane_assign_hunk(req("lane")?, req("path")?, new_start),
+            None => backend.lane_assign(req("lane")?, req("path")?),
+        }
+        .map(|()| "ok".to_owned())
+        .map_err(emap),
+        "git_lanes_unassign" => backend
+            .lane_unassign(req("path")?)
+            .map(|()| "ok".to_owned())
+            .map_err(emap),
+        "git_lanes_commit" => backend
+            .lane_commit(req("lane")?, req("message")?)
+            .map_err(emap),
+        "git_lanes_rename" => backend
+            .lane_rename(req("old")?, req("new")?)
+            .map(|()| "ok".to_owned())
+            .map_err(emap),
+        "git_lanes_delete" => backend
+            .lane_delete(req("name")?)
+            .map(|()| "ok".to_owned())
+            .map_err(emap),
+        "git_lanes_push" => backend.lane_push(req("lane")?).map_err(emap),
+        "git_lanes_pr" => backend.lane_pr(req("lane")?).map_err(emap),
         "git_bisect" => match backend.bisect(&str_vec("args")) {
             Ok(out) if out.is_empty() => Ok("ok".to_owned()),
             Ok(out) => Ok(out),

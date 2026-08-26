@@ -7,6 +7,7 @@
 mod backend;
 mod change_id;
 mod diff;
+mod lanes;
 mod error;
 mod git_repo;
 mod model;
@@ -19,7 +20,7 @@ pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 pub use error::GitError;
 pub use git_repo::{Git2Backend, clone, init};
 pub use model::{
-    BlameLine, Commit, CommitDetails, Head, LogEntry, LogOptions, OpLogEntry, OpProgress, RefEntry,
-    RefKind, Remote, RepoState, RepoStatus, ResetMode, RestackOutcome, SmartlogEntry, Stash,
-    StatusCode, StatusEntry, Worktree,
+    BlameLine, Commit, CommitDetails, Head, HunkRef, Lane, LanesState, LogEntry, LogOptions,
+    OpLogEntry, OpProgress, RefEntry, RefKind, Remote, RepoState, RepoStatus, ResetMode,
+    RestackOutcome, SmartlogEntry, Stash, StatusCode, StatusEntry, Worktree,
 };

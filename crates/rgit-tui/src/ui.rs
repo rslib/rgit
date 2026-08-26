@@ -1359,6 +1359,20 @@ fn context_hints(app: &App) -> (Option<String>, Vec<(&'static str, &'static str)
             vec![("⏎", "restore here"), ("q", "back")],
         ),
         ViewKind::Stack => (Some("stack".into()), vec![("q", "back")]),
+        ViewKind::Lanes => (
+            Some("lanes".into()),
+            vec![
+                ("n", "new lane"),
+                ("a", "assign file"),
+                ("u", "unassign"),
+                ("c", "commit lane"),
+                ("R", "rename"),
+                ("d", "delete lane"),
+                ("p", "push"),
+                ("P", "pull request"),
+                ("q", "back"),
+            ],
+        ),
         ViewKind::Info => (None, vec![("q", "back")]),
         ViewKind::Blame
         | ViewKind::Remotes

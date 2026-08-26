@@ -8,7 +8,7 @@ use ratatui::DefaultTerminal;
 use rgit_git::{GitBackend, GitError, RepoStatus};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::{App, Effect, InfoKind, Leader, Msg, Mutation, TextOp, update};
+use crate::app::{App, Effect, InfoKind, LaneOp, Leader, Msg, Mutation, TextOp, update};
 use crate::events::{Event, Events};
 use crate::keymap::{
     self, resolve_commit_key, resolve_confirm_key, resolve_help_key, resolve_key,
@@ -98,6 +98,53 @@ fn resolve_session_log_key(key: crossterm::event::KeyEvent) -> Option<Msg> {
         keymap::resolve_vim_key(key)
     } else {
         resolve_key(key)
+    }
+}
+
+/// Keys in the lanes view: `n` new lane, `a` assign the file at the cursor, `u`
+/// unassign it, `c` commit the lane at the cursor. Everything else (nav, fold,
+/// quit) falls through to the active profile.
+fn resolve_lanes_key(key: crossterm::event::KeyEvent) -> Option<Msg> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('n') => return Some(Msg::LaneNewPrompt),
+            KeyCode::Char('a') => return Some(Msg::LaneAssignPrompt),
+            KeyCode::Char('u') => return Some(Msg::LaneUnassignAtCursor),
+            KeyCode::Char('c') => return Some(Msg::LaneCommitPrompt),
+            KeyCode::Char('R') => return Some(Msg::LaneRenamePrompt),
+            KeyCode::Char('d') => return Some(Msg::LaneDeleteAtCursor),
+            KeyCode::Char('p') => return Some(Msg::LanePushAtCursor),
+            KeyCode::Char('P') => return Some(Msg::LanePrAtCursor),
+            _ => {}
+        }
+    }
+    if keymap::profile() == keymap::Profile::Vim {
+        keymap::resolve_vim_key(key)
+    } else {
+        resolve_key(key)
+    }
+}
+
+/// Run one lane operation and describe the result for a toast.
+fn run_lane_op(backend: &dyn GitBackend, op: &LaneOp) -> String {
+    let result = match op {
+        LaneOp::New(name) => backend.lane_new(name).map(|()| format!("created lane {name}")),
+        LaneOp::Assign { lane, path } => {
+            backend.lane_assign(lane, path).map(|()| format!("{path} -> {lane}"))
+        }
+        LaneOp::Unassign(path) => backend.lane_unassign(path).map(|()| format!("{path} -> default")),
+        LaneOp::Commit { lane, message } => backend.lane_commit(lane, message),
+        LaneOp::Rename { old, new } => {
+            backend.lane_rename(old, new).map(|()| format!("{old} -> {new}"))
+        }
+        LaneOp::Delete(name) => backend.lane_delete(name).map(|()| format!("deleted lane {name}")),
+        LaneOp::Push(lane) => backend.lane_push(lane),
+        LaneOp::Pr(lane) => backend.lane_pr(lane),
+    };
+    match result {
+        Ok(s) => s,
+        Err(e) => format!("error: {e}"),
     }
 }
 
@@ -202,6 +249,8 @@ async fn event_loop(
                     resolve_leader(&mut app, key)
                 } else if app.active_kind() == crate::app::ViewKind::SessionLog {
                     resolve_session_log_key(key)
+                } else if app.active_kind() == crate::app::ViewKind::Lanes {
+                    resolve_lanes_key(key)
                 } else if keymap::profile() == keymap::Profile::Vim {
                     keymap::resolve_vim_key(key)
                 } else {
@@ -512,6 +561,36 @@ async fn run_msg(
                     if let Ok(parents) = backend.stack_parents() {
                         let current = backend.status().ok().and_then(|s| s.head.branch);
                         let _ = msg_tx.send(Msg::StackLoaded { parents, current });
+                    }
+                });
+            }
+            Effect::LoadLanes => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    if !backend.lanes_active() {
+                        let _ = msg_tx.send(Msg::LaneNotice(
+                            "lanes are off; run `rgit lanes init` first".into(),
+                        ));
+                        return;
+                    }
+                    match backend.lanes_state() {
+                        Ok(state) => {
+                            let _ = msg_tx.send(Msg::LanesLoaded(state));
+                        }
+                        Err(e) => {
+                            let _ = msg_tx.send(Msg::LaneNotice(format!("error: {e}")));
+                        }
+                    }
+                });
+            }
+            Effect::LaneOp(op) => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = msg_tx.send(Msg::LaneNotice(run_lane_op(&*backend, &op)));
+                    if let Ok(state) = backend.lanes_state() {
+                        let _ = msg_tx.send(Msg::LanesLoaded(state));
                     }
                 });
             }

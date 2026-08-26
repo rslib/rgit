@@ -252,6 +252,12 @@ pub enum Command {
         #[command(subcommand)]
         cmd: Option<StackCmd>,
     },
+    /// Lanes: several lines of work in one worktree. Assign uncommitted files to
+    /// lanes and commit each to its own branch (no subcommand lists the lanes).
+    Lanes {
+        #[command(subcommand)]
+        cmd: Option<LanesCmd>,
+    },
     /// Fold each pending change into the stacked commit that last touched those
     /// lines (blame-routed fixups + autosquash).
     Absorb,
@@ -415,6 +421,67 @@ pub enum StackCmd {
     List,
     /// Rebase every descendant onto its parent's new tip.
     Restack,
+}
+
+/// Subcommands for lanes.
+#[derive(clap::Subcommand)]
+pub enum LanesCmd {
+    /// Enter lanes mode: record the fork point and a default lane.
+    Init,
+    /// Leave lanes mode (lane branches are kept).
+    Off,
+    /// List the lanes and their owned files (the default when no subcommand).
+    List,
+    /// Create a new lane committing to a same-named branch.
+    New {
+        /// The lane (and branch) name.
+        name: String,
+    },
+    /// Assign a worktree path to a lane, or a single hunk with `--hunk`.
+    Assign {
+        /// The lane to assign to.
+        lane: String,
+        /// The path to assign.
+        path: String,
+        /// Assign only the hunk starting at this new-file line, not the file.
+        #[arg(long)]
+        hunk: Option<u32>,
+    },
+    /// Return a path to the default lane.
+    Unassign {
+        /// The path to unassign.
+        path: String,
+    },
+    /// Commit a lane's owned changes to its branch.
+    Commit {
+        /// The lane to commit.
+        lane: String,
+        /// The commit message.
+        #[arg(short, long)]
+        message: String,
+    },
+    /// Rename a lane and its branch.
+    Rename {
+        /// The lane to rename.
+        old: String,
+        /// The new name.
+        new: String,
+    },
+    /// Delete a lane (its changes return to default; its branch is kept).
+    Delete {
+        /// The lane to delete.
+        name: String,
+    },
+    /// Push a lane's branch to the remote.
+    Push {
+        /// The lane to push.
+        lane: String,
+    },
+    /// Push a lane's branch and open a pull request (via gh/glab).
+    Pr {
+        /// The lane to open a PR for.
+        lane: String,
+    },
 }
 
 /// Subcommands for branching workflows.
@@ -717,6 +784,22 @@ pub fn run(
                 rgit_git::workflow::release(backend.as_ref(), &version, finish)?
             }
             FlowCmd::Status => rgit_git::workflow::status(backend.as_ref())?,
+        },
+        Command::Lanes { cmd } => match cmd.unwrap_or(LanesCmd::List) {
+            LanesCmd::Init => crate::lanes::init(backend)?,
+            LanesCmd::Off => crate::lanes::off(backend)?,
+            LanesCmd::List => crate::lanes::list(backend)?,
+            LanesCmd::New { name } => crate::lanes::new_lane(backend, &name)?,
+            LanesCmd::Assign { lane, path, hunk } => match hunk {
+                Some(new_start) => crate::lanes::assign_hunk(backend, &lane, &path, new_start)?,
+                None => crate::lanes::assign(backend, &lane, &path)?,
+            },
+            LanesCmd::Unassign { path } => crate::lanes::unassign(backend, &path)?,
+            LanesCmd::Commit { lane, message } => crate::lanes::commit(backend, &lane, &message)?,
+            LanesCmd::Rename { old, new } => crate::lanes::rename(backend, &old, &new)?,
+            LanesCmd::Delete { name } => crate::lanes::delete(backend, &name)?,
+            LanesCmd::Push { lane } => crate::lanes::push(backend, &lane)?,
+            LanesCmd::Pr { lane } => crate::lanes::pr(backend, &lane)?,
         },
         Command::Stack { cmd } => match cmd.unwrap_or(StackCmd::List) {
             StackCmd::New { name } => crate::stack::new(backend, &name)?,

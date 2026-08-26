@@ -29,7 +29,7 @@ struct Policy {
     upstream_first: bool,
 }
 
-fn detect_main(backend: &dyn GitBackend) -> String {
+pub(crate) fn detect_main(backend: &dyn GitBackend) -> String {
     if backend.branch_exists("main") {
         "main".to_owned()
     } else if backend.branch_exists("master") {
@@ -264,7 +264,7 @@ pub fn release(backend: &dyn GitBackend, version: &str, finish: bool) -> Result<
 
 /// After pushing, open a pull/merge request with the forge CLI if available (gh,
 /// then glab); otherwise return guidance. These are the forge tools, not git.
-fn open_pull_request(branch: &str, base: &str) -> String {
+pub(crate) fn open_pull_request(branch: &str, base: &str) -> String {
     if let Some(url) = run_forge(
         "gh",
         &["pr", "create", "--fill", "--base", base, "--head", branch],

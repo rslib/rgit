@@ -285,6 +285,46 @@ pub trait GitBackend: Send + Sync {
     /// Whether a local branch of this name exists.
     fn branch_exists(&self, name: &str) -> bool;
 
+    /// Whether the lanes overlay is active (see the `lanes` module).
+    fn lanes_active(&self) -> bool;
+
+    /// Enter lanes mode: record the fork point and a default lane.
+    fn lanes_init(&self) -> Result<(), GitError>;
+
+    /// Leave lanes mode: delete the state ref, leaving lane branches in place.
+    fn lanes_off(&self) -> Result<(), GitError>;
+
+    /// The lanes state, reconciled against the working tree.
+    fn lanes_state(&self) -> Result<crate::LanesState, GitError>;
+
+    /// Create a new empty lane committing to a same-named branch.
+    fn lane_new(&self, name: &str) -> Result<(), GitError>;
+
+    /// Assign a worktree path to a lane.
+    fn lane_assign(&self, lane: &str, path: &str) -> Result<(), GitError>;
+
+    /// Assign one hunk of a tracked file (by its current `new_start`) to a lane.
+    fn lane_assign_hunk(&self, lane: &str, path: &str, new_start: u32) -> Result<(), GitError>;
+
+    /// Return a path to the default lane.
+    fn lane_unassign(&self, path: &str) -> Result<(), GitError>;
+
+    /// Commit a lane's owned changes to its branch (synthesized in memory).
+    fn lane_commit(&self, lane: &str, message: &str) -> Result<String, GitError>;
+
+    /// Rename a lane and its branch.
+    fn lane_rename(&self, old: &str, new: &str) -> Result<(), GitError>;
+
+    /// Delete a lane, returning its changes to the default lane (branch kept).
+    fn lane_delete(&self, name: &str) -> Result<(), GitError>;
+
+    /// Push a lane's branch to the remote and set its upstream (HEAD stays put).
+    fn lane_push(&self, lane: &str) -> Result<String, GitError>;
+
+    /// Push a lane's branch and open a pull/merge request for it via the forge
+    /// CLI (gh/glab), against the trunk.
+    fn lane_pr(&self, lane: &str) -> Result<String, GitError>;
+
     /// Create a new branch stacked on the current one, recording its parent and
     /// fork point in git config.
     fn stack_new(&self, name: &str) -> Result<String, GitError> {
