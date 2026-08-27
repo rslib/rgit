@@ -1781,6 +1781,70 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn split(&self, rev: &str, paths: &[String]) -> Result<(), GitError> {
+        self.snap("split");
+        {
+            let repo = self.repo.lock().expect("repo mutex");
+            let branch_ref = head_branch_ref(&repo)?;
+            let target = repo.revparse_single(rev)?.peel_to_commit()?;
+            let parent = target
+                .parent(0)
+                .map_err(|_| GitError::Other("cannot split the root commit".to_owned()))?;
+            let p_tree = parent.tree()?;
+            let c_tree = target.tree()?;
+
+            // First part: the parent's tree with the selected paths taken from the
+            // target (nested paths handled via a full-path index).
+            let mut index = git2::Index::new()?;
+            index.read_tree(&p_tree)?;
+            let mut opts = DiffOptions::new();
+            let diff = repo.diff_tree_to_tree(Some(&p_tree), Some(&c_tree), Some(&mut opts))?;
+            let selected = |p: &str| paths.iter().any(|s| p == s || p.starts_with(&format!("{s}/")));
+            let mut moved = 0;
+            for i in 0..diff.deltas().len() {
+                let delta = diff.get_delta(i).expect("delta in range");
+                let path = delta
+                    .new_file()
+                    .path()
+                    .or_else(|| delta.old_file().path())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if !selected(&path) {
+                    continue;
+                }
+                match c_tree.get_path(std::path::Path::new(&path)) {
+                    Ok(entry) => index_set(&mut index, &path, entry.id(), entry.filemode())?,
+                    Err(_) => {
+                        index.remove_path(std::path::Path::new(&path))?;
+                    }
+                }
+                moved += 1;
+            }
+            if moved == 0 {
+                return Err(GitError::Other(
+                    "no changes in the given paths for this commit".to_owned(),
+                ));
+            }
+            let part1_tree = repo.find_tree(index.write_tree_to(&repo)?)?;
+
+            let sig = repo.signature()?;
+            let full_msg = target.message().unwrap_or("");
+            // Part 1 keeps only the subject (a fresh change id); part 2 keeps the
+            // full message and the original change id.
+            let subject = full_msg.lines().next().unwrap_or("").to_owned();
+            let c1 = repo.commit(None, &target.author(), &sig, &subject, &part1_tree, &[&parent])?;
+            let c1_commit = repo.find_commit(c1)?;
+            let c2 = repo.commit(None, &target.author(), &sig, full_msg, &c_tree, &[&c1_commit])?;
+
+            let chain = first_parent_chain(&repo, target.id())?;
+            let descendants: Vec<&git2::Commit> = chain.iter().rev().skip(1).collect();
+            let new_tip = replay_onto(&repo, &descendants, c2)?;
+            repo.reference(&branch_ref, new_tip, true, "rgit split")?;
+        }
+        let _ = self.restack();
+        Ok(())
+    }
+
     fn squash(&self, rev: &str) -> Result<(), GitError> {
         self.snap("squash");
         {
@@ -2468,6 +2532,27 @@ fn reword_commit(repo: &Repository, target: Oid, new_message: &str) -> Result<()
         )?;
     }
     repo.reference(&branch_ref, new_tip, true, "rgit reword")?;
+    Ok(())
+}
+
+/// Set one path in an in-memory index to a tree entry (mode + blob id). Only the
+/// fields git needs to write a tree are set; the rest are zero.
+fn index_set(index: &mut git2::Index, path: &str, id: Oid, mode: i32) -> Result<(), GitError> {
+    let entry = git2::IndexEntry {
+        ctime: git2::IndexTime::new(0, 0),
+        mtime: git2::IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode: mode as u32,
+        uid: 0,
+        gid: 0,
+        file_size: 0,
+        id,
+        flags: 0,
+        flags_extended: 0,
+        path: path.as_bytes().to_vec(),
+    };
+    index.add(&entry)?;
     Ok(())
 }
 

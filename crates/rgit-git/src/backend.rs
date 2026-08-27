@@ -71,6 +71,10 @@ pub trait GitBackend: Send + Sync {
     /// ancestor of HEAD on the first-parent chain and not the root commit.
     fn squash(&self, rev: &str) -> Result<(), GitError>;
 
+    /// Split a commit in two by path: the first commit gets the given paths'
+    /// changes, the second gets the rest, then replay descendants. Op-log-safe.
+    fn split(&self, rev: &str, paths: &[String]) -> Result<(), GitError>;
+
     /// The directory git resolves hooks from (`core.hooksPath` or
     /// `<git-dir>/hooks`), so the caller can run and stream them itself.
     fn hooks_dir(&self) -> std::path::PathBuf;

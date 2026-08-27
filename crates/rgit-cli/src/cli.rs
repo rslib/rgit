@@ -147,6 +147,15 @@ pub enum Command {
         #[arg(default_value = "HEAD")]
         rev: String,
     },
+    /// Split a commit into two by path (given paths first, the rest second).
+    Split {
+        /// The commit to split (default HEAD).
+        #[arg(long, default_value = "HEAD")]
+        rev: String,
+        /// Paths whose changes go into the first commit.
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
     /// Fetch the current branch's remote.
     Fetch,
     /// Fetch and fast-forward the current branch.
@@ -936,6 +945,10 @@ pub fn run(
         Command::Squash { rev } => {
             backend.squash(&rev)?;
             format!("squashed {rev} into its parent")
+        }
+        Command::Split { rev, paths } => {
+            backend.split(&rev, &paths)?;
+            format!("split {rev} into two commits")
         }
         Command::Fetch => net(interactive, "fetch", |r| backend.fetch(r))?,
         Command::Pull => net(interactive, "pull", |r| backend.pull(r))?,
