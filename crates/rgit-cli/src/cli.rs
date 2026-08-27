@@ -178,6 +178,10 @@ pub enum Command {
         #[arg(default_value = "HEAD")]
         base: String,
     },
+    /// Check out the branch stacked on this one (move up the stack).
+    Next,
+    /// Check out this branch's stack parent (move down the stack).
+    Prev,
     /// Fetch the current branch's remote.
     Fetch,
     /// Fetch and fast-forward the current branch.
@@ -977,6 +981,42 @@ pub fn run(
         Command::Split { rev, paths } => {
             backend.split(&rev, &paths)?;
             format!("split {rev} into two commits")
+        }
+        Command::Prev => {
+            let current = backend
+                .status()?
+                .head
+                .branch
+                .ok_or_else(|| anyhow::anyhow!("not on a branch"))?;
+            let parent = backend
+                .stack_parents()?
+                .into_iter()
+                .find(|(b, _)| *b == current)
+                .and_then(|(_, p)| p)
+                .ok_or_else(|| anyhow::anyhow!("{current} has no stack parent"))?;
+            backend.checkout_branch(&parent)?;
+            format!("checked out {parent}")
+        }
+        Command::Next => {
+            let current = backend
+                .status()?
+                .head
+                .branch
+                .ok_or_else(|| anyhow::anyhow!("not on a branch"))?;
+            let children: Vec<String> = backend
+                .stack_parents()?
+                .into_iter()
+                .filter(|(_, p)| p.as_deref() == Some(current.as_str()))
+                .map(|(b, _)| b)
+                .collect();
+            match children.as_slice() {
+                [] => anyhow::bail!("{current} is at the top of the stack"),
+                [one] => {
+                    backend.checkout_branch(one)?;
+                    format!("checked out {one}")
+                }
+                many => anyhow::bail!("multiple children: {}", many.join(", ")),
+            }
         }
         Command::Prune { base } => {
             let deleted = backend.prune_merged(&base)?;
