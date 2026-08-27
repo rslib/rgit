@@ -393,10 +393,17 @@ async fn run_msg(
             Effect::Refresh => spawn_read(app, msg_tx, |b| b.status()),
             Effect::CopyToClipboard(text) => copy_to_clipboard(&text),
             Effect::Mutate(mutation) => {
-                // Extend rewrites HEAD like an amend, so it auto-restacks the
-                // stacked children too (when enabled); other mutations do not.
-                let restack_after =
-                    app.auto_restack() && matches!(mutation, crate::app::Mutation::Extend);
+                // These all rewrite HEAD (amend, reword, squash, uncommit), so
+                // they auto-restack the stacked children too (when enabled);
+                // other mutations do not.
+                let restack_after = app.auto_restack()
+                    && matches!(
+                        mutation,
+                        crate::app::Mutation::Extend
+                            | crate::app::Mutation::Reword { .. }
+                            | crate::app::Mutation::Squash(_)
+                            | crate::app::Mutation::Uncommit(_)
+                    );
                 let backend = app.backend();
                 let tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
@@ -1189,6 +1196,9 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::CreateTag(name) => backend.create_tag(name, ""),
         Mutation::DeleteTag(name) => backend.delete_tag(name),
         Mutation::DeleteBranch(name) => backend.delete_branch(name),
+        Mutation::Reword { rev, message } => backend.reword(rev, message),
+        Mutation::Squash(rev) => backend.squash(rev),
+        Mutation::Uncommit(n) => backend.uncommit(*n),
     }
 }
 

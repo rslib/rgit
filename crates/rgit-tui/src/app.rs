@@ -801,6 +801,15 @@ pub enum Mutation {
     },
     RemoveWorktree(String),
     Extend,
+    /// Rewrite `rev`'s message, replaying its descendants onto the new commit.
+    Reword {
+        rev: String,
+        message: String,
+    },
+    /// Fold `rev` into its parent, keeping the parent's message.
+    Squash(String),
+    /// Undo the last `n` commits, keeping their changes in the working tree.
+    Uncommit(usize),
 }
 
 /// A destructive action awaiting a yes/no answer in the status bar.
@@ -883,6 +892,9 @@ pub enum ActionKind {
     OpFlowStatus,
     OpWorkspaces,
     OpLanes,
+    Reword,
+    Squash,
+    Uncommit,
 }
 
 /// A transient popup: a title, sticky argument toggles, and suffix actions that
@@ -1025,6 +1037,9 @@ impl Transient {
                 action('n', "stack: new branch…", ActionKind::OpStackNew),
                 action('R', "restack", ActionKind::OpRestack),
                 action('a', "absorb", ActionKind::OpAbsorb),
+                action('e', "reword…", ActionKind::Reword),
+                action('q', "squash into parent…", ActionKind::Squash),
+                action('U', "uncommit (soft-reset HEAD~1)", ActionKind::Uncommit),
                 action('f', "flow status", ActionKind::OpFlowStatus),
                 action('w', "workspaces", ActionKind::OpWorkspaces),
                 action('l', "lanes", ActionKind::OpLanes),
@@ -1151,6 +1166,13 @@ pub enum PromptAction {
     LaneStack,
     /// Answer a credential request via `pending_cred_reply`.
     Credential,
+    /// Pick the commit to reword; stash it in `pending_reword_rev` and prompt
+    /// for the new message.
+    RewordRev,
+    /// Reword `pending_reword_rev` with the prompt value.
+    RewordMessage,
+    /// Squash the commit named by the prompt value into its parent.
+    Squash,
 }
 
 /// A minibuffer: a label, an editable input, and optional filterable candidates.
@@ -1707,6 +1729,7 @@ pub struct App {
     /// Restack stacked children after an amend/reword/extend when set.
     auto_restack: bool,
     /// The lane targeted by a pending lane-commit prompt.
+    pending_reword_rev: Option<String>,
     pending_lane: Option<String>,
     /// The path targeted by a pending lane-assign prompt.
     pending_lane_path: Option<String>,
@@ -1786,6 +1809,7 @@ impl App {
             oplog_len: 0,
             gpg_sign: config.commit.gpg_sign,
             auto_restack: config.commit.auto_restack,
+            pending_reword_rev: None,
             pending_lane: None,
             pending_lane_path: None,
             pending_cred_reply: None,
@@ -3235,6 +3259,17 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             }
             return Vec::new();
         }
+        // Reword is a two-step prompt: pick the commit, then its new message.
+        PromptAction::RewordRev => {
+            let rev = if value.trim().is_empty() {
+                "HEAD".to_owned()
+            } else {
+                value
+            };
+            app.pending_reword_rev = Some(rev);
+            revision_prompt(app, "New message", PromptAction::RewordMessage);
+            return Vec::new();
+        }
         _ => {}
     }
     // Flow/workspace ops return a status string, shown as a toast.
@@ -3269,6 +3304,14 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         },
         PromptAction::CherryPick => Mutation::CherryPick(value),
         PromptAction::Revert => Mutation::Revert(value),
+        PromptAction::RewordMessage => match app.pending_reword_rev.take() {
+            Some(rev) => Mutation::Reword {
+                rev,
+                message: value,
+            },
+            None => return Vec::new(),
+        },
+        PromptAction::Squash => Mutation::Squash(value),
         PromptAction::CreateTag => Mutation::CreateTag(value),
         PromptAction::DeleteTag => Mutation::DeleteTag(value),
         PromptAction::StashMessage => Mutation::StashPushMessage(value),
@@ -3289,6 +3332,7 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         | PromptAction::LaneCommit
         | PromptAction::LaneRename
         | PromptAction::LaneStack
+        | PromptAction::RewordRev
         | PromptAction::Credential => {
             return Vec::new();
         }
@@ -3426,6 +3470,19 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
         ActionKind::OpStackNew => update(app, Msg::StackNewPrompt),
         ActionKind::OpRestack => update(app, Msg::Restack),
         ActionKind::OpAbsorb => update(app, Msg::Absorb),
+        ActionKind::Reword => {
+            revision_prompt(app, "Reword commit (empty = HEAD)", PromptAction::RewordRev);
+            Vec::new()
+        }
+        ActionKind::Squash => {
+            revision_prompt(app, "Squash into parent (commit)", PromptAction::Squash);
+            Vec::new()
+        }
+        ActionKind::Uncommit => {
+            app.transient = None;
+            app.loading = true;
+            vec![Effect::Mutate(Mutation::Uncommit(1))]
+        }
         ActionKind::OpFlowStatus => update(app, Msg::OpenFlowStatus),
         ActionKind::OpWorkspaces => update(app, Msg::OpenWorkspaces),
         ActionKind::OpLanes => update(app, Msg::OpenLanes),
