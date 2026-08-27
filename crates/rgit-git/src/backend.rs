@@ -80,6 +80,11 @@ pub trait GitBackend: Send + Sync {
     /// Op-log-safe.
     fn squash_range(&self, from: &str) -> Result<(), GitError>;
 
+    /// Move `rev` to just before or after `target` in the current branch's linear
+    /// history, replaying the affected commits in the new order. Both must be on
+    /// the first-parent chain. A conflict aborts cleanly. Op-log-safe.
+    fn reorder(&self, rev: &str, target: &str, before: bool) -> Result<(), GitError>;
+
     /// The directory git resolves hooks from (`core.hooksPath` or
     /// `<git-dir>/hooks`), so the caller can run and stream them itself.
     fn hooks_dir(&self) -> std::path::PathBuf;

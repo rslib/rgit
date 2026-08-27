@@ -151,6 +151,18 @@ pub enum Command {
         #[arg(long)]
         from: Option<String>,
     },
+    /// Move a commit before or after another in the current branch's history.
+    #[command(name = "move")]
+    Move {
+        /// The commit to move.
+        rev: String,
+        /// Move it to just before this commit.
+        #[arg(long, conflicts_with = "after")]
+        before: Option<String>,
+        /// Move it to just after this commit.
+        #[arg(long)]
+        after: Option<String>,
+    },
     /// Split a commit into two by path (given paths first, the rest second).
     Split {
         /// The commit to split (default HEAD).
@@ -960,6 +972,17 @@ pub fn run(
             backend.split(&rev, &paths)?;
             format!("split {rev} into two commits")
         }
+        Command::Move { rev, before, after } => match (before, after) {
+            (Some(t), None) => {
+                backend.reorder(&rev, &t, true)?;
+                format!("moved {rev} before {t}")
+            }
+            (None, Some(t)) => {
+                backend.reorder(&rev, &t, false)?;
+                format!("moved {rev} after {t}")
+            }
+            _ => anyhow::bail!("pass exactly one of --before or --after"),
+        },
         Command::Fetch => net(interactive, "fetch", |r| backend.fetch(r))?,
         Command::Pull => net(interactive, "pull", |r| backend.pull(r))?,
         Command::Push {

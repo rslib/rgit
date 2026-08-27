@@ -1845,6 +1845,64 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn reorder(&self, rev: &str, target: &str, before: bool) -> Result<(), GitError> {
+        self.snap("reorder");
+        {
+            let repo = self.repo.lock().expect("repo mutex");
+            let branch_ref = head_branch_ref(&repo)?;
+            let rev_oid = repo.revparse_single(rev)?.peel_to_commit()?.id();
+            let target_oid = repo.revparse_single(target)?.peel_to_commit()?.id();
+            if rev_oid == target_oid {
+                return Err(GitError::Other("cannot move a commit onto itself".to_owned()));
+            }
+            // Walk HEAD down the first-parent chain until both are seen.
+            let mut chain: Vec<git2::Commit> = Vec::new();
+            let mut c = repo.head()?.peel_to_commit()?;
+            let (mut seen_rev, mut seen_target) = (false, false);
+            loop {
+                seen_rev |= c.id() == rev_oid;
+                seen_target |= c.id() == target_oid;
+                chain.push(c);
+                if seen_rev && seen_target {
+                    break;
+                }
+                c = match chain.last().unwrap().parent(0) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return Err(GitError::Other(
+                            "both commits must be ancestors of HEAD".to_owned(),
+                        ));
+                    }
+                };
+            }
+            let base = chain
+                .last()
+                .unwrap()
+                .parent(0)
+                .map_err(|_| GitError::Other("cannot reorder across the root commit".to_owned()))?;
+
+            // Affected commits, oldest first; move rev relative to target.
+            let mut order: Vec<Oid> = chain.iter().rev().map(git2::Commit::id).collect();
+            let rev_pos = order.iter().position(|&o| o == rev_oid).expect("rev in order");
+            order.remove(rev_pos);
+            let target_pos = order
+                .iter()
+                .position(|&o| o == target_oid)
+                .expect("target in order");
+            order.insert(if before { target_pos } else { target_pos + 1 }, rev_oid);
+
+            let commits: Vec<git2::Commit> = order
+                .iter()
+                .map(|o| repo.find_commit(*o))
+                .collect::<Result<_, _>>()?;
+            let refs: Vec<&git2::Commit> = commits.iter().collect();
+            let new_tip = replay_onto(&repo, &refs, base.id())?;
+            repo.reference(&branch_ref, new_tip, true, "rgit move")?;
+        }
+        let _ = self.restack();
+        Ok(())
+    }
+
     fn squash_range(&self, from: &str) -> Result<(), GitError> {
         self.snap("squash");
         {
