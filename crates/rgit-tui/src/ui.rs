@@ -770,8 +770,13 @@ fn render_prompt(frame: &mut Frame, prompt: &crate::app::Prompt, list: Rect, inp
         .collect();
     frame.render_widget(Paragraph::new(rows), list);
 
-    // Render the caret as a reversed cell at the cursor's char position.
-    let chars: Vec<char> = prompt.input.chars().collect();
+    // Render the caret as a reversed cell at the cursor's char position. A
+    // masked prompt (a password/passphrase) shows dots instead of the text.
+    let chars: Vec<char> = if prompt.masked {
+        std::iter::repeat_n('\u{2022}', prompt.input.chars().count()).collect()
+    } else {
+        prompt.input.chars().collect()
+    };
     let cur = prompt.cursor.min(chars.len());
     let before: String = chars[..cur].iter().collect();
     let (at, after) = if cur < chars.len() {
@@ -1363,6 +1368,8 @@ fn context_hints(app: &App) -> (Option<String>, Vec<(&'static str, &'static str)
             Some("lanes".into()),
             vec![
                 ("n", "new lane"),
+                ("s", "stack on lane"),
+                ("S", "restack lanes"),
                 ("a", "assign file"),
                 ("u", "unassign"),
                 ("c", "commit lane"),

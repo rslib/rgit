@@ -1,8 +1,8 @@
 use std::sync::OnceLock;
 
 use rgit_git::{
-    BlameLine, CommitDetails, DiffLine, FileDiff, Head, Hunk, LineOrigin, LogEntry, RefEntry,
-    RefKind, Remote, RepoStatus, StatusCode, StatusEntry, Worktree,
+    BlameLine, CommitDetails, CommitRef, Deco, DiffLine, FileDiff, Head, Hunk, LineOrigin, LogEntry,
+    RefEntry, RefKind, Remote, RepoStatus, StatusCode, StatusEntry, Worktree, group_decorations,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{
@@ -411,6 +411,44 @@ use crate::style::{Span, Style};
 
 /// Build the log view's content: a node row per commit, plus a graph link row
 /// wherever the history forks or merges, so branch topology reads at a glance.
+/// Decorations for a log row, git --decorate style: the local branch, its
+/// upstream, then tags, each styled by kind so `<hash> <branch> <upstream>
+/// <summary>` reads at a glance.
+fn ref_labels(refs: &[CommitRef]) -> Vec<Span> {
+    let mut spans = Vec::new();
+    for deco in group_decorations(refs) {
+        match deco {
+            Deco::Local(name) => spans.push(Span::new(format!("  {name}"), Style::Branch)),
+            Deco::Remote { remote, branch } => {
+                spans.push(Span::new(format!("  {remote}/{branch}"), Style::Dim))
+            }
+            Deco::Tag(name) => spans.push(Span::new(format!("  {name}"), Style::Modified)),
+            Deco::Group {
+                branch,
+                local,
+                remotes,
+            } => {
+                spans.push(Span::new("  {".to_owned(), Style::Dim));
+                let mut first = true;
+                if local {
+                    spans.push(Span::new("local".to_owned(), Style::Branch));
+                    first = false;
+                }
+                for r in remotes {
+                    if !first {
+                        spans.push(Span::new(",".to_owned(), Style::Dim));
+                    }
+                    spans.push(Span::new(r, Style::Dim));
+                    first = false;
+                }
+                let name_style = if local { Style::Branch } else { Style::Dim };
+                spans.push(Span::new(format!("}}/{branch}"), name_style));
+            }
+        }
+    }
+    spans
+}
+
 pub fn build_log(entries: &[LogEntry]) -> Vec<Section> {
     if entries.is_empty() {
         let bullet = if nerd_fonts() {
@@ -444,11 +482,17 @@ pub fn build_log(entries: &[LogEntry]) -> Vec<Section> {
                 let e = &entries[idx];
                 let mut spans = row.spans;
                 spans.push(Span::new(e.short_id.clone(), Style::Hash));
+                for span in ref_labels(&e.refs) {
+                    spans.push(span);
+                }
                 spans.push(Span::plain(format!("  {}", e.summary)));
                 spans.push(Span::new(
                     format!("  {} · {}", e.author, e.when),
                     Style::Dim,
                 ));
+                if e.unpushed {
+                    spans.push(Span::new("  \u{2191}".to_owned(), Style::Added));
+                }
                 sections.push(
                     Section::leaf(format!("log/{}", e.short_id), NodeKind::Commit, spans)
                         .with_target(Target::Commit {
@@ -641,7 +685,7 @@ pub fn build_commit(details: &CommitDetails) -> Vec<Section> {
             NodeKind::HeadField,
             vec![
                 Span::new("Commit:  ", Style::FieldLabel),
-                Span::new(details.id.clone(), Style::Hash),
+                Span::new(details.full_id.clone(), Style::Hash),
             ],
         ),
         Section::leaf(
@@ -1058,8 +1102,14 @@ pub fn build(status: &RepoStatus) -> Vec<Section> {
                 let mut spans = Vec::new();
                 spans.extend(icon_span("\u{e729}", Style::Hash));
                 spans.push(Span::new(c.short_id.clone(), Style::Hash));
+                for span in ref_labels(&c.refs) {
+                    spans.push(span);
+                }
                 spans.push(Span::plain(format!("  {}", c.summary)));
                 spans.push(Span::new(format!("  · {}", c.when), Style::Dim));
+                if c.unpushed {
+                    spans.push(Span::new("  \u{2191}unpushed".to_owned(), Style::Added));
+                }
                 Section::leaf(format!("recent/{}", c.short_id), NodeKind::Commit, spans)
                     .with_target(Target::Commit {
                         id: c.short_id.clone(),
@@ -1296,11 +1346,73 @@ mod graph_tests {
             when: String::new(),
             oid: oid.into(),
             parents: parents.iter().map(|p| p.to_string()).collect(),
+            refs: Vec::new(),
+            unpushed: false,
         }
     }
 
     fn text(spans: &[Span]) -> String {
         spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn log_ref_labels_collapse_shared_branch_name() {
+        let refs = vec![
+            CommitRef {
+                name: "main".into(),
+                kind: RefKind::Local,
+                head: true,
+            },
+            CommitRef {
+                name: "origin/main".into(),
+                kind: RefKind::Remote,
+                head: false,
+            },
+            CommitRef {
+                name: "upstream/main".into(),
+                kind: RefKind::Remote,
+                head: false,
+            },
+            CommitRef {
+                name: "v1".into(),
+                kind: RefKind::Tag,
+                head: false,
+            },
+        ];
+        let spans = ref_labels(&refs);
+        let joined: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, "  {local,origin,upstream}/main  v1");
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.text == "local" && s.style == Style::Branch)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.text == "  v1" && s.style == Style::Modified)
+        );
+    }
+
+    #[test]
+    fn log_ref_labels_keep_unique_names_separate() {
+        let refs = vec![
+            CommitRef {
+                name: "feature".into(),
+                kind: RefKind::Local,
+                head: true,
+            },
+            CommitRef {
+                name: "origin/main".into(),
+                kind: RefKind::Remote,
+                head: false,
+            },
+        ];
+        let joined: String = ref_labels(&refs)
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(joined, "  feature  origin/main");
     }
 
     #[test]
@@ -1355,6 +1467,7 @@ mod graph_tests {
             upstream: upstream.map(str::to_owned),
             ahead,
             behind,
+            remotes: Vec::new(),
         }
     }
 

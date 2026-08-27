@@ -6,8 +6,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rgit_git::{
-    BlameLine, CommitDetails, FileDiff, LogEntry, RefEntry, Remote, RepoStatus, SmartlogEntry,
-    Stash, StatusEntry, Worktree,
+    BlameLine, CommitDetails, CommitRef, Deco, FileDiff, LogEntry, RefEntry, Remote, RepoStatus,
+    SmartlogEntry, Stash, StatusEntry, Worktree, group_decorations,
 };
 
 static COLOR: AtomicBool = AtomicBool::new(false);
@@ -32,6 +32,7 @@ const YELLOW: &str = "33";
 const CYAN: &str = "36";
 const DIM: &str = "2";
 const BOLD: &str = "1";
+const MAGENTA: &str = "35";
 
 /// Working-tree status: a branch line, then changed paths grouped by state, one
 /// per line with a colored status code.
@@ -146,13 +147,62 @@ pub fn oplog(entries: &[rgit_git::OpLogEntry]) -> String {
 }
 
 /// One `sha subject` line per commit; the sha is dim.
+/// git --decorate labels for a log line: local branch, upstream, then tags,
+/// each trailed by a space so they slot between the hash and the summary.
+fn ref_decor(refs: &[CommitRef]) -> String {
+    let mut out = String::new();
+    for deco in group_decorations(refs) {
+        match deco {
+            Deco::Local(name) => out.push_str(&format!("{} ", paint(&name, GREEN))),
+            Deco::Remote { remote, branch } => {
+                out.push_str(&format!("{} ", paint(&format!("{remote}/{branch}"), MAGENTA)))
+            }
+            Deco::Tag(name) => out.push_str(&format!("{} ", paint(&name, CYAN))),
+            Deco::Group {
+                branch,
+                local,
+                remotes,
+            } => {
+                let mut parts = Vec::new();
+                if local {
+                    parts.push(paint("local", GREEN));
+                }
+                for r in &remotes {
+                    parts.push(paint(r, MAGENTA));
+                }
+                let name_color = if local { GREEN } else { MAGENTA };
+                out.push_str(&format!(
+                    "{}{}{}{} ",
+                    paint("{", DIM),
+                    parts.join(&paint(",", DIM)),
+                    paint("}/", DIM),
+                    paint(&branch, name_color)
+                ));
+            }
+        }
+    }
+    out
+}
+
 pub fn log(entries: &[LogEntry]) -> String {
     if entries.is_empty() {
         return "no commits".to_owned();
     }
     entries
         .iter()
-        .map(|e| format!("{} {}", paint(&e.short_id, YELLOW), e.summary))
+        .map(|e| {
+            let mark = if e.unpushed {
+                paint(" \u{2191}", GREEN)
+            } else {
+                String::new()
+            };
+            format!(
+                "{} {}{}{mark}",
+                paint(&e.short_id, YELLOW),
+                ref_decor(&e.refs),
+                e.summary
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

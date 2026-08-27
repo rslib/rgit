@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use rgit_git::{GitBackend, LogOptions, ResetMode};
+use rgit_git::{Git2Backend, GitBackend, LogOptions, ResetMode};
 use serde_json::{Map, Value, json};
 
 use rmcp::{
@@ -25,9 +25,49 @@ use rmcp::{
     transport::stdio,
 };
 
-/// The MCP server: a git backend shared across tool calls.
+/// The MCP server: resolves each tool call to a git backend by the optional
+/// `repo` argument, defaulting to the repo the server was started in.
 struct RgitMcp {
-    backend: Arc<dyn GitBackend>,
+    registry: Registry,
+}
+
+/// Maps a tool call's `repo` argument to a backend. Empty/absent uses the repo
+/// the server started in; a value opens another repo on demand (cached).
+struct Registry {
+    default: Arc<dyn GitBackend>,
+    cache: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Arc<dyn GitBackend>>>,
+}
+
+impl Registry {
+    fn new(default: Arc<dyn GitBackend>) -> Self {
+        Self {
+            default,
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Resolve the `repo` argument to a backend. NOTE: this is the local, trusted
+    /// resolver - a value is treated as a filesystem path. A hosted server must
+    /// replace it with name-within-a-managed-root lookup plus access control, and
+    /// never accept arbitrary paths.
+    fn resolve(&self, repo: Option<&str>) -> Result<Arc<dyn GitBackend>, String> {
+        let path = match repo {
+            None => return Ok(self.default.clone()),
+            Some(p) if p.trim().is_empty() => return Ok(self.default.clone()),
+            Some(p) => p,
+        };
+        let canon = std::fs::canonicalize(path).map_err(|e| format!("no such repo {path:?}: {e}"))?;
+        if let Some(b) = self.cache.lock().expect("registry mutex").get(&canon) {
+            return Ok(b.clone());
+        }
+        let backend: Arc<dyn GitBackend> =
+            Arc::new(Git2Backend::discover(&canon).map_err(|e| e.to_string())?);
+        self.cache
+            .lock()
+            .expect("registry mutex")
+            .insert(canon, backend.clone());
+        Ok(backend)
+    }
 }
 
 /// Serve MCP over stdio until the client disconnects. Returns a process exit
@@ -55,7 +95,11 @@ pub fn serve(backend: Arc<dyn GitBackend>) -> i32 {
 }
 
 async fn run(backend: Arc<dyn GitBackend>) -> anyhow::Result<()> {
-    let service = RgitMcp { backend }.serve(stdio()).await?;
+    let service = RgitMcp {
+        registry: Registry::new(backend),
+    }
+    .serve(stdio())
+    .await?;
     service.waiting().await?;
     Ok(())
 }
@@ -127,9 +171,15 @@ impl ServerHandler for RgitMcp {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let backend = self.backend.clone();
         let name = request.name.to_string();
         let args = Value::Object(request.arguments.unwrap_or_default());
+        let backend = match self
+            .registry
+            .resolve(args.get("repo").and_then(Value::as_str))
+        {
+            Ok(b) => b,
+            Err(e) => return Ok(CallToolResult::error(vec![ContentBlock::text(e)]).into()),
+        };
         let result = tokio::task::spawn_blocking(move || dispatch(&backend, &name, &args))
             .await
             .map_err(|e| McpError::internal_error(format!("task join: {e}"), None))?;
@@ -234,6 +284,15 @@ fn schema(props: &[(&str, &str, bool)]) -> Map<String, Value> {
             required.push(json!(field));
         }
     }
+    // Every tool accepts an optional `repo` to target another repository;
+    // empty or omitted uses the repo the server was started in.
+    properties.insert(
+        "repo".to_owned(),
+        json!({
+            "type": "string",
+            "description": "Repository to act on; empty or omitted uses the server's current repo.",
+        }),
+    );
     let mut m = Map::new();
     m.insert("type".to_owned(), json!("object"));
     m.insert("properties".to_owned(), Value::Object(properties));
@@ -505,6 +564,11 @@ fn tools() -> Vec<Tool> {
             &[("name", "string", true)],
         ),
         tool(
+            "git_lanes_stack",
+            "Create a new lane stacked on another (its commits build on that lane's branch).",
+            &[("name", "string", true), ("on", "string", true)],
+        ),
+        tool(
             "git_lanes_assign",
             "Assign a worktree path to a lane, or a single hunk with `hunk` set to its new-file start line.",
             &[
@@ -542,6 +606,11 @@ fn tools() -> Vec<Tool> {
             "git_lanes_pr",
             "Push a lane's branch and open a pull/merge request via gh/glab.",
             &[("lane", "string", true)],
+        ),
+        tool(
+            "git_lanes_restack",
+            "Move each stacked lane onto its parent lane's new tip (in the odb; the worktree is untouched).",
+            none,
         ),
         tool(
             "git_bisect",
@@ -876,6 +945,10 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
             .lane_new(req("name")?)
             .map(|()| "ok".to_owned())
             .map_err(emap),
+        "git_lanes_stack" => backend
+            .lane_stack(req("name")?, req("on")?)
+            .map(|()| "ok".to_owned())
+            .map_err(emap),
         "git_lanes_assign" => match hunk {
             Some(new_start) => backend.lane_assign_hunk(req("lane")?, req("path")?, new_start),
             None => backend.lane_assign(req("lane")?, req("path")?),
@@ -899,6 +972,10 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
             .map_err(emap),
         "git_lanes_push" => backend.lane_push(req("lane")?).map_err(emap),
         "git_lanes_pr" => backend.lane_pr(req("lane")?).map_err(emap),
+        "git_lanes_restack" => backend
+            .lane_restack()
+            .map(|o| crate::stack::render_restack(&o))
+            .map_err(emap),
         "git_bisect" => match backend.bisect(&str_vec("args")) {
             Ok(out) if out.is_empty() => Ok("ok".to_owned()),
             Ok(out) => Ok(out),
@@ -957,4 +1034,54 @@ fn diff_out(
             }
         })
         .map_err(emap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn init_repo(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rgit-mcp-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@e"],
+            vec!["config", "user.name", "t"],
+        ] {
+            assert!(Command::new("git").arg("-C").arg(&dir).args(&args).status().unwrap().success());
+        }
+        std::fs::write(dir.join("f.txt"), "x\n").unwrap();
+        for args in [vec!["add", "f.txt"], vec!["commit", "-qm", "c0"]] {
+            assert!(Command::new("git").arg("-C").arg(&dir).args(&args).status().unwrap().success());
+        }
+        dir
+    }
+
+    #[test]
+    fn registry_defaults_to_bound_repo_and_opens_others_by_path() {
+        let a = init_repo("reg-a");
+        let b = init_repo("reg-b");
+        let default: Arc<dyn GitBackend> = Arc::new(Git2Backend::discover(&a).unwrap());
+        let reg = Registry::new(default);
+
+        // Empty / absent resolves to the bound repo.
+        let canon_a = std::fs::canonicalize(&a).unwrap();
+        assert_eq!(reg.resolve(None).unwrap().workdir(), canon_a);
+        assert_eq!(reg.resolve(Some("")).unwrap().workdir(), canon_a);
+
+        // A path opens that repo, and a second resolve is cached (same Arc).
+        let canon_b = std::fs::canonicalize(&b).unwrap();
+        let first = reg.resolve(Some(b.to_str().unwrap())).unwrap();
+        assert_eq!(first.workdir(), canon_b);
+        let second = reg.resolve(Some(b.to_str().unwrap())).unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "same repo resolves to a cached backend");
+
+        // A missing path errors instead of panicking.
+        assert!(reg.resolve(Some("/no/such/repo/xyzzy")).is_err());
+
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
 }

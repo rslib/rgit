@@ -364,3 +364,99 @@ fn lane_delete_returns_changes_to_default() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn rev(dir: &Path, spec: &str) -> String {
+    let out = Command::new("git")
+        .arg("-C").arg(dir).args(["rev-parse", spec]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+// A stacked lane's commits build on the parent lane's branch, not the fork point.
+#[test]
+fn stacked_lane_builds_on_its_parent_lane() {
+    let dir = init_repo("stacked");
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.lanes_init().unwrap();
+
+    backend.lane_new("feat-a").unwrap();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    backend.lane_assign("feat-a", "a.txt").unwrap();
+    backend.lane_commit("feat-a", "A1").unwrap();
+
+    backend.lane_stack("feat-b", "feat-a").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+    backend.lane_assign("feat-b", "b.txt").unwrap();
+    backend.lane_commit("feat-b", "B1").unwrap();
+
+    // feat-b carries a.txt (from feat-a) AND b.txt, and forks off feat-a's tip.
+    let feat_b = tree_files(&dir, "feat-b");
+    assert!(feat_b.contains(&"a.txt".to_owned()), "inherits feat-a's a.txt");
+    assert!(feat_b.contains(&"b.txt".to_owned()));
+    assert_eq!(rev(&dir, "feat-b~1"), rev(&dir, "feat-a"), "feat-b forks off feat-a");
+
+    // The git stack config records the relationship (composes with restack).
+    let parents = backend.stack_parents().unwrap();
+    let fb = parents.iter().find(|(b, _)| b == "feat-b").unwrap();
+    assert_eq!(fb.1.as_deref(), Some("feat-a"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Stacking on a lane that has not committed yet is refused at commit time.
+#[test]
+fn stacked_lane_requires_the_parent_to_be_committed() {
+    let dir = init_repo("stacked-order");
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.lanes_init().unwrap();
+    backend.lane_new("base-lane").unwrap();
+    backend.lane_stack("child", "base-lane").unwrap();
+
+    std::fs::write(dir.join("c.txt"), "c\n").unwrap();
+    backend.lane_assign("child", "c.txt").unwrap();
+    // base-lane has no branch yet, so the child cannot fork off it.
+    assert!(backend.lane_commit("child", "C1").is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// lane_restack moves a child lane onto the parent's new tip in the odb, without
+// touching the (dirty) worktree or HEAD.
+#[test]
+fn lane_restack_moves_child_onto_parents_new_tip() {
+    let dir = init_repo("lane-restack");
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.lanes_init().unwrap();
+
+    backend.lane_new("feat-a").unwrap();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    backend.lane_assign("feat-a", "a.txt").unwrap();
+    backend.lane_commit("feat-a", "A1").unwrap();
+
+    backend.lane_stack("feat-b", "feat-a").unwrap();
+    std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+    backend.lane_assign("feat-b", "b.txt").unwrap();
+    backend.lane_commit("feat-b", "B1").unwrap();
+
+    // Advance feat-a with a second commit; feat-b is now stale.
+    std::fs::write(dir.join("a2.txt"), "a2\n").unwrap();
+    backend.lane_assign("feat-a", "a2.txt").unwrap();
+    backend.lane_commit("feat-a", "A2").unwrap();
+    assert_ne!(rev(&dir, "feat-b~1"), rev(&dir, "feat-a"), "feat-b is stale before restack");
+
+    let head_before = head_oid(&dir);
+    let outcome = backend.lane_restack().unwrap();
+    assert_eq!(outcome.restacked, vec!["feat-b -> feat-a".to_owned()]);
+    assert!(outcome.conflicted.is_empty());
+
+    // feat-b now forks off feat-a's new tip and inherits a2.txt.
+    assert_eq!(rev(&dir, "feat-b~1"), rev(&dir, "feat-a"), "feat-b moved onto feat-a");
+    let feat_b = tree_files(&dir, "feat-b");
+    assert!(feat_b.contains(&"a2.txt".to_owned()), "inherits the parent's new file");
+    assert!(feat_b.contains(&"b.txt".to_owned()));
+
+    // HEAD and the dirty worktree are untouched.
+    assert_eq!(head_oid(&dir), head_before, "HEAD did not move");
+    assert!(dir.join("a.txt").exists() && dir.join("b.txt").exists() && dir.join("a2.txt").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

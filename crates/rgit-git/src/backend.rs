@@ -300,6 +300,14 @@ pub trait GitBackend: Send + Sync {
     /// Create a new empty lane committing to a same-named branch.
     fn lane_new(&self, name: &str) -> Result<(), GitError>;
 
+    /// Create a new lane stacked on another lane (its commits build on that
+    /// lane's branch), recorded so `restack` composes.
+    fn lane_stack(&self, name: &str, parent: &str) -> Result<(), GitError>;
+
+    /// Move each stacked lane onto its parent lane's current tip, in the object
+    /// database (no checkout), so it is safe with the dirty worktree lanes keep.
+    fn lane_restack(&self) -> Result<crate::RestackOutcome, GitError>;
+
     /// Assign a worktree path to a lane.
     fn lane_assign(&self, lane: &str, path: &str) -> Result<(), GitError>;
 
@@ -324,6 +332,10 @@ pub trait GitBackend: Send + Sync {
     /// Push a lane's branch and open a pull/merge request for it via the forge
     /// CLI (gh/glab), against the trunk.
     fn lane_pr(&self, lane: &str) -> Result<String, GitError>;
+
+    /// Install an interactive credential prompt for network operations. Backends
+    /// that cannot prompt ignore it (the default), failing auth cleanly instead.
+    fn set_credential_prompt(&self, _prompt: Box<dyn crate::CredentialPrompt>) {}
 
     /// Create a new branch stacked on the current one, recording its parent and
     /// fork point in git config.

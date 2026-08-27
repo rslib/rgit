@@ -7,6 +7,7 @@ use rgit_git::{Git2Backend, GitBackend};
 use crate::cli::{Cli, Command};
 
 mod cli;
+mod creds;
 mod interactive;
 mod lanes;
 mod logging;

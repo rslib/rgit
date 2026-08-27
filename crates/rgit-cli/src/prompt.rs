@@ -797,6 +797,15 @@ pub struct Spinner {
     handle: Option<JoinHandle<()>>,
 }
 
+/// While set, the spinner animation thread holds its line instead of redrawing,
+/// so an interactive credential prompt can own the terminal cleanly.
+static SPINNER_SUPPRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Pause or resume spinner drawing. Cheap; safe to call with no spinner running.
+pub fn suppress_spinner(on: bool) {
+    SPINNER_SUPPRESSED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Start a spinner with an initial `title`. On a dumb terminal it degrades to
 /// plain start/stop lines with no animation or escape sequences.
 pub fn spinner(title: &str) -> Spinner {
@@ -837,6 +846,11 @@ pub fn spinner(title: &str) -> Spinner {
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => return,
+            }
+            // Hold the line while a credential prompt owns the terminal, so the
+            // animation does not scribble over the password prompt.
+            if SPINNER_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
             }
             let glyph = g.spinner[frame % g.spinner.len()];
             frame += 1;

@@ -437,6 +437,14 @@ pub enum LanesCmd {
         /// The lane (and branch) name.
         name: String,
     },
+    /// Create a new lane stacked on another (its commits build on that lane).
+    Stack {
+        /// The new lane name.
+        name: String,
+        /// The parent lane to stack on.
+        #[arg(long)]
+        on: String,
+    },
     /// Assign a worktree path to a lane, or a single hunk with `--hunk`.
     Assign {
         /// The lane to assign to.
@@ -482,6 +490,9 @@ pub enum LanesCmd {
         /// The lane to open a PR for.
         lane: String,
     },
+    /// Move each stacked lane onto its parent lane's new tip (in the odb; the
+    /// worktree is not touched).
+    Restack,
 }
 
 /// Subcommands for branching workflows.
@@ -536,6 +547,11 @@ pub fn run(
     command: Command,
     interactive: bool,
 ) -> anyhow::Result<String> {
+    // On a terminal, let network ops prompt for a password/passphrase when the
+    // agent and credential helpers cannot authenticate.
+    if interactive {
+        backend.set_credential_prompt(Box::new(crate::creds::TerminalPrompt));
+    }
     // Resolve a possibly-missing string arg: use it, prompt for it, or error.
     let resolve = |value: Option<String>,
                    what: &str,
@@ -790,6 +806,7 @@ pub fn run(
             LanesCmd::Off => crate::lanes::off(backend)?,
             LanesCmd::List => crate::lanes::list(backend)?,
             LanesCmd::New { name } => crate::lanes::new_lane(backend, &name)?,
+            LanesCmd::Stack { name, on } => crate::lanes::stack(backend, &name, &on)?,
             LanesCmd::Assign { lane, path, hunk } => match hunk {
                 Some(new_start) => crate::lanes::assign_hunk(backend, &lane, &path, new_start)?,
                 None => crate::lanes::assign(backend, &lane, &path)?,
@@ -800,6 +817,7 @@ pub fn run(
             LanesCmd::Delete { name } => crate::lanes::delete(backend, &name)?,
             LanesCmd::Push { lane } => crate::lanes::push(backend, &lane)?,
             LanesCmd::Pr { lane } => crate::lanes::pr(backend, &lane)?,
+            LanesCmd::Restack => crate::lanes::restack(backend)?,
         },
         Command::Stack { cmd } => match cmd.unwrap_or(StackCmd::List) {
             StackCmd::New { name } => crate::stack::new(backend, &name)?,

@@ -23,6 +23,8 @@ const RECENT_LIMIT: usize = 10;
 pub struct Git2Backend {
     repo: Mutex<Repository>,
     workdir: PathBuf,
+    /// An optional interactive credential prompt for network operations.
+    cred_prompt: Mutex<Option<Box<dyn crate::CredentialPrompt>>>,
 }
 
 impl Git2Backend {
@@ -40,6 +42,7 @@ impl Git2Backend {
         Ok(Self {
             repo: Mutex::new(repo),
             workdir,
+            cred_prompt: Mutex::new(None),
         })
     }
 
@@ -185,6 +188,8 @@ impl GitBackend for Git2Backend {
         }
         walk.set_sorting(git2::Sort::TIME)?;
 
+        let unpushed = unpushed_oids(&repo);
+        let decorations = log_decorations(&repo);
         let author_needle = opts.author.as_ref().map(|a| a.to_lowercase());
         let mut entries = Vec::new();
         for oid in walk {
@@ -219,6 +224,8 @@ impl GitBackend for Git2Backend {
                 when: relative_age(commit.time().seconds(), now),
                 oid: commit.id().to_string(),
                 parents: commit.parent_ids().map(|id| id.to_string()).collect(),
+                refs: decorations.get(&commit.id()).cloned().unwrap_or_default(),
+                unpushed: unpushed.contains(&commit.id()),
             });
         }
         Ok(entries)
@@ -323,6 +330,7 @@ impl GitBackend for Git2Backend {
                 .ok()
                 .and_then(|b| b.as_str().ok().map(str::to_owned))
                 .unwrap_or_default(),
+            full_id: commit.id().to_string(),
             author: commit.author().name().unwrap_or("?").to_owned(),
             email: commit.author().email().unwrap_or("").to_owned(),
             when: relative_age(commit.time().seconds(), now),
@@ -1116,6 +1124,18 @@ impl GitBackend for Git2Backend {
         crate::lanes::new_lane(&repo, name)
     }
 
+    fn lane_stack(&self, name: &str, parent: &str) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::lanes::stack(&repo, name, parent)
+    }
+
+    fn lane_restack(&self) -> Result<crate::RestackOutcome, GitError> {
+        self.snap("lane restack");
+        let repo = self.repo.lock().expect("repo mutex");
+        crate::lanes::restack(&repo)
+    }
+
     fn lane_assign(&self, lane: &str, path: &str) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         sync_index(&repo)?;
@@ -1161,8 +1181,13 @@ impl GitBackend for Git2Backend {
                 "lane {lane} has no commits yet; commit it first"
             )));
         }
-        let remote = push_lane_branch(&repo, &branch, &|_| {})?;
+        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        let remote = push_lane_branch(&repo, &branch, &|_| {}, cred_guard.as_deref())?;
         Ok(format!("pushed {branch} to {remote}"))
+    }
+
+    fn set_credential_prompt(&self, prompt: Box<dyn crate::CredentialPrompt>) {
+        *self.cred_prompt.lock().expect("cred mutex") = Some(prompt);
     }
 
     fn lane_pr(&self, lane: &str) -> Result<String, GitError> {
@@ -1175,7 +1200,9 @@ impl GitBackend for Git2Backend {
                 "lane {lane} has no commits yet; commit it first"
             )));
         }
-        push_lane_branch(&repo, &branch, &|_| {})?;
+        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        push_lane_branch(&repo, &branch, &|_| {}, cred_guard.as_deref())?;
+        drop(cred_guard);
         Ok(crate::workflow::open_pull_request(&branch, &base))
     }
 
@@ -1355,14 +1382,17 @@ impl GitBackend for Git2Backend {
 
     fn fetch(&self, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
         let (remote, _) = upstream_remote(&repo)?;
-        do_fetch(&repo, &remote, report)
+        do_fetch(&repo, &remote, report, cred_guard.as_deref())
     }
 
     fn pull(&self, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        let cred = cred_guard.as_deref();
         let (remote, branch) = upstream_remote(&repo)?;
-        do_fetch(&repo, &remote, report)?;
+        do_fetch(&repo, &remote, report, cred)?;
         fast_forward(&repo, &remote, &branch, report)
     }
 
@@ -1374,6 +1404,7 @@ impl GitBackend for Git2Backend {
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
         let (remote_name, branch) = upstream_remote(&repo)?;
         let branch_ref = format!("refs/heads/{branch}");
         let lease = repo
@@ -1388,7 +1419,7 @@ impl GitBackend for Git2Backend {
         let refspec = format!("{lead}{branch_ref}:{branch_ref}");
 
         let rejected = std::sync::atomic::AtomicBool::new(false);
-        let mut callbacks = remote_callbacks(report, &rejected);
+        let mut callbacks = remote_callbacks(report, &rejected, cred_guard.as_deref());
         if force_with_lease {
             // Abort if the remote no longer matches the ref we last fetched -
             // this is force-with-lease, done through the negotiation callback.
@@ -1450,14 +1481,19 @@ fn upstream_remote(repo: &Repository) -> Result<(String, String), GitError> {
     Ok((remote, branch))
 }
 
-fn do_fetch(repo: &Repository, remote: &str, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
+fn do_fetch(
+    repo: &Repository,
+    remote: &str,
+    report: &dyn Fn(OpProgress),
+    cred: Option<&dyn crate::CredentialPrompt>,
+) -> Result<(), GitError> {
     let mut remote = repo.find_remote(remote)?;
     if let Ok(url) = remote.url() {
         report(OpProgress::Line(format!("From {url}")));
     }
     let ignored = std::sync::atomic::AtomicBool::new(false);
     let mut opts = FetchOptions::new();
-    opts.remote_callbacks(remote_callbacks(report, &ignored));
+    opts.remote_callbacks(remote_callbacks(report, &ignored, cred));
     remote.fetch::<&str>(&[], Some(&mut opts), None)?;
     Ok(())
 }
@@ -1508,7 +1544,7 @@ pub fn init(path: &Path) -> Result<(), GitError> {
 pub fn clone(url: &str, path: &Path, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
     let ignored = std::sync::atomic::AtomicBool::new(false);
     let mut opts = FetchOptions::new();
-    opts.remote_callbacks(remote_callbacks(report, &ignored));
+    opts.remote_callbacks(remote_callbacks(report, &ignored, None));
     git2::build::RepoBuilder::new()
         .fetch_options(opts)
         .clone(url, path)?;
@@ -1529,14 +1565,14 @@ fn short7(oid: git2::Oid) -> String {
 /// A credential from a default `~/.ssh/<name>` private key (with its `.pub`),
 /// for when no ssh-agent is available. Passphrase-protected keys cannot be
 /// unlocked here, so they fail and the caller falls through to the next option.
-fn ssh_key_file(user: &str, name: &str) -> Result<Cred, git2::Error> {
+fn ssh_key_file(user: &str, name: &str, passphrase: Option<&str>) -> Result<Cred, git2::Error> {
     let home = std::env::var("HOME").map_err(|_| git2::Error::from_str("HOME is not set"))?;
     let private = PathBuf::from(home).join(".ssh").join(name);
     if !private.exists() {
         return Err(git2::Error::from_str("no such default ssh key"));
     }
     let public = private.with_extension("pub");
-    Cred::ssh_key(user, public.exists().then_some(&public), &private, None)
+    Cred::ssh_key(user, public.exists().then_some(&public), &private, passphrase)
 }
 
 /// The remote to push a lane branch to: the branch's own remote if configured,
@@ -1558,6 +1594,7 @@ fn push_lane_branch(
     repo: &Repository,
     branch: &str,
     report: &dyn Fn(OpProgress),
+    cred: Option<&dyn crate::CredentialPrompt>,
 ) -> Result<String, GitError> {
     let remote_name = default_remote(repo)?;
     let mut remote = repo.find_remote(&remote_name)?;
@@ -1567,7 +1604,7 @@ fn push_lane_branch(
     let branch_ref = format!("refs/heads/{branch}");
     let refspec = format!("{branch_ref}:{branch_ref}");
     let rejected = std::sync::atomic::AtomicBool::new(false);
-    let callbacks = remote_callbacks(report, &rejected);
+    let callbacks = remote_callbacks(report, &rejected, cred);
     let mut opts = PushOptions::new();
     opts.remote_callbacks(callbacks);
     remote.push(&[refspec.as_str()], Some(&mut opts))?;
@@ -1582,6 +1619,7 @@ fn push_lane_branch(
 fn remote_callbacks<'a>(
     report: &'a dyn Fn(OpProgress),
     rejected: &'a std::sync::atomic::AtomicBool,
+    cred: Option<&'a dyn crate::CredentialPrompt>,
 ) -> RemoteCallbacks<'a> {
     let mut cb = RemoteCallbacks::new();
     // libgit2 re-invokes this on every auth failure, so a callback that keeps
@@ -1590,7 +1628,9 @@ fn remote_callbacks<'a>(
     // operation fails cleanly instead. `ssh_attempts` counts only real SSH_KEY
     // requests, not the separate USERNAME lookup libgit2 does first.
     let mut ssh_attempts = 0usize;
-    let mut pass_tried = false;
+    let mut ssh_pass: Option<String> = None;
+    let mut helper_tried = false;
+    let mut prompt_tried = false;
     cb.credentials(move |url, username, allowed| {
         if allowed.contains(CredentialType::USERNAME) {
             return Cred::username(username.unwrap_or("git"));
@@ -1599,9 +1639,23 @@ fn remote_callbacks<'a>(
             let user = username.unwrap_or("git");
             ssh_attempts += 1;
             return match ssh_attempts {
+                // First the agent and unencrypted keys, no passphrase.
                 1 => Cred::ssh_key_from_agent(user),
-                2 => ssh_key_file(user, "id_ed25519"),
-                3 => ssh_key_file(user, "id_rsa"),
+                2 => ssh_key_file(user, "id_ed25519", None),
+                3 => ssh_key_file(user, "id_rsa", None),
+                // Then, if we can prompt, one passphrase retry of each key.
+                4 | 5 if cred.is_some() => {
+                    if ssh_pass.is_none() {
+                        ssh_pass = cred.and_then(|c| c.ssh_passphrase("~/.ssh key"));
+                    }
+                    match &ssh_pass {
+                        Some(pass) if !pass.is_empty() => {
+                            let key = if ssh_attempts == 4 { "id_ed25519" } else { "id_rsa" };
+                            ssh_key_file(user, key, Some(pass))
+                        }
+                        _ => Err(git2::Error::from_str("no passphrase given")),
+                    }
+                }
                 _ => Err(git2::Error::from_str(
                     "ssh authentication failed: no usable key in the agent or ~/.ssh \
                      (unlock your key with ssh-add, or use an https remote)",
@@ -1609,14 +1663,34 @@ fn remote_callbacks<'a>(
             };
         }
         if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) {
-            if pass_tried {
-                return Err(git2::Error::from_str(
-                    "authentication failed: the credential helper had no valid credentials",
-                ));
+            // First the git credential helper (keychain, cache, ...).
+            if !helper_tried {
+                helper_tried = true;
+                if let Ok(config) = git2::Config::open_default() {
+                    if let Ok(c) = Cred::credential_helper(&config, url, username) {
+                        return Ok(c);
+                    }
+                }
             }
-            pass_tried = true;
-            let config = git2::Config::open_default()?;
-            return Cred::credential_helper(&config, url, username);
+            // Then prompt the user, if a prompt is installed.
+            if !prompt_tried {
+                prompt_tried = true;
+                if let Some(cred) = cred {
+                    let user = match username {
+                        Some(u) => u.to_owned(),
+                        None => cred
+                            .username(url)
+                            .ok_or_else(|| git2::Error::from_str("no username given"))?,
+                    };
+                    if let Some(pass) = cred.password(url, &user) {
+                        return Cred::userpass_plaintext(&user, &pass);
+                    }
+                }
+            }
+            return Err(git2::Error::from_str(
+                "authentication failed: no valid credentials (set up a credential helper, \
+                 or run in a terminal to be prompted)",
+            ));
         }
         Err(git2::Error::from_str("no supported authentication method"))
     });
@@ -2109,16 +2183,57 @@ fn fill_upstream(repo: &Repository, branch: &str, head: &mut Head) {
     let Ok(local) = repo.find_branch(branch, BranchType::Local) else {
         return;
     };
-    let Ok(upstream) = local.upstream() else {
+    let mut configured = false;
+    if let Ok(upstream) = local.upstream() {
+        if let Ok(Some(name)) = upstream.name() {
+            head.upstream = Some(name.to_owned());
+            configured = true;
+        }
+        if let (Some(local_oid), Some(up_oid)) = (local.get().target(), upstream.get().target()) {
+            if let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, up_oid) {
+                head.ahead = ahead;
+                head.behind = behind;
+            }
+        }
+    }
+    fill_remotes(repo, &local, branch, head);
+    // No tracking configured, but the branch exists on a remote by name: treat
+    // that as the effective upstream so "published" state and the REMOTE overview
+    // agree. Prefer origin (the usual push target), else the first such remote.
+    if !configured {
+        if let Some((name, ahead, behind)) = head
+            .remotes
+            .iter()
+            .find(|(n, _, _)| n.starts_with("origin/"))
+            .or_else(|| head.remotes.first())
+        {
+            head.upstream = Some(name.clone());
+            head.ahead = *ahead;
+            head.behind = *behind;
+        }
+    }
+}
+
+/// Ahead/behind of `branch` against every remote that has a branch of the same
+/// name, for the REMOTE overview (the tracking upstream is only one of these).
+fn fill_remotes(repo: &Repository, local: &git2::Branch, branch: &str, head: &mut Head) {
+    let Some(local_oid) = local.get().target() else {
         return;
     };
-    if let Ok(Some(name)) = upstream.name() {
-        head.upstream = Some(name.to_owned());
-    }
-    if let (Some(local_oid), Some(up_oid)) = (local.get().target(), upstream.get().target()) {
-        if let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, up_oid) {
-            head.ahead = ahead;
-            head.behind = behind;
+    let Ok(remotes) = repo.remotes() else {
+        return;
+    };
+    for i in 0..remotes.len() {
+        let Ok(Some(remote)) = remotes.get(i) else {
+            continue;
+        };
+        let tracking = format!("{remote}/{branch}");
+        if let Ok(rb) = repo.find_branch(&tracking, BranchType::Remote) {
+            if let Some(roid) = rb.get().target() {
+                if let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, roid) {
+                    head.remotes.push((tracking, ahead, behind));
+                }
+            }
         }
     }
 }
@@ -2252,6 +2367,101 @@ fn collect_stashes(repo: &mut Repository) -> Vec<Stash> {
     stashes
 }
 
+/// Refs pointing at each commit, git --decorate style: a commit's local branch,
+/// that branch's upstream, and any tags, keyed by oid. Ordered local, remote,
+/// tag (HEAD's branch first) so a log row reads `<hash> <branch> <upstream>
+/// <summary>`.
+fn log_decorations(
+    repo: &Repository,
+) -> std::collections::HashMap<git2::Oid, Vec<crate::CommitRef>> {
+    use crate::{CommitRef, RefKind};
+    let mut map: std::collections::HashMap<git2::Oid, Vec<CommitRef>> =
+        std::collections::HashMap::new();
+    let head_branch = repo
+        .head()
+        .ok()
+        .filter(|h| h.is_branch())
+        .and_then(|h| h.shorthand().ok().map(str::to_owned));
+    let Ok(refs) = repo.references() else {
+        return map;
+    };
+    for r in refs.flatten() {
+        let Ok(name) = r.name() else { continue };
+        let (label, kind) = if let Some(b) = name.strip_prefix("refs/heads/") {
+            (b.to_owned(), RefKind::Local)
+        } else if let Some(b) = name.strip_prefix("refs/remotes/") {
+            // origin/HEAD is a symbolic alias, not a real tip; skip it.
+            if b.ends_with("/HEAD") {
+                continue;
+            }
+            (b.to_owned(), RefKind::Remote)
+        } else if let Some(t) = name.strip_prefix("refs/tags/") {
+            (t.to_owned(), RefKind::Tag)
+        } else {
+            continue;
+        };
+        // Peel through annotated tags to the commit the ref ultimately names.
+        let Ok(oid) = r.peel_to_commit().map(|c| c.id()) else {
+            continue;
+        };
+        let head = kind == RefKind::Local && head_branch.as_deref() == Some(label.as_str());
+        map.entry(oid).or_default().push(CommitRef {
+            name: label,
+            kind,
+            head,
+        });
+    }
+    for v in map.values_mut() {
+        v.sort_by_key(|r| (kind_rank(r.kind), !r.head, r.name.clone()));
+    }
+    map
+}
+
+fn kind_rank(k: crate::RefKind) -> u8 {
+    match k {
+        crate::RefKind::Local => 0,
+        crate::RefKind::Remote => 1,
+        crate::RefKind::Tag => 2,
+    }
+}
+
+/// Commits reachable from a local branch but not from any remote-tracking
+/// branch, i.e. local-only work. Empty when the repo has no remote refs (nothing
+/// to compare against), so a purely local repo does not mark everything unpushed.
+fn unpushed_oids(repo: &Repository) -> std::collections::HashSet<git2::Oid> {
+    let mut set = std::collections::HashSet::new();
+    let mut remote_tips = Vec::new();
+    if let Ok(refs) = repo.references() {
+        for r in refs.flatten() {
+            if r.is_remote() {
+                if let Some(oid) = r.target() {
+                    remote_tips.push(oid);
+                }
+            }
+        }
+    }
+    if remote_tips.is_empty() {
+        return set;
+    }
+    let Ok(mut walk) = repo.revwalk() else {
+        return set;
+    };
+    if let Ok(branches) = repo.branches(Some(BranchType::Local)) {
+        for (branch, _) in branches.flatten() {
+            if let Some(oid) = branch.get().target() {
+                let _ = walk.push(oid);
+            }
+        }
+    }
+    for oid in &remote_tips {
+        let _ = walk.hide(*oid);
+    }
+    for oid in walk.flatten() {
+        set.insert(oid);
+    }
+    set
+}
+
 fn collect_recent(repo: &Repository) -> Vec<Commit> {
     let Ok(mut walk) = repo.revwalk() else {
         return Vec::new();
@@ -2260,6 +2470,8 @@ fn collect_recent(repo: &Repository) -> Vec<Commit> {
     if walk.push_head().is_err() {
         return Vec::new();
     }
+    let unpushed = unpushed_oids(repo);
+    let decorations = log_decorations(repo);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -2281,6 +2493,8 @@ fn collect_recent(repo: &Repository) -> Vec<Commit> {
                 .unwrap_or_default()
                 .to_owned(),
             when: relative_age(commit.time().seconds(), now),
+            refs: decorations.get(&commit.id()).cloned().unwrap_or_default(),
+            unpushed: unpushed.contains(&commit.id()),
         })
         .collect()
 }

@@ -113,6 +113,8 @@ fn resolve_lanes_key(key: crossterm::event::KeyEvent) -> Option<Msg> {
             KeyCode::Char('u') => return Some(Msg::LaneUnassignAtCursor),
             KeyCode::Char('c') => return Some(Msg::LaneCommitPrompt),
             KeyCode::Char('R') => return Some(Msg::LaneRenamePrompt),
+            KeyCode::Char('s') => return Some(Msg::LaneStackPrompt),
+            KeyCode::Char('S') => return Some(Msg::LaneRestack),
             KeyCode::Char('d') => return Some(Msg::LaneDeleteAtCursor),
             KeyCode::Char('p') => return Some(Msg::LanePushAtCursor),
             KeyCode::Char('P') => return Some(Msg::LanePrAtCursor),
@@ -123,6 +125,39 @@ fn resolve_lanes_key(key: crossterm::event::KeyEvent) -> Option<Msg> {
         keymap::resolve_vim_key(key)
     } else {
         resolve_key(key)
+    }
+}
+
+/// A credential prompt that runs on the network task's thread but drives the UI:
+/// it asks the main loop (over `tx`) to open a masked minibuffer and blocks on
+/// the reply the user submits. Returning `None` (cancel) fails the operation.
+struct TuiCredentialPrompt {
+    tx: UnboundedSender<Msg>,
+}
+
+impl TuiCredentialPrompt {
+    fn ask(&self, label: String, masked: bool) -> Option<String> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Msg::CredentialRequest {
+                label,
+                masked,
+                reply,
+            })
+            .ok()?;
+        rx.recv().ok().flatten()
+    }
+}
+
+impl rgit_git::CredentialPrompt for TuiCredentialPrompt {
+    fn username(&self, url: &str) -> Option<String> {
+        self.ask(format!("Username for {url}"), false)
+    }
+    fn password(&self, url: &str, user: &str) -> Option<String> {
+        self.ask(format!("Password for {user}@{url}"), true)
+    }
+    fn ssh_passphrase(&self, key: &str) -> Option<String> {
+        self.ask(format!("Passphrase for {key}"), true)
     }
 }
 
@@ -141,6 +176,12 @@ fn run_lane_op(backend: &dyn GitBackend, op: &LaneOp) -> String {
         LaneOp::Delete(name) => backend.lane_delete(name).map(|()| format!("deleted lane {name}")),
         LaneOp::Push(lane) => backend.lane_push(lane),
         LaneOp::Pr(lane) => backend.lane_pr(lane),
+        LaneOp::Stack { name, parent } => backend
+            .lane_stack(name, parent)
+            .map(|()| format!("created {name} stacked on {parent}")),
+        LaneOp::Restack => backend
+            .lane_restack()
+            .map(|o| restack_note(&o).unwrap_or_else(|| "nothing to restack".to_owned())),
     };
     match result {
         Ok(s) => s,
@@ -208,6 +249,12 @@ async fn event_loop(
     let mut events = Events::new(TICK_HZ, FRAME_HZ);
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
 
+    // Let network operations prompt for a password/passphrase through the UI.
+    app.backend()
+        .set_credential_prompt(Box::new(TuiCredentialPrompt {
+            tx: msg_tx.clone(),
+        }));
+
     // Auto-refresh on worktree changes; kept alive for the loop's duration.
     let _watcher = spawn_watcher(app.backend().workdir(), msg_tx.clone());
 
@@ -227,7 +274,12 @@ async fn event_loop(
         let redraw = match incoming {
             Incoming::Event(Event::Resize) => true,
             Incoming::Event(Event::Key(key)) => {
-                let msg = if app.hook_console.is_some() {
+                let msg = if app.prompt.is_some() {
+                    // A minibuffer prompt is modal input; it takes priority even
+                    // over the operation console (a credential prompt opens while
+                    // a push/pull is running in the console).
+                    resolve_prompt_key(key)
+                } else if app.hook_console.is_some() {
                     resolve_hook_key(&app, key)
                 } else if app.help {
                     resolve_help_key(key)
@@ -239,8 +291,6 @@ async fn event_loop(
                     resolve_palette_key(key)
                 } else if app.search.is_some() {
                     resolve_search_key(key)
-                } else if app.prompt.is_some() {
-                    resolve_prompt_key(key)
                 } else if app.transient.is_some() {
                     resolve_transient_key(key)
                 } else if app.confirm.is_some() {
@@ -586,9 +636,18 @@ async fn run_msg(
             }
             Effect::LaneOp(op) => {
                 let backend = app.backend();
+                let auto_restack = app.auto_restack();
                 let msg_tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     let _ = msg_tx.send(Msg::LaneNotice(run_lane_op(&*backend, &op)));
+                    // After committing a lane, move any child lanes onto its new
+                    // tip. lane_restack works in the odb, so it is safe with the
+                    // dirty worktree lanes keep (unlike the checkout-based restack).
+                    if auto_restack && matches!(op, LaneOp::Commit { .. }) {
+                        if let Ok(Some(note)) = backend.lane_restack().map(|o| restack_note(&o)) {
+                            let _ = msg_tx.send(Msg::LaneNotice(note));
+                        }
+                    }
                     if let Ok(state) = backend.lanes_state() {
                         let _ = msg_tx.send(Msg::LanesLoaded(state));
                     }
@@ -660,6 +719,39 @@ async fn run_msg(
                     .flatten();
                     let result = crate::forge::load(origin, workdir).await;
                     let _ = msg_tx.send(Msg::ForgeLoaded(result));
+                });
+            }
+            Effect::LoadRemoteStatus => {
+                let backend = app.backend();
+                let workdir = backend.workdir().to_path_buf();
+                let branch = app.head().and_then(|h| h.branch.clone());
+                let msg_tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    let Some(branch) = branch else {
+                        let _ = msg_tx.send(Msg::RemoteStatusLoaded(None));
+                        return;
+                    };
+                    let origin = tokio::task::spawn_blocking(move || {
+                        backend.remotes().ok().and_then(|rs| {
+                            rs.into_iter().find(|r| r.name == "origin").map(|r| r.url)
+                        })
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    // A forge error (no gh/glab/token) means no section, not a
+                    // misleading "no PR"; success with no match means no PR.
+                    let summary = match crate::forge::load(origin, workdir).await {
+                        Ok(prs) => {
+                            let pr = prs.into_iter().find(|p| p.branch == branch);
+                            Some(crate::app::RemoteSummary {
+                                pr: pr.as_ref().map(|p| (p.number, p.state.clone())),
+                                checks: pr.and_then(|p| p.checks),
+                            })
+                        }
+                        Err(_) => None,
+                    };
+                    let _ = msg_tx.send(Msg::RemoteStatusLoaded(summary));
                 });
             }
             Effect::LoadDiff { from, to } => {

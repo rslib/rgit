@@ -400,6 +400,15 @@ pub enum TextOp {
     StackNew(String),
 }
 
+/// The current branch's forge status, shown in the REMOTE section.
+#[derive(Debug, Clone)]
+pub struct RemoteSummary {
+    /// The open PR for the current branch: `(number, state)`.
+    pub pr: Option<(u64, String)>,
+    /// The PR's CI rollup: `passing` / `failing` / `pending`.
+    pub checks: Option<String>,
+}
+
 /// A lane mutation run from the lanes view, reported and then reloaded.
 #[derive(Debug, Clone)]
 pub enum LaneOp {
@@ -411,6 +420,8 @@ pub enum LaneOp {
     Delete(String),
     Push(String),
     Pr(String),
+    Stack { name: String, parent: String },
+    Restack,
 }
 
 /// A read-only text panel opened as the Info view.
@@ -557,6 +568,15 @@ pub enum Msg {
     Restack,
     /// A note (shown as a toast) that an amend auto-restacked its children.
     AutoRestackNote(String),
+    /// The current branch's forge PR/CI status finished loading.
+    RemoteStatusLoaded(Option<RemoteSummary>),
+    /// A network operation needs a credential; open a (masked) prompt and reply
+    /// with the value the user enters, or `None` if they cancel.
+    CredentialRequest {
+        label: String,
+        masked: bool,
+        reply: std::sync::mpsc::Sender<Option<String>>,
+    },
     /// Open the lanes view.
     OpenLanes,
     /// The lanes state finished loading; (re)build the lanes view.
@@ -573,12 +593,16 @@ pub enum Msg {
     LaneCommitPrompt,
     /// Prompt for a new name for the lane the cursor is in.
     LaneRenamePrompt,
+    /// Prompt for a name for a new lane stacked on the lane the cursor is in.
+    LaneStackPrompt,
     /// Delete the lane the cursor is in.
     LaneDeleteAtCursor,
     /// Push the branch of the lane the cursor is in.
     LanePushAtCursor,
     /// Push and open a PR for the lane the cursor is in.
     LanePrAtCursor,
+    /// Restack all stacked lanes onto their parents' tips.
+    LaneRestack,
     /// Fold pending changes into the commits that last touched those lines.
     Absorb,
     /// Prompt for a workflow preset, then set it.
@@ -1083,6 +1107,7 @@ fn revision_prompt(app: &mut App, label: &str, action: PromptAction) {
         candidates: Vec::new(),
         selected: 0,
         action,
+        masked: false,
     });
 }
 
@@ -1122,6 +1147,10 @@ pub enum PromptAction {
     LaneCommit,
     /// Rename `pending_lane` to the prompt value.
     LaneRename,
+    /// Create a lane named by the prompt value, stacked on `pending_lane`.
+    LaneStack,
+    /// Answer a credential request via `pending_cred_reply`.
+    Credential,
 }
 
 /// A minibuffer: a label, an editable input, and optional filterable candidates.
@@ -1133,6 +1162,8 @@ pub struct Prompt {
     pub candidates: Vec<String>,
     pub selected: usize,
     pub action: PromptAction,
+    /// Render the input as dots (for secrets like a password/passphrase).
+    pub masked: bool,
 }
 
 impl Prompt {
@@ -1523,6 +1554,8 @@ pub enum Effect {
     LoadOplog,
     /// Load the stacked-branch parents, then push the stack view.
     LoadStack,
+    /// Fetch the current branch's forge PR/CI status for the REMOTE section.
+    LoadRemoteStatus,
     /// Load the lanes state, then (re)build the lanes view.
     LoadLanes,
     /// Run a lane operation, toast the result, then reload the lanes view.
@@ -1677,6 +1710,13 @@ pub struct App {
     pending_lane: Option<String>,
     /// The path targeted by a pending lane-assign prompt.
     pending_lane_path: Option<String>,
+    /// Where to send the value of a pending credential prompt.
+    pending_cred_reply: Option<std::sync::mpsc::Sender<Option<String>>>,
+    /// The current branch's forge PR/CI status, shown as a REMOTE section. None
+    /// until loaded or when the forge is unavailable.
+    remote_status: Option<RemoteSummary>,
+    /// When the forge status was last fetched, to throttle network calls.
+    last_remote_fetch: Option<std::time::Instant>,
     /// Last status snapshot, for the adaptive preview pane.
     snapshot: Option<RepoStatus>,
     /// What the preview buffer currently holds, so it is rebuilt only when the
@@ -1748,6 +1788,9 @@ impl App {
             auto_restack: config.commit.auto_restack,
             pending_lane: None,
             pending_lane_path: None,
+            pending_cred_reply: None,
+            remote_status: None,
+            last_remote_fetch: None,
             snapshot: None,
             preview_key: None,
             preview_buf: Buffer::default(),
@@ -1773,6 +1816,11 @@ impl App {
     /// Whether an amend/reword/extend should restack the stacked children after.
     pub fn auto_restack(&self) -> bool {
         self.auto_restack
+    }
+
+    /// The current HEAD summary (branch, upstream, ahead/behind), if loaded.
+    pub fn head(&self) -> Option<&Head> {
+        self.head.as_ref()
     }
 
     /// The short id of the commit under the cursor, if any.
@@ -2394,6 +2442,26 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }];
         }
         Msg::AutoRestackNote(text) => app.push_toast(ToastKind::Success, text),
+        Msg::RemoteStatusLoaded(summary) => {
+            app.remote_status = summary;
+            rebuild_status(app);
+        }
+        Msg::CredentialRequest {
+            label,
+            masked,
+            reply,
+        } => {
+            app.pending_cred_reply = Some(reply);
+            app.prompt = Some(Prompt {
+                label,
+                input: String::new(),
+                cursor: 0,
+                candidates: Vec::new(),
+                selected: 0,
+                action: PromptAction::Credential,
+                masked,
+            });
+        }
         Msg::OpenLanes => return vec![Effect::LoadLanes],
         Msg::LanesLoaded(state) => {
             let content = build_lanes(&state);
@@ -2439,6 +2507,13 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
             None => app.push_toast(ToastKind::Error, "move onto a lane first".into()),
         },
+        Msg::LaneStackPrompt => match lane_at_cursor(app) {
+            Some(parent) => {
+                app.pending_lane = Some(parent.clone());
+                revision_prompt(app, &format!("New lane stacked on {parent}"), PromptAction::LaneStack)
+            }
+            None => app.push_toast(ToastKind::Error, "move onto a lane first".into()),
+        },
         Msg::LaneDeleteAtCursor => match lane_at_cursor(app) {
             Some(lane) => return vec![Effect::LaneOp(LaneOp::Delete(lane))],
             None => app.push_toast(ToastKind::Error, "move onto a lane first".into()),
@@ -2451,6 +2526,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             Some(lane) => return vec![Effect::LaneOp(LaneOp::Pr(lane))],
             None => app.push_toast(ToastKind::Error, "move onto a lane first".into()),
         },
+        Msg::LaneRestack => return vec![Effect::LaneOp(LaneOp::Restack)],
         Msg::TextResult(Ok(text)) => {
             app.busy = None;
             app.push_toast(ToastKind::Success, text);
@@ -2520,6 +2596,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 candidates,
                 selected: 0,
                 action: PromptAction::CheckoutBranch,
+                masked: false,
             });
         }
         Msg::PromptInput(key) => prompt_edit(app, |p| p.apply(key)),
@@ -2528,7 +2605,13 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             let last = p.filtered().len().saturating_sub(1);
             p.selected = (p.selected + 1).min(last);
         }),
-        Msg::PromptCancel => app.prompt = None,
+        Msg::PromptCancel => {
+            app.prompt = None;
+            // Unblock a waiting credential request so the op fails cleanly.
+            if let Some(reply) = app.pending_cred_reply.take() {
+                let _ = reply.send(None);
+            }
+        }
         Msg::PromptSubmit => return prompt_submit(app),
         Msg::Fetch => return open_op(app, ConsoleOp::Fetch),
         Msg::Pull => return open_op(app, ConsoleOp::Pull),
@@ -3032,6 +3115,14 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
     let Some(prompt) = app.prompt.take() else {
         return Vec::new();
     };
+    // A credential prompt answers the waiting network op; an empty entry cancels.
+    if let PromptAction::Credential = prompt.action {
+        let value = prompt.value();
+        if let Some(reply) = app.pending_cred_reply.take() {
+            let _ = reply.send((!value.is_empty()).then_some(value));
+        }
+        return Vec::new();
+    }
     let value = prompt.value();
     if value.is_empty() {
         return Vec::new();
@@ -3137,6 +3228,12 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             }
             return Vec::new();
         }
+        PromptAction::LaneStack => {
+            if let Some(parent) = app.pending_lane.take() {
+                return vec![Effect::LaneOp(LaneOp::Stack { name: value, parent })];
+            }
+            return Vec::new();
+        }
         _ => {}
     }
     // Flow/workspace ops return a status string, shown as a toast.
@@ -3189,7 +3286,9 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         | PromptAction::LaneNew
         | PromptAction::LaneAssign
         | PromptAction::LaneCommit
-        | PromptAction::LaneRename => {
+        | PromptAction::LaneRename
+        | PromptAction::LaneStack
+        | PromptAction::Credential => {
             return Vec::new();
         }
         PromptAction::DeleteBranch => Mutation::DeleteBranch(value),
@@ -3722,8 +3821,8 @@ fn refreshed(app: &mut App, result: RefreshResult) -> Vec<Effect> {
             app.state = status.state;
             app.changed = status.entries.len();
             app.snapshot = Some(status.clone());
-            app.status_buffer_mut().set_content(build(&status));
             app.head = Some(status.head);
+            rebuild_status(app);
             app.error = None;
             // The working tree changed, so cached file diffs are stale; commit
             // and stash diffs are immutable and stay cached. Force the current
@@ -3736,16 +3835,114 @@ fn refreshed(app: &mut App, result: RefreshResult) -> Vec<Effect> {
             if let Some(label) = finished {
                 app.push_toast(ToastKind::Success, format!("{label} done"));
             }
-            return app.sync_preview();
+            let mut effects = app.sync_preview();
+            // Refresh the forge PR/CI status, throttled so frequent worktree
+            // refreshes do not spam the network.
+            let stale = app
+                .last_remote_fetch
+                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(20));
+            if stale {
+                app.last_remote_fetch = Some(std::time::Instant::now());
+                effects.push(Effect::LoadRemoteStatus);
+            }
+            return effects;
         }
         Err(e) => app.push_toast(ToastKind::Error, e.to_string()),
     }
     Vec::new()
 }
 
+/// Rebuild the status buffer from the last snapshot plus the REMOTE section,
+/// preserving fold state and cursor.
+fn rebuild_status(app: &mut App) {
+    let Some(status) = app.snapshot.clone() else {
+        return;
+    };
+    let mut sections = build(&status);
+    if let Some(section) = build_remote_section(app.remote_status.as_ref(), app.head.as_ref()) {
+        sections.push(section);
+    }
+    app.status_buffer_mut().set_content(sections);
+}
+
+/// The REMOTE section: per-remote ahead/behind for the current branch, plus its
+/// open PR and CI rollup once loaded. `None` when there is nothing to show (no
+/// remotes and no loaded forge status).
+fn build_remote_section(remote: Option<&RemoteSummary>, head: Option<&Head>) -> Option<Section> {
+    use rgit_model::{NodeKind, Section, Span, Style};
+    let mut children: Vec<Section> = Vec::new();
+
+    // One line per remote that has this branch: `origin/main  up 2 down 0`.
+    for (r, (name, ahead, behind)) in head.map(|h| &h.remotes).into_iter().flatten().enumerate() {
+        let mut spans = vec![Span::new(name.clone(), Style::Branch)];
+        if *ahead > 0 {
+            spans.push(Span::new(format!("  \u{2191}{ahead}"), Style::Added));
+        }
+        if *behind > 0 {
+            spans.push(Span::new(format!("  \u{2193}{behind}"), Style::Deleted));
+        }
+        if *ahead == 0 && *behind == 0 {
+            spans.push(Span::new("  up to date".to_owned(), Style::Dim));
+        }
+        children.push(Section::leaf(format!("remote/{r}"), NodeKind::Info, spans));
+    }
+
+    // The current branch's PR and CI, once loaded.
+    if let Some(remote) = remote {
+        let mut spans = Vec::new();
+        match &remote.pr {
+            Some((num, state)) => {
+                spans.push(Span::new(format!("PR #{num} "), Style::Hash));
+                let style = if state.eq_ignore_ascii_case("open")
+                    || state.eq_ignore_ascii_case("opened")
+                {
+                    Style::Added
+                } else {
+                    Style::Dim
+                };
+                spans.push(Span::new(state.clone(), style));
+            }
+            None => spans.push(Span::new("no open pull request".to_owned(), Style::Dim)),
+        }
+        if let Some(checks) = &remote.checks {
+            let (sym, style) = match checks.as_str() {
+                "passing" => ("\u{2714}", Style::Added),
+                "failing" => ("\u{2718}", Style::Deleted),
+                _ => ("\u{2022}", Style::Dim),
+            };
+            spans.push(Span::new(format!("   {sym} {checks}"), style));
+        }
+        children.push(Section::leaf("remote/pr", NodeKind::Info, spans));
+    }
+
+    if children.is_empty() {
+        return None;
+    }
+    Some(Section::branch(
+        "remote",
+        NodeKind::Section,
+        vec![Span::new("REMOTE".to_owned(), Style::Dim)],
+        children,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_section_appears_only_when_loaded() {
+        assert!(build_remote_section(None, None).is_none());
+        let summary = RemoteSummary {
+            pr: Some((7, "open".into())),
+            checks: Some("passing".into()),
+        };
+        let mut buffer = Buffer::default();
+        buffer.set_content(vec![build_remote_section(Some(&summary), None).unwrap()]);
+        let ids: Vec<String> = buffer.rows().map(|r| r.id.clone()).collect();
+        assert!(ids.contains(&"remote".to_owned()));
+        assert!(ids.contains(&"remote/pr".to_owned()));
+    }
 
     #[test]
     fn build_lanes_encodes_lane_and_path_in_section_ids() {
@@ -3759,6 +3956,7 @@ mod tests {
                     paths: vec!["src/a.rs".into()],
                     hunks: vec![],
                     commits: vec![],
+                    parent: None,
                 },
                 Lane {
                     name: "feat".into(),
@@ -3769,6 +3967,7 @@ mod tests {
                         anchor: "deadbeef".into(),
                     }],
                     commits: vec![("abc1234".into(), "did a thing".into())],
+                    parent: None,
                 },
             ],
         };
@@ -3861,6 +4060,7 @@ mod tests {
             candidates: Vec::new(),
             selected: 0,
             action: PromptAction::CreateBranch,
+            masked: false,
         };
         let ch = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);

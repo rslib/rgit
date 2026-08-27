@@ -62,6 +62,8 @@ mod tests {
                 short_id: "abc1234".into(),
                 summary: "init".into(),
                 when: "just now".into(),
+                refs: Vec::new(),
+                unpushed: false,
             }],
             ..Default::default()
         };

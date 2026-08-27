@@ -783,3 +783,39 @@ fn discover_outside_a_repo_is_an_error() {
     std::fs::create_dir_all(&dir).unwrap();
     assert!(Git2Backend::discover(&dir).is_err());
 }
+
+#[test]
+fn commits_not_on_a_remote_are_marked_unpushed() {
+    let dir = init_repo("unpushed");
+    std::fs::write(dir.join("a.txt"), "1\n").unwrap();
+    git(&dir, &["add", "a.txt"]);
+    git(&dir, &["commit", "-qm", "C0"]);
+    let c0 = String::from_utf8_lossy(
+        &Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_owned();
+    // Pretend C0 is on origin/main; C1 is then local-only.
+    git(&dir, &["update-ref", "refs/remotes/origin/main", &c0]);
+    std::fs::write(dir.join("a.txt"), "2\n").unwrap();
+    git(&dir, &["commit", "-aqm", "C1"]);
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let recent = backend.status().unwrap().recent;
+    let c1 = recent.iter().find(|c| c.summary == "C1").unwrap();
+    let c0e = recent.iter().find(|c| c.summary == "C0").unwrap();
+    assert!(c1.unpushed, "C1 is not on any remote");
+    assert!(!c0e.unpushed, "C0 is on origin/main");
+
+    let log = backend.log(&Default::default()).unwrap();
+    assert!(log.iter().find(|e| e.summary == "C1").unwrap().unpushed);
+    assert!(!log.iter().find(|e| e.summary == "C0").unwrap().unpushed);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

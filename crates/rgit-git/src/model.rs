@@ -73,6 +73,10 @@ pub struct Head {
     pub upstream: Option<String>,
     pub ahead: usize,
     pub behind: usize,
+    /// Ahead/behind of the current branch against each remote that has it, as
+    /// `(remote_ref, ahead, behind)` (e.g. `("origin/main", 2, 0)`). For the
+    /// REMOTE overview across all remotes, not just the tracking upstream.
+    pub remotes: Vec<(String, usize, usize)>,
 }
 
 /// One path reported by `git status`, carrying its index and worktree states.
@@ -186,6 +190,10 @@ pub struct Commit {
     pub summary: String,
     /// Relative age ("3 hours ago").
     pub when: String,
+    /// Refs pointing at this commit (git --decorate order: local, remote, tag).
+    pub refs: Vec<CommitRef>,
+    /// Not reachable from any remote-tracking branch, i.e. local-only.
+    pub unpushed: bool,
 }
 
 /// An entry in the stash stack, `index` 0 being the most recent.
@@ -303,6 +311,9 @@ pub struct Lane {
     /// Commits this lane has made above the fork point, newest first, as
     /// `(short_id, summary)`. Derived at read time (not persisted), for display.
     pub commits: Vec<(String, String)>,
+    /// The lane this one is stacked on, if any: its commits build on that lane's
+    /// branch instead of the shared fork point.
+    pub parent: Option<String>,
 }
 
 /// The lanes overlay: a fork point and the lanes assigned over it. The default
@@ -326,6 +337,100 @@ pub struct LogEntry {
     pub oid: String,
     /// Full parent oids, first-parent first.
     pub parents: Vec<String>,
+    /// Refs pointing at this commit (git --decorate order: local, remote, tag).
+    pub refs: Vec<CommitRef>,
+    /// Not reachable from any remote-tracking branch, i.e. local-only.
+    pub unpushed: bool,
+}
+
+/// A ref decorating a log entry: a branch, upstream, or tag that points at it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRef {
+    pub name: String,
+    pub kind: RefKind,
+    /// True when this is the local branch HEAD is currently on.
+    pub head: bool,
+}
+
+/// A display token for a commit's refs. Refs that share a branch name collapse
+/// into one [`Deco::Group`] so `main origin/main upstream/main` renders as
+/// `{local,origin,upstream}/main` instead of repeating the name three times.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Deco {
+    Local(String),
+    Remote { remote: String, branch: String },
+    Tag(String),
+    Group {
+        branch: String,
+        /// The local branch of this name is present.
+        local: bool,
+        /// Remotes that carry a branch of this name.
+        remotes: Vec<String>,
+    },
+}
+
+/// Collapse a commit's refs for display: refs sharing a branch name fold into a
+/// single `{local,<remote>,...}/branch` token; unique branches and tags render on
+/// their own. Order follows the input (HEAD's local branch first), tags last.
+pub fn group_decorations(refs: &[CommitRef]) -> Vec<Deco> {
+    struct Agg {
+        local: bool,
+        remotes: Vec<String>,
+    }
+    // Order-preserving suffix -> aggregate; first occurrence fixes position.
+    fn slot(branches: &mut Vec<(String, Agg)>, key: &str) -> usize {
+        if let Some(i) = branches.iter().position(|(k, _)| k == key) {
+            i
+        } else {
+            branches.push((
+                key.to_owned(),
+                Agg {
+                    local: false,
+                    remotes: Vec::new(),
+                },
+            ));
+            branches.len() - 1
+        }
+    }
+    let mut branches: Vec<(String, Agg)> = Vec::new();
+    let mut tags: Vec<String> = Vec::new();
+    for r in refs {
+        match r.kind {
+            RefKind::Tag => tags.push(r.name.clone()),
+            RefKind::Local => {
+                let i = slot(&mut branches, &r.name);
+                branches[i].1.local = true;
+            }
+            RefKind::Remote => {
+                let (remote, branch) = match r.name.split_once('/') {
+                    Some((rm, b)) => (rm.to_owned(), b.to_owned()),
+                    None => (String::new(), r.name.clone()),
+                };
+                let i = slot(&mut branches, &branch);
+                branches[i].1.remotes.push(remote);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (branch, agg) in branches {
+        let count = usize::from(agg.local) + agg.remotes.len();
+        if count >= 2 {
+            out.push(Deco::Group {
+                branch,
+                local: agg.local,
+                remotes: agg.remotes,
+            });
+        } else if agg.local {
+            out.push(Deco::Local(branch));
+        } else {
+            out.push(Deco::Remote {
+                remote: agg.remotes.into_iter().next().unwrap_or_default(),
+                branch,
+            });
+        }
+    }
+    out.extend(tags.into_iter().map(Deco::Tag));
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,7 +459,10 @@ pub struct BlameLine {
 /// A commit's metadata and its diff against its first parent.
 #[derive(Debug, Clone)]
 pub struct CommitDetails {
+    /// Abbreviated commit id, for compact display.
     pub id: String,
+    /// Full 40-hex commit id, for the detail header and copy-paste.
+    pub full_id: String,
     pub author: String,
     pub email: String,
     pub when: String,

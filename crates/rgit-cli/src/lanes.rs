@@ -24,6 +24,11 @@ pub fn new_lane(backend: &Arc<dyn GitBackend>, name: &str) -> Result<String> {
     Ok(format!("created lane {name}"))
 }
 
+pub fn stack(backend: &Arc<dyn GitBackend>, name: &str, on: &str) -> Result<String> {
+    backend.lane_stack(name, on)?;
+    Ok(format!("created lane {name} stacked on {on}"))
+}
+
 pub fn assign(backend: &Arc<dyn GitBackend>, lane: &str, path: &str) -> Result<String> {
     backend.lane_assign(lane, path)?;
     Ok(format!("{path} -> {lane}"))
@@ -64,6 +69,10 @@ pub fn push(backend: &Arc<dyn GitBackend>, lane: &str) -> Result<String> {
 
 pub fn pr(backend: &Arc<dyn GitBackend>, lane: &str) -> Result<String> {
     Ok(backend.lane_pr(lane)?)
+}
+
+pub fn restack(backend: &Arc<dyn GitBackend>) -> Result<String> {
+    Ok(crate::stack::render_restack(&backend.lane_restack()?))
 }
 
 /// List the lanes, each with its branch and owned files.

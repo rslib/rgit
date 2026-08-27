@@ -6,6 +6,7 @@
 
 mod backend;
 mod change_id;
+mod creds;
 mod diff;
 mod lanes;
 mod error;
@@ -16,11 +17,13 @@ pub mod workflow;
 pub mod workspace;
 
 pub use backend::GitBackend;
+pub use creds::CredentialPrompt;
 pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 pub use error::GitError;
 pub use git_repo::{Git2Backend, clone, init};
 pub use model::{
-    BlameLine, Commit, CommitDetails, Head, HunkRef, Lane, LanesState, LogEntry, LogOptions,
+    BlameLine, Commit, CommitDetails, CommitRef, Deco, Head, HunkRef, Lane, LanesState, LogEntry,
+    LogOptions, group_decorations,
     OpLogEntry, OpProgress, RefEntry, RefKind, Remote, RepoState, RepoStatus, ResetMode,
     RestackOutcome, SmartlogEntry, Stash, StatusCode, StatusEntry, Worktree,
 };

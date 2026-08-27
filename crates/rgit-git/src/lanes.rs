@@ -51,6 +51,7 @@ pub fn init(repo: &Repository) -> Result<(), GitError> {
             paths: Vec::new(),
             hunks: Vec::new(),
             commits: Vec::new(),
+            parent: None,
         }],
     };
     save(repo, &state)
@@ -130,8 +131,176 @@ pub fn new_lane(repo: &Repository, name: &str) -> Result<(), GitError> {
         paths: Vec::new(),
         hunks: Vec::new(),
         commits: Vec::new(),
+        parent: None,
     });
     save(repo, &state)
+}
+
+/// Create a new lane stacked on another: its commits build on the parent lane's
+/// branch instead of the shared fork point. Also records the git stack config on
+/// the lane branch so the existing `restack` moves it when the parent advances.
+pub fn stack(repo: &Repository, name: &str, parent: &str) -> Result<(), GitError> {
+    if name == parent {
+        return Err(other("a lane cannot be stacked on itself"));
+    }
+    if !git2::Reference::is_valid_name(&format!("refs/heads/{name}")) {
+        return Err(other(format!("invalid lane/branch name: {name:?}")));
+    }
+    let mut state = state(repo)?;
+    if state.lanes.iter().any(|l| l.name == name) {
+        return Err(other(format!("lane already exists: {name}")));
+    }
+    let parent_branch = state
+        .lanes
+        .iter()
+        .find(|l| l.name == parent)
+        .map(|l| l.branch.clone())
+        .ok_or_else(|| other(format!("no such parent lane: {parent}")))?;
+
+    // Record the stack relationship in git config, so `stack`/`restack` see it.
+    let mut cfg = repo.config()?;
+    cfg.set_str(&format!("branch.{name}.rgit-stack-parent"), &parent_branch)?;
+    if let Some(tip) = repo
+        .find_branch(&parent_branch, git2::BranchType::Local)
+        .ok()
+        .and_then(|b| b.get().target())
+    {
+        cfg.set_str(&format!("branch.{name}.rgit-stack-base"), &tip.to_string())?;
+    }
+
+    state.lanes.push(Lane {
+        name: name.to_owned(),
+        branch: name.to_owned(),
+        paths: Vec::new(),
+        hunks: Vec::new(),
+        commits: Vec::new(),
+        parent: Some(parent.to_owned()),
+    });
+    save(repo, &state)
+}
+
+/// Move each stacked lane onto its parent lane's current tip, entirely in the
+/// object database (cherry-pick in memory) so the dirty worktree lanes keep is
+/// never touched. A conflict on one lane is reported and skipped; the rest still
+/// move. This is the worktree-safe counterpart to the checkout-based `restack`.
+pub fn restack(repo: &Repository) -> Result<crate::RestackOutcome, GitError> {
+    let state = state(repo)?;
+    let parents: HashMap<String, String> = state
+        .lanes
+        .iter()
+        .filter_map(|l| l.parent.clone().map(|p| (l.name.clone(), p)))
+        .collect();
+    if parents.is_empty() {
+        return Ok(crate::RestackOutcome::default());
+    }
+    let branch_of = |name: &str| {
+        state
+            .lanes
+            .iter()
+            .find(|l| l.name == name)
+            .map(|l| l.branch.clone())
+    };
+    // Parents before children, so a child restacks onto its already-moved parent.
+    let mut order: Vec<String> = parents.keys().cloned().collect();
+    order.sort_by_key(|n| lane_depth(n, &parents));
+
+    let mut outcome = crate::RestackOutcome::default();
+    for name in order {
+        let parent_name = &parents[&name];
+        let (Some(lane_branch), Some(parent_branch)) =
+            (branch_of(&name), branch_of(parent_name))
+        else {
+            continue;
+        };
+        let Some(new_base) = tip_of(repo, &parent_branch) else {
+            continue; // the parent lane has no commits yet
+        };
+        let base_key = format!("branch.{lane_branch}.rgit-stack-base");
+        let record_base = |repo: &Repository| {
+            if let Ok(mut c) = repo.config() {
+                let _ = c.set_str(&base_key, &new_base.to_string());
+            }
+        };
+        let Some(lane_tip) = tip_of(repo, &lane_branch) else {
+            record_base(repo);
+            continue; // no commits to replay
+        };
+        if lane_tip == new_base || repo.graph_descendant_of(lane_tip, new_base).unwrap_or(false) {
+            record_base(repo); // already on top of the parent
+            continue;
+        }
+        match replay_onto(repo, lane_tip, new_base) {
+            Ok(new_tip) => {
+                repo.reference(
+                    &format!("refs/heads/{lane_branch}"),
+                    new_tip,
+                    true,
+                    "rgit lane restack",
+                )?;
+                record_base(repo);
+                outcome.restacked.push(format!("{name} -> {parent_name}"));
+            }
+            Err(GitError::Conflict(_)) => outcome.conflicted.push(name.clone()),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(outcome)
+}
+
+fn tip_of(repo: &Repository, branch: &str) -> Option<Oid> {
+    repo.find_branch(branch, git2::BranchType::Local)
+        .ok()
+        .and_then(|b| b.get().target())
+}
+
+/// How many stacked lane ancestors a lane has, for ordering parents first.
+fn lane_depth(name: &str, parents: &HashMap<String, String>) -> usize {
+    let mut depth = 0;
+    let mut cursor = name;
+    while let Some(parent) = parents.get(cursor) {
+        if !parents.contains_key(parent) {
+            break;
+        }
+        depth += 1;
+        cursor = parent;
+        if depth > 1000 {
+            break;
+        }
+    }
+    depth
+}
+
+/// Replay `merge_base(lane_tip, new_base)..lane_tip` onto `new_base` in the odb,
+/// via cherry-pick, and return the new tip oid. Never touches index or worktree.
+fn replay_onto(repo: &Repository, lane_tip: Oid, new_base: Oid) -> Result<Oid, GitError> {
+    let fork = repo.merge_base(lane_tip, new_base)?;
+    let mut walk = repo.revwalk()?;
+    walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+    walk.push(lane_tip)?;
+    walk.hide(fork)?;
+
+    let mut base = repo.find_commit(new_base)?;
+    for oid in walk {
+        let commit = repo.find_commit(oid?)?;
+        let mut index = repo.cherrypick_commit(&commit, &base, 0, None)?;
+        if index.has_conflicts() {
+            return Err(GitError::Conflict(format!(
+                "conflict replaying {}",
+                commit.id()
+            )));
+        }
+        let tree = repo.find_tree(index.write_tree_to(repo)?)?;
+        let new = repo.commit(
+            None,
+            &commit.author(),
+            &commit.committer(),
+            commit.message().unwrap_or(""),
+            &tree,
+            &[&base],
+        )?;
+        base = repo.find_commit(new)?;
+    }
+    Ok(base.id())
 }
 
 /// The branch a lane commits to.
@@ -263,13 +432,30 @@ pub fn commit(repo: &Repository, lane_name: &str, message: &str) -> Result<Strin
         return Err(other(format!("lane {lane_name} has no owned changes")));
     }
 
-    // Start from the lane branch's tip, or the fork point for a lane's first
-    // commit. That tip is the new commit's parent.
-    let parent_oid = repo
+    // The new commit's parent: the lane's own tip if it has commits; else the
+    // parent lane's tip for a stacked lane; else the shared fork point.
+    let own_tip = repo
         .find_branch(&lane.branch, git2::BranchType::Local)
         .ok()
-        .and_then(|b| b.get().target())
-        .unwrap_or(base);
+        .and_then(|b| b.get().target());
+    let parent_oid = match own_tip {
+        Some(tip) => tip,
+        None => match &lane.parent {
+            Some(parent_lane) => {
+                let parent_branch = state
+                    .lanes
+                    .iter()
+                    .find(|l| &l.name == parent_lane)
+                    .map(|l| l.branch.clone())
+                    .ok_or_else(|| other(format!("parent lane {parent_lane} not found")))?;
+                repo.find_branch(&parent_branch, git2::BranchType::Local)
+                    .ok()
+                    .and_then(|b| b.get().target())
+                    .ok_or_else(|| other(format!("commit the parent lane {parent_lane} first")))?
+            }
+            None => base,
+        },
+    };
     let parent = repo.find_commit(parent_oid)?;
     let start_tree = parent.tree()?;
 
@@ -608,6 +794,9 @@ fn serialize(state: &LanesState) -> String {
     s.push_str(&format!("base: {}\n", state.base));
     for lane in &state.lanes {
         s.push_str(&format!("lane: {} {}\n", lane.name, lane.branch));
+        if let Some(parent) = &lane.parent {
+            s.push_str(&format!("parent: {} {}\n", lane.name, parent));
+        }
         for path in &lane.paths {
             s.push_str(&format!("path: {} {}\n", lane.name, path));
         }
@@ -632,7 +821,14 @@ fn parse(message: &str) -> LanesState {
                     paths: Vec::new(),
                     hunks: Vec::new(),
                     commits: Vec::new(),
+                    parent: None,
                 });
+            }
+        } else if let Some(v) = line.strip_prefix("parent: ") {
+            if let Some((lane, parent)) = v.trim().split_once(' ') {
+                if let Some(l) = lanes.iter_mut().find(|l| l.name == lane) {
+                    l.parent = Some(parent.to_owned());
+                }
             }
         } else if let Some(v) = line.strip_prefix("path: ") {
             if let Some((lane, path)) = v.split_once(' ') {
@@ -670,6 +866,7 @@ mod tests {
                     paths: vec!["src/a.rs".into()],
                     hunks: vec![],
                     commits: vec![],
+                    parent: None,
                 },
                 Lane {
                     name: "parser".into(),
@@ -680,6 +877,7 @@ mod tests {
                         anchor: "deadbeef".into(),
                     }],
                     commits: vec![],
+                    parent: None,
                 },
             ],
         };
