@@ -242,6 +242,11 @@ pub trait GitBackend: Send + Sync {
     /// The newest tag by tagged-commit time, if any, for a release summary.
     fn latest_tag(&self) -> Result<Option<crate::TagInfo>, GitError>;
 
+    /// Every tag, newest tagged-commit first, for the releases page. Annotated
+    /// tags carry their own message; lightweight tags fall back to the commit
+    /// summary.
+    fn all_tags(&self) -> Result<Vec<crate::TagInfo>, GitError>;
+
     /// A gzipped tarball of a revision's tree (as `git archive` would produce),
     /// for source downloads.
     fn archive_targz(&self, rev: &str) -> Result<Vec<u8>, GitError>;

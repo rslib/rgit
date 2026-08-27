@@ -312,6 +312,15 @@ fn refs_page(b: &dyn GitBackend, repo: &str, base: &str) -> Result<Markup, AppEr
     Ok(view::refs(repo, base, &side_info(b, base, repo), &b.refs()?))
 }
 
+fn releases_page(b: &dyn GitBackend, repo: &str, base: &str) -> Result<Markup, AppError> {
+    Ok(view::releases(
+        repo,
+        base,
+        &side_info(b, base, repo),
+        &b.all_tags()?,
+    ))
+}
+
 fn blame_page(b: &dyn GitBackend, repo: &str, base: &str, path: &str) -> Result<Markup, AppError> {
     Ok(view::blame(repo, base, &side_info(b, base, repo), path, &b.blame(path)?))
 }
@@ -837,6 +846,16 @@ async fn s_refs(State(s): State<Shared>) -> Result<Markup, AppError> {
     let (b, r, base) = ctx(&s, None)?;
     refs_page(b.as_ref(), &r, &base)
 }
+
+async fn s_releases(State(s): State<Shared>) -> Result<Markup, AppError> {
+    let (b, r, base) = ctx(&s, None)?;
+    releases_page(b.as_ref(), &r, &base)
+}
+
+async fn m_releases(State(s): State<Shared>, Path(repo): Path<String>) -> Result<Markup, AppError> {
+    let (b, r, base) = ctx(&s, Some(&repo))?;
+    releases_page(b.as_ref(), &r, &base)
+}
 async fn s_blame(State(s): State<Shared>, Path(path): Path<String>) -> Result<Markup, AppError> {
     let (b, r, base) = ctx(&s, None)?;
     blame_page(b.as_ref(), &r, &base, &path)
@@ -1073,6 +1092,7 @@ fn single_router(state: Shared) -> Router {
         .route("/commit/{rev}/diffs", get(s_commit_diffs))
         .route("/commit/{rev}/diff/{*path}", get(s_commit_diff))
         .route("/refs", get(s_refs))
+        .route("/releases", get(s_releases))
         .route("/blame/{*path}", get(s_blame))
         .route("/diff/{*path}", get(s_diff))
         .route("/files", get(s_files))
@@ -1099,6 +1119,7 @@ fn multi_router(state: Shared) -> Router {
         .route("/{repo}/commit/{rev}/diffs", get(m_commit_diffs))
         .route("/{repo}/commit/{rev}/diff/{*path}", get(m_commit_diff))
         .route("/{repo}/refs", get(m_refs))
+        .route("/{repo}/releases", get(m_releases))
         .route("/{repo}/blame/{*path}", get(m_blame))
         .route("/{repo}/diff/{*path}", get(m_diff))
         .route("/{repo}/files", get(m_files))

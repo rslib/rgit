@@ -930,6 +930,44 @@ impl GitBackend for Git2Backend {
         Ok(best.map(|(_, ti)| ti))
     }
 
+    fn all_tags(&self) -> Result<Vec<crate::TagInfo>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut out: Vec<(i64, crate::TagInfo)> = Vec::new();
+        for name in repo.tag_names(None)?.iter().filter_map(|t| t.ok().flatten()) {
+            let Ok(obj) = repo.revparse_single(name) else {
+                continue;
+            };
+            let Ok(commit) = obj.peel_to_commit() else {
+                continue;
+            };
+            let t = commit.time().seconds();
+            // Prefer an annotated tag's own message; else the commit summary.
+            let tag_msg = obj
+                .as_tag()
+                .and_then(|tg| tg.message().ok().flatten())
+                // Drop a trailing PGP/SSH signature block from a signed tag.
+                .map(|m| m.split("-----BEGIN").next().unwrap_or(m).trim().to_owned())
+                .filter(|m| !m.is_empty());
+            let message = tag_msg
+                .or_else(|| commit.summary().ok().flatten().map(|s| s.to_owned()))
+                .unwrap_or_default();
+            out.push((
+                t,
+                crate::TagInfo {
+                    name: name.to_owned(),
+                    when: relative_age(t, now),
+                    message,
+                },
+            ));
+        }
+        out.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+        Ok(out.into_iter().map(|(_, ti)| ti).collect())
+    }
+
     fn archive_targz(&self, rev: &str) -> Result<Vec<u8>, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let tree = repo.revparse_single(rev)?.peel_to_commit()?.tree()?;

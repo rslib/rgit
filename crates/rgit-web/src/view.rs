@@ -10,17 +10,18 @@ use std::collections::HashMap;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use rgit_git::{
     BlameLine, Blob, CommitOverview, CommitRef, Deco, FileDiff, GrepMatch, Head, LanesState,
-    LastCommit, LineOrigin, LogEntry, RefEntry, RefKind, RepoStatus, StatusEntry, TreeEntry,
+    LastCommit, LineOrigin, LogEntry, RefEntry, RefKind, RepoStatus, StatusEntry, TagInfo, TreeEntry,
     group_decorations,
 };
 
 use crate::{assets, highlight};
 
-const TABS: [(&str, &str, &str); 4] = [
+const TABS: [(&str, &str, &str); 5] = [
     ("summary", "1", ""),
     ("log", "2", "/log"),
     ("tree", "3", "/tree"),
     ("refs", "4", "/refs"),
+    ("releases", "5", "/releases"),
 ];
 
 /// Repo metadata for the sidebar, gathered once per request.
@@ -102,22 +103,27 @@ fn ref_switcher(base: &str, rev: &str, side: &SideInfo) -> Markup {
             }
             div.refpop id="refpop" {
                 div.rpf { input id="ref-input" placeholder="find a branch or tag\u{2026}" autocomplete="off"; }
+                div.rpk id="ref-kinds" {
+                    button type="button" class="rpk-pill on" data-kind="all" { "All" }
+                    button type="button" class="rpk-pill" data-kind="branch" { "Branches" span.rpk-n { (side.branch_names.len()) } }
+                    button type="button" class="rpk-pill" data-kind="tag" { "Tags" span.rpk-n { (side.tag_names.len()) } }
+                }
                 div.rpl id="ref-list" {
                     @if !is_named {
-                        div.rpg { "Commit" }
-                        a class="refitem on" data-ref=(rev) href=(at(base, rev, "/tree")) { (rev) }
+                        div.rpg data-kind="commit" { "Commit" }
+                        a class="refitem on" data-kind="commit" data-ref=(rev) href=(at(base, rev, "/tree")) { (rev) }
                     }
-                    a class=(if rev == "HEAD" { "refitem on" } else { "refitem" }) data-ref="HEAD" href=(href(base, "/tree")) { "HEAD" }
+                    a class=(if rev == "HEAD" { "refitem on" } else { "refitem" }) data-kind="branch" data-ref="HEAD" href=(href(base, "/tree")) { "HEAD" }
                     @if !side.branch_names.is_empty() {
-                        div.rpg { "Branches" }
+                        div.rpg data-kind="branch" { "Branches" }
                         @for b in &side.branch_names {
-                            a class=(if rev == *b { "refitem on" } else { "refitem" }) data-ref=(b) href=(at(base, b, "/tree")) { (b) }
+                            a class=(if rev == *b { "refitem on" } else { "refitem" }) data-kind="branch" data-ref=(b) href=(at(base, b, "/tree")) { (b) }
                         }
                     }
                     @if !side.tag_names.is_empty() {
-                        div.rpg { "Tags" }
+                        div.rpg data-kind="tag" { "Tags" }
                         @for t in &side.tag_names {
-                            a class=(if rev == *t { "refitem on" } else { "refitem" }) data-ref=(t) href=(at(base, t, "/tree")) { (t) }
+                            a class=(if rev == *t { "refitem on" } else { "refitem" }) data-kind="tag" data-ref=(t) href=(at(base, t, "/tree")) { (t) }
                         }
                     }
                 }
@@ -218,6 +224,7 @@ pub fn layout(
                         a.pitem href=(href(base, "/log")) { span.pic { "\u{2630}" } "log" }
                         a.pitem href=(href(base, "/tree")) { span.pic { "\u{1f4c1}" } "tree" }
                         a.pitem href=(href(base, "/refs")) { span.pic { "\u{2325}" } "refs" }
+                        a.pitem href=(href(base, "/releases")) { span.pic { "\u{2691}" } "releases" }
                         a.pitem data-act="finder" { span.pic { "\u{1f50d}" } "find file" span.phint { "t" } }
                         a.pitem href=(side.archive) { span.pic { "\u{2193}" } "download source" }
                         @if let Some(u) = &side.clone_url { a.pitem data-copy-text=(u) { span.pic { "\u{29c9}" } "copy clone URL" } }
@@ -980,15 +987,16 @@ pub fn commit(repo: &str, base: &str, side: &SideInfo, d: &CommitOverview) -> Ma
         .iter()
         .fold((0usize, 0usize), |(a, r), f| (a + f.additions, r + f.deletions));
     let files_side = html! {
-        aside.difffiles {
+        aside.difffiles data-pane="files" {
             div.dfh { span.dft { "Changed files" } span.dfn { (d.files.len()) } }
             div.dfmode {
-                a.dfm.on data-mode="one" { "one" }
-                a.dfm data-mode="list" { "list" }
+                a.dfm.on data-point data-mode="one" { "one" }
+                a.dfm data-point data-mode="list" { "list" }
             }
             div.dflist {
                 @for (i, f) in d.files.iter().enumerate() {
                     a class=(if i == 0 { "dfitem on" } else { "dfitem" })
+                        data-point
                         data-file=(i)
                         data-diff=(href(base, &format!("/commit/{}/diff/{}", d.id, f.path))) {
                         span.dfp { (f.path) }
@@ -1001,7 +1009,7 @@ pub fn commit(repo: &str, base: &str, side: &SideInfo, d: &CommitOverview) -> Ma
     let body = html! {
         div.difflayout {
             (files_side)
-            div.diffmain {
+            div.diffmain data-pane="main" {
                 div.sec { div.body {
                     div.cmeta {
                         p.subj { (d.message.lines().next().unwrap_or_default()) }
@@ -1166,6 +1174,33 @@ pub fn refs(repo: &str, base: &str, side: &SideInfo, entries: &[RefEntry]) -> Ma
         (table("Tags", RefKind::Tag, "\u{2691}", true))
     };
     layout(repo, base, "refs", "", side, "", None, "HEAD", body)
+}
+
+/// The releases page: every tag newest-first, each with its message and age, and
+/// a link to browse that tag's tree. The newest is marked "latest".
+pub fn releases(repo: &str, base: &str, side: &SideInfo, tags: &[TagInfo]) -> Markup {
+    let body = html! {
+        div.sec {
+            div.h { span.title { "Releases" } span.count { (tags.len()) } }
+            div.body {
+                @if tags.is_empty() {
+                    div.binary { "no tags yet; tag a commit to cut a release" }
+                }
+                @for (i, t) in tags.iter().enumerate() {
+                    div class="row rel-row" data-point {
+                        span.rel-tag.m {
+                            span.gl.t { "\u{2691}" }
+                            a data-go href=(at(base, &t.name, "/tree")) { (t.name) }
+                            @if i == 0 { span.rel-latest { "latest" } }
+                        }
+                        span.rel-msg { (t.message) }
+                        span.meta { (t.when) }
+                    }
+                }
+            }
+        }
+    };
+    layout(repo, base, "releases", "", side, "", None, "HEAD", body)
 }
 
 pub fn blame(repo: &str, base: &str, side: &SideInfo, path: &str, lines: &[BlameLine]) -> Markup {

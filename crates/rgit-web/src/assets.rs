@@ -60,6 +60,12 @@ nav.tabs .tabsep{width:1px; height:16px; background:var(--line2); margin:0 10px 
 .rpf{padding:8px; border-bottom:1px solid var(--line);}
 .rpf input{width:100%; font-family:var(--mono); font-size:12px; padding:5px 9px; border:1px solid var(--line2); border-radius:6px; background:var(--sunk); color:var(--ink); outline:none;}
 .rpf input:focus{border-color:var(--acc-line); background:var(--panel);}
+.rpk{display:flex; gap:6px; padding:8px; border-bottom:1px solid var(--line);}
+.rpk-pill{display:inline-flex; align-items:center; gap:5px; font-family:var(--mono); font-size:11px; padding:3px 9px; border:1px solid var(--line2); border-radius:999px; background:transparent; color:var(--dim); cursor:pointer;}
+.rpk-pill:hover{color:var(--ink); border-color:var(--acc-line);}
+.rpk-pill.on{color:var(--acc-ink); border-color:var(--acc-line); background:var(--sunk);}
+.rpk-n{font-size:10px; color:var(--faint);}
+.rpk-pill.on .rpk-n{color:var(--acc-ink);}
 .rpl{max-height:340px; overflow-y:auto; padding:6px;}
 .rpg{font-family:var(--mono); font-size:10px; text-transform:uppercase; letter-spacing:.08em; color:var(--faint); padding:7px 8px 3px;}
 .refitem{display:block; padding:5px 9px; border-radius:6px; font-family:var(--mono); font-size:12px; color:var(--ink); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
@@ -257,7 +263,7 @@ a.kbcur:not([data-point]){text-decoration:underline; text-decoration-color:var(-
    static main/list panes get position:relative; the explorer and info sidebar
    are already position:sticky (a relative override there would cancel sticky and
    drop them 96px via their top:96px), and sticky already anchors the overlay. */
-.content, .treemain{position:relative;}
+.content, .treemain, .diffmain{position:relative;}
 [data-pane].panefocus::before{content:""; position:absolute; left:0; top:0; bottom:0; width:2px; background:var(--acc); border-radius:2px; z-index:3; pointer-events:none;}
 .row .hash{color:var(--acc-ink); font-weight:500;} .row .hash a{color:var(--acc-ink);} .row .hash a:hover{text-decoration:underline;}
 .row .subj{color:var(--ink); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
@@ -368,6 +374,12 @@ a.kbcur:not([data-point]){text-decoration:underline; text-decoration-color:var(-
 .tbl .gl{margin-right:7px; color:var(--br);} .tbl .gl.t{color:var(--pend);}
 .tbl .badge{font-family:var(--mono); font-size:10.5px; color:var(--acc); border:1px solid var(--line2); border-radius:5px; padding:1px 6px;}
 
+.rel-row{grid-template-columns:minmax(180px,260px) 1fr auto;}
+.rel-tag{display:inline-flex; align-items:center; gap:6px; color:var(--acc-ink);}
+.rel-tag .gl.t{color:var(--pend);} .rel-tag a{color:var(--acc-ink);} .rel-tag a:hover{text-decoration:underline;}
+.rel-latest{font-family:var(--mono); font-size:10px; text-transform:uppercase; letter-spacing:.06em; color:var(--acc); border:1px solid var(--acc-line); border-radius:999px; padding:1px 7px;}
+.rel-msg{color:var(--dim); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+
 .blameline{display:grid; grid-template-columns:158px 46px 1fr; align-items:baseline;
   font-family:var(--mono); font-size:12.5px; line-height:1.6;}
 .blameline .who{color:var(--dim); padding:0 10px; border-right:1px solid var(--line); background:var(--panel);
@@ -445,17 +457,40 @@ function panes(){return slice(document.querySelectorAll('[data-pane]')).filter(f
 function apane(){return document.querySelector('[data-pane].panefocus');}
 function scopeEl(){return apane()||document;}
 function rows(){var s=scopeEl(); var p=s.querySelectorAll('[data-point]'); if(p.length)return slice(p);
-  if(s!==document)return slice(s.querySelectorAll('a[href]')); return [];}
+  if(s!==document)return slice(s.querySelectorAll('a[href],button,[data-copy],[data-copy-text]')); return [];}
 function cur(){return document.querySelector('.kbcur');}
-function move(d){var r=rows(); if(!r.length)return; var c=cur(); var i=c?r.indexOf(c):-1;
-  if(i<0&&d<0)i=0; i=Math.max(0,Math.min(r.length-1,i+d));
-  if(c)c.classList.remove('kbcur'); r[i].classList.add('kbcur'); r[i].scrollIntoView({block:'nearest'});}
-// h/l move focus between panes; the cursor jumps into the newly focused pane.
-function focusPane(d){var ps=panes(); if(ps.length<2)return;
-  var f=apane(); var i=f?ps.indexOf(f):(d>0?-1:0); i=(i+d+ps.length)%ps.length;
+function select(el){if(!el)return; var c=cur(); if(c)c.classList.remove('kbcur'); el.classList.add('kbcur'); el.scrollIntoView({block:'nearest'});}
+// Geometry-aware cursor: move to the nearest navigable in a compass direction,
+// so a card grid steps down/up by row (j/k) and across by column (h/l), while a
+// plain list still just goes next/previous. The perpendicular offset is weighted
+// so "down" prefers the same column rather than drifting sideways.
+function centers(){return rows().map(function(el){var r=el.getBoundingClientRect(); return {el:el, x:r.left+r.width/2, y:r.top+r.height/2};});}
+function nearest(dir){var list=centers(); if(!list.length)return null;
+  var c=cur(); var from=null; for(var i=0;i<list.length;i++){if(list[i].el===c){from=list[i];break;}}
+  if(!from)return list[0].el;
+  var best=null, bestScore=Infinity;
+  for(var j=0;j<list.length;j++){var p=list[j]; if(p.el===c)continue; var dx=p.x-from.x, dy=p.y-from.y, ok, along, perp;
+    if(dir==='down'){ok=dy>1; along=dy; perp=Math.abs(dx);}
+    else if(dir==='up'){ok=dy<-1; along=-dy; perp=Math.abs(dx);}
+    else if(dir==='right'){ok=dx>1; along=dx; perp=Math.abs(dy);}
+    else {ok=dx<-1; along=-dx; perp=Math.abs(dy);}
+    if(!ok)continue; var score=along+perp*2; if(score<bestScore){bestScore=score; best=p.el;}}
+  return best;}
+function move(d){var t=nearest(d>0?'down':'up'); if(t){select(t); return true;}
+  if(!cur()){var r=rows(); if(r.length){select(r[0]); return true;}} return false;}
+// h/l: step across a grid row first; only cross to the neighbouring pane when
+// there is no navigable item that way (a plain list, or the row edge).
+function horiz(d){if(cur()){var t=nearest(d>0?'right':'left'); if(t){select(t); return true;}} return focusPane(d);}
+function focusPane(d){var ps=panes(); if(ps.length<2)return false;
+  // Start from the pane the cursor is actually in, so the first cross moves to a
+  // real neighbour rather than snapping to pane 0 (or the last pane).
+  var f=apane(); if(!f){var c=cur(); f=c&&c.closest&&c.closest('[data-pane]');}
+  var i=ps.indexOf(f); if(i<0)i=(d>0?-1:0); i=(i+d+ps.length)%ps.length;
   ps.forEach(function(p){p.classList.remove('panefocus');});
   var c=cur(); if(c)c.classList.remove('kbcur');
-  ps[i].classList.add('panefocus'); ps[i].scrollIntoView({block:'nearest'}); move(1);}
+  ps[i].classList.add('panefocus');
+  var r=rows(); if(r.length){select(r[0]); return true;}
+  ps[i].scrollIntoView({block:'nearest'}); return true;}
 var toastEl=document.getElementById('toast');
 function toast(msg){ if(!toastEl)return; toastEl.textContent=msg; toastEl.classList.add('show'); setTimeout(function(){toastEl.classList.remove('show');},1100); }
 document.addEventListener('click',function(e){
@@ -557,11 +592,14 @@ Array.prototype.forEach.call(document.querySelectorAll('.hsearch'),function(hs){
 var refsw=document.getElementById('refsw');
 if(refsw){
   var refbtn=document.getElementById('refbtn'), refInput=document.getElementById('ref-input'), refList=document.getElementById('ref-list');
+  var refKinds=document.getElementById('ref-kinds'), refKind='all';
   var refVisible=function(){return Array.prototype.slice.call(refList.querySelectorAll('.refitem')).filter(function(e){return e.style.display!=='none';});};
   var refFilter=function(){
     var q=refInput.value.toLowerCase();
     Array.prototype.forEach.call(refList.querySelectorAll('.refitem'),function(e){
-      e.style.display=(e.getAttribute('data-ref')||'').toLowerCase().indexOf(q)>=0?'':'none'; e.classList.remove('sel');
+      var okText=(e.getAttribute('data-ref')||'').toLowerCase().indexOf(q)>=0;
+      var okKind=refKind==='all'||e.getAttribute('data-kind')===refKind;
+      e.style.display=(okText&&okKind)?'':'none'; e.classList.remove('sel');
     });
     Array.prototype.forEach.call(refList.querySelectorAll('.rpg'),function(g){
       var n=g.nextElementSibling, any=false;
@@ -575,6 +613,10 @@ if(refsw){
   refbtn.addEventListener('click',function(e){ e.stopPropagation(); refsw.classList.contains('open')?refClose():refOpen(); });
   document.addEventListener('click',function(e){ if(!refsw.contains(e.target)) refClose(); });
   refInput.addEventListener('input',refFilter);
+  if(refKinds){ refKinds.addEventListener('click',function(e){ var p=e.target.closest('.rpk-pill'); if(!p)return;
+    refKind=p.getAttribute('data-kind');
+    Array.prototype.forEach.call(refKinds.querySelectorAll('.rpk-pill'),function(b){b.classList.toggle('on',b===p);});
+    refFilter(); refInput.focus(); }); }
   refInput.addEventListener('keydown',function(e){
     var vis=refVisible(), cur=refList.querySelector('.refitem.sel'), i=cur?vis.indexOf(cur):-1;
     if(e.key==='ArrowDown'){ e.preventDefault(); if(cur)cur.classList.remove('sel'); var nx=vis[Math.min(vis.length-1,i+1)]; if(nx){nx.classList.add('sel'); nx.scrollIntoView({block:'nearest'});} }
@@ -694,11 +736,11 @@ document.addEventListener('keydown',function(e){
   if(e.key==='t'){e.preventDefault();openFinder();return;}
   if(e.key==='y'){var pl=document.querySelector('[data-permalink]'); var url=pl?pl.getAttribute('data-permalink'):location.href;
     try{navigator.clipboard.writeText(new URL(url,location.href).href);}catch(x){} toast('permalink copied');return;}
-  if(e.key==='j'){e.preventDefault();move(1);}
-  else if(e.key==='k'){e.preventDefault();move(-1);}
-  else if(e.key==='l'){e.preventDefault();focusPane(1);}
-  else if(e.key==='h'){e.preventDefault();focusPane(-1);}
-  else if(e.key==='Enter'){var c=cur(); if(c){var a=c.matches('a[href]')?c:(c.querySelector('a[data-go]')||c.querySelector('a[href]')); if(a)location.href=a.href;}}
-  else if(e.key>='1'&&e.key<='6'){var t=document.querySelectorAll('nav.tabs a')[+e.key-1]; if(t)location.href=t.href;}
+  if(e.key==='j'){if(move(1))e.preventDefault();}
+  else if(e.key==='k'){if(move(-1))e.preventDefault();}
+  else if(e.key==='l'){if(horiz(1))e.preventDefault();}
+  else if(e.key==='h'){if(horiz(-1))e.preventDefault();}
+  else if(e.key==='Enter'){var c=cur(); if(c){var a=c.matches('a[href]')?c:(c.querySelector('a[data-go]')||c.querySelector('a[href]')); if(a){location.href=a.href;} else {c.click();}}}
+  else if(e.key>='1'&&e.key<='5'){var t=document.querySelectorAll('nav.tabs > a')[+e.key-1]; if(t)location.href=t.href;}
 });
 "#;
