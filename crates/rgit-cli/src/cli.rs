@@ -188,6 +188,8 @@ pub enum Command {
     Pull,
     /// Fetch, fast-forward branches to their upstreams, and restack the stack.
     Sync,
+    /// Push every branch in the stack and open a pull request per branch.
+    Submit,
     /// Push the current branch to its upstream.
     Push {
         /// Overwrite the remote branch unconditionally (dangerous).
@@ -1041,6 +1043,7 @@ pub fn run(
         },
         Command::Fetch => net(interactive, "fetch", |r| backend.fetch(r))?,
         Command::Pull => net(interactive, "pull", |r| backend.pull(r))?,
+        Command::Submit => backend.submit_stack(&|_| {})?.join("\n"),
         Command::Sync => {
             let outcome = backend.sync(&|_| {})?;
             let mut msg = String::from("synced");

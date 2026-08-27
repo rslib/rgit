@@ -95,6 +95,11 @@ pub trait GitBackend: Send + Sync {
     /// bases. Op-log-safe.
     fn sync(&self, report: &dyn Fn(crate::OpProgress)) -> Result<crate::RestackOutcome, GitError>;
 
+    /// Push every branch in the current stack (bottom-up, force-with-lease) and
+    /// open or update a pull request per branch (base = its stack parent), via
+    /// the forge CLI. Returns a note per branch.
+    fn submit_stack(&self, report: &dyn Fn(crate::OpProgress)) -> Result<Vec<String>, GitError>;
+
     /// The directory git resolves hooks from (`core.hooksPath` or
     /// `<git-dir>/hooks`), so the caller can run and stream them itself.
     fn hooks_dir(&self) -> std::path::PathBuf;

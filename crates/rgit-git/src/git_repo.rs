@@ -1876,6 +1876,40 @@ impl GitBackend for Git2Backend {
         self.restack()
     }
 
+    fn submit_stack(&self, report: &dyn Fn(OpProgress)) -> Result<Vec<String>, GitError> {
+        let parents: std::collections::HashMap<String, Option<String>> =
+            self.stack_parents()?.into_iter().collect();
+        let start = self
+            .status()?
+            .head
+            .branch
+            .ok_or_else(|| GitError::Other("not on a branch".to_owned()))?;
+        // The stack chain for the current branch, bottom-up (child before parent
+        // when reversed).
+        let mut chain: Vec<(String, String)> = Vec::new();
+        let mut cur = start.clone();
+        while let Some(Some(p)) = parents.get(&cur) {
+            chain.push((cur.clone(), p.clone()));
+            cur = p.clone();
+        }
+        chain.reverse();
+        if chain.is_empty() {
+            return Err(GitError::Other(
+                "the current branch is not in a stack".to_owned(),
+            ));
+        }
+        let mut notes = Vec::new();
+        for (branch, base) in &chain {
+            self.checkout_branch(branch)?;
+            // force-with-lease + set upstream: a stack submit re-pushes rewritten
+            // branches, but only when the remote still matches ours.
+            self.push(false, true, true, report)?;
+            notes.push(crate::workflow::open_pull_request(branch, base));
+        }
+        let _ = self.checkout_branch(&start);
+        Ok(notes)
+    }
+
     fn prune_merged(&self, base: &str) -> Result<Vec<String>, GitError> {
         self.snap("prune");
         let repo = self.repo.lock().expect("repo mutex");
