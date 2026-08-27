@@ -243,8 +243,22 @@ a.aside{color:var(--dim);} a.aside:hover{color:var(--acc);}
 .row{display:grid; align-items:baseline; gap:11px; padding:6px 14px 6px 22px; border-bottom:1px solid var(--line);
   position:relative;}
 .row:last-child{border-bottom:0;}
-.row.on{background:var(--sunk);}
-.row.on::before{content:"\25B8"; position:absolute; left:8px; top:6px; color:var(--acc); font-size:10px;}
+.row.kbcur{background:var(--sunk);}
+.row.kbcur::before{content:"\25B8"; position:absolute; left:8px; top:6px; color:var(--acc); font-size:10px;}
+/* Keyboard cursor (j/k): a soft tint and a thin left accent rail, never a hard
+   box. Block points (cards, search hits) and inline fallback links share it. */
+[data-point].kbcur:not(.row){background:var(--sunk); box-shadow:inset 2px 0 0 var(--acc); border-radius:4px;}
+tr[data-point].kbcur{background:var(--sunk); box-shadow:inset 2px 0 0 var(--acc);}
+/* Inline fallback links (sidebar, explorer): an accent underline reads cleaner
+   than a box around a run of text. */
+a.kbcur:not([data-point]){text-decoration:underline; text-decoration-color:var(--acc); text-decoration-thickness:2px; text-underline-offset:3px; color:var(--acc-ink);}
+/* Focused pane (h/l): a continuous left rail, drawn as an overlay so inner cards
+   cannot chop it into segments the way an inset shadow gets occluded. Only the
+   static main/list panes get position:relative; the explorer and info sidebar
+   are already position:sticky (a relative override there would cancel sticky and
+   drop them 96px via their top:96px), and sticky already anchors the overlay. */
+.content, .treemain{position:relative;}
+[data-pane].panefocus::before{content:""; position:absolute; left:0; top:0; bottom:0; width:2px; background:var(--acc); border-radius:2px; z-index:3; pointer-events:none;}
 .row .hash{color:var(--acc-ink); font-weight:500;} .row .hash a{color:var(--acc-ink);} .row .hash a:hover{text-decoration:underline;}
 .row .subj{color:var(--ink); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
 .row .meta{color:var(--faint); font-size:11.5px; white-space:nowrap;} .row .meta .a{color:var(--dim);}
@@ -421,10 +435,27 @@ if(tb) tb.addEventListener('click',function(){
   var n=root.getAttribute('data-theme')==='dark'?'light':'dark';
   root.setAttribute('data-theme',n); try{localStorage.setItem('rgit-theme',n);}catch(e){}
 });
-function rows(){return Array.prototype.slice.call(document.querySelectorAll('[data-point]'));}
-function cur(){return document.querySelector('[data-point].on');}
+function slice(n){return Array.prototype.slice.call(n);}
+// j/k operate within the focused pane when one is set (h/l), else the whole
+// page. A pane with no explicit [data-point] rows falls back to its links, so
+// every pane - sidebar included - is navigable.
+// Leaf panes only: a pane that contains another pane (e.g. the content column
+// wrapping the file explorer + code) is a container, not a focus target.
+function panes(){return slice(document.querySelectorAll('[data-pane]')).filter(function(p){return !p.querySelector('[data-pane]');});}
+function apane(){return document.querySelector('[data-pane].panefocus');}
+function scopeEl(){return apane()||document;}
+function rows(){var s=scopeEl(); var p=s.querySelectorAll('[data-point]'); if(p.length)return slice(p);
+  if(s!==document)return slice(s.querySelectorAll('a[href]')); return [];}
+function cur(){return document.querySelector('.kbcur');}
 function move(d){var r=rows(); if(!r.length)return; var c=cur(); var i=c?r.indexOf(c):-1;
-  i=Math.max(0,Math.min(r.length-1,i+d)); if(c)c.classList.remove('on'); r[i].classList.add('on'); r[i].scrollIntoView({block:'nearest'});}
+  if(i<0&&d<0)i=0; i=Math.max(0,Math.min(r.length-1,i+d));
+  if(c)c.classList.remove('kbcur'); r[i].classList.add('kbcur'); r[i].scrollIntoView({block:'nearest'});}
+// h/l move focus between panes; the cursor jumps into the newly focused pane.
+function focusPane(d){var ps=panes(); if(ps.length<2)return;
+  var f=apane(); var i=f?ps.indexOf(f):(d>0?-1:0); i=(i+d+ps.length)%ps.length;
+  ps.forEach(function(p){p.classList.remove('panefocus');});
+  var c=cur(); if(c)c.classList.remove('kbcur');
+  ps[i].classList.add('panefocus'); ps[i].scrollIntoView({block:'nearest'}); move(1);}
 var toastEl=document.getElementById('toast');
 function toast(msg){ if(!toastEl)return; toastEl.textContent=msg; toastEl.classList.add('show'); setTimeout(function(){toastEl.classList.remove('show');},1100); }
 document.addEventListener('click',function(e){
@@ -665,7 +696,9 @@ document.addEventListener('keydown',function(e){
     try{navigator.clipboard.writeText(new URL(url,location.href).href);}catch(x){} toast('permalink copied');return;}
   if(e.key==='j'){e.preventDefault();move(1);}
   else if(e.key==='k'){e.preventDefault();move(-1);}
-  else if(e.key==='Enter'){var c=cur(); var a=c&&c.querySelector('a[data-go]'); if(a)location.href=a.href;}
+  else if(e.key==='l'){e.preventDefault();focusPane(1);}
+  else if(e.key==='h'){e.preventDefault();focusPane(-1);}
+  else if(e.key==='Enter'){var c=cur(); if(c){var a=c.matches('a[href]')?c:(c.querySelector('a[data-go]')||c.querySelector('a[href]')); if(a)location.href=a.href;}}
   else if(e.key>='1'&&e.key<='6'){var t=document.querySelectorAll('nav.tabs a')[+e.key-1]; if(t)location.href=t.href;}
 });
 "#;

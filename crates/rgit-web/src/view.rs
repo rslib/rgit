@@ -180,8 +180,8 @@ pub fn layout(
                     }
                 }
                 main.shell {
-                    div.content { (body) }
-                    aside.side {
+                    div.content data-pane="main" { (body) }
+                    aside.side data-pane="side" {
                         @if let Some(c) = ctx_card { (c) }
                         (sidebar(base, side))
                     }
@@ -190,13 +190,14 @@ pub fn layout(
                     span.mode { (active.to_uppercase()) }
                     @if !ctx_line.is_empty() { span.ctxl.m { (ctx_line) } }
                     span.sp {}
-                    span.keys.m { b { "j/k" } " move  " b { "t" } " find  " b { "y" } " link  " b { "?" } " keys" }
+                    span.keys.m { b { "j/k" } " move  " b { "h/l" } " pane  " b { "t" } " find  " b { "y" } " link  " b { "?" } " keys" }
                 }
                 div.scrim id="scrim" {}
                 div id="whichkey" {
                     h3 { "Keys" }
                     div.wk {
                         div { kbd { "j" } kbd { "k" } span.d { "move cursor" } }
+                        div { kbd { "h" } kbd { "l" } span.d { "switch pane" } }
                         div { kbd { "RET" } span.d { "open at point" } }
                         div { kbd { "1" } "-" kbd { "6" } span.d { "switch view" } }
                         div { kbd { ":" } span.d { "command palette" } }
@@ -401,8 +402,8 @@ fn plain_layout(title: &str, content: Markup, sidebar: Markup) -> Markup {
                     button.ib id="theme" title="Theme" { "\u{25d1}" }
                 }
                 main.shell {
-                    div.content { (content) }
-                    aside.side { (sidebar) }
+                    div.content data-pane="main" { (content) }
+                    aside.side data-pane="side" { (sidebar) }
                 }
                 script { (PreEscaped(assets::JS)) }
             }
@@ -490,7 +491,7 @@ pub fn index(repos: &[RepoCard]) -> Markup {
         }
         div.repogrid {
             @for r in repos {
-                a.repocard href=(format!("/{}", r.name)) data-name=(r.name) {
+                a.repocard href=(format!("/{}", r.name)) data-name=(r.name) data-point {
                     div.rctop { span.rcicon { "\u{1f4e6}" } span.rcname.m { (r.name) } }
                     @if let Some(d) = &r.description { p.rcdesc { (d) } }
                     div.rcstats {
@@ -827,7 +828,7 @@ fn explorer_aside(base: &str, rev: &str, files: &[String], path: &str, current: 
     let root = build_file_tree(files);
     let open: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     html! {
-        aside.explorer {
+        aside.explorer data-pane="explorer" {
             div.eh { "Files" }
             div.etree { (render_explorer(&root, "", &open, base, rev, current)) }
         }
@@ -848,7 +849,7 @@ pub fn tree(
     let body = html! {
       div.treegrid {
         (explorer_aside(base, rev, files, path, ""))
-        div.treemain {
+        div.treemain data-pane="main" {
         div.sec {
             div.body {
                 (crumb(base, rev, path))
@@ -912,7 +913,7 @@ pub fn blob(
     let body = html! {
       div.treegrid {
         (explorer_aside(base, rev, files, dir, &blob.path))
-        div.treemain {
+        div.treemain data-pane="main" {
         div.sec {
             div.body {
                 (file_header(&blob.path, Some(&size), &tabs, Some(permalink)))
@@ -1146,10 +1147,10 @@ pub fn refs(repo: &str, base: &str, side: &SideInfo, entries: &[RefEntry]) -> Ma
                     div.h { span.title { (title) } span.count { (rows.len()) } }
                     div.body { table.tbl {
                         @for r in rows {
-                            tr {
+                            tr data-point {
                                 td {
                                     span class=(if tag { "gl t" } else { "gl" }) { (glyph) }
-                                    span.nm { a href=(at(base, &r.name, "/tree")) { (r.name) } }
+                                    span.nm { a data-go href=(at(base, &r.name, "/tree")) { (r.name) } }
                                     @if r.is_head { " " span.badge { "HEAD" } }
                                 }
                             }
@@ -1213,12 +1214,12 @@ fn group_by_file(matches: &[GrepMatch]) -> Vec<(&str, Vec<&GrepMatch>)> {
 fn result_files(groups: &[(&str, Vec<&GrepMatch>)], mark: &str, link: impl Fn(&str) -> String) -> Markup {
     html! {
         @for (path, ms) in groups {
-            div.srfile {
-                a.srpath.m href=(link(path)) { (path) }
+            div.srfile data-point {
+                a.srpath.m data-go href=(link(path)) { (path) }
                 span.srn { (ms.len()) }
             }
             @for m in ms {
-                a.srline href=(format!("{}#L{}", link(path), m.line)) {
+                a.srline data-point href=(format!("{}#L{}", link(path), m.line)) {
                     span.srlno.m { (m.line) }
                     span.srtext.m { (highlight_match(path, &m.text, mark)) }
                 }
@@ -1310,7 +1311,7 @@ fn sem_hit(hit: &rgit_index::SearchHit, repo: Option<&str>) -> Markup {
     };
     let syntax = highlight::syntax_for_path(&hit.path);
     html! {
-        a.semhit href=(href) {
+        a.semhit data-point href=(href) {
             div.semtop {
                 span.sempath.m { (shown) }
                 span.semloc.m { "L" (hit.start_line) "-" (hit.end_line) }
