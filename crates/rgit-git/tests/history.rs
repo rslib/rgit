@@ -374,3 +374,207 @@ fn rebase_abort_cleans_up_a_cli_started_rebase() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn message(dir: &Path, rev: &str) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["log", "-1", "--format=%B", rev])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+fn count(dir: &Path) -> usize {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+fn commit(dir: &Path, file: &str, content: &str, msg: &str) {
+    std::fs::write(dir.join(file), content).unwrap();
+    git(dir, &["add", file]);
+    git(dir, &["commit", "-qm", msg]);
+}
+
+#[test]
+fn reword_changes_message_and_replays_descendants() {
+    let dir = init_repo("reword");
+    commit(&dir, "a", "a\n", "A");
+    commit(&dir, "b", "b\n", "B");
+    commit(&dir, "c", "c\n", "C");
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.reword("HEAD~1", "B reworded").unwrap();
+
+    assert_eq!(count(&dir), 3, "commit count is unchanged");
+    assert!(message(&dir, "HEAD~1").starts_with("B reworded"));
+    assert_eq!(message(&dir, "HEAD"), "C", "C still on top, message intact");
+    assert!(dir.join("c").exists() && dir.join("b").exists() && dir.join("a").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn uncommit_keeps_changes_staged() {
+    let dir = init_repo("uncommit");
+    commit(&dir, "f", "v1\n", "A");
+    let a = head(&dir);
+    commit(&dir, "f", "v2\n", "B");
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.uncommit(1).unwrap();
+
+    assert_eq!(head(&dir), a, "HEAD moved back to A");
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["diff", "--cached", "--name-only"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "f", "B's change is staged");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn squash_folds_a_commit_into_its_parent() {
+    let dir = init_repo("squash");
+    commit(&dir, "a", "a\n", "A");
+    commit(&dir, "b", "b\n", "B");
+    commit(&dir, "c", "c\n", "C");
+    commit(&dir, "d", "d\n", "D");
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.squash("HEAD~1").unwrap(); // fold C into B
+
+    assert_eq!(count(&dir), 3, "one fewer commit");
+    for f in ["a", "b", "c", "d"] {
+        assert!(dir.join(f).exists(), "{f} preserved");
+    }
+    assert!(message(&dir, "HEAD~1").contains('C'), "B now mentions C");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn squash_range_folds_many_into_one() {
+    let dir = init_repo("squash-range");
+    commit(&dir, "base", "base\n", "base");
+    let base = head(&dir);
+    for n in 1..=3 {
+        commit(&dir, "f", &format!("wip{n}\n"), &format!("wip {n}"));
+    }
+    assert_eq!(count(&dir), 4);
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.squash_range("HEAD~3").unwrap();
+
+    assert_eq!(count(&dir), 2, "the three wip commits became one");
+    assert_eq!(parent(&dir, "HEAD"), base, "the fold sits on base");
+    assert_eq!(std::fs::read_to_string(dir.join("f")).unwrap(), "wip3\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn split_by_path_makes_two_commits() {
+    let dir = init_repo("split");
+    std::fs::write(dir.join("a"), "base\n").unwrap();
+    std::fs::write(dir.join("b"), "base\n").unwrap();
+    git(&dir, &["add", "a", "b"]);
+    git(&dir, &["commit", "-qm", "base"]);
+    std::fs::write(dir.join("a"), "base\nx\n").unwrap();
+    std::fs::write(dir.join("b"), "base\ny\n").unwrap();
+    git(&dir, &["add", "a", "b"]);
+    git(&dir, &["commit", "-qm", "change a and b"]);
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.split("HEAD", &["a".to_owned()]).unwrap();
+
+    assert_eq!(count(&dir), 3, "the commit became two");
+    // Part 1 (HEAD~1) touches only a; part 2 (HEAD) only b.
+    let names = |rev: &str| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["show", "--name-only", "--format=", rev])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    assert_eq!(names("HEAD~1"), "a");
+    assert_eq!(names("HEAD"), "b");
+    assert_eq!(std::fs::read_to_string(dir.join("a")).unwrap(), "base\nx\n");
+    assert_eq!(std::fs::read_to_string(dir.join("b")).unwrap(), "base\ny\n");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn move_reorders_independent_commits() {
+    let dir = init_repo("move");
+    commit(&dir, "base", "base\n", "base");
+    commit(&dir, "a", "a\n", "add a");
+    commit(&dir, "b", "b\n", "add b");
+    commit(&dir, "c", "c\n", "add c");
+    let add_c = head(&dir);
+    let add_a = String::from_utf8_lossy(
+        &Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["rev-parse", "HEAD~2"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_owned();
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.reorder(&add_c, &add_a, true).unwrap(); // move c before a
+
+    assert_eq!(count(&dir), 4);
+    for f in ["base", "a", "b", "c"] {
+        assert!(dir.join(f).exists(), "{f} preserved");
+    }
+    // add c is now below add a.
+    assert!(message(&dir, "HEAD~2").starts_with("add c"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prune_deletes_only_merged_branches() {
+    let dir = init_repo("prune");
+    commit(&dir, "base", "base\n", "base");
+    git(&dir, &["branch", "merged"]);
+    git(&dir, &["checkout", "-q", "merged"]);
+    commit(&dir, "m", "m\n", "on merged");
+    git(&dir, &["checkout", "-q", "main"]);
+    git(&dir, &["merge", "-q", "--no-ff", "merged", "-m", "merge"]);
+    git(&dir, &["branch", "open"]);
+    git(&dir, &["checkout", "-q", "open"]);
+    commit(&dir, "o", "o\n", "on open");
+    git(&dir, &["checkout", "-q", "main"]);
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let deleted = backend.prune_merged("HEAD").unwrap();
+
+    assert_eq!(deleted, vec!["merged".to_owned()]);
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["branch", "--format=%(refname:short)"])
+        .output()
+        .unwrap();
+    let branches = String::from_utf8_lossy(&out.stdout);
+    assert!(branches.contains("open") && branches.contains("main"));
+    assert!(!branches.contains("merged"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
