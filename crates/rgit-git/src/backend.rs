@@ -270,6 +270,14 @@ pub trait GitBackend: Send + Sync {
     /// order): each `(short_id, subject)`.
     fn commits_between(&self, base: &str) -> Result<Vec<(String, String)>, GitError>;
 
+    /// Walk up to `max_commits` of HEAD's first-parent history and accumulate,
+    /// per changed file path, how many commits touched it and the newest such
+    /// commit's author time. Used to churn- and recency-weight search results.
+    fn file_activity(
+        &self,
+        max_commits: usize,
+    ) -> Result<std::collections::HashMap<String, crate::FileActivity>, GitError>;
+
     /// Abort an in-progress rebase, restoring the pre-rebase HEAD. Shells out to
     /// `git` so it works for CLI-started (interactive) rebases too, which libgit2
     /// cannot drive.

@@ -1008,6 +1008,59 @@ impl GitBackend for Git2Backend {
         Ok(out)
     }
 
+    fn file_activity(
+        &self,
+        max_commits: usize,
+    ) -> Result<std::collections::HashMap<String, crate::FileActivity>, GitError> {
+        use std::collections::HashMap;
+        let repo = self.repo.lock().expect("repo mutex");
+        let mut acc: HashMap<String, crate::FileActivity> = HashMap::new();
+        // First-parent walk: on a merge, count the mainline change once rather
+        // than re-counting every side-branch commit the merge brought in.
+        let mut commit = match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
+            Some(c) => c,
+            None => return Ok(acc),
+        };
+        let mut opts = DiffOptions::new();
+        for _ in 0..max_commits {
+            let when = commit.time().seconds();
+            let tree = commit.tree()?;
+            let parent = commit.parent(0).ok();
+            let parent_tree = match parent.as_ref() {
+                Some(p) => Some(p.tree()?),
+                None => None,
+            };
+            let diff =
+                repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
+            for i in 0..diff.deltas().len() {
+                let Some(delta) = diff.get_delta(i) else {
+                    continue;
+                };
+                let Some(path) = delta
+                    .new_file()
+                    .path()
+                    .or_else(|| delta.old_file().path())
+                    .map(|p| p.to_string_lossy().into_owned())
+                else {
+                    continue;
+                };
+                let e = acc.entry(path).or_insert(crate::FileActivity {
+                    commits: 0,
+                    last_epoch: when,
+                });
+                e.commits += 1;
+                if when > e.last_epoch {
+                    e.last_epoch = when;
+                }
+            }
+            match parent {
+                Some(p) => commit = p,
+                None => break,
+            }
+        }
+        Ok(acc)
+    }
+
     fn rebase_onto(&self, rev: &str, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
         self.snap("rebase");
         let repo = self.repo.lock().expect("repo mutex");

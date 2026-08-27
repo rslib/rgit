@@ -443,6 +443,52 @@ pub fn search(
         .collect())
 }
 
+/// Like [`search`], but multiply each hit's semantic score by
+/// `1 + alpha * boost[path]` before ranking, so a per-path history weight (churn
+/// and recency) reorders results without displacing genuinely relevant ones. A
+/// larger candidate pool is scored so boosting can promote a hit past the plain
+/// semantic top-`k`.
+pub fn search_boosted(
+    index: &Index,
+    embedder: &Embedder,
+    query: &str,
+    k: usize,
+    boost: &std::collections::HashMap<String, f32>,
+    alpha: f32,
+) -> Result<Vec<SearchHit>, IndexError> {
+    if index.is_empty() || query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let q = embedder
+        .embed(vec![query.to_owned()])?
+        .pop()
+        .map(Point)
+        .ok_or_else(|| IndexError::Embed("empty query embedding".into()))?;
+
+    let pool = (k * 5).max(50);
+    let mut search = Search::default();
+    let mut hits: Vec<SearchHit> = index
+        .hnsw
+        .search(&q, &mut search)
+        .take(pool)
+        .map(|item| {
+            let c = &index.records[*item.value as usize].chunk;
+            let semantic = 1.0 - item.distance;
+            let weight = boost.get(&c.path).copied().unwrap_or(0.0);
+            SearchHit {
+                score: semantic * (1.0 + alpha * weight),
+                path: c.path.clone(),
+                start_line: c.start_line,
+                end_line: c.end_line,
+                preview: c.preview.clone(),
+            }
+        })
+        .collect();
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    hits.truncate(k);
+    Ok(hits)
+}
+
 /// Where a repo's index is stored: under `.git/rgit/` for a normal repo, or the
 /// working dir itself when `.git` is not a directory (e.g. a linked worktree).
 pub fn index_path(workdir: &Path) -> PathBuf {

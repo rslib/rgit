@@ -402,6 +402,39 @@ pub struct LanesState {
     pub lanes: Vec<Lane>,
 }
 
+/// How active a file has been across recent history: how many commits touched
+/// it in the walked window and the author time (unix seconds) of the newest such
+/// commit. Feeds churn- and recency-weighted search ranking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileActivity {
+    pub commits: u32,
+    pub last_epoch: i64,
+}
+
+/// Collapse a [`FileActivity`] map into a per-path history weight in `[0, 1]`,
+/// blending recency (newer edits weigh more, ~30-day half-life) and churn (more
+/// commits weigh more, saturating). Callers fold this into search ranking so hot
+/// files surface above cold ones at equal semantic relevance.
+pub fn activity_weights(
+    activity: &std::collections::HashMap<String, FileActivity>,
+) -> std::collections::HashMap<String, f32> {
+    const HALF_LIFE_SECS: f32 = 30.0 * 24.0 * 60.0 * 60.0;
+    const CHURN_MIDPOINT: f32 = 4.0;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    activity
+        .iter()
+        .map(|(path, a)| {
+            let age = (now - a.last_epoch).max(0) as f32;
+            let recency = (-age / HALF_LIFE_SECS * std::f32::consts::LN_2).exp();
+            let churn = a.commits as f32 / (a.commits as f32 + CHURN_MIDPOINT);
+            (path.clone(), 0.6 * recency + 0.4 * churn)
+        })
+        .collect()
+}
+
 /// A commit in the log view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry {

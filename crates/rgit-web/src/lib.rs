@@ -567,6 +567,18 @@ fn embedder() -> Result<&'static rgit_index::Embedder, AppError> {
 
 const SEMANTIC_LIMIT: usize = 40;
 
+/// How strongly git history reorders semantic results, and how far back the
+/// churn/recency walk looks. Mirrors the CLI so both surfaces rank the same way.
+const HISTORY_ALPHA: f32 = 0.5;
+const HISTORY_WINDOW: usize = 500;
+
+/// Per-path churn/recency weights for a repo, empty when history is unavailable.
+fn history_boost(b: &dyn GitBackend) -> HashMap<String, f32> {
+    b.file_activity(HISTORY_WINDOW)
+        .map(|a| rgit_git::activity_weights(&a))
+        .unwrap_or_default()
+}
+
 /// Meaning-based search of one repo's semantic index.
 fn semantic_page(
     b: &dyn GitBackend,
@@ -578,8 +590,11 @@ fn semantic_page(
     let index = rgit_index::load(&rgit_index::index_path(b.workdir()));
     let indexed = index.is_some();
     let hits = match (&index, query.is_empty()) {
-        (Some(idx), false) => rgit_index::search(idx, embedder()?, query, SEMANTIC_LIMIT)
-            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        (Some(idx), false) => {
+            let boost = history_boost(b);
+            rgit_index::search_boosted(idx, embedder()?, query, SEMANTIC_LIMIT, &boost, HISTORY_ALPHA)
+                .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        }
         _ => Vec::new(),
     };
     Ok(view::semantic(
@@ -602,7 +617,15 @@ fn global_semantic_page(reg: &Registry, q: &HashMap<String, String>) -> Result<M
         for name in reg.list() {
             if let Ok(b) = reg.resolve(&name) {
                 if let Some(index) = rgit_index::load(&rgit_index::index_path(b.workdir())) {
-                    if let Ok(hits) = rgit_index::search(&index, embedder, query, SEMANTIC_LIMIT) {
+                    let boost = history_boost(b.as_ref());
+                    if let Ok(hits) = rgit_index::search_boosted(
+                        &index,
+                        embedder,
+                        query,
+                        SEMANTIC_LIMIT,
+                        &boost,
+                        HISTORY_ALPHA,
+                    ) {
                         if !hits.is_empty() {
                             groups.push((name, hits));
                         }

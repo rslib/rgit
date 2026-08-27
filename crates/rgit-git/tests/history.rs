@@ -401,6 +401,51 @@ fn commit(dir: &Path, file: &str, content: &str, msg: &str) {
     git(dir, &["commit", "-qm", msg]);
 }
 
+/// Commit `file` with an explicit author/committer date (RFC 2822 or a git
+/// approxidate), so tests can pin recency.
+fn commit_at(dir: &Path, file: &str, content: &str, msg: &str, date: &str) {
+    std::fs::write(dir.join(file), content).unwrap();
+    git(dir, &["add", file]);
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["commit", "-qm", msg])
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn file_activity_counts_churn_and_recency() {
+    let dir = init_repo("activity");
+    // hot: touched three times, most recently. cold: once, long ago.
+    commit_at(&dir, "cold", "c0\n", "cold", "2020-01-01T00:00:00");
+    commit_at(&dir, "hot", "h0\n", "hot 1", "2020-02-01T00:00:00");
+    commit_at(&dir, "hot", "h1\n", "hot 2", "2020-03-01T00:00:00");
+    commit_at(&dir, "hot", "h2\n", "hot 3", "2025-06-01T00:00:00");
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let activity = backend.file_activity(100).unwrap();
+
+    let hot = activity.get("hot").expect("hot tracked");
+    let cold = activity.get("cold").expect("cold tracked");
+    assert_eq!(hot.commits, 3);
+    assert_eq!(cold.commits, 1);
+    assert!(hot.last_epoch > cold.last_epoch);
+
+    let weights = rgit_git::activity_weights(&activity);
+    assert!(
+        weights["hot"] > weights["cold"],
+        "hot {} should outweigh cold {}",
+        weights["hot"],
+        weights["cold"]
+    );
+}
+
 #[test]
 fn reword_changes_message_and_replays_descendants() {
     let dir = init_repo("reword");

@@ -731,9 +731,14 @@ fn hybrid_hits(backend: &Arc<dyn GitBackend>, repo: &str, query: &str, pool: usi
     const CHUNK_STEP: usize = 30;
 
     let semantic = match rgit_index::load(&rgit_index::index_path(backend.workdir())) {
-        Some(index) => rgit_index::Embedder::new()
-            .and_then(|e| rgit_index::search(&index, &e, query, pool))
-            .unwrap_or_default(),
+        Some(index) => {
+            let boost = history_boost(backend);
+            rgit_index::Embedder::new()
+                .and_then(|e| {
+                    rgit_index::search_boosted(&index, &e, query, pool, &boost, HISTORY_ALPHA)
+                })
+                .unwrap_or_default()
+        }
         None => Vec::new(),
     };
     let lexical = backend
@@ -819,6 +824,20 @@ pub(crate) fn code_search(
     Ok(out.trim_end().to_owned())
 }
 
+/// How strongly git history reorders semantic results, and how far back the
+/// churn/recency walk looks.
+const HISTORY_ALPHA: f32 = 0.5;
+const HISTORY_WINDOW: usize = 500;
+
+/// Per-path churn/recency weights for a repo, or an empty map when history is
+/// unavailable (a shallow or empty repo). Never fails the search.
+fn history_boost(backend: &Arc<dyn GitBackend>) -> std::collections::HashMap<String, f32> {
+    backend
+        .file_activity(HISTORY_WINDOW)
+        .map(|a| rgit_git::activity_weights(&a))
+        .unwrap_or_default()
+}
+
 /// Semantic-only search over a scope (one repo, or every repo under `root`).
 pub(crate) fn semantic_search(
     backend: &Arc<dyn GitBackend>,
@@ -832,7 +851,8 @@ pub(crate) fn semantic_search(
     let mut hits: Vec<(f32, String, rgit_index::SearchHit)> = Vec::new();
     for (label, b) in &targets {
         if let Some(index) = rgit_index::load(&rgit_index::index_path(b.workdir())) {
-            for h in rgit_index::search(&index, &embedder, query, limit)
+            let boost = history_boost(b);
+            for h in rgit_index::search_boosted(&index, &embedder, query, limit, &boost, HISTORY_ALPHA)
                 .map_err(|e| anyhow::anyhow!("{e}"))?
             {
                 hits.push((h.score, label.clone(), h));
