@@ -1845,6 +1845,33 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn squash_range(&self, from: &str) -> Result<(), GitError> {
+        self.snap("squash");
+        {
+            let repo = self.repo.lock().expect("repo mutex");
+            let branch_ref = head_branch_ref(&repo)?;
+            let base = repo.revparse_single(from)?.peel_to_commit()?;
+            let head = repo.head()?.peel_to_commit()?;
+            if base.id() == head.id() {
+                return Err(GitError::Other("nothing to squash".to_owned()));
+            }
+            let chain = first_parent_chain(&repo, base.id())?; // [HEAD.., base]
+            // Folded commits, oldest first (base's child up to HEAD).
+            let folded: Vec<&git2::Commit> = chain.iter().rev().skip(1).collect();
+            let mut msg = String::new();
+            for c in &folded {
+                msg.push_str(c.message().unwrap_or("").trim_end());
+                msg.push_str("\n\n");
+            }
+            let msg = crate::change_id::preserve(head.message().unwrap_or(""), msg.trim_end());
+            let sig = repo.signature()?;
+            let new = repo.commit(None, &head.author(), &sig, &msg, &head.tree()?, &[&base])?;
+            repo.reference(&branch_ref, new, true, "rgit squash range")?;
+        }
+        let _ = self.restack();
+        Ok(())
+    }
+
     fn squash(&self, rev: &str) -> Result<(), GitError> {
         self.snap("squash");
         {

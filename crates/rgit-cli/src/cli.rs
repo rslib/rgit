@@ -141,11 +141,15 @@ pub enum Command {
         #[arg(default_value_t = 1)]
         n: usize,
     },
-    /// Fold a commit into its parent and restack descendants (default HEAD).
+    /// Fold a commit into its parent (default HEAD), or a whole range with
+    /// `--from` (fold every commit after <rev> up to HEAD into one).
     Squash {
         /// The commit to squash into its parent (default HEAD).
         #[arg(default_value = "HEAD")]
         rev: String,
+        /// Fold every commit after this one, up to HEAD, into a single commit.
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Split a commit into two by path (given paths first, the rest second).
     Split {
@@ -942,10 +946,16 @@ pub fn run(
             backend.uncommit(n)?;
             format!("uncommitted {n} commit(s); changes kept staged")
         }
-        Command::Squash { rev } => {
-            backend.squash(&rev)?;
-            format!("squashed {rev} into its parent")
-        }
+        Command::Squash { rev, from } => match from {
+            Some(base) => {
+                backend.squash_range(&base)?;
+                format!("squashed everything after {base} into one commit")
+            }
+            None => {
+                backend.squash(&rev)?;
+                format!("squashed {rev} into its parent")
+            }
+        },
         Command::Split { rev, paths } => {
             backend.split(&rev, &paths)?;
             format!("split {rev} into two commits")

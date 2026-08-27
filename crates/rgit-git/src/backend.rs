@@ -75,6 +75,11 @@ pub trait GitBackend: Send + Sync {
     /// changes, the second gets the rest, then replay descendants. Op-log-safe.
     fn split(&self, rev: &str, paths: &[String]) -> Result<(), GitError>;
 
+    /// Fold every commit after `from` up to HEAD into a single commit on `from`
+    /// (HEAD's tree, joined messages). `from` must be an ancestor of HEAD.
+    /// Op-log-safe.
+    fn squash_range(&self, from: &str) -> Result<(), GitError>;
+
     /// The directory git resolves hooks from (`core.hooksPath` or
     /// `<git-dir>/hooks`), so the caller can run and stream them itself.
     fn hooks_dir(&self) -> std::path::PathBuf;
