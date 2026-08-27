@@ -155,14 +155,29 @@ a.aside{color:var(--dim);} a.aside:hover{color:var(--acc);}
 .hsearch input{flex:1; border:0; outline:0; background:transparent; color:var(--ink); font-family:var(--mono); font-size:12.5px; padding:0 10px; min-width:40px;}
 .hsearch input::placeholder{color:var(--faint);}
 .hsearch .slash{font-family:var(--mono); font-size:11px; color:var(--faint); border:1px solid var(--line2); border-radius:4px; padding:1px 6px; margin-right:7px;}
-.qhint{position:absolute; top:38px; left:0; right:0; background:var(--panel); border:1px solid var(--line2); border-radius:8px; box-shadow:0 10px 34px rgba(0,0,0,.2); padding:6px; z-index:40; display:none;}
-.hsearch.open .qhint{display:block;}
-.qhint .qh{font-family:var(--mono); font-size:10.5px; color:var(--faint); text-transform:uppercase; letter-spacing:.08em; padding:6px 8px 3px;}
-.qrow{display:flex; align-items:baseline; gap:10px; padding:5px 8px; border-radius:6px;}
-.qrow .k{font-family:var(--mono); font-size:12px; color:var(--acc-ink); min-width:52px;}
-.qrow .d{font-size:12px; color:var(--dim);}
+/* search autocomplete dropdown */
+.aclist{position:absolute; top:38px; left:0; right:0; background:var(--panel); border:1px solid var(--line2); border-radius:8px; box-shadow:0 10px 34px rgba(0,0,0,.2); padding:6px; z-index:40; display:none; max-height:340px; overflow-y:auto;}
+.hsearch.acopen .aclist{display:block;}
+.acitem{display:flex; align-items:baseline; gap:10px; padding:5px 9px; border-radius:6px; cursor:pointer;}
+.acitem.on{background:var(--sunk);}
+.acitem .ack{font-family:var(--mono); font-size:12px; color:var(--acc-ink); white-space:nowrap;}
+.acitem .acd{font-size:12px; color:var(--faint); margin-left:auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
 
 .srhead{padding:12px 14px; border-bottom:1px solid var(--line); font-family:var(--mono); font-size:12.5px; color:var(--dim);} .srhead .srq{color:var(--acc-ink); font-weight:500;}
+.grepo{display:flex; align-items:baseline; gap:8px; padding:10px 14px 6px; border-top:1px solid var(--line); background:var(--sunk);}
+.grepo:first-of-type{border-top:0;} .grepo .grepon{font-size:12.5px; color:var(--acc-ink); font-weight:600;}
+/* text/meaning toggle + semantic hits */
+.modetabs{display:inline-flex; border:1px solid var(--line2); border-radius:7px; overflow:hidden; margin-bottom:14px;}
+.modetabs a{font-family:var(--mono); font-size:11.5px; padding:4px 13px; color:var(--dim); border-right:1px solid var(--line2);}
+.modetabs a:last-child{border-right:0;} .modetabs a:hover{color:var(--acc-ink);}
+.modetabs a.on{background:var(--acc-sb); color:var(--acc-ink);}
+.semhit{display:block; border:1px solid var(--line); border-radius:9px; background:var(--panel); box-shadow:var(--sh); padding:9px 12px; margin-bottom:9px;}
+.semhit:hover{border-color:var(--acc-line);}
+.semtop{display:flex; align-items:baseline; gap:10px;}
+.semtop .sempath{font-size:12.5px; color:var(--acc-ink); font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.semtop .semloc{font-size:11px; color:var(--faint);}
+.semtop .semscore{margin-left:auto; font-size:11px; color:var(--faint);}
+.semprev{margin:7px 0 0; font-family:var(--mono); font-size:12px; color:var(--dim); white-space:pre; overflow-x:auto;}
 .srfile{display:flex; align-items:baseline; gap:8px; padding:10px 14px 5px; border-top:1px solid var(--line);}
 .srfile:first-of-type{border-top:0;}
 .srfile .srpath{font-family:var(--mono); font-size:12px; color:var(--acc-ink); font-weight:500;} .srfile .srn{font-family:var(--mono); font-size:11px; color:var(--faint);}
@@ -432,8 +447,9 @@ if(difflayout){
   function dfWrap(item,h){ return '<div class="dfwrap" data-file="'+item.getAttribute('data-file')+'">'+h+'</div>'; }
   function dfOne(item){ dfMark(item); diffbox.innerHTML='<div class="diffloading">'+(diffbox.getAttribute('data-loading')||'loading')+'</div>';
     dfFetch(item.getAttribute('data-diff')).then(function(h){ diffbox.innerHTML=dfWrap(item,h); }).catch(function(){ diffbox.innerHTML='<div class="diffloading">failed to load diff</div>'; }); }
-  function dfList(){ diffbox.innerHTML=''; var seq=Promise.resolve();
-    dfitems.forEach(function(item){ seq=seq.then(function(){ return dfFetch(item.getAttribute('data-diff')).then(function(h){ diffbox.insertAdjacentHTML('beforeend',dfWrap(item,h)); }); }); }); }
+  function dfList(){ var url=diffbox.getAttribute('data-diffs'); if(!url){ return; }
+    diffbox.innerHTML='<div class="diffloading">'+(diffbox.getAttribute('data-loading')||'loading')+'</div>';
+    fetch(url).then(function(r){return r.text();}).then(function(h){ diffbox.innerHTML=h; }).catch(function(){ diffbox.innerHTML='<div class="diffloading">failed to load diffs</div>'; }); }
   dfitems.forEach(function(item){ item.addEventListener('click',function(e){ e.preventDefault();
     if(dfmode==='one'){ dfOne(item); }
     else { dfMark(item); var t=diffbox.querySelector('.dfwrap[data-file="'+item.getAttribute('data-file')+'"]'); if(t)t.scrollIntoView({block:'start'}); }
@@ -455,12 +471,54 @@ if(repoFilter){ repoFilter.addEventListener('input',function(){ var q=repoFilter
   Array.prototype.forEach.call(document.querySelectorAll('.repocard'),function(c){
     c.style.display=(c.getAttribute('data-name')||'').toLowerCase().indexOf(q)>=0?'':'none'; }); }); }
 
-// Header scoped search: reveal the qualifier hint while focused.
-var hsearch=document.querySelector('.hsearch'), hsInput=hsearch&&hsearch.querySelector('input');
-if(hsearch&&hsInput){
-  hsInput.addEventListener('focus',function(){hsearch.classList.add('open');});
-  hsInput.addEventListener('blur',function(){setTimeout(function(){hsearch.classList.remove('open');},150);});
-}
+// Header search autocomplete: complete qualifiers and their values as you type.
+// repo: from /api/repos, path: from the current repo's file list (single-repo
+// only - too much across all repos), lang:/ext: from static lists.
+var AC_LANGS=['rust','python','javascript','typescript','go','c','cpp','java','kotlin','swift','ruby','php','shell','bash','toml','yaml','json','markdown','html','css','scss','sql','lua','haskell','ocaml','zig','make','cmake','dockerfile','rst'];
+var AC_EXTS=['rs','py','js','mjs','ts','tsx','jsx','go','c','h','cpp','cc','hpp','java','kt','swift','rb','php','sh','bash','toml','yaml','yml','json','md','html','css','scss','sql','lua','zig'];
+var AC_QUALS=[{k:'repo:',d:'one repository'},{k:'lang:',d:'by language'},{k:'path:',d:'by path (single repo)'},{k:'ext:',d:'by extension'}];
+var acRepos=null, acFiles=null;
+function acLoadRepos(cb){ if(acRepos){cb(acRepos);return;} fetch('/api/repos').then(function(r){return r.json();}).then(function(j){acRepos=j||[];cb(acRepos);}).catch(function(){cb([]);}); }
+function acLoadFiles(cb){ if(acFiles){cb(acFiles);return;} if(!BASE){cb([]);return;} fetch(BASE+'/files').then(function(r){return r.text();}).then(function(t){acFiles=t?t.split('\n').filter(Boolean):[];cb(acFiles);}).catch(function(){cb([]);}); }
+var hsInput=null;
+Array.prototype.forEach.call(document.querySelectorAll('.hsearch'),function(hs){
+  var input=hs.querySelector('input'), list=hs.querySelector('.aclist');
+  if(!input||!list) return;
+  if(!hsInput) hsInput=input;
+  var items=[], sel=-1;
+  function token(){ var v=input.value, pos=input.selectionStart==null?v.length:input.selectionStart;
+    var s=pos; while(s>0 && !/\s/.test(v[s-1])) s--; var e=pos; while(e<v.length && !/\s/.test(v[e])) e++;
+    return {start:s, end:e, upto:v.slice(s,pos)}; }
+  function paint(){ var els=list.querySelectorAll('.acitem'); Array.prototype.forEach.call(els,function(el,i){el.classList.toggle('on',i===sel);}); var on=list.querySelector('.acitem.on'); if(on)on.scrollIntoView({block:'nearest'}); }
+  function render(arr){ items=arr; sel=arr.length?0:-1;
+    if(!arr.length){ hs.classList.remove('acopen'); list.innerHTML=''; return; }
+    var h=''; for(var i=0;i<arr.length;i++){ h+='<div class="acitem'+(i===0?' on':'')+'" data-i="'+i+'"><span class="ack">'+esc(arr[i].label)+'</span><span class="acd">'+esc(arr[i].hint||'')+'</span></div>'; }
+    list.innerHTML=h; hs.classList.add('acopen'); }
+  function suggest(){ var t=token(), m=t.upto.match(/^(repo|lang|path|ext):(.*)$/i);
+    if(m){ var key=m[1].toLowerCase(), val=m[2].toLowerCase();
+      if(key==='lang') render(AC_LANGS.filter(function(l){return l.indexOf(val)===0;}).slice(0,30).map(function(l){return {ins:'lang:'+l,label:l,hint:'language'};}));
+      else if(key==='ext') render(AC_EXTS.filter(function(x){return x.indexOf(val)===0;}).slice(0,30).map(function(x){return {ins:'ext:'+x,label:x,hint:'extension'};}));
+      else if(key==='repo') acLoadRepos(function(rs){ render(rs.filter(function(r){return r.toLowerCase().indexOf(val)>=0;}).slice(0,30).map(function(r){return {ins:'repo:'+r,label:r,hint:'repository'};})); });
+      else if(key==='path'){ acLoadFiles(function(fs){ render(fs.filter(function(f){return f.toLowerCase().indexOf(val)>=0;}).slice(0,20).map(function(f){return {ins:'path:'+f,label:f,hint:'path'};})); }); }
+      return; }
+    var q=t.upto.toLowerCase();
+    render(AC_QUALS.filter(function(x){return q===''||x.k.indexOf(q)===0;}).map(function(x){return {ins:x.k,label:x.k,hint:x.d};})); }
+  function accept(i){ if(i<0||i>=items.length)return; var t=token(), v=input.value, ins=items[i].ins;
+    var tail=ins.charAt(ins.length-1)===':'?'':' ';
+    input.value=v.slice(0,t.start)+ins+tail+v.slice(t.end);
+    var p=(v.slice(0,t.start)+ins+tail).length; input.setSelectionRange(p,p);
+    hs.classList.remove('acopen'); input.focus(); if(tail==='') suggest(); }
+  input.addEventListener('input',suggest);
+  input.addEventListener('focus',suggest);
+  input.addEventListener('blur',function(){ setTimeout(function(){hs.classList.remove('acopen');},150); });
+  input.addEventListener('keydown',function(e){ if(!hs.classList.contains('acopen'))return;
+    if(e.key==='ArrowDown'){e.preventDefault(); sel=Math.min(items.length-1,sel+1); paint();}
+    else if(e.key==='ArrowUp'){e.preventDefault(); sel=Math.max(0,sel-1); paint();}
+    else if(e.key==='Tab'){e.preventDefault(); accept(sel);}
+    else if(e.key==='Enter'){ if(items[sel]&&items[sel].ins.charAt(items[sel].ins.length-1)===':'){ e.preventDefault(); accept(sel); } else { hs.classList.remove('acopen'); } }
+    else if(e.key==='Escape'){ hs.classList.remove('acopen'); } });
+  list.addEventListener('mousedown',function(e){ var it=e.target.closest('.acitem'); if(it){ e.preventDefault(); accept(+it.getAttribute('data-i')); } });
+});
 
 // Ref switcher: a searchable branch/tag dropdown (custom component, not a native
 // select). Items are links, so navigation is a plain click; the input filters and

@@ -441,6 +441,8 @@ impl GitBackend for Git2Backend {
             let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
             repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))?
         } else {
+            // Include untracked files so a brand-new file shows as an all-added diff.
+            opts.include_untracked(true).recurse_untracked_dirs(true);
             repo.diff_index_to_workdir(None, Some(&mut opts))?
         };
         Ok(extract(&diff)?.into_iter().find(|f| f.path == path))

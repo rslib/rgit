@@ -71,6 +71,21 @@ fn at(base: &str, rev: &str, rest: &str) -> String {
 /// `ctx_line` is the status-line context (branch/path/sha); `ctx_card` an
 /// optional "At point" card pinned above the sidebar.
 #[allow(clippy::too_many_arguments)]
+/// The header code-search box. `scope` renders a `repo:` pill (multi-repo repo
+/// pages); the empty `.aclist` is filled by the autocomplete JS in `assets`.
+fn search_box(action: &str, scope: Option<&str>, placeholder: &str) -> Markup {
+    html! {
+        form.hsearch method="get" action=(action) {
+            div.sbox {
+                @if let Some(s) = scope { span.scope { "repo:" (s) } }
+                input type="search" name="q" placeholder=(placeholder) autocomplete="off";
+                span.slash { "/" }
+            }
+            div.aclist {}
+        }
+    }
+}
+
 /// The searchable branch/tag dropdown in the tab bar. A styled button opens a
 /// filterable list (Commit context when at a bare rev, then HEAD, branches, and
 /// tags); the JS in `assets` drives the open/filter/keyboard behavior.
@@ -139,21 +154,7 @@ pub fn layout(
                 header {
                     a.logo.m href="/" { "r" b { "git" } " " span style="color:var(--dim);font-weight:400" { "serve" } }
                     span.path { a.m href="/" { "repos" } " / " span.m style="color:var(--acc)" { (repo) } }
-                    form.hsearch method="get" action=(href(base, "/search")) {
-                        div.sbox {
-                            @if !base.is_empty() { span.scope { "repo:" (repo) } }
-                            input type="search" name="q" placeholder="search code\u{2026}" autocomplete="off";
-                            span.slash { "/" }
-                        }
-                        div.qhint {
-                            div.qh { "Qualifiers" }
-                            div.qrow { span.k { "lang:" } span.d { "by language (lang:rust)" } }
-                            div.qrow { span.k { "path:" } span.d { "by path or glob (path:crates/*)" } }
-                            div.qrow { span.k { "ext:" } span.d { "by extension (ext:rs)" } }
-                            div.qrow { span.k { "\u{201c}\u{2026}\u{201d}" } span.d { "exact phrase" } }
-                            div.qrow { span.k { "/re/" } span.d { "regular expression" } }
-                        }
-                    }
+                    (search_box(&href(base, "/search"), (!base.is_empty()).then_some(repo), "search code\u{2026}"))
                     div.cw {
                         button.btn.pri id="cloneBtn" { "\u{2913} Clone" }
                         div.cpop id="cpop" {
@@ -391,11 +392,12 @@ fn plain_layout(title: &str, content: Markup, sidebar: Markup) -> Markup {
                 link rel="preconnect" href="https://fonts.googleapis.com";
                 link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Hanken+Grotesk:wght@400;500;600;700&display=swap";
                 style { (PreEscaped(assets::CSS)) }
+                style { (PreEscaped(highlight::css())) }
             }
             body {
                 header {
                     a.logo.m href="/" { "r" b { "git" } " " span style="color:var(--dim);font-weight:400" { "serve" } }
-                    span.sp {}
+                    (search_box("/search", None, "search all repos\u{2026}"))
                     button.ib id="theme" title="Theme" { "\u{25d1}" }
                 }
                 main.shell {
@@ -701,11 +703,7 @@ fn change_rows(base: &str, entries: &[&StatusEntry], kind: Change) -> Markup {
             div class="row change" data-point {
                 span class=(format!("stc {cls}")) { (get(e)) }
                 span.stp.m {
-                    @if matches!(kind, Change::Untracked) {
-                        a data-go href=(href(base, &format!("/blob/{}", e.path))) { (e.path) }
-                    } @else {
-                        a data-go href=(href(base, &format!("/diff/{}{}", e.path, if staged { "?staged=1" } else { "" }))) { (e.path) }
-                    }
+                    a data-go href=(href(base, &format!("/diff/{}{}", e.path, if staged { "?staged=1" } else { "" }))) { (e.path) }
                     @if let Some(o) = &e.orig_path { span.storig { " \u{2190} " (o) } }
                 }
             }
@@ -1016,9 +1014,10 @@ pub fn commit(repo: &str, base: &str, side: &SideInfo, d: &CommitOverview) -> Ma
                         }
                     }
                 } }
-                // Diffs load on demand (one file per request) so a commit that
-                // touches many files does not render every hunk up front.
-                div id="diffbox" data-loading="loading diff\u{2026}" {}
+                // Diffs load on demand: "one" fetches a single file, "list"
+                // fetches them all in one request. Either way the commit page
+                // itself never renders every hunk up front.
+                div id="diffbox" data-loading="loading diff\u{2026}" data-diffs=(href(base, &format!("/commit/{}/diffs", d.id))) {}
             }
         }
     };
@@ -1038,6 +1037,16 @@ pub fn diff_fragment(diff: Option<&FileDiff>) -> Markup {
     match diff {
         Some(f) => diff_file(0, f),
         None => html! { div.sec { div.body { div.binary { "no changes for this file" } } } },
+    }
+}
+
+/// Every file's diff for a commit, each wrapped with its index, for the "list"
+/// mode's single bulk request.
+pub fn commit_diffs_fragment(files: &[FileDiff]) -> Markup {
+    html! {
+        @for (i, f) in files.iter().enumerate() {
+            div.dfwrap data-file=(i) { (diff_file(0, f)) }
+        }
     }
 }
 
@@ -1187,8 +1196,8 @@ pub fn blame(repo: &str, base: &str, side: &SideInfo, path: &str, lines: &[Blame
     layout(repo, base, "tree", "", side, path, None, "HEAD", body)
 }
 
-pub fn search(repo: &str, base: &str, side: &SideInfo, query: &str, matches: &[GrepMatch]) -> Markup {
-    // Group consecutive matches by file (grep returns them path-sorted).
+/// Group consecutive path-sorted matches into (path, matches) runs.
+fn group_by_file(matches: &[GrepMatch]) -> Vec<(&str, Vec<&GrepMatch>)> {
     let mut groups: Vec<(&str, Vec<&GrepMatch>)> = Vec::new();
     for m in matches {
         match groups.last_mut() {
@@ -1196,7 +1205,43 @@ pub fn search(repo: &str, base: &str, side: &SideInfo, query: &str, matches: &[G
             _ => groups.push((&m.path, vec![m])),
         }
     }
+    groups
+}
+
+/// One search-result run of files, with each line syntax-highlighted and the
+/// match marked. `mark` is the pattern to emphasize; `link` builds the blob href.
+fn result_files(groups: &[(&str, Vec<&GrepMatch>)], mark: &str, link: impl Fn(&str) -> String) -> Markup {
+    html! {
+        @for (path, ms) in groups {
+            div.srfile {
+                a.srpath.m href=(link(path)) { (path) }
+                span.srn { (ms.len()) }
+            }
+            @for m in ms {
+                a.srline href=(format!("{}#L{}", link(path), m.line)) {
+                    span.srlno.m { (m.line) }
+                    span.srtext.m { (highlight_match(path, &m.text, mark)) }
+                }
+            }
+        }
+    }
+}
+
+/// The text/meaning toggle shown on the search and semantic pages.
+fn search_modes(base: &str, query: &str, active: &str) -> Markup {
+    let q = q_encode(query);
+    html! {
+        div.modetabs {
+            a class=(if active == "text" { "on" } else { "" }) href=(href(base, &format!("/search?q={q}"))) { "text" }
+            a class=(if active == "meaning" { "on" } else { "" }) href=(href(base, &format!("/semantic?q={q}"))) { "meaning" }
+        }
+    }
+}
+
+pub fn search(repo: &str, base: &str, side: &SideInfo, query: &str, pattern: &str, matches: &[GrepMatch]) -> Markup {
+    let groups = group_by_file(matches);
     let body = html! {
+        (search_modes(base, query, "text"))
         div.sec { div.body {
             @if query.is_empty() {
                 div.binary { "type a query in the search box" }
@@ -1204,41 +1249,231 @@ pub fn search(repo: &str, base: &str, side: &SideInfo, query: &str, matches: &[G
                 div.binary { "no matches for \u{201c}" (query) "\u{201d}" }
             } @else {
                 div.srhead { (matches.len()) " matches in " (groups.len()) " files for \u{201c}" span.srq { (query) } "\u{201d}" }
-                @for (path, ms) in &groups {
-                    div.srfile {
-                        a.srpath.m href=(href(base, &format!("/blob/{path}"))) { (path) }
-                        span.srn { (ms.len()) }
-                    }
-                    @for m in ms {
-                        a.srline href=(href(base, &format!("/blob/{path}#L{}", m.line))) {
-                            span.srlno.m { (m.line) }
-                            span.srtext.m { (mark_match(&m.text, query)) }
-                        }
-                    }
-                }
+                (result_files(&groups, pattern, |p| href(base, &format!("/blob/{p}"))))
             }
         } }
     };
     layout(repo, base, "search", "", side, query, None, "HEAD", body)
 }
 
-/// Escape a line and wrap the first case-insensitive match of `query` in `<mark>`.
-fn mark_match(line: &str, query: &str) -> Markup {
-    let lower = line.to_lowercase();
-    let ql = query.to_lowercase();
-    match lower.find(&ql) {
-        Some(i) if !ql.is_empty() => {
-            let (a, rest) = line.split_at(i);
-            let (m, b) = rest.split_at(query.len().min(rest.len()));
-            PreEscaped(format!(
-                "{}<mark>{}</mark>{}",
-                html_escape(a),
-                html_escape(m),
-                html_escape(b)
-            ))
+/// The cross-repo search page: results grouped by repo, then file.
+pub fn global_search(query: &str, pattern: &str, groups: &[(String, Vec<GrepMatch>)]) -> Markup {
+    let total: usize = groups.iter().map(|(_, m)| m.len()).sum();
+    let content = html! {
+        div.sec { div.body {
+            @if query.is_empty() {
+                div.binary { "search every repository from here" }
+            } @else if groups.is_empty() {
+                div.binary { "no matches for \u{201c}" (query) "\u{201d}" }
+            } @else {
+                div.srhead { (total) " matches in " (groups.len()) " repositories for \u{201c}" span.srq { (query) } "\u{201d}" }
+                @for (repo, ms) in groups {
+                    div.grepo { span.grepon.m { (repo) } span.srn { (ms.len()) } }
+                    (result_files(&group_by_file(ms), pattern, |p| format!("/{repo}/blob/{p}")))
+                }
+            }
+        } }
+    };
+    let sidebar = html! {
+        @if !groups.is_empty() {
+            div.card {
+                div.ch { "By repository" }
+                div.cb {
+                    @for (repo, ms) in groups {
+                        div.langrow { span.langl { (repo) } span.langn { (ms.len()) } }
+                    }
+                }
+            }
         }
-        _ => PreEscaped(html_escape(line)),
+        div.card {
+            div.ch { "Scope" }
+            div.cb {
+                p.desc { "Add " span.m style="color:var(--acc-ink)" { "repo:" } " to search one repo, "
+                    span.m style="color:var(--acc-ink)" { "lang:" } " / " span.m style="color:var(--acc-ink)" { "path:" }
+                    " to narrow, or " span.m style="color:var(--acc-ink)" { "/re/" } " for a regex." }
+            }
+        }
+    };
+    plain_layout("rgit / search", content, sidebar)
+}
+
+/// One semantic hit: score, path with line range, and a code preview linking to
+/// the blob at that line. `repo` prefixes the path for cross-repo results.
+fn sem_hit(hit: &rgit_index::SearchHit, repo: Option<&str>) -> Markup {
+    let href = match repo {
+        Some(r) => format!("/{r}/blob/{}#L{}", hit.path, hit.start_line),
+        None => format!("/blob/{}#L{}", hit.path, hit.start_line),
+    };
+    let shown = match repo {
+        Some(r) => format!("{r}/{}", hit.path),
+        None => hit.path.clone(),
+    };
+    let syntax = highlight::syntax_for_path(&hit.path);
+    html! {
+        a.semhit href=(href) {
+            div.semtop {
+                span.sempath.m { (shown) }
+                span.semloc.m { "L" (hit.start_line) "-" (hit.end_line) }
+                span.semscore.m { (format!("{:.2}", hit.score)) }
+            }
+            pre.semprev { (PreEscaped(highlight::highlight_fragment(syntax, hit.preview.lines().next().unwrap_or("")))) }
+        }
     }
+}
+
+/// Meaning-based search of one repo's semantic index.
+pub fn semantic(
+    repo: &str,
+    base: &str,
+    side: &SideInfo,
+    query: &str,
+    indexed: bool,
+    hits: &[rgit_index::SearchHit],
+) -> Markup {
+    let body = html! {
+        (search_modes(base, query, "meaning"))
+        div.sec { div.body {
+            @if !indexed {
+                div.binary { "no semantic index. run " code.m { "rgit index build" } " to enable meaning-based search." }
+            } @else if query.is_empty() {
+                div.binary { "search the code by meaning (embeddings), not exact text" }
+            } @else if hits.is_empty() {
+                div.binary { "no semantic matches for \u{201c}" (query) "\u{201d}" }
+            } @else {
+                div.srhead { (hits.len()) " results by meaning for \u{201c}" span.srq { (query) } "\u{201d}" }
+                @for h in hits { (sem_hit(h, None)) }
+            }
+        } }
+    };
+    layout(repo, base, "search", "", side, query, None, "HEAD", body)
+}
+
+/// Cross-repo meaning-based search, grouped by repo.
+pub fn global_semantic(query: &str, groups: &[(String, Vec<rgit_index::SearchHit>)]) -> Markup {
+    let total: usize = groups.iter().map(|(_, h)| h.len()).sum();
+    let content = html! {
+        div.modetabs {
+            a href=(&format!("/search?q={}", q_encode(query))) { "text" }
+            a.on href=(&format!("/semantic?q={}", q_encode(query))) { "meaning" }
+        }
+        div.sec { div.body {
+            @if query.is_empty() {
+                div.binary { "search every repository by meaning" }
+            } @else if groups.is_empty() {
+                div.binary { "no semantic matches (or no indexes built) for \u{201c}" (query) "\u{201d}" }
+            } @else {
+                div.srhead { (total) " results by meaning in " (groups.len()) " repositories for \u{201c}" span.srq { (query) } "\u{201d}" }
+                @for (repo, hits) in groups {
+                    div.grepo { span.grepon.m { (repo) } span.srn { (hits.len()) } }
+                    @for h in hits { (sem_hit(h, Some(repo))) }
+                }
+            }
+        } }
+    };
+    let sidebar = html! {
+        @if !groups.is_empty() {
+            div.card {
+                div.ch { "By repository" }
+                div.cb {
+                    @for (repo, hits) in groups {
+                        div.langrow { span.langl { (repo) } span.langn { (hits.len()) } }
+                    }
+                }
+            }
+        }
+        div.card {
+            div.ch { "Meaning search" }
+            div.cb { p.desc { "Ranks code by embedding similarity, not exact text. Build indexes with "
+                span.m style="color:var(--acc-ink)" { "rgit index build --root <dir>" } "." } }
+        }
+    };
+    plain_layout("rgit / semantic", content, sidebar)
+}
+
+/// Syntax-highlight one result line and mark the matched span. The syntax comes
+/// from the file extension; the match is the first ASCII-case-insensitive
+/// occurrence of `query` (best effort - a scoped query may not appear verbatim,
+/// in which case the line is highlighted without a mark).
+fn highlight_match(path: &str, line: &str, query: &str) -> Markup {
+    let syntax = highlight::syntax_for_path(path);
+    let html = highlight::highlight_fragment(syntax, line);
+    let needle = query.to_ascii_lowercase();
+    let range = (!needle.is_empty())
+        .then(|| line.to_ascii_lowercase().find(&needle))
+        .flatten()
+        .map(|b| {
+            let start = line[..b].chars().count();
+            (start, start + query.chars().count())
+        });
+    match range {
+        Some((s, e)) => PreEscaped(mark_in_html(&html, s, e)),
+        None => PreEscaped(html),
+    }
+}
+
+/// Wrap the visible characters `[start, end)` of already-highlighted HTML in
+/// `<mark>`, splitting at tag boundaries so the markup stays well-formed.
+fn mark_in_html(html: &str, start: usize, end: usize) -> String {
+    if start >= end {
+        return html.to_owned();
+    }
+    let mut out = String::with_capacity(html.len() + 16);
+    let mut vis = 0usize;
+    let mut in_mark = false;
+    let mut it = html.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '<' => {
+                if in_mark {
+                    out.push_str("</mark>");
+                }
+                out.push('<');
+                for t in it.by_ref() {
+                    out.push(t);
+                    if t == '>' {
+                        break;
+                    }
+                }
+                if in_mark {
+                    out.push_str("<mark>");
+                }
+            }
+            '&' => {
+                if vis == start {
+                    out.push_str("<mark>");
+                    in_mark = true;
+                }
+                out.push('&');
+                for t in it.by_ref() {
+                    out.push(t);
+                    if t == ';' {
+                        break;
+                    }
+                }
+                vis += 1;
+                if vis == end {
+                    out.push_str("</mark>");
+                    in_mark = false;
+                }
+            }
+            _ => {
+                if vis == start {
+                    out.push_str("<mark>");
+                    in_mark = true;
+                }
+                out.push(c);
+                vis += 1;
+                if vis == end {
+                    out.push_str("</mark>");
+                    in_mark = false;
+                }
+            }
+        }
+    }
+    if in_mark {
+        out.push_str("</mark>");
+    }
+    out
 }
 
 fn crumb(base: &str, rev: &str, path: &str) -> Markup {

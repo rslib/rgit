@@ -304,6 +304,10 @@ fn commit_diff_fragment(b: &dyn GitBackend, rev: &str, path: &str) -> Result<Mar
     Ok(view::diff_fragment(b.commit_file_diff(rev, path)?.as_ref()))
 }
 
+fn commit_diffs_fragment(b: &dyn GitBackend, rev: &str) -> Result<Markup, AppError> {
+    Ok(view::commit_diffs_fragment(&b.commit_details(rev)?.files))
+}
+
 fn refs_page(b: &dyn GitBackend, repo: &str, base: &str) -> Result<Markup, AppError> {
     Ok(view::refs(repo, base, &side_info(b, base, repo), &b.refs()?))
 }
@@ -501,28 +505,132 @@ fn search_page(
     q: &HashMap<String, String>,
 ) -> Result<Markup, AppError> {
     let query = q.get("q").map(String::as_str).unwrap_or("").trim();
+    let gq = parse_query(query).0;
     let matches = if query.is_empty() {
         Vec::new()
     } else {
-        b.grep_query(&parse_query(query)).unwrap_or_default()
+        b.grep_query(&gq).unwrap_or_default()
     };
     Ok(view::search(
         repo,
         base,
         &side_info(b, base, repo),
         query,
+        &gq.pattern,
         &matches,
     ))
 }
 
-/// Parse a GitHub-style scoped query into a [`GrepQuery`]. Qualifiers:
-/// `lang:` / `ext:` narrow by extension, `path:` by a path substring, a
-/// `/.../`-wrapped term is a regex, a `"..."`-wrapped term is an exact phrase,
-/// and `repo:` is accepted but ignored here (search is already per-repo).
-/// Everything else is the literal pattern.
-fn parse_query(raw: &str) -> GrepQuery {
+/// Cross-repo code search over every repo in the managed root (or the one named
+/// by a `repo:` scope), grouped by repo. Only available in multi-repo mode.
+fn global_search_page(reg: &Registry, q: &HashMap<String, String>) -> Result<Markup, AppError> {
+    const MAX_TOTAL: usize = 400;
+    let query = q.get("q").map(String::as_str).unwrap_or("").trim();
+    let (gq, scope) = parse_query(query);
+    let mut groups: Vec<(String, Vec<rgit_git::GrepMatch>)> = Vec::new();
+    if !query.is_empty() {
+        let names: Vec<String> = match &scope {
+            Some(name) => reg.list().into_iter().filter(|n| n == name).collect(),
+            None => reg.list(),
+        };
+        let mut total = 0usize;
+        for name in names {
+            if total >= MAX_TOTAL {
+                break;
+            }
+            if let Ok(b) = reg.resolve(&name) {
+                if let Ok(mut ms) = b.grep_query(&gq) {
+                    if ms.is_empty() {
+                        continue;
+                    }
+                    ms.truncate(MAX_TOTAL - total);
+                    total += ms.len();
+                    groups.push((name, ms));
+                }
+            }
+        }
+    }
+    Ok(view::global_search(query, &gq.pattern, &groups))
+}
+
+/// A process-wide embedding model, loaded once (the model download/load is too
+/// slow to repeat per request). The load error is cached too, so a missing model
+/// does not retry every request.
+fn embedder() -> Result<&'static rgit_index::Embedder, AppError> {
+    static CELL: std::sync::OnceLock<Result<rgit_index::Embedder, String>> =
+        std::sync::OnceLock::new();
+    match CELL.get_or_init(|| rgit_index::Embedder::new().map_err(|e| e.to_string())) {
+        Ok(e) => Ok(e),
+        Err(e) => Err(AppError(StatusCode::INTERNAL_SERVER_ERROR, e.clone())),
+    }
+}
+
+const SEMANTIC_LIMIT: usize = 40;
+
+/// Meaning-based search of one repo's semantic index.
+fn semantic_page(
+    b: &dyn GitBackend,
+    repo: &str,
+    base: &str,
+    q: &HashMap<String, String>,
+) -> Result<Markup, AppError> {
+    let query = q.get("q").map(String::as_str).unwrap_or("").trim();
+    let index = rgit_index::load(&rgit_index::index_path(b.workdir()));
+    let indexed = index.is_some();
+    let hits = match (&index, query.is_empty()) {
+        (Some(idx), false) => rgit_index::search(idx, embedder()?, query, SEMANTIC_LIMIT)
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        _ => Vec::new(),
+    };
+    Ok(view::semantic(
+        repo,
+        base,
+        &side_info(b, base, repo),
+        query,
+        indexed,
+        &hits,
+    ))
+}
+
+/// Cross-repo meaning-based search over every repo's semantic index, grouped by
+/// repo. Multi-repo mode only.
+fn global_semantic_page(reg: &Registry, q: &HashMap<String, String>) -> Result<Markup, AppError> {
+    let query = q.get("q").map(String::as_str).unwrap_or("").trim();
+    let mut groups: Vec<(String, Vec<rgit_index::SearchHit>)> = Vec::new();
+    if !query.is_empty() {
+        let embedder = embedder()?;
+        for name in reg.list() {
+            if let Ok(b) = reg.resolve(&name) {
+                if let Some(index) = rgit_index::load(&rgit_index::index_path(b.workdir())) {
+                    if let Ok(hits) = rgit_index::search(&index, embedder, query, SEMANTIC_LIMIT) {
+                        if !hits.is_empty() {
+                            groups.push((name, hits));
+                        }
+                    }
+                }
+            }
+        }
+        // Keep the best across repos by cosine score.
+        for (_, hits) in &mut groups {
+            hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        groups.sort_by(|a, b| {
+            let (sa, sb) = (a.1.first().map(|h| h.score).unwrap_or(0.0), b.1.first().map(|h| h.score).unwrap_or(0.0));
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    Ok(view::global_semantic(query, &groups))
+}
+
+/// Parse a GitHub-style scoped query into a [`GrepQuery`] and an optional
+/// `repo:` scope. Qualifiers: `lang:` / `ext:` narrow by extension, `path:` by a
+/// path substring, a `/.../`-wrapped term is a regex, a `"..."`-wrapped term is
+/// an exact phrase. The `repo:` scope is only meaningful for the cross-repo
+/// search; a per-repo page ignores it. Everything else is the literal pattern.
+fn parse_query(raw: &str) -> (GrepQuery, Option<String>) {
     let mut regex = false;
     let mut path = None;
+    let mut repo = None;
     let mut exts: Vec<String> = Vec::new();
     let mut pattern = String::new();
     let mut terms: Vec<String> = Vec::new();
@@ -535,8 +643,10 @@ fn parse_query(raw: &str) -> GrepQuery {
             if !v.is_empty() {
                 path = Some(v.to_owned());
             }
-        } else if tok.strip_prefix("repo:").is_some() {
-            // Per-repo search is already scoped; cross-repo scope is handled elsewhere.
+        } else if let Some(v) = tok.strip_prefix("repo:") {
+            if !v.is_empty() {
+                repo = Some(v.to_owned());
+            }
         } else if tok.len() >= 2 && tok.starts_with('/') && tok.ends_with('/') {
             regex = true;
             pattern = tok[1..tok.len() - 1].to_owned();
@@ -549,12 +659,15 @@ fn parse_query(raw: &str) -> GrepQuery {
     if pattern.is_empty() {
         pattern = terms.join(" ");
     }
-    GrepQuery {
-        pattern,
-        regex,
-        path,
-        exts,
-    }
+    (
+        GrepQuery {
+            pattern,
+            regex,
+            path,
+            exts,
+        },
+        repo,
+    )
 }
 
 /// Split a query into tokens, keeping `"..."` and `/.../` groups intact.
@@ -690,6 +803,13 @@ async fn s_commit_diff(
     let (b, _, _) = ctx(&s, None)?;
     commit_diff_fragment(b.as_ref(), &rev, &path)
 }
+async fn s_commit_diffs(
+    State(s): State<Shared>,
+    Path(rev): Path<String>,
+) -> Result<Markup, AppError> {
+    let (b, _, _) = ctx(&s, None)?;
+    commit_diffs_fragment(b.as_ref(), &rev)
+}
 async fn s_refs(State(s): State<Shared>) -> Result<Markup, AppError> {
     let (b, r, base) = ctx(&s, None)?;
     refs_page(b.as_ref(), &r, &base)
@@ -727,6 +847,13 @@ async fn s_search(
 ) -> Result<Markup, AppError> {
     let (b, r, base) = ctx(&s, None)?;
     search_page(b.as_ref(), &r, &base, &q)
+}
+async fn s_semantic(
+    State(s): State<Shared>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Markup, AppError> {
+    let (b, r, base) = ctx(&s, None)?;
+    semantic_page(b.as_ref(), &r, &base, &q)
 }
 
 // --- multi-repo handlers (repo segment) ---
@@ -827,6 +954,13 @@ async fn m_commit_diff(
     let (b, _, _) = ctx(&s, Some(&repo))?;
     commit_diff_fragment(b.as_ref(), &rev, &path)
 }
+async fn m_commit_diffs(
+    State(s): State<Shared>,
+    Path((repo, rev)): Path<(String, String)>,
+) -> Result<Markup, AppError> {
+    let (b, _, _) = ctx(&s, Some(&repo))?;
+    commit_diffs_fragment(b.as_ref(), &rev)
+}
 async fn m_refs(State(s): State<Shared>, Path(repo): Path<String>) -> Result<Markup, AppError> {
     let (b, r, base) = ctx(&s, Some(&repo))?;
     refs_page(b.as_ref(), &r, &base)
@@ -870,6 +1004,40 @@ async fn m_search(
     let (b, r, base) = ctx(&s, Some(&repo))?;
     search_page(b.as_ref(), &r, &base, &q)
 }
+async fn m_semantic(
+    State(s): State<Shared>,
+    Path(repo): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Markup, AppError> {
+    let (b, r, base) = ctx(&s, Some(&repo))?;
+    semantic_page(b.as_ref(), &r, &base, &q)
+}
+async fn g_search(
+    State(s): State<Shared>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Markup, AppError> {
+    match &s.repos {
+        Repos::Multi(reg) => global_search_page(reg, &q),
+        Repos::Single { .. } => Err(AppError(StatusCode::NOT_FOUND, "not found".into())),
+    }
+}
+async fn g_semantic(
+    State(s): State<Shared>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Markup, AppError> {
+    match &s.repos {
+        Repos::Multi(reg) => global_semantic_page(reg, &q),
+        Repos::Single { .. } => Err(AppError(StatusCode::NOT_FOUND, "not found".into())),
+    }
+}
+async fn g_repos(State(s): State<Shared>) -> Response {
+    let names = match &s.repos {
+        Repos::Multi(reg) => reg.list(),
+        Repos::Single { name, .. } => vec![name.clone()],
+    };
+    let body = serde_json::to_string(&names).unwrap_or_else(|_| "[]".into());
+    ([("content-type", "application/json")], body).into_response()
+}
 
 fn single_router(state: Shared) -> Router {
     Router::new()
@@ -879,6 +1047,7 @@ fn single_router(state: Shared) -> Router {
         .route("/tree/{*path}", get(s_tree))
         .route("/blob/{*path}", get(s_blob))
         .route("/commit/{rev}", get(s_commit))
+        .route("/commit/{rev}/diffs", get(s_commit_diffs))
         .route("/commit/{rev}/diff/{*path}", get(s_commit_diff))
         .route("/refs", get(s_refs))
         .route("/blame/{*path}", get(s_blame))
@@ -887,18 +1056,24 @@ fn single_router(state: Shared) -> Router {
         .route("/archive", get(s_archive))
         .route("/prs", get(s_prs))
         .route("/search", get(s_search))
+        .route("/semantic", get(s_semantic))
+        .route("/api/repos", get(g_repos))
         .with_state(state)
 }
 
 fn multi_router(state: Shared) -> Router {
     Router::new()
         .route("/", get(m_index))
+        .route("/search", get(g_search))
+        .route("/semantic", get(g_semantic))
+        .route("/api/repos", get(g_repos))
         .route("/{repo}", get(m_summary))
         .route("/{repo}/log", get(m_log))
         .route("/{repo}/tree", get(m_tree_root))
         .route("/{repo}/tree/{*path}", get(m_tree))
         .route("/{repo}/blob/{*path}", get(m_blob))
         .route("/{repo}/commit/{rev}", get(m_commit))
+        .route("/{repo}/commit/{rev}/diffs", get(m_commit_diffs))
         .route("/{repo}/commit/{rev}/diff/{*path}", get(m_commit_diff))
         .route("/{repo}/refs", get(m_refs))
         .route("/{repo}/blame/{*path}", get(m_blame))
@@ -907,6 +1082,7 @@ fn multi_router(state: Shared) -> Router {
         .route("/{repo}/archive", get(m_archive))
         .route("/{repo}/prs", get(m_prs))
         .route("/{repo}/search", get(m_search))
+        .route("/{repo}/semantic", get(m_semantic))
         .with_state(state)
 }
 
