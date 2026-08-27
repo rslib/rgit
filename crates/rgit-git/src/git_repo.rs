@@ -1845,6 +1845,37 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn sync(&self, report: &dyn Fn(OpProgress)) -> Result<crate::RestackOutcome, GitError> {
+        self.snap("sync");
+        self.fetch(report)?;
+        {
+            let repo = self.repo.lock().expect("repo mutex");
+            let current_ref: Option<String> = repo
+                .head()
+                .ok()
+                .and_then(|h| h.name().ok().map(str::to_owned));
+            for entry in repo.branches(Some(BranchType::Local))? {
+                let (branch, _) = entry?;
+                let full = branch.get().name().ok().map(str::to_owned);
+                if full.is_none() || full == current_ref {
+                    continue;
+                }
+                let tip = branch.get().peel_to_commit()?.id();
+                if let Ok(upstream) = branch.upstream() {
+                    let up = upstream.get().peel_to_commit()?.id();
+                    // Only a strict fast-forward is safe to apply to a ref we are
+                    // not on (no working tree to update).
+                    if up != tip && repo.graph_descendant_of(up, tip).unwrap_or(false) {
+                        if let Some(name) = &full {
+                            repo.reference(name, up, true, "rgit sync fast-forward")?;
+                        }
+                    }
+                }
+            }
+        }
+        self.restack()
+    }
+
     fn prune_merged(&self, base: &str) -> Result<Vec<String>, GitError> {
         self.snap("prune");
         let repo = self.repo.lock().expect("repo mutex");

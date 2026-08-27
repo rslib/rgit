@@ -90,6 +90,11 @@ pub trait GitBackend: Send + Sync {
     /// deleted. Op-log-safe.
     fn prune_merged(&self, base: &str) -> Result<Vec<String>, GitError>;
 
+    /// Fetch, fast-forward every non-current local branch to its upstream where
+    /// safe (a strict fast-forward), then restack the stack onto the updated
+    /// bases. Op-log-safe.
+    fn sync(&self, report: &dyn Fn(crate::OpProgress)) -> Result<crate::RestackOutcome, GitError>;
+
     /// The directory git resolves hooks from (`core.hooksPath` or
     /// `<git-dir>/hooks`), so the caller can run and stream them itself.
     fn hooks_dir(&self) -> std::path::PathBuf;

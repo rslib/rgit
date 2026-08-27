@@ -186,6 +186,8 @@ pub enum Command {
     Fetch,
     /// Fetch and fast-forward the current branch.
     Pull,
+    /// Fetch, fast-forward branches to their upstreams, and restack the stack.
+    Sync,
     /// Push the current branch to its upstream.
     Push {
         /// Overwrite the remote branch unconditionally (dangerous).
@@ -1039,6 +1041,17 @@ pub fn run(
         },
         Command::Fetch => net(interactive, "fetch", |r| backend.fetch(r))?,
         Command::Pull => net(interactive, "pull", |r| backend.pull(r))?,
+        Command::Sync => {
+            let outcome = backend.sync(&|_| {})?;
+            let mut msg = String::from("synced");
+            if !outcome.restacked.is_empty() {
+                msg.push_str(&format!("; restacked {}", outcome.restacked.join(", ")));
+            }
+            if !outcome.conflicted.is_empty() {
+                msg.push_str(&format!("; conflicts in {}", outcome.conflicted.join(", ")));
+            }
+            msg
+        }
         Command::Push {
             force,
             force_with_lease,
