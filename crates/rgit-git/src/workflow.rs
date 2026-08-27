@@ -265,11 +265,28 @@ pub fn release(backend: &dyn GitBackend, version: &str, finish: bool) -> Result<
 /// After pushing, open a pull/merge request with the forge CLI if available (gh,
 /// then glab); otherwise return guidance. These are the forge tools, not git.
 pub(crate) fn open_pull_request(branch: &str, base: &str) -> String {
+    // GitHub via gh. A stack re-submit re-pushes a rewritten branch, and an open
+    // PR already tracks the branch head, so the push updated it: check for an
+    // existing PR first and report that, rather than failing on a duplicate
+    // `pr create` and misreporting it as "gh not installed".
+    if let Some(url) = run_forge(
+        "gh",
+        &["pr", "view", branch, "--json", "url", "-q", ".url"],
+    ) {
+        return format!("pushed {branch} and updated its pull request:\n{url}");
+    }
     if let Some(url) = run_forge(
         "gh",
         &["pr", "create", "--fill", "--base", base, "--head", branch],
     ) {
         return format!("pushed {branch} and opened a pull request:\n{url}");
+    }
+    // GitLab via glab. `mr view <branch>` prints the URL on its own line when an
+    // MR exists, so the same update-vs-create split applies.
+    if let Some(url) = run_forge("glab", &["mr", "view", branch, "-F", "json"])
+        .and_then(|json| forge_json_field(&json, "web_url"))
+    {
+        return format!("pushed {branch} and updated its merge request:\n{url}");
     }
     if let Some(url) = run_forge(
         "glab",
@@ -289,6 +306,19 @@ pub(crate) fn open_pull_request(branch: &str, base: &str) -> String {
     format!("pushed {branch}. Open a pull request into {base} (install gh or glab to automate).")
 }
 
+/// Pull a top-level string field out of a forge CLI's JSON output without a JSON
+/// dependency: find `"field"`, then the next quoted value after the colon.
+fn forge_json_field(json: &str, field: &str) -> Option<String> {
+    let key = format!("\"{field}\"");
+    let after = &json[json.find(&key)? + key.len()..];
+    let colon = after.find(':')?;
+    let rest = &after[colon + 1..];
+    let start = rest.find('"')? + 1;
+    let end = rest[start..].find('"')? + start;
+    let value = rest[start..end].replace("\\/", "/");
+    (!value.is_empty()).then_some(value)
+}
+
 fn run_forge(bin: &str, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new(bin).args(args).output().ok()?;
     if out.status.success() {
@@ -296,5 +326,20 @@ fn run_forge(bin: &str, args: &[&str]) -> Option<String> {
         (!url.is_empty()).then_some(url)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forge_json_field;
+
+    #[test]
+    fn extracts_web_url_from_forge_json() {
+        let json = r#"{"iid":7,"web_url":"https:\/\/gitlab.com\/acme\/app\/-\/merge_requests\/7","title":"x"}"#;
+        assert_eq!(
+            forge_json_field(json, "web_url").as_deref(),
+            Some("https://gitlab.com/acme/app/-/merge_requests/7")
+        );
+        assert_eq!(forge_json_field(json, "missing"), None);
     }
 }

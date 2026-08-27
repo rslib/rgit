@@ -378,7 +378,7 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "code_search",
-            "Best general code search: fuses literal grep and semantic ranking (reciprocal-rank fusion) and tags each hit lexical/semantic/both. Prefer this over git_grep or semantic_search alone. Local by default; `root` searches every repo under a directory (global). Needs an index (`index_build`); without it, degrades to grep. Returns score, path:line, and the tag.",
+            "Best general code search: fuses literal grep and semantic ranking (reciprocal-rank fusion), then re-ranks by git history (churn and recency) so hot files surface first, and tags each hit lexical/semantic/both. Prefer this over git_grep or semantic_search alone. Local by default; `root` searches every repo under a directory (global). Needs an index (`index_build`); without it, degrades to grep. Returns score, path:line, and the tag.",
             &[
                 ("query", "string", true),
                 ("limit", "number", false),
@@ -387,7 +387,7 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "semantic_search",
-            "Search the codebase by meaning only, using the local embedding index (build it first with index_build). Prefer code_search for general use; use this for purely conceptual matches. Local by default; `root` searches every repo under a directory (global). Returns score, path, and line range per hit.",
+            "Search the codebase by meaning only, using the local embedding index (build it first with index_build), re-ranked by git history (churn and recency). Prefer code_search for general use; use this for purely conceptual matches. Local by default; `root` searches every repo under a directory (global). Returns score, path, and line range per hit.",
             &[
                 ("query", "string", true),
                 ("limit", "number", false),

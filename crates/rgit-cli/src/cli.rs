@@ -400,6 +400,8 @@ pub enum IndexCmd {
         root: Option<String>,
     },
     /// Search the semantic index by meaning (local, or global with `--root`).
+    /// Results are re-ranked by git history, so recently and frequently changed
+    /// files surface above cold ones at equal relevance.
     Search {
         /// The natural-language or code query.
         query: String,
@@ -412,8 +414,8 @@ pub enum IndexCmd {
     },
     /// Report whether an index exists and how many chunks it holds.
     Status,
-    /// Hybrid search: fuse literal grep and semantic ranking (local, or global
-    /// with `--root`).
+    /// Hybrid search: fuse literal grep and semantic ranking, then re-rank by
+    /// git history (churn and recency) (local, or global with `--root`).
     Code {
         /// The query (literal terms help the lexical side; prose helps semantic).
         query: String,
