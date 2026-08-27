@@ -1781,6 +1781,48 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn squash(&self, rev: &str) -> Result<(), GitError> {
+        self.snap("squash");
+        {
+            let repo = self.repo.lock().expect("repo mutex");
+            let branch_ref = head_branch_ref(&repo)?;
+            let target = repo.revparse_single(rev)?.peel_to_commit()?;
+            let parent = target
+                .parent(0)
+                .map_err(|_| GitError::Other("cannot squash the root commit".to_owned()))?;
+            let chain = first_parent_chain(&repo, target.id())?; // [HEAD.., target]
+
+            // Fold target into its parent: parent's parents, target's tree, and
+            // both messages joined.
+            let combined = format!(
+                "{}\n\n{}",
+                parent.message().unwrap_or("").trim_end(),
+                target.message().unwrap_or("").trim_end()
+            );
+            let combined = crate::change_id::preserve(parent.message().unwrap_or(""), &combined);
+            let sig = repo.signature()?;
+            let grandparents: Vec<git2::Commit> = (0..parent.parent_count())
+                .filter_map(|k| parent.parent(k).ok())
+                .collect();
+            let gp_refs: Vec<&git2::Commit> = grandparents.iter().collect();
+            let squashed = repo.commit(
+                None,
+                &parent.author(),
+                &sig,
+                &combined,
+                &target.tree()?,
+                &gp_refs,
+            )?;
+
+            // Replay the commits above target onto the squashed commit.
+            let descendants: Vec<&git2::Commit> = chain.iter().rev().skip(1).collect();
+            let new_tip = replay_onto(&repo, &descendants, squashed)?;
+            repo.reference(&branch_ref, new_tip, true, "rgit squash")?;
+        }
+        let _ = self.restack();
+        Ok(())
+    }
+
     fn hooks_dir(&self) -> PathBuf {
         let repo = self.repo.lock().expect("repo mutex");
         // core.hooksPath wins (relative to the working directory); otherwise the
@@ -2427,6 +2469,28 @@ fn reword_commit(repo: &Repository, target: Oid, new_message: &str) -> Result<()
     }
     repo.reference(&branch_ref, new_tip, true, "rgit reword")?;
     Ok(())
+}
+
+/// Cherry-pick `commits` (oldest first) one by one onto `base`, returning the new
+/// tip. A conflict aborts with `GitError::Conflict` and leaves refs untouched
+/// (only dangling objects are written), so the caller's op-log snapshot fully
+/// recovers. Each replayed commit keeps its author and message.
+fn replay_onto(repo: &Repository, commits: &[&git2::Commit], base: Oid) -> Result<Oid, GitError> {
+    let sig = repo.signature()?;
+    let mut tip = base;
+    for c in commits {
+        let our = repo.find_commit(tip)?;
+        let mut index = repo.cherrypick_commit(c, &our, 0, None)?;
+        if index.has_conflicts() {
+            return Err(GitError::Conflict(format!(
+                "conflict replaying {}",
+                &c.id().to_string()[..7]
+            )));
+        }
+        let tree = repo.find_tree(index.write_tree_to(repo)?)?;
+        tip = repo.commit(None, &c.author(), &sig, c.message().unwrap_or(""), &tree, &[&our])?;
+    }
+    Ok(tip)
 }
 
 /// Run the pre-commit and commit-msg hooks, letting commit-msg rewrite `msg`.

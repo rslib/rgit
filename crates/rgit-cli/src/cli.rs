@@ -141,6 +141,12 @@ pub enum Command {
         #[arg(default_value_t = 1)]
         n: usize,
     },
+    /// Fold a commit into its parent and restack descendants (default HEAD).
+    Squash {
+        /// The commit to squash into its parent (default HEAD).
+        #[arg(default_value = "HEAD")]
+        rev: String,
+    },
     /// Fetch the current branch's remote.
     Fetch,
     /// Fetch and fast-forward the current branch.
@@ -926,6 +932,10 @@ pub fn run(
         Command::Uncommit { n } => {
             backend.uncommit(n)?;
             format!("uncommitted {n} commit(s); changes kept staged")
+        }
+        Command::Squash { rev } => {
+            backend.squash(&rev)?;
+            format!("squashed {rev} into its parent")
         }
         Command::Fetch => net(interactive, "fetch", |r| backend.fetch(r))?,
         Command::Pull => net(interactive, "pull", |r| backend.pull(r))?,
