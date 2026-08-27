@@ -537,6 +537,50 @@ fn tools() -> Vec<Tool> {
             none,
         ),
         tool(
+            "git_reword",
+            "Change a commit's message (default HEAD) and restack descendants. Op-log-safe.",
+            &[("message", "string", true), ("rev", "string", false)],
+        ),
+        tool(
+            "git_uncommit",
+            "Undo the last commit(s), keeping the changes staged (default 1).",
+            &[("n", "number", false)],
+        ),
+        tool(
+            "git_squash",
+            "Fold a commit into its parent (default HEAD); with `from`, fold every commit after `from` up to HEAD into one. Restacks descendants.",
+            &[("rev", "string", false), ("from", "string", false)],
+        ),
+        tool(
+            "git_split",
+            "Split a commit (default HEAD) into two by path: the given `paths`' changes first, the rest second. Restacks descendants.",
+            &[("paths", "string[]", true), ("rev", "string", false)],
+        ),
+        tool(
+            "git_move",
+            "Reorder a commit before or after another in the current branch's history. Pass exactly one of `before`/`after`.",
+            &[
+                ("rev", "string", true),
+                ("before", "string", false),
+                ("after", "string", false),
+            ],
+        ),
+        tool(
+            "git_prune",
+            "Delete local branches fully merged into a base (default HEAD).",
+            &[("base", "string", false)],
+        ),
+        tool(
+            "git_sync",
+            "Fetch, fast-forward branches to their upstreams, and restack the stack.",
+            none,
+        ),
+        tool(
+            "git_submit",
+            "Push every branch in the current stack and open a pull request per branch (via gh/glab).",
+            none,
+        ),
+        tool(
             "git_flow_init",
             "Set the active branching workflow: gitflow, github, gitlab, trunk, or release-flow.",
             &[("preset", "string", true)],
@@ -973,6 +1017,44 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
             .map(|e| crate::render::smartlog(&e))
             .map_err(emap),
         "git_absorb" => backend.absorb().map_err(emap),
+        "git_reword" => done(backend.reword(s("rev").unwrap_or("HEAD"), req("message")?)),
+        "git_uncommit" => done(backend.uncommit(
+            args.get("n").and_then(Value::as_u64).unwrap_or(1) as usize,
+        )),
+        "git_squash" => match s("from") {
+            Some(from) => done(backend.squash_range(from)),
+            None => done(backend.squash(s("rev").unwrap_or("HEAD"))),
+        },
+        "git_split" => done(backend.split(s("rev").unwrap_or("HEAD"), &str_vec("paths"))),
+        "git_move" => match (s("before"), s("after")) {
+            (Some(t), None) => done(backend.reorder(req("rev")?, t, true)),
+            (None, Some(t)) => done(backend.reorder(req("rev")?, t, false)),
+            _ => Err("pass exactly one of before or after".to_owned()),
+        },
+        "git_prune" => backend
+            .prune_merged(s("base").unwrap_or("HEAD"))
+            .map(|d| {
+                if d.is_empty() {
+                    "no merged branches".to_owned()
+                } else {
+                    format!("deleted: {}", d.join(", "))
+                }
+            })
+            .map_err(emap),
+        "git_sync" => backend
+            .sync(&|_| {})
+            .map(|o| {
+                let mut m = "synced".to_owned();
+                if !o.restacked.is_empty() {
+                    m.push_str(&format!("; restacked {}", o.restacked.join(", ")));
+                }
+                if !o.conflicted.is_empty() {
+                    m.push_str(&format!("; conflicts in {}", o.conflicted.join(", ")));
+                }
+                m
+            })
+            .map_err(emap),
+        "git_submit" => backend.submit_stack(&|_| {}).map(|n| n.join("\n")).map_err(emap),
 
         "git_flow_init" => rgit_git::workflow::init(backend.as_ref(), req("preset")?).map_err(emap),
         "git_flow_start" => rgit_git::workflow::start(backend.as_ref(), req("name")?).map_err(emap),
