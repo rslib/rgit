@@ -62,6 +62,10 @@ pub trait GitBackend: Send + Sync {
     /// must be an ancestor of HEAD on the first-parent chain.
     fn reword(&self, rev: &str, message: &str) -> Result<(), GitError>;
 
+    /// Undo the last `n` commits, keeping their changes staged in the working
+    /// tree (a soft reset to `HEAD~n`). Op-log-safe.
+    fn uncommit(&self, n: usize) -> Result<(), GitError>;
+
     /// The directory git resolves hooks from (`core.hooksPath` or
     /// `<git-dir>/hooks`), so the caller can run and stream them itself.
     fn hooks_dir(&self) -> std::path::PathBuf;

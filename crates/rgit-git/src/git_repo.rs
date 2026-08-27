@@ -1773,6 +1773,14 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn uncommit(&self, n: usize) -> Result<(), GitError> {
+        self.snap("uncommit");
+        let repo = self.repo.lock().expect("repo mutex");
+        let target = repo.revparse_single(&format!("HEAD~{}", n.max(1)))?;
+        repo.reset(&target, ResetType::Soft, None)?;
+        Ok(())
+    }
+
     fn hooks_dir(&self) -> PathBuf {
         let repo = self.repo.lock().expect("repo mutex");
         // core.hooksPath wins (relative to the working directory); otherwise the

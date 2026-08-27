@@ -135,6 +135,12 @@ pub enum Command {
         #[arg(default_value = "HEAD")]
         rev: String,
     },
+    /// Undo the last commit(s), keeping the changes staged (default 1).
+    Uncommit {
+        /// How many commits to undo.
+        #[arg(default_value_t = 1)]
+        n: usize,
+    },
     /// Fetch the current branch's remote.
     Fetch,
     /// Fetch and fast-forward the current branch.
@@ -916,6 +922,10 @@ pub fn run(
         Command::Reword { message, rev } => {
             backend.reword(&rev, &message)?;
             format!("reworded {rev}")
+        }
+        Command::Uncommit { n } => {
+            backend.uncommit(n)?;
+            format!("uncommitted {n} commit(s); changes kept staged")
         }
         Command::Fetch => net(interactive, "fetch", |r| backend.fetch(r))?,
         Command::Pull => net(interactive, "pull", |r| backend.pull(r))?,
