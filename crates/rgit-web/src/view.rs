@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use rgit_git::{
-    BlameLine, Blob, CommitDetails, CommitRef, Deco, FileDiff, GrepMatch, Head, LanesState,
+    BlameLine, Blob, CommitOverview, CommitRef, Deco, FileDiff, GrepMatch, Head, LanesState,
     LastCommit, LineOrigin, LogEntry, RefEntry, RefKind, RepoStatus, StatusEntry, TreeEntry,
     group_decorations,
 };
@@ -71,6 +71,47 @@ fn at(base: &str, rev: &str, rest: &str) -> String {
 /// `ctx_line` is the status-line context (branch/path/sha); `ctx_card` an
 /// optional "At point" card pinned above the sidebar.
 #[allow(clippy::too_many_arguments)]
+/// The searchable branch/tag dropdown in the tab bar. A styled button opens a
+/// filterable list (Commit context when at a bare rev, then HEAD, branches, and
+/// tags); the JS in `assets` drives the open/filter/keyboard behavior.
+fn ref_switcher(base: &str, rev: &str, side: &SideInfo) -> Markup {
+    let is_named = rev == "HEAD"
+        || side.branch_names.iter().any(|b| b == rev)
+        || side.tag_names.iter().any(|t| t == rev);
+    html! {
+        div.refsw id="refsw" {
+            button.refbtn type="button" id="refbtn" title="Browse a branch or tag" {
+                span.rbi { "\u{2387}" }
+                span.rbl { (rev) }
+                span.rbc { "\u{25be}" }
+            }
+            div.refpop id="refpop" {
+                div.rpf { input id="ref-input" placeholder="find a branch or tag\u{2026}" autocomplete="off"; }
+                div.rpl id="ref-list" {
+                    @if !is_named {
+                        div.rpg { "Commit" }
+                        a class="refitem on" data-ref=(rev) href=(at(base, rev, "/tree")) { (rev) }
+                    }
+                    a class=(if rev == "HEAD" { "refitem on" } else { "refitem" }) data-ref="HEAD" href=(href(base, "/tree")) { "HEAD" }
+                    @if !side.branch_names.is_empty() {
+                        div.rpg { "Branches" }
+                        @for b in &side.branch_names {
+                            a class=(if rev == *b { "refitem on" } else { "refitem" }) data-ref=(b) href=(at(base, b, "/tree")) { (b) }
+                        }
+                    }
+                    @if !side.tag_names.is_empty() {
+                        div.rpg { "Tags" }
+                        @for t in &side.tag_names {
+                            a class=(if rev == *t { "refitem on" } else { "refitem" }) data-ref=(t) href=(at(base, t, "/tree")) { (t) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn layout(
     repo: &str,
     base: &str,
@@ -90,7 +131,7 @@ pub fn layout(
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { "rgit / " (repo) }
                 link rel="preconnect" href="https://fonts.googleapis.com";
-                link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap";
+                link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Hanken+Grotesk:wght@400;500;600;700&display=swap";
                 style { (PreEscaped(assets::CSS)) }
                 style { (PreEscaped(highlight::css())) }
             }
@@ -98,23 +139,21 @@ pub fn layout(
                 header {
                     a.logo.m href="/" { "r" b { "git" } " " span style="color:var(--dim);font-weight:400" { "serve" } }
                     span.path { a.m href="/" { "repos" } " / " span.m style="color:var(--acc)" { (repo) } }
-                    select.refsel id="refsel" data-base=(base) title="Browse a branch or tag" {
-                        option value="HEAD" selected[rev == "HEAD"] { "HEAD" }
-                        @if !side.branch_names.is_empty() {
-                            optgroup label="Branches" {
-                                @for b in &side.branch_names { option value=(b) selected[rev == b] { (b) } }
-                            }
-                        }
-                        @if !side.tag_names.is_empty() {
-                            optgroup label="Tags" {
-                                @for t in &side.tag_names { option value=(t) selected[rev == t] { (t) } }
-                            }
-                        }
-                    }
                     form.hsearch method="get" action=(href(base, "/search")) {
-                        input type="search" name="q" placeholder="search code\u{2026}" autocomplete="off";
+                        div.sbox {
+                            @if !base.is_empty() { span.scope { "repo:" (repo) } }
+                            input type="search" name="q" placeholder="search code\u{2026}" autocomplete="off";
+                            span.slash { "/" }
+                        }
+                        div.qhint {
+                            div.qh { "Qualifiers" }
+                            div.qrow { span.k { "lang:" } span.d { "by language (lang:rust)" } }
+                            div.qrow { span.k { "path:" } span.d { "by path or glob (path:crates/*)" } }
+                            div.qrow { span.k { "ext:" } span.d { "by extension (ext:rs)" } }
+                            div.qrow { span.k { "\u{201c}\u{2026}\u{201d}" } span.d { "exact phrase" } }
+                            div.qrow { span.k { "/re/" } span.d { "regular expression" } }
+                        }
                     }
-                    span.sp {}
                     div.cw {
                         button.btn.pri id="cloneBtn" { "\u{2913} Clone" }
                         div.cpop id="cpop" {
@@ -130,6 +169,8 @@ pub fn layout(
                     button.ib id="theme" title="Theme" { "\u{25d1}" }
                 }
                 nav.tabs {
+                    (ref_switcher(base, rev, side))
+                    span.tabsep {}
                     @for (name, key, path) in TABS {
                         @let url = if name == "log" || name == "tree" { at(base, rev, path) } else { href(base, path) };
                         a href=(url) class=(if name == active { "on" } else { "" }) {
@@ -198,6 +239,46 @@ fn ctx_card(title: &str, rows: &[(&str, String)]) -> Markup {
             }
         }
     }
+}
+
+/// A segmented control: one `(label, href, active)` per tab.
+fn seg(tabs: &[(&str, String, bool)]) -> Markup {
+    html! {
+        div.seg {
+            @for (label, url, on) in tabs {
+                a class=(if *on { "on" } else { "" }) href=(url) { (label) }
+            }
+        }
+    }
+}
+
+/// The header shared by the blob, blame, and working-tree diff views: the file
+/// path, optional meta (size or state), a segmented control of related views,
+/// and an optional trailing action.
+fn file_header(
+    path: &str,
+    meta: Option<&str>,
+    tabs: &[(&str, String, bool)],
+    trailing: Option<Markup>,
+) -> Markup {
+    html! {
+        div.filehead {
+            span.p { (path) }
+            @if let Some(m) = meta { span.fsz { (m) } }
+            span.sp {}
+            (seg(tabs))
+            @if let Some(t) = trailing { (t) }
+        }
+    }
+}
+
+/// The `code | blame | raw` tabs for a file at `rev`, with one marked active.
+fn file_tabs(base: &str, path: &str, rev: &str, active: &str) -> Vec<(&'static str, String, bool)> {
+    vec![
+        ("code", at(base, rev, &format!("/blob/{path}?src=1")), active == "code"),
+        ("blame", href(base, &format!("/blame/{path}")), active == "blame"),
+        ("raw", at(base, rev, &format!("/blob/{path}?raw=1")), active == "raw"),
+    ]
 }
 
 /// Percent-encode a value for a URL query (keeps unreserved chars).
@@ -308,7 +389,7 @@ fn plain_layout(title: &str, content: Markup, sidebar: Markup) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
                 link rel="preconnect" href="https://fonts.googleapis.com";
-                link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap";
+                link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Hanken+Grotesk:wght@400;500;600;700&display=swap";
                 style { (PreEscaped(assets::CSS)) }
             }
             body {
@@ -353,6 +434,7 @@ pub fn index(repos: &[RepoCard]) -> Markup {
     let mut langs: Vec<(&str, usize)> = lang_counts.into_iter().collect();
     langs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
 
+    let recent: Vec<&RepoCard> = repos.iter().filter(|r| r.last.is_some()).take(8).collect();
     let sidebar = html! {
         div.card {
             div.ch { "Overview" }
@@ -360,6 +442,23 @@ pub fn index(repos: &[RepoCard]) -> Markup {
                 div.stat { span.l { "Repositories" } span.v { (repos.len()) } }
                 div.stat { span.l { "Branches" } span.v { (total_branches) } }
                 div.stat { span.l { "Tags" } span.v { (total_tags) } }
+            }
+        }
+        @if !recent.is_empty() {
+            div.card {
+                div.ch { "Recent activity" }
+                div.cb {
+                    div.feed {
+                        @for r in &recent {
+                            @if let Some((id, summary, when)) = &r.last {
+                                a href=(format!("/{}", r.name)) {
+                                    div.fr { span.frn { (r.name) } span.fhh { (id) } span.ft { (when) } }
+                                    div.fs { (summary) }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         @if !langs.is_empty() {
@@ -440,7 +539,7 @@ fn commit_row(base: &str, hash: &str, refs: &[CommitRef], subject: &str, meta: &
     html! {
         div class=(if head { "row commit-row head" } else { "row commit-row" }) data-point {
             span.node { "\u{25cf}" }
-            span.hash.m { (hash) }
+            span.hash.m { a href=(href(base, &format!("/commit/{hash}"))) { (hash) } }
             span.subj {
                 a data-go href=(href(base, &format!("/commit/{hash}"))) { (subject) }
                 (refs_markup(refs))
@@ -596,15 +695,16 @@ fn change_rows(base: &str, entries: &[&StatusEntry], kind: Change) -> Markup {
         Change::Unstaged => ("y", |e| e.worktree.letter()),
         Change::Untracked => ("r", |_| "?"),
     };
+    let staged = matches!(kind, Change::Staged);
     html! {
         @for e in entries {
-            div class="row change" {
+            div class="row change" data-point {
                 span class=(format!("stc {cls}")) { (get(e)) }
                 span.stp.m {
                     @if matches!(kind, Change::Untracked) {
-                        (e.path)
+                        a data-go href=(href(base, &format!("/blob/{}", e.path))) { (e.path) }
                     } @else {
-                        a href=(href(base, &format!("/blob/{}", e.path))) { (e.path) }
+                        a data-go href=(href(base, &format!("/diff/{}{}", e.path, if staged { "?staged=1" } else { "" }))) { (e.path) }
                     }
                     @if let Some(o) = &e.orig_path { span.storig { " \u{2190} " (o) } }
                 }
@@ -800,24 +900,24 @@ pub fn blob(
 ) -> Markup {
     let raw = at(base, rev, &format!("/blob/{}?raw=1", blob.path));
     let dir = blob.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let size = human_size(blob.size);
+    let mut tabs: Vec<(&str, String, bool)> = Vec::new();
+    if previewable {
+        tabs.push(("preview", at(base, rev, &format!("/blob/{}", blob.path)), rendered.is_some()));
+        tabs.push(("code", at(base, rev, &format!("/blob/{}?src=1", blob.path)), rendered.is_none()));
+    } else {
+        tabs.push(("code", at(base, rev, &format!("/blob/{}", blob.path)), true));
+    }
+    tabs.push(("blame", href(base, &format!("/blame/{}", blob.path)), false));
+    tabs.push(("raw", raw.clone(), false));
+    let permalink = html! { a data-copy="#permalink" href="#" title="copy permalink" { "permalink" } };
     let body = html! {
       div.treegrid {
         (explorer_aside(base, rev, files, dir, &blob.path))
         div.treemain {
         div.sec {
             div.body {
-                div.filehead {
-                    span.p { (blob.path) }
-                    span { (human_size(blob.size)) }
-                    span.sp {}
-                    @if previewable {
-                        a class=(if rendered.is_some() { "vt on" } else { "vt" }) href=(at(base, rev, &format!("/blob/{}", blob.path))) { "rendered" }
-                        a class=(if rendered.is_none() { "vt on" } else { "vt" }) href=(at(base, rev, &format!("/blob/{}?src=1", blob.path))) { "code" }
-                    }
-                    a href=(href(base, &format!("/blame/{}", blob.path))) { "blame" }
-                    a href=(raw) { "raw" }
-                    a data-copy="#permalink" href="#" title="copy permalink" { "permalink" }
-                }
+                (file_header(&blob.path, Some(&size), &tabs, Some(permalink)))
                 span id="permalink" style="display:none" { (perma) }
                 @if let Some(html) = rendered {
                     div class="markdown-body" { (PreEscaped(html)) }
@@ -867,7 +967,6 @@ fn code_block(path: &str, text: &str) -> Markup {
             div.g {
                 @for i in 1..=n {
                     a id=(format!("L{i}")) href=(format!("#L{i}")) { (i) }
-                    "\n"
                 }
             }
             div.src { pre { (PreEscaped(content)) } }
@@ -875,24 +974,53 @@ fn code_block(path: &str, text: &str) -> Markup {
     }
 }
 
-pub fn commit(repo: &str, base: &str, side: &SideInfo, d: &CommitDetails) -> Markup {
+pub fn commit(repo: &str, base: &str, side: &SideInfo, d: &CommitOverview) -> Markup {
     let perma = href(base, &format!("/commit/{}", d.full_id));
-    let (add, del) = d.files.iter().fold((0usize, 0usize), |(a, r), f| {
-        let (fa, fr) = diff_counts(f);
-        (a + fa, r + fr)
-    });
-    let body = html! {
-        div.sec { div.body {
-            div.cmeta {
-                p.subj { (d.message.lines().next().unwrap_or_default()) }
-                div.full { (d.full_id) }
-                div.by {
-                    b { (d.author) } " " (d.email) " \u{b7} " (d.when)
-                    " \u{b7} " span.diffstat { (d.files.len()) " files " b.p { "+" (add) } " " b.m { "\u{2212}" (del) } }
+    let (add, del) = d
+        .files
+        .iter()
+        .fold((0usize, 0usize), |(a, r), f| (a + f.additions, r + f.deletions));
+    let files_side = html! {
+        aside.difffiles {
+            div.dfh { span.dft { "Changed files" } span.dfn { (d.files.len()) } }
+            div.dfmode {
+                a.dfm.on data-mode="one" { "one" }
+                a.dfm data-mode="list" { "list" }
+            }
+            div.dflist {
+                @for (i, f) in d.files.iter().enumerate() {
+                    a class=(if i == 0 { "dfitem on" } else { "dfitem" })
+                        data-file=(i)
+                        data-diff=(href(base, &format!("/commit/{}/diff/{}", d.id, f.path))) {
+                        span.dfp { (f.path) }
+                        span.dfs { b.p { "+" (f.additions) } " " b.m { "\u{2212}" (f.deletions) } }
+                    }
                 }
             }
-        } }
-        @for f in &d.files { (diff_file(f)) }
+        }
+    };
+    let body = html! {
+        div.difflayout {
+            (files_side)
+            div.diffmain {
+                div.sec { div.body {
+                    div.cmeta {
+                        p.subj { (d.message.lines().next().unwrap_or_default()) }
+                        div.full { (d.full_id) }
+                        div.by {
+                            b { (d.author) } " " (d.email) " \u{b7} " (d.when)
+                            " \u{b7} " span.diffstat { (d.files.len()) " files " b.p { "+" (add) } " " b.m { "\u{2212}" (del) } }
+                        }
+                        div.cactions {
+                            a.cbtn href=(at(base, &d.id, "/tree")) { "\u{25a4} Browse files at this commit" }
+                        }
+                    }
+                } }
+                // Diffs load on demand (one file per request) so a commit that
+                // touches many files does not render every hunk up front.
+                div id="diffbox" data-loading="loading diff\u{2026}" {}
+            }
+        }
     };
     let card = ctx_card(
         "This commit",
@@ -903,6 +1031,44 @@ pub fn commit(repo: &str, base: &str, side: &SideInfo, d: &CommitDetails) -> Mar
         ],
     );
     layout(repo, base, "log", &perma, side, &d.id, Some(card), "HEAD", body)
+}
+
+/// The rendered diff for one file, returned as a fragment for on-demand loading.
+pub fn diff_fragment(diff: Option<&FileDiff>) -> Markup {
+    match diff {
+        Some(f) => diff_file(0, f),
+        None => html! { div.sec { div.body { div.binary { "no changes for this file" } } } },
+    }
+}
+
+/// One file's uncommitted diff (staged or unstaged), reached from the summary.
+pub fn worktree_diff(
+    repo: &str,
+    base: &str,
+    side: &SideInfo,
+    path: &str,
+    staged: bool,
+    diff: Option<&FileDiff>,
+) -> Markup {
+    let label = if staged { "staged" } else { "unstaged" };
+    let meta = format!("{label} changes");
+    let staged_q = if staged { "?staged=1" } else { "" };
+    let tabs: Vec<(&str, String, bool)> = vec![
+        ("diff", href(base, &format!("/diff/{path}{staged_q}")), true),
+        ("code", href(base, &format!("/blob/{path}?src=1")), false),
+        ("blame", href(base, &format!("/blame/{path}")), false),
+    ];
+    let body = html! {
+        div.sec { div.body {
+            (file_header(path, Some(&meta), &tabs, None))
+        } }
+        @match diff {
+            Some(f) => (diff_file(0, f)),
+            None => div.sec { div.body { div.binary { "no " (label) " changes for this file" } } }
+        }
+    };
+    let card = ctx_card("Working change", &[("file", path.to_owned()), ("state", label.to_owned())]);
+    layout(repo, base, "summary", "", side, path, Some(card), "HEAD", body)
 }
 
 fn diff_counts(f: &FileDiff) -> (usize, usize) {
@@ -920,10 +1086,10 @@ fn diff_counts(f: &FileDiff) -> (usize, usize) {
     (add, del)
 }
 
-fn diff_file(f: &FileDiff) -> Markup {
+fn diff_file(i: usize, f: &FileDiff) -> Markup {
     let (add, del) = diff_counts(f);
     html! {
-        div.filediff {
+        div.filediff id=(format!("fd{i}")) data-file=(i) {
             div.fh {
                 span.p { (f.path) }
                 span.diffstat { b.p { "+" (add) } " " b.m { "\u{2212}" (del) } }
@@ -931,9 +1097,13 @@ fn diff_file(f: &FileDiff) -> Markup {
             @if f.binary {
                 div.binary { "binary file" }
             } @else {
-                // Plain (not syntax-highlighted) so a diff renders instantly; the
-                // +/- coloring carries the change. Blobs are highlighted, since
-                // opening a file is a deliberate, one-off action.
+                // Syntax-highlight each line by the file's syntax (picked by
+                // extension, so no per-file content detection). Very large diffs
+                // fall back to plain text so the page stays fast; the +/- coloring
+                // and background still carry the change.
+                @let total: usize = f.hunks.iter().map(|h| h.lines.len()).sum();
+                @let syntax = highlight::syntax_for_path(&f.path);
+                @let hl = total <= 3000;
                 div.hunk { pre {
                     @for h in &f.hunks {
                         span.ln.h { (h.header) "\n" }
@@ -944,7 +1114,12 @@ fn diff_file(f: &FileDiff) -> Markup {
                                 LineOrigin::Meta => ("ln h", "\\"),
                                 LineOrigin::Context => ("ln", " "),
                             };
-                            span class=(cls) { (mark) (l.text) "\n" }
+                            span class=(cls) {
+                                (mark)
+                                @if hl { (PreEscaped(highlight::highlight_fragment(syntax, &l.text))) }
+                                @else { (l.text) }
+                                "\n"
+                            }
                         }
                     }
                 } }
@@ -984,20 +1159,26 @@ pub fn refs(repo: &str, base: &str, side: &SideInfo, entries: &[RefEntry]) -> Ma
 }
 
 pub fn blame(repo: &str, base: &str, side: &SideInfo, path: &str, lines: &[BlameLine]) -> Markup {
+    let syntax = highlight::syntax_for_path(path);
+    let hl = lines.len() <= 5000;
     let body = html! {
         div.sec { div.body {
-            div.filehead {
-                span.p { (path) }
-                span { "blame" }
-                span.sp {}
-                a href=(href(base, &format!("/blob/{path}"))) { "source" }
-            }
+            (file_header(path, None, &file_tabs(base, path, "HEAD", "blame"), None))
             div {
                 @for (i, l) in lines.iter().enumerate() {
                     div.blameline {
-                        span.who { b { (l.short_id) } " " (l.author) }
+                        span.who {
+                            @if !l.short_id.is_empty() {
+                                a.bh href=(href(base, &format!("/commit/{}", l.short_id))) { (l.short_id) }
+                                " "
+                                a.ba href=(href(base, &format!("/log?author={}", q_encode(&l.author)))) { (l.author) }
+                            }
+                        }
                         span.no { (i + 1) }
-                        span.bt { (l.line) }
+                        span.bt {
+                            @if hl { (PreEscaped(highlight::highlight_fragment(syntax, &l.line))) }
+                            @else { (l.line) }
+                        }
                     }
                 }
             }

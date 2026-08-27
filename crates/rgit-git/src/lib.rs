@@ -22,9 +22,9 @@ pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 pub use error::GitError;
 pub use git_repo::{Git2Backend, clone, init};
 pub use model::{
-    BlameLine, Commit, CommitDetails, CommitRef, Deco, Head, HunkRef, Lane, LanesState, LogEntry,
+    BlameLine, Commit, CommitDetails, CommitFile, CommitOverview, CommitRef, Deco, Head, HunkRef, Lane, LanesState, LogEntry,
     LogOptions, group_decorations,
-    Blob, GrepMatch, LastCommit, OpLogEntry, OpProgress, RefEntry, RefKind, Remote, RepoState, RepoStatus,
+    Blob, GrepMatch, GrepQuery, LastCommit, OpLogEntry, OpProgress, RefEntry, RefKind, Remote, RepoState, RepoStatus,
     ResetMode, RestackOutcome, SmartlogEntry, Stash, StatusCode, StatusEntry, TagInfo, TreeEntry,
     Worktree,
 };

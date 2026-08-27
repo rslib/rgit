@@ -351,6 +351,78 @@ impl GitBackend for Git2Backend {
         })
     }
 
+    fn commit_overview(&self, rev: &str) -> Result<crate::CommitOverview, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let commit = repo.revparse_single(rev)?.peel_to_commit()?;
+        let tree = commit.tree()?;
+        let parent_tree = commit.parent(0).ok().map(|p| p.tree()).transpose()?;
+        let mut opts = DiffOptions::new();
+        let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
+
+        let mut files = Vec::with_capacity(diff.deltas().len());
+        for idx in 0..diff.deltas().len() {
+            let delta = diff.get_delta(idx).expect("delta in range");
+            let path = delta
+                .new_file()
+                .path()
+                .or_else(|| delta.old_file().path())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let binary = delta.flags().is_binary();
+            let (additions, deletions) = if binary {
+                (0, 0)
+            } else {
+                match Patch::from_diff(&diff, idx)? {
+                    Some(patch) => {
+                        let (_ctx, add, del) = patch.line_stats()?;
+                        (add, del)
+                    }
+                    None => (0, 0),
+                }
+            };
+            files.push(crate::CommitFile {
+                path,
+                additions,
+                deletions,
+                binary,
+            });
+        }
+
+        Ok(crate::CommitOverview {
+            id: commit
+                .as_object()
+                .short_id()
+                .ok()
+                .and_then(|b| b.as_str().ok().map(str::to_owned))
+                .unwrap_or_default(),
+            full_id: commit.id().to_string(),
+            author: commit.author().name().unwrap_or("?").to_owned(),
+            email: commit.author().email().unwrap_or("").to_owned(),
+            when: relative_age(commit.time().seconds(), now),
+            message: commit.message().unwrap_or("").trim_end().to_owned(),
+            files,
+        })
+    }
+
+    fn commit_file_diff(
+        &self,
+        rev: &str,
+        path: &str,
+    ) -> Result<Option<crate::FileDiff>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let commit = repo.revparse_single(rev)?.peel_to_commit()?;
+        let tree = commit.tree()?;
+        let parent_tree = commit.parent(0).ok().map(|p| p.tree()).transpose()?;
+        let mut opts = DiffOptions::new();
+        opts.pathspec(path);
+        let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
+        Ok(extract(&diff)?.into_iter().find(|f| f.path == path))
+    }
+
     fn diff_refs(&self, from: &str, to: &str) -> Result<Vec<crate::FileDiff>, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let from_tree = repo.revparse_single(from)?.peel_to_tree()?;
@@ -358,6 +430,20 @@ impl GitBackend for Git2Backend {
         let mut opts = DiffOptions::new();
         let diff = repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))?;
         extract(&diff)
+    }
+
+    fn file_diff(&self, path: &str, staged: bool) -> Result<Option<crate::FileDiff>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        let mut opts = DiffOptions::new();
+        opts.pathspec(path);
+        let diff = if staged {
+            let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+            repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))?
+        } else {
+            repo.diff_index_to_workdir(None, Some(&mut opts))?
+        };
+        Ok(extract(&diff)?.into_iter().find(|f| f.path == path))
     }
 
     fn blame(&self, path: &str) -> Result<Vec<crate::BlameLine>, GitError> {
@@ -677,6 +763,16 @@ impl GitBackend for Git2Backend {
     }
 
     fn grep(&self, pattern: &str) -> Result<Vec<crate::GrepMatch>, GitError> {
+        let q = crate::GrepQuery {
+            pattern: pattern.to_owned(),
+            regex: false,
+            path: None,
+            exts: Vec::new(),
+        };
+        self.grep_query(&q)
+    }
+
+    fn grep_query(&self, q: &crate::GrepQuery) -> Result<Vec<crate::GrepMatch>, GitError> {
         use grep::regex::RegexMatcherBuilder;
         use grep::searcher::Searcher;
         use grep::searcher::sinks::UTF8;
@@ -684,33 +780,58 @@ impl GitBackend for Git2Backend {
 
         const MAX_MATCHES: usize = 300;
         const MAX_PER_FILE: u64 = 50;
-        if pattern.is_empty() {
+        if q.pattern.is_empty() {
             return Ok(Vec::new());
         }
         let workdir = self.workdir.clone();
-        // Literal, case-insensitive: escape the pattern so it matches text, not
-        // as a regex.
+        // Literal, case-insensitive by default: escape the pattern so it
+        // matches text, not as a regex, unless the caller asked for regex mode.
+        let pattern = if q.regex {
+            q.pattern.clone()
+        } else {
+            regex::escape(&q.pattern)
+        };
         let matcher = RegexMatcherBuilder::new()
             .case_insensitive(true)
-            .build(&regex::escape(pattern))
+            .build(&pattern)
             .map_err(|e| GitError::Other(e.to_string()))?;
 
-        // Collect files once (gitignore-aware), then search them in parallel.
-        let files: Vec<std::path::PathBuf> = ignore::WalkBuilder::new(&workdir)
+        let path_filter = q.path.as_ref().map(|p| p.to_lowercase());
+
+        // Collect files once (gitignore-aware), then filter by path/extension
+        // before searching them in parallel.
+        let files: Vec<(std::path::PathBuf, String)> = ignore::WalkBuilder::new(&workdir)
             .build()
             .filter_map(Result::ok)
             .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
             .map(ignore::DirEntry::into_path)
+            .filter_map(|path| {
+                let rel = path
+                    .strip_prefix(&workdir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                if let Some(needle) = &path_filter {
+                    if !rel.to_lowercase().contains(needle.as_str()) {
+                        return None;
+                    }
+                }
+                if !q.exts.is_empty() {
+                    let ext = rel
+                        .rsplit_once('.')
+                        .map(|(_, ext)| ext.to_lowercase())
+                        .unwrap_or_default();
+                    if !q.exts.iter().any(|e| e == &ext) {
+                        return None;
+                    }
+                }
+                Some((path, rel))
+            })
             .collect();
 
         let mut out: Vec<crate::GrepMatch> = files
             .par_iter()
-            .flat_map_iter(|path| {
-                let rel = path
-                    .strip_prefix(&workdir)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .into_owned();
+            .flat_map_iter(|(path, rel)| {
                 let mut matches = Vec::new();
                 let _ = Searcher::new().search_path(
                     &matcher,

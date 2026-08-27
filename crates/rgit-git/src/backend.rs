@@ -138,8 +138,21 @@ pub trait GitBackend: Send + Sync {
     /// a revision (e.g. a short id).
     fn commit_details(&self, rev: &str) -> Result<crate::CommitDetails, GitError>;
 
+    /// A commit's metadata and changed-file list with line counts but no hunks,
+    /// so a commit touching many files lists cheaply.
+    fn commit_overview(&self, rev: &str) -> Result<crate::CommitOverview, GitError>;
+
+    /// The full diff for one file in a commit (against its first parent). None if
+    /// the file is not part of the commit's diff.
+    fn commit_file_diff(&self, rev: &str, path: &str)
+    -> Result<Option<crate::FileDiff>, GitError>;
+
     /// The diff between two revisions' trees (`from` as the old side).
     fn diff_refs(&self, from: &str, to: &str) -> Result<Vec<crate::FileDiff>, GitError>;
+
+    /// The working-tree diff for one file: unstaged (index vs workdir) when
+    /// `staged` is false, staged (HEAD vs index) when true. None if unchanged.
+    fn file_diff(&self, path: &str, staged: bool) -> Result<Option<crate::FileDiff>, GitError>;
 
     /// Blame a working-tree file: each line with the commit that last touched it.
     fn blame(&self, path: &str) -> Result<Vec<crate::BlameLine>, GitError>;
@@ -171,6 +184,10 @@ pub trait GitBackend: Send + Sync {
     /// parallel (ripgrep's engine). Bounded in total matches so it stays
     /// responsive; binary files are skipped.
     fn grep(&self, pattern: &str) -> Result<Vec<crate::GrepMatch>, GitError>;
+
+    /// Scoped code search: like [`GitBackend::grep`] but with an optional
+    /// regex mode, a path substring filter, and an extension allowlist.
+    fn grep_query(&self, q: &crate::GrepQuery) -> Result<Vec<crate::GrepMatch>, GitError>;
 
     /// Resolve a revision to its full 40-hex commit id, for stable permalinks.
     fn rev_parse(&self, rev: &str) -> Result<String, GitError>;

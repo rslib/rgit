@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use rgit_git::{Git2Backend, GitBackend, LogOptions, ResetMode};
+use rgit_git::{Git2Backend, GitBackend, GrepQuery, LogOptions, ResetMode};
 use serde_json::{Map, Value, json};
 
 use rmcp::{
@@ -363,8 +363,13 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_grep",
-            "Search the working tree for a literal string (case-insensitive, parallel, gitignore-aware). Returns path:line: text matches.",
-            &[("pattern", "string", true)],
+            "Search the working tree for a literal string (case-insensitive, parallel, gitignore-aware). Returns path:line: text matches. Optionally scope the search with `regex`, `path`, and `ext`.",
+            &[
+                ("pattern", "string", true),
+                ("regex", "boolean", false),
+                ("path", "string", false),
+                ("ext", "string[]", false),
+            ],
         ),
         tool(
             "git_branches",
@@ -806,10 +811,31 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
             .list_files(s("rev").unwrap_or("HEAD"))
             .map(|f| f.join("\n"))
             .map_err(emap),
-        "git_grep" => backend
-            .grep(req("pattern")?)
-            .map(|m| crate::render::grep(&m))
-            .map_err(emap),
+        "git_grep" => {
+            let exts: Vec<String> = match args.get("ext") {
+                Some(Value::Array(_)) => str_vec("ext"),
+                Some(Value::String(s)) => s
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                _ => Vec::new(),
+            }
+            .iter()
+            .map(|e| e.trim_start_matches('.').to_lowercase())
+            .collect();
+            let q = GrepQuery {
+                pattern: req("pattern")?.to_owned(),
+                regex: flag("regex"),
+                path: s("path").map(str::to_owned),
+                exts,
+            };
+            backend
+                .grep_query(&q)
+                .map(|m| crate::render::grep(&m))
+                .map_err(emap)
+        }
         "git_branches" => {
             let current = backend.status().ok().and_then(|s| s.head.branch);
             backend

@@ -66,6 +66,17 @@ fn detect_language(path: &str, text: &str) -> Option<String> {
     lang
 }
 
+/// The file extensions a language uses, from the bundled syntax set (broad
+/// coverage: Rust, Python, TOML, CMake, ...). Looks the language up by name then
+/// by lowercase token; empty when it is unknown to the syntax set.
+pub fn lang_extensions(lang: &str) -> Vec<String> {
+    let ss = syntaxes();
+    ss.find_syntax_by_name(lang)
+        .or_else(|| ss.find_syntax_by_token(&lang.to_ascii_lowercase()))
+        .map(|s| s.file_extensions.clone())
+        .unwrap_or_default()
+}
+
 /// Map a Linguist language name to a syntect syntax (by name, then token, then a
 /// few name mismatches).
 fn syntax_for_language(ss: &'static SyntaxSet, lang: &str) -> Option<&'static SyntaxReference> {
@@ -103,23 +114,65 @@ pub fn code_block_html(lang: &str, code: &str) -> String {
 }
 
 /// One-syntax highlighting of multi-line text: emit each line's classed spans,
-/// re-adding the newline the span generator drops so lines stay separate.
+/// one line per source line. The two-face `extra_newlines` syntaxes keep the
+/// source newline inside the trailing span (not at the very end of the string),
+/// so drop that embedded newline and add a single plain separator - otherwise
+/// every line renders as two under `white-space:pre`.
 fn spans(syntax: &SyntaxReference, text: &str) -> String {
     let ss = syntaxes();
     let mut parse = ParseState::new(syntax);
     let mut scope = ScopeStack::new();
     let mut out = String::new();
     for line in LinesWithEndings::from(text) {
-        let html = parse
+        let mut html = parse
             .parse_line(line, ss)
             .ok()
             .and_then(|ops| line_tokens_to_classed_spans(line, &ops, STYLE, &mut scope).ok())
             .map(|(html, _)| html)
             .unwrap_or_else(|| escape(line));
-        out.push_str(html.trim_end_matches('\n'));
+        if let Some(pos) = html.rfind('\n') {
+            html.remove(pos);
+        }
+        out.push_str(&html);
         out.push('\n');
     }
     out
+}
+
+/// Pick a syntax for a diff by extension only. Diffs highlight many files, so
+/// this skips the hyperpolyglot content detection (a temp-file write per file)
+/// that the blob view can afford; extension lookup is enough for a diff.
+pub fn syntax_for_path(path: &str) -> &'static SyntaxReference {
+    let ss = syntaxes();
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let ext = base.rsplit('.').next().unwrap_or("");
+    ss.find_syntax_by_extension(base)
+        .or_else(|| ss.find_syntax_by_extension(ext))
+        .unwrap_or_else(|| ss.find_syntax_plain_text())
+}
+
+/// Highlight one line in isolation for a diff view. Hunks skip lines, so there is
+/// no reliable cross-line parse state; a multi-line string or comment is only
+/// approximate, but keywords, strings, and comments within a line are colored.
+pub fn highlight_fragment(syntax: &SyntaxReference, text: &str) -> String {
+    let ss = syntaxes();
+    let mut parse = ParseState::new(syntax);
+    let mut scope = ScopeStack::new();
+    let Ok(ops) = parse.parse_line(text, ss) else {
+        return escape(text);
+    };
+    match line_tokens_to_classed_spans(text, &ops, STYLE, &mut scope) {
+        // Close any spans still open at the line's end so the fragment is
+        // self-contained; otherwise the unclosed spans nest each diff line inside
+        // the previous one and the left padding compounds into a staircase.
+        Ok((mut html, open)) => {
+            for _ in 0..open.max(0) {
+                html.push_str("</span>");
+            }
+            html
+        }
+        Err(_) => escape(text),
+    }
 }
 
 /// The class stylesheet for both themes: a light default, and a dark set applied

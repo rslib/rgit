@@ -287,6 +287,21 @@ pub struct GrepMatch {
     pub text: String,
 }
 
+/// A scoped code search request.
+#[derive(Debug, Clone, Default)]
+pub struct GrepQuery {
+    /// Text to match; literal unless `regex` is set.
+    pub pattern: String,
+    /// Treat `pattern` as a regular expression instead of a literal string.
+    pub regex: bool,
+    /// Keep only files whose repo-relative path contains this substring
+    /// (case-insensitive).
+    pub path: Option<String>,
+    /// Keep only files with one of these extensions (lowercase, no leading
+    /// dot); empty means any extension.
+    pub exts: Vec<String>,
+}
+
 /// A file's contents at a revision, for the blob/file view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blob {
@@ -530,6 +545,30 @@ pub struct CommitDetails {
     pub when: String,
     pub message: String,
     pub files: Vec<FileDiff>,
+}
+
+/// One changed file in a commit, with line counts but no hunks - cheap to list
+/// even for a commit that touches many files. The hunks load on demand.
+#[derive(Debug, Clone)]
+pub struct CommitFile {
+    pub path: String,
+    pub additions: usize,
+    pub deletions: usize,
+    pub binary: bool,
+}
+
+/// A commit's metadata and the list of files it changed, without any hunk bodies.
+/// The full diff for a single file is fetched separately, so a large commit does
+/// not render every diff up front.
+#[derive(Debug, Clone)]
+pub struct CommitOverview {
+    pub id: String,
+    pub full_id: String,
+    pub author: String,
+    pub email: String,
+    pub when: String,
+    pub message: String,
+    pub files: Vec<CommitFile>,
 }
 
 /// Progress reported by a network operation, for the operation console and its

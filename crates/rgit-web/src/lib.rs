@@ -24,7 +24,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use maud::Markup;
-use rgit_git::{Git2Backend, GitBackend, GitError, LogOptions, RefKind};
+use rgit_git::{Git2Backend, GitBackend, GitError, GrepQuery, LogOptions, RefKind};
 
 const LOG_PAGE: usize = 50;
 
@@ -297,7 +297,11 @@ fn summary_page(b: &dyn GitBackend, repo: &str, base: &str) -> Result<Markup, Ap
 }
 
 fn commit_page(b: &dyn GitBackend, repo: &str, base: &str, rev: &str) -> Result<Markup, AppError> {
-    Ok(view::commit(repo, base, &side_info(b, base, repo), &b.commit_details(rev)?))
+    Ok(view::commit(repo, base, &side_info(b, base, repo), &b.commit_overview(rev)?))
+}
+
+fn commit_diff_fragment(b: &dyn GitBackend, rev: &str, path: &str) -> Result<Markup, AppError> {
+    Ok(view::diff_fragment(b.commit_file_diff(rev, path)?.as_ref()))
 }
 
 fn refs_page(b: &dyn GitBackend, repo: &str, base: &str) -> Result<Markup, AppError> {
@@ -306,6 +310,25 @@ fn refs_page(b: &dyn GitBackend, repo: &str, base: &str) -> Result<Markup, AppEr
 
 fn blame_page(b: &dyn GitBackend, repo: &str, base: &str, path: &str) -> Result<Markup, AppError> {
     Ok(view::blame(repo, base, &side_info(b, base, repo), path, &b.blame(path)?))
+}
+
+fn diff_page(
+    b: &dyn GitBackend,
+    repo: &str,
+    base: &str,
+    path: &str,
+    q: &HashMap<String, String>,
+) -> Result<Markup, AppError> {
+    let staged = q.get("staged").map(|v| v == "1").unwrap_or(false);
+    let diff = b.file_diff(path, staged)?;
+    Ok(view::worktree_diff(
+        repo,
+        base,
+        &side_info(b, base, repo),
+        path,
+        staged,
+        diff.as_ref(),
+    ))
 }
 
 fn log_page(
@@ -481,7 +504,7 @@ fn search_page(
     let matches = if query.is_empty() {
         Vec::new()
     } else {
-        b.grep(query).unwrap_or_default()
+        b.grep_query(&parse_query(query)).unwrap_or_default()
     };
     Ok(view::search(
         repo,
@@ -490,6 +513,97 @@ fn search_page(
         query,
         &matches,
     ))
+}
+
+/// Parse a GitHub-style scoped query into a [`GrepQuery`]. Qualifiers:
+/// `lang:` / `ext:` narrow by extension, `path:` by a path substring, a
+/// `/.../`-wrapped term is a regex, a `"..."`-wrapped term is an exact phrase,
+/// and `repo:` is accepted but ignored here (search is already per-repo).
+/// Everything else is the literal pattern.
+fn parse_query(raw: &str) -> GrepQuery {
+    let mut regex = false;
+    let mut path = None;
+    let mut exts: Vec<String> = Vec::new();
+    let mut pattern = String::new();
+    let mut terms: Vec<String> = Vec::new();
+    for tok in tokenize(raw) {
+        if let Some(v) = tok.strip_prefix("lang:") {
+            exts.extend(lang_exts(v));
+        } else if let Some(v) = tok.strip_prefix("ext:") {
+            exts.push(v.trim_start_matches('.').to_ascii_lowercase());
+        } else if let Some(v) = tok.strip_prefix("path:") {
+            if !v.is_empty() {
+                path = Some(v.to_owned());
+            }
+        } else if tok.strip_prefix("repo:").is_some() {
+            // Per-repo search is already scoped; cross-repo scope is handled elsewhere.
+        } else if tok.len() >= 2 && tok.starts_with('/') && tok.ends_with('/') {
+            regex = true;
+            pattern = tok[1..tok.len() - 1].to_owned();
+        } else if tok.len() >= 2 && tok.starts_with('"') && tok.ends_with('"') {
+            terms.push(tok[1..tok.len() - 1].to_owned());
+        } else {
+            terms.push(tok);
+        }
+    }
+    if pattern.is_empty() {
+        pattern = terms.join(" ");
+    }
+    GrepQuery {
+        pattern,
+        regex,
+        path,
+        exts,
+    }
+}
+
+/// Split a query into tokens, keeping `"..."` and `/.../` groups intact.
+fn tokenize(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut delim: Option<char> = None;
+    for c in s.chars() {
+        match delim {
+            Some(d) => {
+                cur.push(c);
+                if c == d {
+                    out.push(std::mem::take(&mut cur));
+                    delim = None;
+                }
+            }
+            None => {
+                if c.is_whitespace() {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                } else if (c == '"' || c == '/') && cur.is_empty() {
+                    cur.push(c);
+                    delim = Some(c);
+                } else {
+                    cur.push(c);
+                }
+            }
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Resolve a `lang:` value to candidate file extensions using the bundled syntax
+/// set (the same Linguist-derived data used for highlighting). Falls back to
+/// treating the value itself as an extension when the language is unknown.
+fn lang_exts(lang: &str) -> Vec<String> {
+    let exts: Vec<String> = highlight::lang_extensions(lang)
+        .into_iter()
+        .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
+        .collect();
+    if exts.is_empty() {
+        vec![lang.trim_start_matches('.').to_ascii_lowercase()]
+    } else {
+        exts
+    }
 }
 
 fn files_body(b: &dyn GitBackend) -> Result<Response, AppError> {
@@ -569,6 +683,13 @@ async fn s_commit(State(s): State<Shared>, Path(rev): Path<String>) -> Result<Ma
     let (b, r, base) = ctx(&s, None)?;
     commit_page(b.as_ref(), &r, &base, &rev)
 }
+async fn s_commit_diff(
+    State(s): State<Shared>,
+    Path((rev, path)): Path<(String, String)>,
+) -> Result<Markup, AppError> {
+    let (b, _, _) = ctx(&s, None)?;
+    commit_diff_fragment(b.as_ref(), &rev, &path)
+}
 async fn s_refs(State(s): State<Shared>) -> Result<Markup, AppError> {
     let (b, r, base) = ctx(&s, None)?;
     refs_page(b.as_ref(), &r, &base)
@@ -576,6 +697,14 @@ async fn s_refs(State(s): State<Shared>) -> Result<Markup, AppError> {
 async fn s_blame(State(s): State<Shared>, Path(path): Path<String>) -> Result<Markup, AppError> {
     let (b, r, base) = ctx(&s, None)?;
     blame_page(b.as_ref(), &r, &base, &path)
+}
+async fn s_diff(
+    State(s): State<Shared>,
+    Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Markup, AppError> {
+    let (b, r, base) = ctx(&s, None)?;
+    diff_page(b.as_ref(), &r, &base, &path, &q)
 }
 async fn s_files(State(s): State<Shared>) -> Result<Response, AppError> {
     let (b, _, _) = ctx(&s, None)?;
@@ -691,6 +820,13 @@ async fn m_commit(
     let (b, r, base) = ctx(&s, Some(&repo))?;
     commit_page(b.as_ref(), &r, &base, &rev)
 }
+async fn m_commit_diff(
+    State(s): State<Shared>,
+    Path((repo, rev, path)): Path<(String, String, String)>,
+) -> Result<Markup, AppError> {
+    let (b, _, _) = ctx(&s, Some(&repo))?;
+    commit_diff_fragment(b.as_ref(), &rev, &path)
+}
 async fn m_refs(State(s): State<Shared>, Path(repo): Path<String>) -> Result<Markup, AppError> {
     let (b, r, base) = ctx(&s, Some(&repo))?;
     refs_page(b.as_ref(), &r, &base)
@@ -701,6 +837,14 @@ async fn m_blame(
 ) -> Result<Markup, AppError> {
     let (b, r, base) = ctx(&s, Some(&repo))?;
     blame_page(b.as_ref(), &r, &base, &path)
+}
+async fn m_diff(
+    State(s): State<Shared>,
+    Path((repo, path)): Path<(String, String)>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Markup, AppError> {
+    let (b, r, base) = ctx(&s, Some(&repo))?;
+    diff_page(b.as_ref(), &r, &base, &path, &q)
 }
 async fn m_files(State(s): State<Shared>, Path(repo): Path<String>) -> Result<Response, AppError> {
     let (b, _, _) = ctx(&s, Some(&repo))?;
@@ -735,8 +879,10 @@ fn single_router(state: Shared) -> Router {
         .route("/tree/{*path}", get(s_tree))
         .route("/blob/{*path}", get(s_blob))
         .route("/commit/{rev}", get(s_commit))
+        .route("/commit/{rev}/diff/{*path}", get(s_commit_diff))
         .route("/refs", get(s_refs))
         .route("/blame/{*path}", get(s_blame))
+        .route("/diff/{*path}", get(s_diff))
         .route("/files", get(s_files))
         .route("/archive", get(s_archive))
         .route("/prs", get(s_prs))
@@ -753,8 +899,10 @@ fn multi_router(state: Shared) -> Router {
         .route("/{repo}/tree/{*path}", get(m_tree))
         .route("/{repo}/blob/{*path}", get(m_blob))
         .route("/{repo}/commit/{rev}", get(m_commit))
+        .route("/{repo}/commit/{rev}/diff/{*path}", get(m_commit_diff))
         .route("/{repo}/refs", get(m_refs))
         .route("/{repo}/blame/{*path}", get(m_blame))
+        .route("/{repo}/diff/{*path}", get(m_diff))
         .route("/{repo}/files", get(m_files))
         .route("/{repo}/archive", get(m_archive))
         .route("/{repo}/prs", get(m_prs))
