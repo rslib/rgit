@@ -258,6 +258,9 @@ tr[data-point].kbcur{background:var(--sunk); box-shadow:inset 2px 0 0 var(--acc)
 /* Inline fallback links (sidebar, explorer): an accent underline reads cleaner
    than a box around a run of text. */
 a.kbcur:not([data-point]){text-decoration:underline; text-decoration-color:var(--acc); text-decoration-thickness:2px; text-underline-offset:3px; color:var(--acc-ink);}
+/* Fallback buttons / copy controls (e.g. the sidebar Clone card): a ring, since
+   they are standalone controls rather than rows or inline links. */
+button.kbcur:not([data-point]), [data-copy].kbcur:not(a):not([data-point]), [data-copy-text].kbcur:not(a):not([data-point]){box-shadow:0 0 0 2px var(--acc); border-radius:6px; color:var(--acc-ink);}
 /* Focused pane (h/l): a continuous left rail, drawn as an overlay so inner cards
    cannot chop it into segments the way an inset shadow gets occluded. Only the
    static main/list panes get position:relative; the explorer and info sidebar
@@ -634,7 +637,7 @@ if(cloneBtn&&cpop){
 var scrim=document.getElementById('scrim'), wk=document.getElementById('whichkey');
 var finder=document.getElementById('finder'), findInput=document.getElementById('find-input'), findList=document.getElementById('find-list');
 var palette=document.getElementById('palette'), palInput=document.getElementById('pal-input'), palList=document.getElementById('pal-list');
-function closeAll(){ if(wk)wk.classList.remove('open'); if(finder)finder.classList.remove('open'); if(palette)palette.classList.remove('open'); if(scrim)scrim.classList.remove('open'); }
+function closeAll(){ if(wk)wk.classList.remove('open'); if(finder)finder.classList.remove('open'); if(palette)palette.classList.remove('open'); if(scrim)scrim.classList.remove('open'); var cp=document.getElementById('cpop'); if(cp)cp.classList.remove('open'); }
 if(scrim) scrim.addEventListener('click',closeAll);
 function toggleWk(){ if(!wk)return; var was=wk.classList.contains('open'); closeAll(); if(!was){ wk.classList.add('open'); if(scrim)scrim.classList.add('open'); } }
 
@@ -734,6 +737,10 @@ document.addEventListener('keydown',function(e){
   if(e.key==='?'){e.preventDefault();toggleWk();return;}
   if(e.key===':'){e.preventDefault();openPalette();return;}
   if(e.key==='t'){e.preventDefault();openFinder();return;}
+  if(e.key==='c'){var cb=document.getElementById('cloneBtn'), cp=document.getElementById('cpop');
+    if(cb&&cp){ e.preventDefault(); cb.click();
+      if(cp.classList.contains('open')){ var f=cp.querySelector('button,a[href]'); if(f)setTimeout(function(){f.focus();},20); } }
+    return;}
   if(e.key==='y'){var pl=document.querySelector('[data-permalink]'); var url=pl?pl.getAttribute('data-permalink'):location.href;
     try{navigator.clipboard.writeText(new URL(url,location.href).href);}catch(x){} toast('permalink copied');return;}
   if(e.key==='j'){if(move(1))e.preventDefault();}

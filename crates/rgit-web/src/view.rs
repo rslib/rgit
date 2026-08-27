@@ -208,6 +208,7 @@ pub fn layout(
                         div { kbd { "1" } "-" kbd { "6" } span.d { "switch view" } }
                         div { kbd { ":" } span.d { "command palette" } }
                         div { kbd { "t" } span.d { "find file" } }
+                        div { kbd { "c" } span.d { "clone menu" } }
                         div { kbd { "y" } span.d { "copy permalink" } }
                         div { kbd { "Esc" } span.d { "close" } }
                     }
