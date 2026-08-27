@@ -87,6 +87,24 @@ fn main() -> ! {
                 }
             }
         }
+        // The `git` escape hatch is a transparent passthrough: inherit stdin,
+        // stdout, and stderr so stdin-reading subcommands (commit-tree,
+        // hash-object --stdin, apply) and interactive ones behave exactly like
+        // git, and exit with git's own status.
+        Some(Command::Git { args }) => {
+            let backend = discover_or_exit();
+            let status = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(backend.workdir())
+                .status();
+            match status {
+                Ok(s) => exit(s.code().unwrap_or(if s.success() { 0 } else { 1 })),
+                Err(e) => {
+                    eprintln!("rgit: could not run git: {e}");
+                    exit(1);
+                }
+            }
+        }
         // Every other subcommand runs one operation and prints compact output.
         Some(command) => {
             // Color and prompts only on a real terminal.
