@@ -172,6 +172,12 @@ pub enum Command {
         #[arg(required = true)]
         paths: Vec<String>,
     },
+    /// Delete local branches already merged into a base (default HEAD).
+    Prune {
+        /// Delete branches merged into this revision.
+        #[arg(default_value = "HEAD")]
+        base: String,
+    },
     /// Fetch the current branch's remote.
     Fetch,
     /// Fetch and fast-forward the current branch.
@@ -971,6 +977,14 @@ pub fn run(
         Command::Split { rev, paths } => {
             backend.split(&rev, &paths)?;
             format!("split {rev} into two commits")
+        }
+        Command::Prune { base } => {
+            let deleted = backend.prune_merged(&base)?;
+            if deleted.is_empty() {
+                format!("no branches merged into {base}")
+            } else {
+                format!("deleted {} merged: {}", deleted.len(), deleted.join(", "))
+            }
         }
         Command::Move { rev, before, after } => match (before, after) {
             (Some(t), None) => {

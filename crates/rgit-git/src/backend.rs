@@ -85,6 +85,11 @@ pub trait GitBackend: Send + Sync {
     /// the first-parent chain. A conflict aborts cleanly. Op-log-safe.
     fn reorder(&self, rev: &str, target: &str, before: bool) -> Result<(), GitError>;
 
+    /// Delete local branches fully merged into `base` (tip is an ancestor of
+    /// base), except the current branch and `base` itself. Returns the names
+    /// deleted. Op-log-safe.
+    fn prune_merged(&self, base: &str) -> Result<Vec<String>, GitError>;
+
     /// The directory git resolves hooks from (`core.hooksPath` or
     /// `<git-dir>/hooks`), so the caller can run and stream them itself.
     fn hooks_dir(&self) -> std::path::PathBuf;

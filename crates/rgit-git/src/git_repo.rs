@@ -1845,6 +1845,42 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn prune_merged(&self, base: &str) -> Result<Vec<String>, GitError> {
+        self.snap("prune");
+        let repo = self.repo.lock().expect("repo mutex");
+        let base_oid = repo.revparse_single(base)?.peel_to_commit()?.id();
+        let current_ref: Option<String> = repo
+            .head()
+            .ok()
+            .and_then(|h| h.name().ok().map(str::to_owned));
+        let mut deleted = Vec::new();
+        for entry in repo.branches(Some(BranchType::Local))? {
+            let (mut branch, _) = entry?;
+            let full = branch.get().name().ok().map(str::to_owned);
+            if full.is_some() && full == current_ref {
+                continue;
+            }
+            let name = full
+                .as_deref()
+                .map(|f| f.trim_start_matches("refs/heads/").to_owned())
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let tip = branch.get().peel_to_commit()?.id();
+            if tip == base_oid {
+                continue;
+            }
+            // Merged when base descends from the branch tip (tip is an ancestor).
+            if repo.graph_descendant_of(base_oid, tip).unwrap_or(false) {
+                branch.delete()?;
+                deleted.push(name);
+            }
+        }
+        deleted.sort();
+        Ok(deleted)
+    }
+
     fn reorder(&self, rev: &str, target: &str, before: bool) -> Result<(), GitError> {
         self.snap("reorder");
         {
