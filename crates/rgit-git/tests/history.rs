@@ -578,3 +578,58 @@ fn prune_deletes_only_merged_branches() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn rev(dir: &Path, r: &str) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", r])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+#[test]
+fn sync_fast_forwards_a_branch_to_its_upstream() {
+    let base = scratch("sync-remote");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let remote = base.join("remote.git");
+    let work = base.join("work");
+    let work2 = base.join("work2");
+    let url = format!("file://{}", remote.display());
+
+    // A bare remote, and a working clone with a user identity.
+    git(&base, &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    git(&base, &["clone", "-q", &url, work.to_str().unwrap()]);
+    git(&work, &["config", "user.email", "t@example.com"]);
+    git(&work, &["config", "user.name", "test"]);
+
+    commit(&work, "f", "base\n", "base");
+    git(&work, &["push", "-q", "-u", "origin", "main"]);
+    // A tracked feature branch, then move off it so it is not current.
+    git(&work, &["checkout", "-qb", "feat"]);
+    commit(&work, "g", "g\n", "on feat");
+    git(&work, &["push", "-q", "-u", "origin", "feat"]);
+    git(&work, &["checkout", "-q", "main"]);
+
+    // Advance origin/feat from a second clone.
+    git(&base, &["clone", "-q", &url, work2.to_str().unwrap()]);
+    git(&work2, &["config", "user.email", "t@example.com"]);
+    git(&work2, &["config", "user.name", "test"]);
+    git(&work2, &["checkout", "-q", "feat"]);
+    commit(&work2, "h", "h\n", "advance feat");
+    git(&work2, &["push", "-q", "origin", "feat"]);
+
+    // Sync fetches and fast-forwards the non-current feat to its upstream.
+    let backend = Git2Backend::discover(&work).unwrap();
+    backend.sync(&|_| {}).unwrap();
+
+    assert_eq!(
+        rev(&work, "feat"),
+        rev(&work, "origin/feat"),
+        "sync should fast-forward feat to its upstream"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
