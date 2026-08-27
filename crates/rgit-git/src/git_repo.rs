@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use git2::build::CheckoutBuilder;
 use git2::{
     ApplyLocation, ApplyOptions, BranchType, Cred, CredentialType, Diff, DiffOptions, ErrorCode,
-    FetchOptions, ObjectType, Patch, PushOptions, RemoteCallbacks, Repository, ResetType, Status,
-    StatusOptions,
+    FetchOptions, ObjectType, Oid, Patch, PushOptions, RemoteCallbacks, Repository, ResetType,
+    Status, StatusOptions,
 };
 
 use crate::model::{RepoState, ResetMode};
@@ -1761,6 +1761,18 @@ impl GitBackend for Git2Backend {
         make_amend(&repo, message, true)
     }
 
+    fn reword(&self, rev: &str, message: &str) -> Result<(), GitError> {
+        self.snap("reword");
+        {
+            let repo = self.repo.lock().expect("repo mutex");
+            let target = repo.revparse_single(rev)?.peel_to_commit()?.id();
+            reword_commit(&repo, target, message)?;
+        }
+        // Descendant stacked branches point at the old oids; move them forward.
+        let _ = self.restack();
+        Ok(())
+    }
+
     fn hooks_dir(&self) -> PathBuf {
         let repo = self.repo.lock().expect("repo mutex");
         // core.hooksPath wins (relative to the working directory); otherwise the
@@ -2334,6 +2346,78 @@ fn make_amend(repo: &Repository, message: &str, verify: bool) -> Result<(), GitE
     if verify {
         let _ = git2_hooks::hooks_post_commit(repo, None);
     }
+    Ok(())
+}
+
+/// The first-parent chain from HEAD down to and including `target`, newest
+/// first. Errors if `target` is not an ancestor of HEAD on that chain.
+fn first_parent_chain(repo: &Repository, target: Oid) -> Result<Vec<git2::Commit<'_>>, GitError> {
+    let mut chain = Vec::new();
+    let mut c = repo.head()?.peel_to_commit()?;
+    loop {
+        let id = c.id();
+        chain.push(c);
+        if id == target {
+            return Ok(chain);
+        }
+        c = match chain.last().unwrap().parent(0) {
+            Ok(p) => p,
+            Err(_) => {
+                return Err(GitError::Other(
+                    "revision is not an ancestor of HEAD".to_owned(),
+                ));
+            }
+        };
+    }
+}
+
+/// The ref HEAD points at (a branch), for updating after a history rewrite.
+/// Errors on a detached HEAD, which these edits do not support.
+fn head_branch_ref(repo: &Repository) -> Result<String, GitError> {
+    let head = repo.head()?;
+    if head.is_branch() {
+        Ok(head.name().unwrap_or("HEAD").to_owned())
+    } else {
+        Err(GitError::Other(
+            "HEAD is detached; edit a commit on a branch".to_owned(),
+        ))
+    }
+}
+
+/// Change `target`'s message, keeping its tree and parents, and re-create every
+/// commit above it with the rewritten parent (their trees are unchanged, so no
+/// merge is needed). Updates the current branch to the new tip.
+fn reword_commit(repo: &Repository, target: Oid, new_message: &str) -> Result<(), GitError> {
+    let branch_ref = head_branch_ref(repo)?;
+    let chain = first_parent_chain(repo, target)?; // [HEAD, ..., target]
+    let sig = repo.signature()?;
+    let mut new_tip = target;
+    // Rebuild bottom-up (target first).
+    for commit in chain.iter().rev() {
+        let is_target = commit.id() == target;
+        let message = if is_target {
+            crate::change_id::preserve(commit.message().unwrap_or(""), new_message)
+        } else {
+            commit.message().unwrap_or("").to_owned()
+        };
+        let parents: Vec<git2::Commit> = if is_target {
+            (0..commit.parent_count())
+                .filter_map(|k| commit.parent(k).ok())
+                .collect()
+        } else {
+            vec![repo.find_commit(new_tip)?]
+        };
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        new_tip = repo.commit(
+            None,
+            &commit.author(),
+            &sig,
+            &message,
+            &commit.tree()?,
+            &parent_refs,
+        )?;
+    }
+    repo.reference(&branch_ref, new_tip, true, "rgit reword")?;
     Ok(())
 }
 

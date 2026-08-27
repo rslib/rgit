@@ -57,6 +57,11 @@ pub trait GitBackend: Send + Sync {
     /// Replace HEAD with a new commit from the index, keeping HEAD's parents.
     fn amend(&self, message: &str) -> Result<(), GitError>;
 
+    /// Change any commit's message (keeping its tree and parents) and replay its
+    /// descendants on the current branch, then restack stacked children. The rev
+    /// must be an ancestor of HEAD on the first-parent chain.
+    fn reword(&self, rev: &str, message: &str) -> Result<(), GitError>;
+
     /// The directory git resolves hooks from (`core.hooksPath` or
     /// `<git-dir>/hooks`), so the caller can run and stream them itself.
     fn hooks_dir(&self) -> std::path::PathBuf;

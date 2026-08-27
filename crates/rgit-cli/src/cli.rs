@@ -126,6 +126,15 @@ pub enum Command {
     },
     /// Amend HEAD with the staged changes, keeping its message (no editor).
     Extend,
+    /// Change any commit's message and restack its descendants (default HEAD).
+    Reword {
+        /// The new message.
+        #[arg(short, long)]
+        message: String,
+        /// The commit to reword (default HEAD).
+        #[arg(default_value = "HEAD")]
+        rev: String,
+    },
     /// Fetch the current branch's remote.
     Fetch,
     /// Fetch and fast-forward the current branch.
@@ -903,6 +912,10 @@ pub fn run(
         Command::Extend => {
             backend.commit_extend()?;
             backend.commit_report().join("\n")
+        }
+        Command::Reword { message, rev } => {
+            backend.reword(&rev, &message)?;
+            format!("reworded {rev}")
         }
         Command::Fetch => net(interactive, "fetch", |r| backend.fetch(r))?,
         Command::Pull => net(interactive, "pull", |r| backend.pull(r))?,
