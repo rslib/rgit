@@ -306,6 +306,11 @@ pub enum Command {
     },
     /// Run the Model Context Protocol server over stdio.
     Mcp,
+    /// Semantic code search: build the on-disk vector index or query it.
+    Index {
+        #[command(subcommand)]
+        action: IndexCmd,
+    },
     /// Serve the web viewer for this repository, or a directory of repositories.
     Serve {
         /// Address to bind.
@@ -322,6 +327,42 @@ pub enum Command {
         /// clone URL is <base>/<repo>.git instead of the repo's own remotes.
         #[arg(long)]
         clone_base: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IndexCmd {
+    /// Build (or incrementally rebuild) the index. Local by default; `--root DIR`
+    /// builds every repo under a directory.
+    Build {
+        /// Build every git repo directly under this directory (global).
+        #[arg(long)]
+        root: Option<String>,
+    },
+    /// Search the semantic index by meaning (local, or global with `--root`).
+    Search {
+        /// The natural-language or code query.
+        query: String,
+        /// Maximum results.
+        #[arg(short, long, default_value_t = 8)]
+        limit: usize,
+        /// Search every git repo directly under this directory (global).
+        #[arg(long)]
+        root: Option<String>,
+    },
+    /// Report whether an index exists and how many chunks it holds.
+    Status,
+    /// Hybrid search: fuse literal grep and semantic ranking (local, or global
+    /// with `--root`).
+    Code {
+        /// The query (literal terms help the lexical side; prose helps semantic).
+        query: String,
+        /// Maximum results.
+        #[arg(short, long, default_value_t = 8)]
+        limit: usize,
+        /// Search every git repo directly under this directory (global).
+        #[arg(long)]
+        root: Option<String>,
     },
 }
 
@@ -556,6 +597,226 @@ pub enum WorkspaceCmd {
     },
 }
 
+/// Build or query the semantic index for the current repository.
+fn index_cmd(backend: &Arc<dyn GitBackend>, action: IndexCmd) -> anyhow::Result<String> {
+    match action {
+        IndexCmd::Build { root } => index_build(backend, root.as_deref()),
+        IndexCmd::Search { query, limit, root } => {
+            semantic_search(backend, root.as_deref(), &query, limit)
+        }
+        IndexCmd::Code { query, limit, root } => {
+            code_search(backend, root.as_deref(), &query, limit)
+        }
+        IndexCmd::Status => {
+            let path = rgit_index::index_path(backend.workdir());
+            match rgit_index::load(&path) {
+                Some(index) => Ok(format!("indexed: {} chunks ({})", index.len(), path.display())),
+                None => Ok(format!("no index ({}); run `rgit index build`", path.display())),
+            }
+        }
+    }
+}
+
+/// One repo's directory name, for labeling multi-repo output.
+fn repo_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".to_owned())
+}
+
+/// Resolve a scope to (label, backend) targets. `root` searches/builds every git
+/// repo directly under a directory (global); otherwise the single `default` repo
+/// (local).
+pub(crate) fn repo_targets(
+    root: Option<&str>,
+    default: &Arc<dyn GitBackend>,
+) -> anyhow::Result<Vec<(String, Arc<dyn GitBackend>)>> {
+    match root.filter(|r| !r.trim().is_empty()) {
+        None => Ok(vec![(repo_label(default.workdir()), default.clone())]),
+        Some(dir) => {
+            let mut out: Vec<(String, Arc<dyn GitBackend>)> = Vec::new();
+            for entry in std::fs::read_dir(dir)?.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    if let Ok(b) = rgit_git::Git2Backend::discover(&p) {
+                        out.push((repo_label(&p), Arc::new(b)));
+                    }
+                }
+            }
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            if out.is_empty() {
+                anyhow::bail!("no git repositories directly under {dir}");
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// A fused search result across (possibly) many repos.
+struct Hit {
+    score: f64,
+    repo: String,
+    path: String,
+    line: usize,
+    tag: &'static str,
+}
+
+/// Hybrid hits for one repo: fuse literal `grep` and semantic ranking with
+/// reciprocal-rank fusion (RRF), bucketing locations to the chunk window so a
+/// lexical match and a semantic hit in the same region reinforce each other.
+/// Degrades to grep when the repo has no index.
+fn hybrid_hits(backend: &Arc<dyn GitBackend>, repo: &str, query: &str, pool: usize) -> Vec<Hit> {
+    use std::collections::HashMap;
+    const K: f64 = 60.0;
+    const CHUNK_STEP: usize = 30;
+
+    let semantic = match rgit_index::load(&rgit_index::index_path(backend.workdir())) {
+        Some(index) => rgit_index::Embedder::new()
+            .and_then(|e| rgit_index::search(&index, &e, query, pool))
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let lexical = backend
+        .grep_query(&rgit_git::GrepQuery {
+            pattern: query.to_owned(),
+            regex: false,
+            path: None,
+            exts: Vec::new(),
+        })
+        .unwrap_or_default();
+
+    #[derive(Default)]
+    struct Fused {
+        score: f64,
+        lexical: bool,
+        semantic: bool,
+        line: usize,
+    }
+    let bucket = |line: usize| (line.saturating_sub(1) / CHUNK_STEP) * CHUNK_STEP + 1;
+    let mut acc: HashMap<(String, usize), Fused> = HashMap::new();
+    for (rank, m) in lexical.iter().enumerate().take(pool) {
+        let e = acc.entry((m.path.clone(), bucket(m.line))).or_default();
+        e.score += 1.0 / (K + rank as f64);
+        e.lexical = true;
+        if e.line == 0 {
+            e.line = m.line;
+        }
+    }
+    for (rank, h) in semantic.iter().enumerate() {
+        let e = acc
+            .entry((h.path.clone(), bucket(h.start_line)))
+            .or_default();
+        e.score += 1.0 / (K + rank as f64);
+        e.semantic = true;
+        if e.line == 0 {
+            e.line = h.start_line;
+        }
+    }
+    acc.into_iter()
+        .map(|((path, _), f)| Hit {
+            score: f.score,
+            repo: repo.to_owned(),
+            path,
+            line: f.line,
+            tag: match (f.lexical, f.semantic) {
+                (true, true) => "both",
+                (true, false) => "lexical",
+                _ => "semantic",
+            },
+        })
+        .collect()
+}
+
+/// Hybrid code search over a scope (one repo, or every repo under `root`),
+/// fusing lexical and semantic ranking. Results are rendered `score path:line
+/// [tag]`, prefixed with the repo when the scope spans more than one.
+pub(crate) fn code_search(
+    backend: &Arc<dyn GitBackend>,
+    root: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<String> {
+    let targets = repo_targets(root, backend)?;
+    let multi = targets.len() > 1;
+    let pool = (limit * 3).max(20);
+    let mut hits: Vec<Hit> = Vec::new();
+    for (label, b) in &targets {
+        hits.extend(hybrid_hits(b, label, query, pool));
+    }
+    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(limit);
+    if hits.is_empty() {
+        return Ok("no matches".to_owned());
+    }
+    let mut out = String::new();
+    for h in hits {
+        if multi {
+            out.push_str(&format!("{:.4}  {}/{}:{}  [{}]\n", h.score, h.repo, h.path, h.line, h.tag));
+        } else {
+            out.push_str(&format!("{:.4}  {}:{}  [{}]\n", h.score, h.path, h.line, h.tag));
+        }
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+/// Semantic-only search over a scope (one repo, or every repo under `root`).
+pub(crate) fn semantic_search(
+    backend: &Arc<dyn GitBackend>,
+    root: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<String> {
+    let targets = repo_targets(root, backend)?;
+    let multi = targets.len() > 1;
+    let embedder = rgit_index::Embedder::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut hits: Vec<(f32, String, rgit_index::SearchHit)> = Vec::new();
+    for (label, b) in &targets {
+        if let Some(index) = rgit_index::load(&rgit_index::index_path(b.workdir())) {
+            for h in rgit_index::search(&index, &embedder, query, limit)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            {
+                hits.push((h.score, label.clone(), h));
+            }
+        }
+    }
+    if hits.is_empty() {
+        return Ok("no index; run `rgit index build` first".to_owned());
+    }
+    hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(limit);
+    let mut out = String::new();
+    for (score, repo, h) in hits {
+        if multi {
+            out.push_str(&format!("{score:.3}  {}/{}:{}-{}\n", repo, h.path, h.start_line, h.end_line));
+        } else {
+            out.push_str(&format!("{score:.3}  {}:{}-{}\n", h.path, h.start_line, h.end_line));
+        }
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+/// Build (incrementally) the index for one repo, or every repo under `root`.
+pub(crate) fn index_build(
+    backend: &Arc<dyn GitBackend>,
+    root: Option<&str>,
+) -> anyhow::Result<String> {
+    let targets = repo_targets(root, backend)?;
+    let embedder = rgit_index::Embedder::new().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut out = String::new();
+    for (label, b) in &targets {
+        let path = rgit_index::index_path(b.workdir());
+        let previous = rgit_index::load(&path);
+        let (index, stats) = rgit_index::build_with(b.workdir(), &embedder, previous.as_ref())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        rgit_index::save(&index, &path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        out.push_str(&format!(
+            "{label}: {} chunks ({} reused, {} embedded)\n",
+            stats.total, stats.reused, stats.embedded
+        ));
+    }
+    Ok(out.trim_end().to_owned())
+}
+
 /// Run a subcommand and return its compact output. When `interactive`, a
 /// missing required argument is prompted for; otherwise it errors. `Mcp` is
 /// handled by the caller (it takes over the process), so it is unreachable here.
@@ -581,6 +842,7 @@ pub fn run(
         }
     };
     Ok(match command {
+        Command::Index { action } => index_cmd(backend, action)?,
         Command::Status => render::status(&backend.status()?),
         Command::Log { limit, all, author } => {
             render::log(&backend.log(&LogOptions {

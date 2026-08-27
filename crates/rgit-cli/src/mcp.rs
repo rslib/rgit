@@ -372,6 +372,29 @@ fn tools() -> Vec<Tool> {
             ],
         ),
         tool(
+            "index_build",
+            "Build (or incrementally rebuild) the semantic index. Local by default (the current repo, or `repo`); `root` builds every git repo directly under a directory (global). Incremental: unchanged files are reused by git blob OID, only edited files are re-embedded. Reports per-repo chunk counts.",
+            &[("repo", "string", false), ("root", "string", false)],
+        ),
+        tool(
+            "code_search",
+            "Best general code search: fuses literal grep and semantic ranking (reciprocal-rank fusion) and tags each hit lexical/semantic/both. Prefer this over git_grep or semantic_search alone. Local by default; `root` searches every repo under a directory (global). Needs an index (`index_build`); without it, degrades to grep. Returns score, path:line, and the tag.",
+            &[
+                ("query", "string", true),
+                ("limit", "number", false),
+                ("root", "string", false),
+            ],
+        ),
+        tool(
+            "semantic_search",
+            "Search the codebase by meaning only, using the local embedding index (build it first with index_build). Prefer code_search for general use; use this for purely conceptual matches. Local by default; `root` searches every repo under a directory (global). Returns score, path, and line range per hit.",
+            &[
+                ("query", "string", true),
+                ("limit", "number", false),
+                ("root", "string", false),
+            ],
+        ),
+        tool(
             "git_branches",
             "Local branch names, marking the current one.",
             none,
@@ -835,6 +858,17 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
                 .grep_query(&q)
                 .map(|m| crate::render::grep(&m))
                 .map_err(emap)
+        }
+        "index_build" => crate::cli::index_build(backend, s("root")).map_err(|e| e.to_string()),
+        "code_search" => {
+            let query = req("query")?;
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
+            crate::cli::code_search(backend, s("root"), query, limit).map_err(|e| e.to_string())
+        }
+        "semantic_search" => {
+            let query = req("query")?;
+            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
+            crate::cli::semantic_search(backend, s("root"), query, limit).map_err(|e| e.to_string())
         }
         "git_branches" => {
             let current = backend.status().ok().and_then(|s| s.head.branch);

@@ -11,6 +11,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 rgit-git = { path = "crates/rgit-git" }
+rgit-index = { path = "crates/rgit-index" }
 rgit-model = { path = "crates/rgit-model" }
 rgit-tui = { path = "crates/rgit-tui" }
 rgit-web = { path = "crates/rgit-web" }

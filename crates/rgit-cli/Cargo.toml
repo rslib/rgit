@@ -10,6 +10,7 @@ anyhow = "1.0.104"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
 rgit-git.workspace = true
+rgit-index.workspace = true
 rgit-tui.workspace = true
 rgit-web.workspace = true
 serde_json.workspace = true
