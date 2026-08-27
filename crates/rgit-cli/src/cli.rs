@@ -306,6 +306,23 @@ pub enum Command {
     },
     /// Run the Model Context Protocol server over stdio.
     Mcp,
+    /// Serve the web viewer for this repository, or a directory of repositories.
+    Serve {
+        /// Address to bind.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to listen on.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Serve every git repository under this directory, addressed by name,
+        /// instead of the current repository.
+        #[arg(long)]
+        root: Option<String>,
+        /// Public clone base (e.g. https://git.example.dev). When set, the shown
+        /// clone URL is <base>/<repo>.git instead of the repo's own remotes.
+        #[arg(long)]
+        clone_base: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -566,7 +583,12 @@ pub fn run(
     Ok(match command {
         Command::Status => render::status(&backend.status()?),
         Command::Log { limit, all, author } => {
-            render::log(&backend.log(&LogOptions { limit, all, author })?)
+            render::log(&backend.log(&LogOptions {
+                limit,
+                all,
+                author,
+                ..LogOptions::default()
+            })?)
         }
         Command::Diff { from, to, patch } => match (from, to) {
             (Some(from), Some(to)) => diff_out(&backend.diff_refs(&from, &to)?, patch),
@@ -857,7 +879,7 @@ pub fn run(
             backend.git(&args)?
         }
         Command::Git { args } => backend.git(&args)?,
-        Command::Init { .. } | Command::Clone { .. } | Command::Mcp => {
+        Command::Init { .. } | Command::Clone { .. } | Command::Mcp | Command::Serve { .. } => {
             unreachable!("handled before dispatch")
         }
     })

@@ -819,3 +819,98 @@ fn commits_not_on_a_remote_are_marked_unpushed() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn list_tree_and_read_blob_at_head() {
+    let dir = init_repo("tree-blob");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(dir.join("README.md"), "# hi\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "init"]);
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+
+    // Root listing: directories before files, each alphabetical.
+    let root = backend.list_tree("HEAD", "").unwrap();
+    let names: Vec<_> = root.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(names, vec!["src", "README.md"]);
+    assert!(root[0].is_dir && !root[1].is_dir);
+    assert_eq!(root[1].path, "README.md");
+
+    // Subdirectory listing carries full paths.
+    let src = backend.list_tree("HEAD", "src").unwrap();
+    assert_eq!(src.len(), 1);
+    assert_eq!(src[0].path, "src/main.rs");
+
+    // Blob content decodes as text.
+    let blob = backend.read_blob("HEAD", "src/main.rs").unwrap();
+    assert!(!blob.is_binary);
+    assert_eq!(blob.text.as_deref(), Some("fn main() {}\n"));
+    assert_eq!(blob.size, 13);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tree_last_commits_reports_the_touching_commit_per_path() {
+    let dir = init_repo("tree-last");
+    std::fs::write(dir.join("a.txt"), "a1\n").unwrap();
+    std::fs::write(dir.join("b.txt"), "b1\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "add a and b"]);
+    // A second commit touches only a.txt; b's last commit stays the first.
+    std::fs::write(dir.join("a.txt"), "a1\na2\n").unwrap();
+    git(&dir, &["add", "a.txt"]);
+    git(&dir, &["commit", "-q", "-m", "extend a"]);
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let paths = vec!["a.txt".to_owned(), "b.txt".to_owned()];
+    let last = backend.tree_last_commits("HEAD", &paths).unwrap();
+    assert_eq!(last["a.txt"].summary, "extend a");
+    assert_eq!(last["b.txt"].summary, "add a and b");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn list_files_walks_the_whole_tree() {
+    let dir = init_repo("list-files");
+    std::fs::create_dir_all(dir.join("src/util")).unwrap();
+    std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+    std::fs::write(dir.join("src/main.rs"), "fn main(){}\n").unwrap();
+    std::fs::write(dir.join("src/util/mod.rs"), "\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "init"]);
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let mut files = backend.list_files("HEAD").unwrap();
+    files.sort();
+    assert_eq!(files, vec!["Cargo.toml", "src/main.rs", "src/util/mod.rs"]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rev_parse_and_archive() {
+    let dir = init_repo("archive");
+    std::fs::write(dir.join("a.txt"), "hello\n").unwrap();
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/main.rs"), "fn main(){}\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "init"]);
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+
+    // rev_parse resolves HEAD to a 40-hex id.
+    let sha = backend.rev_parse("HEAD").unwrap();
+    assert_eq!(sha.len(), 40);
+    assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+
+    // The archive is a real gzip stream carrying the tree's files.
+    let bytes = backend.archive_targz("HEAD").unwrap();
+    assert_eq!(&bytes[..2], &[0x1f, 0x8b], "gzip magic");
+    assert!(bytes.len() > 20);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

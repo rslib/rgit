@@ -147,6 +147,45 @@ pub trait GitBackend: Send + Sync {
     /// All references: local branches, remote branches, and tags.
     fn refs(&self) -> Result<Vec<crate::RefEntry>, GitError>;
 
+    /// List one directory of a revision's tree. `path` is empty for the root;
+    /// entries come directories first, then files, each sorted by name.
+    fn list_tree(&self, rev: &str, path: &str) -> Result<Vec<crate::TreeEntry>, GitError>;
+
+    /// Read a file's contents at a revision. Binary blobs return with `text`
+    /// None and `is_binary` set, rather than lossy garbage.
+    fn read_blob(&self, rev: &str, path: &str) -> Result<crate::Blob, GitError>;
+
+    /// The most recent commit that touched each of `paths` (full, slash-separated
+    /// paths under a directory), keyed by path. Resolves via one history walk that
+    /// exits once every path is found, for the tree view's latest-commit strip.
+    fn tree_last_commits(
+        &self,
+        rev: &str,
+        paths: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::LastCommit>, GitError>;
+
+    /// Every file path in a revision's tree, for the fuzzy file finder.
+    fn list_files(&self, rev: &str) -> Result<Vec<String>, GitError>;
+
+    /// Case-insensitive literal search over the working tree, gitignore-aware and
+    /// parallel (ripgrep's engine). Bounded in total matches so it stays
+    /// responsive; binary files are skipped.
+    fn grep(&self, pattern: &str) -> Result<Vec<crate::GrepMatch>, GitError>;
+
+    /// Resolve a revision to its full 40-hex commit id, for stable permalinks.
+    fn rev_parse(&self, rev: &str) -> Result<String, GitError>;
+
+    /// Commit counts per author (name, email, count) from HEAD's history
+    /// (bounded), most first, for a contributors summary.
+    fn contributors(&self) -> Result<Vec<(String, String, usize)>, GitError>;
+
+    /// The newest tag by tagged-commit time, if any, for a release summary.
+    fn latest_tag(&self) -> Result<Option<crate::TagInfo>, GitError>;
+
+    /// A gzipped tarball of a revision's tree (as `git archive` would produce),
+    /// for source downloads.
+    fn archive_targz(&self, rev: &str) -> Result<Vec<u8>, GitError>;
+
     /// Check out a revision (tag or remote branch) as a detached HEAD.
     fn checkout_detached(&self, rev: &str) -> Result<(), GitError>;
 

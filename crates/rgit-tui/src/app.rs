@@ -3191,6 +3191,7 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             all: app.pending_log_all,
             author: Some(value),
             limit: app.log_limit,
+            ..LogOptions::default()
         };
         app.begin_log(opts.clone());
         return vec![Effect::LoadLog(opts)];

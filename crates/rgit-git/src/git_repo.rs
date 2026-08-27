@@ -180,6 +180,12 @@ impl GitBackend for Git2Backend {
         let mut walk = repo.revwalk()?;
         let seeded = if opts.all {
             walk.push_glob("refs/*").is_ok()
+        } else if let Some(rev) = &opts.rev {
+            repo.revparse_single(rev)
+                .ok()
+                .and_then(|o| o.peel_to_commit().ok())
+                .map(|c| walk.push(c.id()).is_ok())
+                .unwrap_or(false)
         } else {
             walk.push_head().is_ok()
         };
@@ -192,6 +198,7 @@ impl GitBackend for Git2Backend {
         let decorations = log_decorations(&repo);
         let author_needle = opts.author.as_ref().map(|a| a.to_lowercase());
         let mut entries = Vec::new();
+        let mut passed = 0usize;
         for oid in walk {
             if entries.len() >= opts.limit {
                 break;
@@ -206,6 +213,11 @@ impl GitBackend for Git2Backend {
                 {
                     continue;
                 }
+            }
+            // Skip the first `offset` matches for pagination, after filtering.
+            passed += 1;
+            if passed <= opts.offset {
+                continue;
             }
             entries.push(crate::LogEntry {
                 short_id: commit
@@ -518,6 +530,323 @@ impl GitBackend for Git2Backend {
             });
         }
         Ok(out)
+    }
+
+    fn list_tree(&self, rev: &str, path: &str) -> Result<Vec<crate::TreeEntry>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let commit = repo.revparse_single(rev)?.peel_to_commit()?;
+        let root = commit.tree()?;
+        let tree = if path.is_empty() {
+            root
+        } else {
+            root.get_path(std::path::Path::new(path))?
+                .to_object(&repo)?
+                .peel_to_tree()?
+        };
+        let mut out = Vec::with_capacity(tree.len());
+        for e in tree.iter() {
+            let Ok(name) = e.name() else { continue };
+            let is_dir = e.kind() == Some(git2::ObjectType::Tree);
+            let full = if path.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{path}/{name}")
+            };
+            let size = if is_dir {
+                0
+            } else {
+                e.to_object(&repo)
+                    .ok()
+                    .and_then(|o| o.into_blob().ok())
+                    .map(|b| b.size() as u64)
+                    .unwrap_or(0)
+            };
+            out.push(crate::TreeEntry {
+                name: name.to_owned(),
+                path: full,
+                is_dir,
+                size,
+            });
+        }
+        // Directories first, then files, each alphabetical: the settled listing.
+        out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        Ok(out)
+    }
+
+    fn read_blob(&self, rev: &str, path: &str) -> Result<crate::Blob, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let commit = repo.revparse_single(rev)?.peel_to_commit()?;
+        let blob = commit
+            .tree()?
+            .get_path(std::path::Path::new(path))?
+            .to_object(&repo)?
+            .peel_to_blob()?;
+        let content = blob.content();
+        let is_binary = blob.is_binary();
+        Ok(crate::Blob {
+            path: path.to_owned(),
+            size: content.len() as u64,
+            is_binary,
+            text: (!is_binary).then(|| String::from_utf8_lossy(content).into_owned()),
+        })
+    }
+
+    fn tree_last_commits(
+        &self,
+        rev: &str,
+        paths: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::LastCommit>, GitError> {
+        use std::collections::{HashMap, HashSet};
+        let repo = self.repo.lock().expect("repo mutex");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let start = repo.revparse_single(rev)?.peel_to_commit()?.id();
+        let mut walk = repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TIME)?;
+        walk.push(start)?;
+
+        let mut want: HashSet<String> = paths.iter().cloned().collect();
+        let mut found: HashMap<String, crate::LastCommit> = HashMap::new();
+        // Bound the walk so a huge history cannot stall a page; unresolved paths
+        // simply show no latest-commit rather than blocking.
+        let mut budget = 2000usize;
+        for oid in walk {
+            if want.is_empty() || budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let commit = repo.find_commit(oid?)?;
+            let tree = commit.tree()?;
+            let parent_trees: Vec<git2::Tree> =
+                commit.parents().filter_map(|p| p.tree().ok()).collect();
+            // A commit "touches" a path when its object id there differs from the
+            // path in every parent. For a merge that only carried a side's version
+            // through unchanged the ids match a parent, so it is simplified away -
+            // matching `git log -- path` rather than flagging the merge.
+            let oid_at = |t: &git2::Tree, p: &str| {
+                t.get_path(std::path::Path::new(p)).ok().map(|e| e.id())
+            };
+            let matched: Vec<String> = want
+                .iter()
+                .filter(|p| {
+                    let cur = oid_at(&tree, p);
+                    if parent_trees.is_empty() {
+                        cur.is_some()
+                    } else {
+                        parent_trees.iter().all(|pt| oid_at(pt, p) != cur)
+                    }
+                })
+                .cloned()
+                .collect();
+            if !matched.is_empty() {
+                let last = crate::LastCommit {
+                    short_id: commit
+                        .as_object()
+                        .short_id()
+                        .ok()
+                        .and_then(|b| b.as_str().ok().map(str::to_owned))
+                        .unwrap_or_default(),
+                    summary: commit.summary().ok().flatten().unwrap_or_default().to_owned(),
+                    when: relative_age(commit.time().seconds(), now),
+                };
+                for p in matched {
+                    found.insert(p.clone(), last.clone());
+                    want.remove(&p);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    fn list_files(&self, rev: &str) -> Result<Vec<String>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let tree = repo.revparse_single(rev)?.peel_to_commit()?.tree()?;
+        let mut out = Vec::new();
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if entry.kind() == Some(git2::ObjectType::Blob) {
+                if let Ok(name) = entry.name() {
+                    // `root` is the containing dir with a trailing slash, or empty.
+                    out.push(format!("{root}{name}"));
+                }
+            }
+            git2::TreeWalkResult::Ok
+        })?;
+        Ok(out)
+    }
+
+    fn grep(&self, pattern: &str) -> Result<Vec<crate::GrepMatch>, GitError> {
+        use grep::regex::RegexMatcherBuilder;
+        use grep::searcher::Searcher;
+        use grep::searcher::sinks::UTF8;
+        use rayon::prelude::*;
+
+        const MAX_MATCHES: usize = 300;
+        const MAX_PER_FILE: u64 = 50;
+        if pattern.is_empty() {
+            return Ok(Vec::new());
+        }
+        let workdir = self.workdir.clone();
+        // Literal, case-insensitive: escape the pattern so it matches text, not
+        // as a regex.
+        let matcher = RegexMatcherBuilder::new()
+            .case_insensitive(true)
+            .build(&regex::escape(pattern))
+            .map_err(|e| GitError::Other(e.to_string()))?;
+
+        // Collect files once (gitignore-aware), then search them in parallel.
+        let files: Vec<std::path::PathBuf> = ignore::WalkBuilder::new(&workdir)
+            .build()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .map(ignore::DirEntry::into_path)
+            .collect();
+
+        let mut out: Vec<crate::GrepMatch> = files
+            .par_iter()
+            .flat_map_iter(|path| {
+                let rel = path
+                    .strip_prefix(&workdir)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned();
+                let mut matches = Vec::new();
+                let _ = Searcher::new().search_path(
+                    &matcher,
+                    path,
+                    UTF8(|lnum, line| {
+                        matches.push(crate::GrepMatch {
+                            path: rel.clone(),
+                            line: lnum as usize,
+                            text: line.trim_end().chars().take(300).collect(),
+                        });
+                        Ok(matches.len() < MAX_PER_FILE as usize)
+                    }),
+                );
+                matches.into_iter()
+            })
+            .collect();
+
+        // Stable order (paths walk in arbitrary parallel order), then cap.
+        out.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+        out.truncate(MAX_MATCHES);
+        Ok(out)
+    }
+
+    fn rev_parse(&self, rev: &str) -> Result<String, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        Ok(repo
+            .revparse_single(rev)?
+            .peel_to_commit()?
+            .id()
+            .to_string())
+    }
+
+    fn contributors(&self) -> Result<Vec<(String, String, usize)>, GitError> {
+        use std::collections::HashMap;
+        let repo = self.repo.lock().expect("repo mutex");
+        let mut walk = repo.revwalk()?;
+        if walk.push_head().is_err() {
+            return Ok(Vec::new());
+        }
+        // name -> (email of first sighting, commit count).
+        let mut by_name: HashMap<String, (String, usize)> = HashMap::new();
+        // Bound the walk so the sidebar cannot stall on a huge history.
+        for oid in walk.flatten().take(5000) {
+            if let Ok(commit) = repo.find_commit(oid) {
+                let author = commit.author();
+                let name = author.name().unwrap_or("?").to_owned();
+                let email = author.email().unwrap_or("").to_owned();
+                let entry = by_name.entry(name).or_insert((email, 0));
+                entry.1 += 1;
+            }
+        }
+        let mut out: Vec<(String, String, usize)> = by_name
+            .into_iter()
+            .map(|(name, (email, count))| (name, email, count))
+            .collect();
+        out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        out.truncate(8);
+        Ok(out)
+    }
+
+    fn latest_tag(&self) -> Result<Option<crate::TagInfo>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut best: Option<(i64, crate::TagInfo)> = None;
+        let tags = repo.tag_names(None)?;
+        for name in tags.iter().filter_map(|t| t.ok().flatten()) {
+            let Ok(obj) = repo.revparse_single(name) else {
+                continue;
+            };
+            let Ok(commit) = obj.peel_to_commit() else {
+                continue;
+            };
+            let t = commit.time().seconds();
+            if best.as_ref().map(|(bt, _)| t > *bt).unwrap_or(true) {
+                let message = commit
+                    .summary()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .to_owned();
+                best = Some((
+                    t,
+                    crate::TagInfo {
+                        name: name.to_owned(),
+                        when: relative_age(t, now),
+                        message,
+                    },
+                ));
+            }
+        }
+        Ok(best.map(|(_, ti)| ti))
+    }
+
+    fn archive_targz(&self, rev: &str) -> Result<Vec<u8>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let tree = repo.revparse_single(rev)?.peel_to_commit()?.tree()?;
+        let mut buf = Vec::new();
+        let encoder = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        // A write failure inside the walk closure is captured here, since the
+        // callback can only signal continue/abort, not return an error.
+        let mut failure: Option<GitError> = None;
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if entry.kind() != Some(git2::ObjectType::Blob) {
+                return git2::TreeWalkResult::Ok;
+            }
+            let Ok(name) = entry.name() else {
+                return git2::TreeWalkResult::Ok;
+            };
+            let path = format!("{root}{name}");
+            let blob = match entry.to_object(&repo).and_then(|o| o.peel_to_blob()) {
+                Ok(b) => b,
+                Err(e) => {
+                    failure = Some(e.into());
+                    return git2::TreeWalkResult::Abort;
+                }
+            };
+            let content = blob.content();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(if entry.filemode() == 0o120000 { 0o777 } else { 0o644 });
+            header.set_cksum();
+            if let Err(e) = builder.append_data(&mut header, &path, content) {
+                failure = Some(e.into());
+                return git2::TreeWalkResult::Abort;
+            }
+            git2::TreeWalkResult::Ok
+        })?;
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        builder.into_inner()?.finish()?;
+        Ok(buf)
     }
 
     fn checkout_detached(&self, rev: &str) -> Result<(), GitError> {

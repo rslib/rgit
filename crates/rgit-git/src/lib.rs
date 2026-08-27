@@ -24,6 +24,7 @@ pub use git_repo::{Git2Backend, clone, init};
 pub use model::{
     BlameLine, Commit, CommitDetails, CommitRef, Deco, Head, HunkRef, Lane, LanesState, LogEntry,
     LogOptions, group_decorations,
-    OpLogEntry, OpProgress, RefEntry, RefKind, Remote, RepoState, RepoStatus, ResetMode,
-    RestackOutcome, SmartlogEntry, Stash, StatusCode, StatusEntry, Worktree,
+    Blob, GrepMatch, LastCommit, OpLogEntry, OpProgress, RefEntry, RefKind, Remote, RepoState, RepoStatus,
+    ResetMode, RestackOutcome, SmartlogEntry, Stash, StatusCode, StatusEntry, TagInfo, TreeEntry,
+    Worktree,
 };

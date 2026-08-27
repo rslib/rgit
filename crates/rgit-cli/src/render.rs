@@ -6,8 +6,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rgit_git::{
-    BlameLine, CommitDetails, CommitRef, Deco, FileDiff, LogEntry, RefEntry, Remote, RepoStatus,
-    SmartlogEntry, Stash, StatusEntry, Worktree, group_decorations,
+    BlameLine, Blob, CommitDetails, CommitRef, Deco, FileDiff, GrepMatch, LogEntry, RefEntry,
+    Remote, RepoStatus, SmartlogEntry, Stash, StatusEntry, TreeEntry, Worktree, group_decorations,
 };
 
 static COLOR: AtomicBool = AtomicBool::new(false);
@@ -182,6 +182,45 @@ fn ref_decor(refs: &[CommitRef]) -> String {
         }
     }
     out
+}
+
+/// A directory listing: directories (trailing slash) first, then files with
+/// their byte size.
+pub fn tree(entries: &[TreeEntry]) -> String {
+    if entries.is_empty() {
+        return "empty tree".to_owned();
+    }
+    entries
+        .iter()
+        .map(|e| {
+            if e.is_dir {
+                format!("{}/", e.name)
+            } else {
+                format!("{:>9}  {}", e.size, e.name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Code search results as `path:line: text`, one match per line (grep -n style).
+pub fn grep(matches: &[GrepMatch]) -> String {
+    if matches.is_empty() {
+        return "no matches".to_owned();
+    }
+    matches
+        .iter()
+        .map(|m| format!("{}:{}: {}", m.path, m.line, m.text))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A file's contents, or a note for a binary blob.
+pub fn blob(b: &Blob) -> String {
+    match &b.text {
+        Some(text) => text.clone(),
+        None => format!("<binary file, {} bytes>", b.size),
+    }
 }
 
 pub fn log(entries: &[LogEntry]) -> String {

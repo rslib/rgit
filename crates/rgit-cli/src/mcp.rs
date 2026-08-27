@@ -347,6 +347,26 @@ fn tools() -> Vec<Tool> {
             none,
         ),
         tool(
+            "git_tree",
+            "List one directory of a revision's tree (rev defaults to HEAD, path to the root).",
+            &[("rev", "string", false), ("path", "string", false)],
+        ),
+        tool(
+            "git_blob",
+            "Read a file's contents at a revision (rev defaults to HEAD).",
+            &[("path", "string", true), ("rev", "string", false)],
+        ),
+        tool(
+            "git_files",
+            "Every file path in a revision's tree (rev defaults to HEAD).",
+            &[("rev", "string", false)],
+        ),
+        tool(
+            "git_grep",
+            "Search the working tree for a literal string (case-insensitive, parallel, gitignore-aware). Returns path:line: text matches.",
+            &[("pattern", "string", true)],
+        ),
+        tool(
             "git_branches",
             "Local branch names, marking the current one.",
             none,
@@ -740,8 +760,10 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
         "git_log" => {
             let opts = LogOptions {
                 limit: args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize,
+                offset: args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize,
                 all: flag("all"),
                 author: s("author").map(str::to_owned),
+                rev: s("rev").map(str::to_owned),
             };
             backend
                 .log(&opts)
@@ -771,6 +793,22 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
         "git_refs" => backend
             .refs()
             .map(|r| crate::render::refs(&r))
+            .map_err(emap),
+        "git_tree" => backend
+            .list_tree(s("rev").unwrap_or("HEAD"), s("path").unwrap_or(""))
+            .map(|t| crate::render::tree(&t))
+            .map_err(emap),
+        "git_blob" => backend
+            .read_blob(s("rev").unwrap_or("HEAD"), req("path")?)
+            .map(|b| crate::render::blob(&b))
+            .map_err(emap),
+        "git_files" => backend
+            .list_files(s("rev").unwrap_or("HEAD"))
+            .map(|f| f.join("\n"))
+            .map_err(emap),
+        "git_grep" => backend
+            .grep(req("pattern")?)
+            .map(|m| crate::render::grep(&m))
             .map_err(emap),
         "git_branches" => {
             let current = backend.status().ok().and_then(|s| s.head.branch);

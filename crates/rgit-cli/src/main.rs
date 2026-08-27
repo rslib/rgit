@@ -45,6 +45,48 @@ fn main() -> ! {
             let result = rgit_git::clone(&url, std::path::Path::new(&dir), &|_| {});
             exit(report_result(result, &format!("cloned into {dir}")));
         }
+        // The web viewer takes over the process, like the TUI, so it runs on
+        // its own runtime rather than through the one-shot dispatch below.
+        Some(Command::Serve {
+            host,
+            port,
+            root,
+            clone_base,
+        }) => {
+            let addr = match format!("{host}:{port}").parse::<std::net::SocketAddr>() {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("rgit: bad --host/--port ({e})");
+                    exit(1);
+                }
+            };
+            let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("rgit: {e}");
+                    exit(1);
+                }
+            };
+            let served = match root {
+                Some(dir) => runtime.block_on(rgit_web::serve_root(
+                    std::path::PathBuf::from(dir),
+                    addr,
+                    clone_base,
+                )),
+                None => {
+                    let backend = discover_or_exit();
+                    let repo = rgit_web::repo_name(backend.as_ref());
+                    runtime.block_on(rgit_web::serve(backend, repo, addr, clone_base))
+                }
+            };
+            match served {
+                Ok(()) => exit(0),
+                Err(e) => {
+                    eprintln!("rgit: {e}");
+                    exit(1);
+                }
+            }
+        }
         // Every other subcommand runs one operation and prints compact output.
         Some(command) => {
             // Color and prompts only on a real terminal.

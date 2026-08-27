@@ -222,20 +222,82 @@ pub struct Worktree {
 pub struct LogOptions {
     /// Maximum number of commits to walk.
     pub limit: usize,
+    /// Skip this many commits before collecting, for pagination.
+    pub offset: usize,
     /// Include every ref's history, not just HEAD's.
     pub all: bool,
     /// Keep only commits whose author name/email contains this (case-insensitive).
     pub author: Option<String>,
+    /// Start the walk from this revision instead of HEAD (a branch/tag/sha).
+    pub rev: Option<String>,
 }
 
 impl Default for LogOptions {
     fn default() -> Self {
         Self {
             limit: 200,
+            offset: 0,
             all: false,
             author: None,
+            rev: None,
         }
     }
+}
+
+/// One entry in a tree listing (the tree/file browser).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    /// The entry's base name.
+    pub name: String,
+    /// Full path from the repo root, slash-separated.
+    pub path: String,
+    /// A subdirectory (a tree) rather than a file (a blob).
+    pub is_dir: bool,
+    /// Blob size in bytes; 0 for directories.
+    pub size: u64,
+}
+
+/// The newest tag in a repo, for the sidebar's release card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagInfo {
+    pub name: String,
+    /// Relative age of the tagged commit.
+    pub when: String,
+    /// The tag's message, or the tagged commit's summary for a lightweight tag.
+    pub message: String,
+}
+
+/// The most recent commit that touched a tree entry, for the "latest commit per
+/// file" strip in the tree view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastCommit {
+    pub short_id: String,
+    pub summary: String,
+    /// Relative age like `2h` or `3d`.
+    pub when: String,
+}
+
+/// One matching line from a code search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepMatch {
+    pub path: String,
+    /// 1-based line number.
+    pub line: usize,
+    /// The matching line, trimmed and length-capped.
+    pub text: String,
+}
+
+/// A file's contents at a revision, for the blob/file view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blob {
+    /// Full path from the repo root.
+    pub path: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// Binary (non-text) content; `text` is None when set.
+    pub is_binary: bool,
+    /// UTF-8 text, lossily decoded; None for binary blobs.
+    pub text: Option<String>,
 }
 
 /// One entry in the operation log (undo stack), newest first.

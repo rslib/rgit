@@ -1,0 +1,32 @@
+[package]
+name = "rgit-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rgit-git.workspace = true
+serde_json.workspace = true
+syntect.workspace = true
+two-face = "0.5"
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+ammonia = "4"
+axum = "0.8"
+maud = { version = "0.27", features = ["axum"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net"] }
+tower-http = { version = "0.6", features = ["trace", "compression-gzip"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rst_parser = "0.4.2"
+rst_renderer = "0.4.2"
+hyperpolyglot = "0.1.7"
+
+[lib]
+name = "rgit_web"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rgit-web"
+path = "src/main.rs"

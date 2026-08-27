@@ -13,6 +13,7 @@ rust-version = "1.85"
 rgit-git = { path = "crates/rgit-git" }
 rgit-model = { path = "crates/rgit-model" }
 rgit-tui = { path = "crates/rgit-tui" }
+rgit-web = { path = "crates/rgit-web" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"

@@ -8,7 +8,13 @@ rust-version.workspace = true
 [dependencies]
 git2 = { version = "0.21.0", features = ["ssh", "https", "vendored-openssl"] }
 git2-hooks = "0.7.0"
+flate2 = "1"
+grep = "0.3"
+ignore = "0.4"
+rayon = "1"
 reflink-copy = "0.1"
+regex = "1"
+tar = "0.4"
 thiserror = "2.0.20"
 tracing.workspace = true
 walkdir = "2"
