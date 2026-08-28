@@ -178,6 +178,10 @@ pub trait GitBackend: Send + Sync {
     /// Local branch names, sorted.
     fn local_branches(&self) -> Result<Vec<String>, GitError>;
 
+    /// Remote-tracking branch names (e.g. `origin/main`), sorted. For `git
+    /// branch -r` / `-a`.
+    fn remote_branches(&self) -> Result<Vec<String>, GitError>;
+
     /// Check out an existing local branch.
     fn checkout_branch(&self, name: &str) -> Result<(), GitError>;
 

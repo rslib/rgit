@@ -1859,6 +1859,22 @@ impl GitBackend for Git2Backend {
         Ok(names)
     }
 
+    fn remote_branches(&self) -> Result<Vec<String>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let mut names = Vec::new();
+        for branch in repo.branches(Some(BranchType::Remote))? {
+            let (branch, _) = branch?;
+            if let Some(name) = branch.name()?.map(str::to_owned) {
+                // Skip the symbolic `origin/HEAD` pointer git also hides.
+                if !name.ends_with("/HEAD") {
+                    names.push(name);
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     fn checkout_branch(&self, name: &str) -> Result<(), GitError> {
         self.snap("checkout");
         let repo = self.repo.lock().expect("repo mutex");

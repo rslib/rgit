@@ -84,6 +84,12 @@ pub enum Command {
     Show {
         /// The commit to show (branch, tag, or sha).
         rev: String,
+        /// Show the full unified patch (git's -p), not just the diffstat.
+        #[arg(short, long)]
+        patch: bool,
+        /// List only the names of the files the commit changed.
+        #[arg(long = "name-only")]
+        name_only: bool,
     },
     /// Blame a file: `sha author line` per line.
     Blame {
@@ -336,6 +342,12 @@ pub enum Command {
     Branch {
         #[command(subcommand)]
         cmd: Option<BranchCmd>,
+        /// List remote-tracking branches too (git's -a).
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// List only remote-tracking branches (git's -r).
+        #[arg(short = 'r', long)]
+        remotes: bool,
     },
     /// Stash management (no subcommand stashes the working tree).
     Stash {
@@ -1090,7 +1102,25 @@ pub fn run(
             };
             diff_out(&files, patch, name_only)
         }
-        Command::Show { rev } => render::commit_details(&backend.commit_details(&rev)?),
+        Command::Show {
+            rev,
+            patch,
+            name_only,
+        } => {
+            let details = backend.commit_details(&rev)?;
+            if name_only {
+                details
+                    .files
+                    .iter()
+                    .map(|f| f.path.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else if patch {
+                render::patch(&details.files)
+            } else {
+                render::commit_details(&details)
+            }
+        }
         Command::Blame { path } => render::blame(&backend.blame(&path)?),
         Command::Refs => render::refs(&backend.refs()?),
         Command::Stage { path, hunk, lines } => ok(match (hunk, lines.as_slice()) {
@@ -1381,10 +1411,15 @@ pub fn run(
             })?;
             ok(backend.revert(&rev))
         }
-        Command::Branch { cmd } => match cmd {
+        Command::Branch { cmd, all, remotes } => match cmd {
+            None if remotes => backend.remote_branches()?.join("\n"),
             None => {
                 let current = backend.status().ok().and_then(|s| s.head.branch);
-                render::branches(&backend.local_branches()?, current.as_deref())
+                let mut names = backend.local_branches()?;
+                if all {
+                    names.extend(backend.remote_branches()?);
+                }
+                render::branches(&names, current.as_deref())
             }
             Some(BranchCmd::Create { name }) => ok(backend.create_branch(&name)),
             Some(BranchCmd::Checkout { name }) => ok(backend.checkout_branch(&name)),
