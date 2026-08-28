@@ -568,7 +568,10 @@ pub enum Msg {
         key: PreviewKey,
         sections: Vec<Section>,
     },
-    BlameLoaded(Vec<BlameLine>),
+    BlameLoaded {
+        path: String,
+        lines: Vec<BlameLine>,
+    },
     Refs,
     RefsLoaded(Vec<RefEntry>),
     RemoteMenu,
@@ -2876,9 +2879,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.push_view(ViewKind::Commit, buffer);
         }
         Msg::PreviewBuilt { key, sections } => app.preview_built(key, sections),
-        Msg::BlameLoaded(lines) => {
+        Msg::BlameLoaded { path, lines } => {
             let mut buffer = Buffer::default();
-            buffer.set_content(build_blame(&lines));
+            buffer.set_content(build_blame(&path, &lines));
             app.push_view(ViewKind::Blame, buffer);
         }
         Msg::BranchesLoaded(candidates) => {

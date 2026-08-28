@@ -12,7 +12,9 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 fn syntax_set() -> &'static SyntaxSet {
     static SET: OnceLock<SyntaxSet> = OnceLock::new();
-    SET.get_or_init(SyntaxSet::load_defaults_newlines)
+    // two-face bundles bat's full syntax set (hundreds of languages), the same
+    // broad coverage the web viewer uses - far more than syntect's defaults.
+    SET.get_or_init(two_face::syntax::extra_newlines)
 }
 
 /// RGB colors the host theme maps onto syntax roles, so diff highlighting uses
@@ -387,21 +389,18 @@ pub fn build_worktrees(worktrees: &[Worktree]) -> Vec<Section> {
 }
 
 /// Build the blame view: each file line prefixed with its commit and author.
-pub fn build_blame(lines: &[BlameLine]) -> Vec<Section> {
+pub fn build_blame(path: &str, lines: &[BlameLine]) -> Vec<Section> {
     lines
         .iter()
         .enumerate()
         .map(|(i, bl)| {
             let author: String = bl.author.chars().take(12).collect();
-            Section::leaf(
-                format!("blame/{i}"),
-                NodeKind::DiffLine,
-                vec![
-                    Span::new(format!("{:>7} ", bl.short_id), Style::Hash),
-                    Span::new(format!("{author:<12} "), Style::Dim),
-                    Span::plain(bl.line.clone()),
-                ],
-            )
+            let mut spans = vec![
+                Span::new(format!("{:>7} ", bl.short_id), Style::Hash),
+                Span::new(format!("{author:<12} "), Style::Dim),
+            ];
+            spans.extend(highlight_code(path, &bl.line));
+            Section::leaf(format!("blame/{i}"), NodeKind::DiffLine, spans)
         })
         .collect()
 }
@@ -933,6 +932,46 @@ fn syntax_spans(line: &DiffLine, syntax: &SyntaxReference) -> Vec<Span> {
         Err(_) => spans.push(washed(Span::plain(line.text.clone()))),
     }
     spans
+}
+
+/// The syntax for `path`, by extension, or plain text when unknown.
+fn syntax_for_path(path: &str) -> &'static SyntaxReference {
+    let ss = syntax_set();
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(|e| ss.find_syntax_by_extension(e))
+        .unwrap_or_else(|| ss.find_syntax_plain_text())
+}
+
+/// One line of highlighted spans from a `HighlightLines` result, using the host
+/// syntax palette; a highlight failure falls back to a plain span.
+fn highlighted_spans(h: &mut HighlightLines, line: &str) -> Vec<Span> {
+    match h.highlight_line(line, syntax_set()) {
+        Ok(ranges) => ranges
+            .into_iter()
+            .map(|(t, s)| {
+                let c = t.foreground;
+                Span::new(s.to_owned(), Style::Rgb(c.r, c.g, c.b))
+            })
+            .collect(),
+        Err(_) => vec![Span::plain(line.to_owned())],
+    }
+}
+
+/// Highlight one isolated line of code from `path`'s language (no cross-line
+/// state), for per-line contexts like blame.
+pub fn highlight_code(path: &str, line: &str) -> Vec<Span> {
+    let mut h = HighlightLines::new(syntax_for_path(path), syn_theme());
+    highlighted_spans(&mut h, line)
+}
+
+/// Highlight a whole file into one span-run per line. Highlighting from the top
+/// keeps multi-line constructs (strings, block comments) correct even when the
+/// caller only shows a window.
+pub fn highlight_file(path: &str, text: &str) -> Vec<Vec<Span>> {
+    let mut h = HighlightLines::new(syntax_for_path(path), syn_theme());
+    text.lines().map(|line| highlighted_spans(&mut h, line)).collect()
 }
 
 /// The old-side start line parsed from a `@@ -old,c +new,c @@` header.

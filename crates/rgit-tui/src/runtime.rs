@@ -583,7 +583,7 @@ async fn run_msg(
                 let msg_tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     if let Ok(lines) = backend.blame(&path) {
-                        let _ = msg_tx.send(Msg::BlameLoaded(lines));
+                        let _ = msg_tx.send(Msg::BlameLoaded { path, lines });
                     }
                 });
             }
@@ -1282,25 +1282,19 @@ fn snippet_sections(dir: &Path, path: &str, line: usize) -> Vec<rgit_model::Sect
             vec![Span::new("cannot read file".to_owned(), Style::Dim)],
         )];
     };
-    let lines: Vec<&str> = text.lines().collect();
+    let highlighted = rgit_model::highlight_file(path, &text);
+    let count = highlighted.len();
     let hit = line.saturating_sub(1);
     let start = hit.saturating_sub(CONTEXT);
-    let end = (hit + CONTEXT + 1).min(lines.len());
+    let end = (hit + CONTEXT + 1).min(count);
     let width = end.to_string().len();
     (start..end)
         .map(|i| {
             let n = i + 1;
-            let is_hit = n == line;
-            let gutter = Style::Dim;
-            let body = if is_hit { Style::Added } else { Style::Plain };
-            Section::leaf(
-                format!("snippet/{n}"),
-                NodeKind::Info,
-                vec![
-                    Span::new(format!("{:>w$}  ", n, w = width), gutter),
-                    Span::new(lines.get(i).copied().unwrap_or("").to_owned(), body),
-                ],
-            )
+            let marker = if n == line { "\u{25b8}" } else { " " };
+            let mut spans = vec![Span::new(format!("{marker}{n:>width$}  "), Style::Dim)];
+            spans.extend(highlighted.get(i).cloned().unwrap_or_default());
+            Section::leaf(format!("snippet/{n}"), NodeKind::Info, spans)
         })
         .collect()
 }

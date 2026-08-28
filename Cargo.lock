@@ -3589,6 +3589,7 @@ version = "0.0.0"
 dependencies = [
  "rgit-git",
  "syntect",
+ "two-face",
 ]
 
 [[package]]

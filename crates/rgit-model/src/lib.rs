@@ -10,6 +10,7 @@ mod style;
 
 pub use build::{
     GlyphMode, SyntaxColors, build, build_blame, build_commit, build_diff, build_log, build_refs,
+    highlight_code, highlight_file,
     build_remotes, build_worktrees, glyph, glyph_mode, set_glyph_mode, set_side_by_side,
     set_syntax_colors, unicode,
 };
