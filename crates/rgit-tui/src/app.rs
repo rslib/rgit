@@ -545,8 +545,10 @@ pub enum Msg {
     CodeFinderUp,
     CodeFinderDown,
     CodeFinderCancel,
-    /// Open the file at the selected hit.
+    /// Open the file at the selected hit (in the TUI).
     CodeFinderSubmit,
+    /// Open the selected hit in $EDITOR at its line.
+    CodeFinderEditor,
     /// Fold the semantic index into the current query's results.
     CodeFinderSemantic,
     /// Search results for `query`; `semantic` is true when the index was used.
@@ -1703,6 +1705,11 @@ pub enum Effect {
         path: String,
         line: usize,
     },
+    /// Suspend the TUI and open `path` in $EDITOR at `line`.
+    OpenInEditor {
+        path: String,
+        line: usize,
+    },
     /// Load all refs, then push the refs view.
     LoadRefs,
     /// Load the smartlog, then push the smartlog view.
@@ -2585,6 +2592,16 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             if let Some(f) = app.code_finder.take() {
                 if let Some(h) = f.hits.get(f.selected) {
                     return vec![Effect::LoadBlame(h.path.clone())];
+                }
+            }
+        }
+        Msg::CodeFinderEditor => {
+            if let Some(f) = app.code_finder.take() {
+                if let Some(h) = f.hits.get(f.selected) {
+                    return vec![Effect::OpenInEditor {
+                        path: h.path.clone(),
+                        line: h.line,
+                    }];
                 }
             }
         }

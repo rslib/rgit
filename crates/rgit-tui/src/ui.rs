@@ -457,11 +457,14 @@ fn render_code_finder(frame: &mut Frame, app: &App, input_area: Rect, list_area:
     let hint = if f.searching {
         " searching…".to_owned()
     } else if f.semantic {
-        format!("  {} hits (meaning + text)", f.hits.len())
+        format!("  {} hits (meaning + text)  ^e: editor", f.hits.len())
     } else if f.hits.is_empty() {
         "  type to search, Tab for meaning".to_owned()
     } else {
-        format!("  {} hits (text)  Tab: meaning", f.hits.len())
+        format!(
+            "  {} hits (text)  Tab: meaning  ^e: editor",
+            f.hits.len()
+        )
     };
     let input_line = Line::from(vec![
         RSpan::styled("code › ", RStyle::default().fg(theme::accent())),

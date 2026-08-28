@@ -570,6 +570,21 @@ async fn run_msg(
                     let _ = msg_tx.send(Msg::PreviewBuilt { key, sections });
                 });
             }
+            Effect::OpenInEditor { path, line } => {
+                // Hand the terminal to $EDITOR at the line, then take it back,
+                // the same suspend/resume the commit editor uses.
+                let full = app.backend().workdir().join(&path);
+                events.pause();
+                ratatui::restore();
+                let editor = editor_command();
+                let opened =
+                    tokio::task::spawn_blocking(move || run_editor_at(&editor, &full, line)).await;
+                *terminal = ratatui::init();
+                events.resume();
+                if !matches!(opened, Ok(Ok(true))) {
+                    app.push_toast(crate::app::ToastKind::Error, "editor exited abnormally".into());
+                }
+            }
             Effect::BuildSnippetPreview { key, path, line } => {
                 let dir = app.backend().workdir().to_path_buf();
                 let msg_tx = msg_tx.clone();
@@ -1507,6 +1522,20 @@ fn run_editor(editor: &str, path: &Path) -> std::io::Result<bool> {
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(path)
+        .status()?;
+    Ok(status.success())
+}
+
+/// Open `path` in `editor` at `line`. The `+<line>` argument is understood by
+/// vim, nvim, emacs, nano, and most terminal editors; it degrades to opening the
+/// file at the top for the few that ignore it.
+fn run_editor_at(editor: &str, path: &Path, line: usize) -> std::io::Result<bool> {
+    let line = line.max(1);
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} +{line} \"$1\""))
         .arg("sh")
         .arg(path)
         .status()?;

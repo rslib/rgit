@@ -445,6 +445,7 @@ pub fn resolve_finder_key(key: KeyEvent) -> Option<Msg> {
         KeyCode::Char('p') if ctrl => Some(Msg::CodeFinderUp),
         KeyCode::Char('n') if ctrl => Some(Msg::CodeFinderDown),
         KeyCode::Char('s') if ctrl => Some(Msg::CodeFinderSemantic),
+        KeyCode::Char('e') if ctrl => Some(Msg::CodeFinderEditor),
         KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
             Some(Msg::CodeFinderChar(c))
         }
