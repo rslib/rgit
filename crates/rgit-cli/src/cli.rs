@@ -331,6 +331,9 @@ pub enum Command {
         /// Reset the index and working tree too (discards changes).
         #[arg(long)]
         hard: bool,
+        /// Unstage these paths instead of moving HEAD (git's `reset -- <paths>`).
+        #[arg(last = true, value_name = "PATH")]
+        paths: Vec<String>,
     },
     /// Cherry-pick a commit onto HEAD.
     CherryPick {
@@ -1412,7 +1415,19 @@ pub fn run(
             let out = backend.bisect(&args)?;
             if out.is_empty() { "ok".to_owned() } else { out }
         }
-        Command::Reset { rev, soft, hard } => {
+        Command::Reset {
+            rev,
+            soft,
+            hard,
+            paths,
+        } => {
+            // `reset -- <paths>` unstages those paths (git's path-scoped reset).
+            if !paths.is_empty() {
+                for p in &paths {
+                    backend.unstage_file(p)?;
+                }
+                return Ok(format!("unstaged {}", paths.join(", ")));
+            }
             let rev = resolve(rev, "a revision to reset to", &|| {
                 crate::interactive::pick_commit(backend, "Reset to which commit?")
             })?;
