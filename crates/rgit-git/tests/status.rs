@@ -523,7 +523,7 @@ fn add_list_and_remove_worktrees() {
     assert_eq!(worktrees.len(), 1);
     assert_eq!(worktrees[0].name, "feature-wt");
 
-    backend.remove_worktree("feature-wt").unwrap();
+    backend.remove_worktree("feature-wt", false).unwrap();
     assert!(backend.worktrees().unwrap().is_empty());
 }
 

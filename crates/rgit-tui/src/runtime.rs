@@ -1189,7 +1189,7 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::AddRemote { name, url } => backend.add_remote(name, url),
         Mutation::RemoveRemote(name) => backend.remove_remote(name),
         Mutation::AddWorktree { name, path } => backend.add_worktree(name, path),
-        Mutation::RemoveWorktree(name) => backend.remove_worktree(name),
+        Mutation::RemoveWorktree(name) => backend.remove_worktree(name, false),
         Mutation::Extend => backend.commit_extend(),
         Mutation::RebaseAbort => backend.rebase_abort(),
         Mutation::RebaseContinue => backend.rebase_continue(),

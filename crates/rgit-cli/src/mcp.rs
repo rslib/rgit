@@ -408,8 +408,14 @@ fn tools() -> Vec<Tool> {
         tool("git_worktrees", "Linked worktrees.", none),
         tool(
             "git_describe",
-            "Describe a revision relative to the nearest tag (default HEAD).",
-            &[("rev", "string", false)],
+            "Describe a revision relative to the nearest tag (default HEAD). `tags` uses lightweight tags too, `dirty` appends -dirty, `long` forces long format, `abbrev` sets the oid length.",
+            &[
+                ("rev", "string", false),
+                ("tags", "boolean", false),
+                ("dirty", "boolean", false),
+                ("long", "boolean", false),
+                ("abbrev", "number", false),
+            ],
         ),
         tool(
             "git_stage",
@@ -795,8 +801,13 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_worktree_remove",
-            "Remove a linked worktree.",
-            &[("name", "string", true)],
+            "Remove a linked worktree. `force` removes it even if locked.",
+            &[("name", "string", true), ("force", "boolean", false)],
+        ),
+        tool(
+            "git_worktree_prune",
+            "Prune worktree entries whose working tree is gone.",
+            none,
         ),
         tool(
             "git_clean",
@@ -962,7 +973,7 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
             .worktrees()
             .map(|w| crate::render::worktrees(&w))
             .map_err(emap),
-        "git_describe" => backend.describe(s("rev").unwrap_or("HEAD")).map_err(emap),
+        "git_describe" => backend.describe(s("rev").unwrap_or("HEAD"), flag("tags"), flag("dirty"), flag("long"), args.get("abbrev").and_then(Value::as_u64).map(|n| n as u32)).map_err(emap),
 
         "git_stage" => done(match (hunk, lines.as_slice()) {
             (Some(h), l) if !l.is_empty() => backend.stage_lines(req("path")?, h, l),
@@ -1230,7 +1241,17 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
         "git_remote_rename" => done(backend.rename_remote(req("old")?, req("new")?)),
 
         "git_worktree_add" => done(backend.add_worktree(req("name")?, req("path")?)),
-        "git_worktree_remove" => done(backend.remove_worktree(req("name")?)),
+        "git_worktree_remove" => done(backend.remove_worktree(req("name")?, flag("force"))),
+        "git_worktree_prune" => backend
+            .prune_worktrees()
+            .map(|p| {
+                if p.is_empty() {
+                    "nothing to prune".to_owned()
+                } else {
+                    format!("pruned {}", p.join(", "))
+                }
+            })
+            .map_err(emap),
 
         "git_clean" => backend.clean(flag("dry_run")).map(|o| if flag("dry_run") { o } else { "ok".to_owned() }).map_err(emap),
         "git_rm" => done(backend.remove_path(req("path")?, flag("cached"))),

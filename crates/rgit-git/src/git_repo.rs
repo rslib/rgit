@@ -1426,15 +1426,33 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
-    fn describe(&self, rev: &str) -> Result<String, GitError> {
+    fn describe(
+        &self,
+        rev: &str,
+        tags: bool,
+        dirty: bool,
+        long: bool,
+        abbrev: Option<u32>,
+    ) -> Result<String, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let obj = repo.revparse_single(rev)?;
         let mut opts = git2::DescribeOptions::new();
-        opts.describe_tags().show_commit_oid_as_fallback(true);
+        if tags {
+            opts.describe_tags();
+        }
+        opts.show_commit_oid_as_fallback(true);
         let describe = obj.describe(&opts)?;
-        Ok(describe.format(Some(
-            git2::DescribeFormatOptions::new().dirty_suffix("-dirty"),
-        ))?)
+        let mut fmt = git2::DescribeFormatOptions::new();
+        if dirty {
+            fmt.dirty_suffix("-dirty");
+        }
+        if long {
+            fmt.always_use_long_format(true);
+        }
+        if let Some(n) = abbrev {
+            fmt.abbreviated_size(n);
+        }
+        Ok(describe.format(Some(&fmt))?)
     }
 
     fn git(&self, args: &[String]) -> Result<String, GitError> {
@@ -1718,13 +1736,39 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
-    fn remove_worktree(&self, name: &str) -> Result<(), GitError> {
+    fn remove_worktree(&self, name: &str, force: bool) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let wt = repo.find_worktree(name)?;
         let mut opts = git2::WorktreePruneOptions::new();
-        opts.valid(true).working_tree(true);
+        opts.valid(true).working_tree(true).locked(force);
         wt.prune(Some(&mut opts))?;
         Ok(())
+    }
+
+    fn prune_worktrees(&self) -> Result<Vec<String>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let mut pruned = Vec::new();
+        for name in repo.worktrees()?.iter().filter_map(|t| t.ok().flatten()) {
+            let Ok(wt) = repo.find_worktree(name) else {
+                continue;
+            };
+            // Only prune entries whose working tree is missing (not valid).
+            let mut opts = git2::WorktreePruneOptions::new();
+            opts.valid(false).working_tree(true);
+            if wt.is_prunable(Some(&mut opts)).unwrap_or(false) && wt.prune(Some(&mut opts)).is_ok() {
+                pruned.push(name.to_owned());
+            }
+        }
+        Ok(pruned)
+    }
+
+    fn prune_objects(&self, dry_run: bool) -> Result<String, GitError> {
+        // libgit2 has no object prune; shell out like the other gc-style ops.
+        let mut args = vec!["prune"];
+        if dry_run {
+            args.push("-n");
+        }
+        self.run_git(&args, &[])
     }
 
     fn config_get(&self, key: &str) -> Result<Option<String>, GitError> {

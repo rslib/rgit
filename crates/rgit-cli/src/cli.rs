@@ -95,6 +95,9 @@ pub enum Command {
     Blame {
         /// The file to annotate.
         path: String,
+        /// Limit to a 1-based line range `START,END` (git's -L).
+        #[arg(short = 'L', value_name = "START,END")]
+        lines: Option<String>,
     },
     /// All refs (local branches, remotes, tags).
     Refs,
@@ -210,10 +213,12 @@ pub enum Command {
         paths: Vec<String>,
     },
     /// Delete local branches already merged into a base (default HEAD).
+    /// Prune unreachable objects (git's `prune`). For deleting merged branches,
+    /// use `branch prune`.
     Prune {
-        /// Delete branches merged into this revision.
-        #[arg(default_value = "HEAD")]
-        base: String,
+        /// List what would be removed without deleting (git's -n).
+        #[arg(short = 'n', long = "dry-run")]
+        dry_run: bool,
     },
     /// Check out the branch stacked on this one (move up the stack).
     Next,
@@ -367,10 +372,25 @@ pub enum Command {
         #[command(subcommand)]
         cmd: Option<StashCmd>,
     },
-    /// Tag management.
+    /// Tag management: `tag` lists, `tag <name>` creates, `tag -d <name>` deletes.
     Tag {
-        #[command(subcommand)]
-        cmd: Option<TagCmd>,
+        /// The tag to create (annotated when -m/-a is given).
+        name: Option<String>,
+        /// Annotation message (implies an annotated tag).
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Make an annotated tag even without a message.
+        #[arg(short, long)]
+        annotate: bool,
+        /// Replace an existing tag of the same name (git's -f).
+        #[arg(short, long)]
+        force: bool,
+        /// Delete this tag (git's -d).
+        #[arg(short = 'd', long, value_name = "NAME")]
+        delete: Option<String>,
+        /// List tags (the default with no name); accepted for git compatibility.
+        #[arg(short, long)]
+        list: bool,
     },
     /// Remote management (no subcommand lists remotes).
     Remote {
@@ -437,6 +457,18 @@ pub enum Command {
     Describe {
         /// The revision to describe (defaults to HEAD).
         rev: Option<String>,
+        /// Use lightweight tags too, not just annotated ones (git's --tags).
+        #[arg(long)]
+        tags: bool,
+        /// Append -dirty when the working tree has uncommitted changes.
+        #[arg(long)]
+        dirty: bool,
+        /// Always use the long format (tag-count-oid), even on a tag.
+        #[arg(long)]
+        long: bool,
+        /// Number of hex digits for the abbreviated commit oid.
+        #[arg(long, value_name = "N")]
+        abbrev: Option<u32>,
     },
     /// Create a new repository in the current directory (or PATH).
     Init {
@@ -565,6 +597,12 @@ pub enum BranchCmd {
         /// The new branch name.
         new: String,
     },
+    /// Delete every local branch already merged into a base (default HEAD).
+    Prune {
+        /// Delete branches merged into this revision.
+        #[arg(default_value = "HEAD")]
+        base: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -596,24 +634,6 @@ pub enum StashCmd {
     List,
 }
 
-#[derive(Subcommand)]
-pub enum TagCmd {
-    /// List all tags, newest first (the default when `tag` has no subcommand).
-    List,
-    /// Create a tag (annotated when a message is given).
-    Create {
-        /// The tag name.
-        name: String,
-        /// An annotation message.
-        #[arg(short, long)]
-        message: Option<String>,
-    },
-    /// Delete a tag (prompted for if no name on a terminal).
-    Delete {
-        /// The tag to delete.
-        name: Option<String>,
-    },
-}
 
 #[derive(Subcommand)]
 pub enum RemoteCmd {
@@ -658,7 +678,12 @@ pub enum WorktreeCmd {
     Remove {
         /// The worktree name.
         name: String,
+        /// Remove even if locked (git's -f/--force).
+        #[arg(short = 'f', long)]
+        force: bool,
     },
+    /// Prune worktree entries whose working tree is gone (git's `worktree prune`).
+    Prune,
 }
 
 /// Subcommands for stacked branches.
@@ -1148,7 +1173,22 @@ pub fn run(
                 render::commit_details(&details)
             }
         }
-        Command::Blame { path } => render::blame(&backend.blame(&path)?),
+        Command::Blame { path, lines } => {
+            let all = backend.blame(&path)?;
+            let selected = match lines {
+                Some(spec) => {
+                    let (a, b) = spec
+                        .split_once(',')
+                        .ok_or_else(|| anyhow::anyhow!("-L wants START,END"))?;
+                    let start: usize = a.trim().parse().map_err(|_| anyhow::anyhow!("bad -L start"))?;
+                    let end: usize = b.trim().parse().map_err(|_| anyhow::anyhow!("bad -L end"))?;
+                    let lo = start.saturating_sub(1);
+                    all.into_iter().skip(lo).take(end.saturating_sub(lo)).collect()
+                }
+                None => all,
+            };
+            render::blame(&selected)
+        }
         Command::Refs => render::refs(&backend.refs()?),
         Command::Stage { path, hunk, lines } => ok(match (hunk, lines.as_slice()) {
             (Some(h), l) if !l.is_empty() => backend.stage_lines(&path, h, l),
@@ -1272,12 +1312,12 @@ pub fn run(
                 many => anyhow::bail!("multiple children: {}", many.join(", ")),
             }
         }
-        Command::Prune { base } => {
-            let deleted = backend.prune_merged(&base)?;
-            if deleted.is_empty() {
-                format!("no branches merged into {base}")
+        Command::Prune { dry_run } => {
+            let out = backend.prune_objects(dry_run)?;
+            if out.trim().is_empty() {
+                "nothing to prune".to_owned()
             } else {
-                format!("deleted {} merged: {}", deleted.len(), deleted.join(", "))
+                out.trim_end().to_owned()
             }
         }
         Command::Move { rev, before, after } => match (before, after) {
@@ -1490,6 +1530,14 @@ pub fn run(
                 None => anyhow::bail!("a branch name required"),
             },
             Some(BranchCmd::Rename { old, new }) => ok(backend.rename_branch(&old, &new)),
+            Some(BranchCmd::Prune { base }) => {
+                let deleted = backend.prune_merged(&base)?;
+                if deleted.is_empty() {
+                    format!("no branches merged into {base}")
+                } else {
+                    format!("deleted {} merged: {}", deleted.len(), deleted.join(", "))
+                }
+            }
         },
         Command::Stash { cmd } => match cmd {
             None => ok_msg(backend.stash_push(false)),
@@ -1521,8 +1569,23 @@ pub fn run(
             )?)),
             Some(StashCmd::List) => render::stashes(&backend.status()?.stashes),
         },
-        Command::Tag { cmd } => match cmd {
-            None | Some(TagCmd::List) => {
+        Command::Tag {
+            name,
+            message,
+            annotate: _,
+            force,
+            delete,
+            list: _,
+        } => {
+            if let Some(del) = delete {
+                ok(backend.delete_tag(&del))
+            } else if let Some(name) = name {
+                // `-f` re-tags: drop an existing tag of the same name first.
+                if force {
+                    let _ = backend.delete_tag(&name);
+                }
+                ok(backend.create_tag(&name, message.as_deref().unwrap_or("")))
+            } else {
                 let names: Vec<String> = backend.all_tags()?.into_iter().map(|t| t.name).collect();
                 if names.is_empty() {
                     "no tags".to_owned()
@@ -1530,16 +1593,7 @@ pub fn run(
                     names.join("\n")
                 }
             }
-            Some(TagCmd::Create { name, message }) => {
-                ok(backend.create_tag(&name, message.as_deref().unwrap_or("")))
-            }
-            Some(TagCmd::Delete { name }) => {
-                let name = resolve(name, "a tag name", &|| {
-                    crate::interactive::pick_tag(backend, "Delete which tag?")
-                })?;
-                ok(backend.delete_tag(&name))
-            }
-        },
+        }
         Command::Remote { cmd } => match cmd {
             None => render::remotes(&backend.remotes()?),
             Some(RemoteCmd::Add { name, url }) => ok(backend.add_remote(&name, &url)),
@@ -1588,7 +1642,15 @@ pub fn run(
         Command::Worktree { cmd } => match cmd {
             None => render::worktrees(&backend.worktrees()?),
             Some(WorktreeCmd::Add { name, path }) => ok(backend.add_worktree(&name, &path)),
-            Some(WorktreeCmd::Remove { name }) => ok(backend.remove_worktree(&name)),
+            Some(WorktreeCmd::Remove { name, force }) => ok(backend.remove_worktree(&name, force)),
+            Some(WorktreeCmd::Prune) => {
+                let pruned = backend.prune_worktrees()?;
+                if pruned.is_empty() {
+                    "nothing to prune".to_owned()
+                } else {
+                    format!("pruned {}", pruned.join(", "))
+                }
+            }
         },
         Command::Clean { dry_run } => {
             if dry_run {
@@ -1614,7 +1676,13 @@ pub fn run(
             ok(backend.remove_path(&path, cached))
         }
         Command::Mv { from, to, force } => ok(backend.move_path(&from, &to, force)),
-        Command::Describe { rev } => backend.describe(rev.as_deref().unwrap_or("HEAD"))?,
+        Command::Describe {
+            rev,
+            tags,
+            dirty,
+            long,
+            abbrev,
+        } => backend.describe(rev.as_deref().unwrap_or("HEAD"), tags, dirty, long, abbrev)?,
         Command::Submodule { mut args } => {
             args.insert(0, "submodule".to_owned());
             backend.git(&args)?

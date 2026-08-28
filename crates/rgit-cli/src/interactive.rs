@@ -81,22 +81,6 @@ pub fn multiselect_branches(
     prompt::multiselect(prompt, items).map_err(err)
 }
 
-/// Select a tag name.
-pub fn pick_tag(backend: &Arc<dyn GitBackend>, prompt: &str) -> anyhow::Result<String> {
-    use rgit_git::RefKind;
-    let tags: Vec<String> = backend
-        .refs()?
-        .into_iter()
-        .filter(|r| r.kind == RefKind::Tag)
-        .map(|r| r.name)
-        .collect();
-    if tags.is_empty() {
-        anyhow::bail!("no tags");
-    }
-    let items = tags.into_iter().map(|t| Item::new(t.clone(), t)).collect();
-    prompt::select(prompt, items).map_err(err)
-}
-
 /// Select a changed path from the working tree.
 pub fn pick_file(backend: &Arc<dyn GitBackend>, prompt: &str) -> anyhow::Result<String> {
     let paths: Vec<String> = backend

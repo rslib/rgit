@@ -377,7 +377,18 @@ pub trait GitBackend: Send + Sync {
     fn move_path(&self, from: &str, to: &str, force: bool) -> Result<(), GitError>;
 
     /// Describe a revision relative to the nearest tag (`git describe`).
-    fn describe(&self, rev: &str) -> Result<String, GitError>;
+    /// Describe `rev` relative to the nearest tag. `tags` also considers
+    /// lightweight tags (git's `--tags`); `dirty` appends `-dirty` when the
+    /// worktree is modified; `long` always shows the long format; `abbrev` sets
+    /// the abbreviated-oid length.
+    fn describe(
+        &self,
+        rev: &str,
+        tags: bool,
+        dirty: bool,
+        long: bool,
+        abbrev: Option<u32>,
+    ) -> Result<String, GitError>;
 
     /// Run any `git` subcommand and return its stdout - the escape hatch for
     /// operations rgit does not model natively (submodule, notes, grep, gc, ...).
@@ -443,7 +454,16 @@ pub trait GitBackend: Send + Sync {
     fn add_worktree(&self, name: &str, path: &str) -> Result<(), GitError>;
 
     /// Remove the linked worktree named `name`.
-    fn remove_worktree(&self, name: &str) -> Result<(), GitError>;
+    /// Remove a linked worktree. `force` prunes it even when locked (git's `-f`).
+    fn remove_worktree(&self, name: &str, force: bool) -> Result<(), GitError>;
+
+    /// Prune worktree admin entries whose working tree is gone (git's `worktree
+    /// prune`). Returns the names pruned.
+    fn prune_worktrees(&self) -> Result<Vec<String>, GitError>;
+
+    /// Prune unreachable objects (git's `prune`). `dry_run` reports what would be
+    /// removed without deleting. Returns git's output.
+    fn prune_objects(&self, dry_run: bool) -> Result<String, GitError>;
 
     /// Delete a local branch.
     /// Delete a local branch. With `force` false (git's `-d`), refuse a branch
