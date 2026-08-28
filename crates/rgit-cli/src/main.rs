@@ -32,7 +32,12 @@ fn main() -> ! {
                 "ok",
             ));
         }
-        Some(Command::Clone { url, dir }) => {
+        Some(Command::Clone {
+            url,
+            dir,
+            branch,
+            depth,
+        }) => {
             // Default the target directory to the repo name, as git does.
             let dir = dir.unwrap_or_else(|| {
                 url.trim_end_matches('/')
@@ -42,7 +47,13 @@ fn main() -> ! {
                     .trim_end_matches(".git")
                     .to_owned()
             });
-            let result = rgit_git::clone(&url, std::path::Path::new(&dir), &|_| {});
+            let result = rgit_git::clone(
+                &url,
+                std::path::Path::new(&dir),
+                branch.as_deref(),
+                depth,
+                &|_| {},
+            );
             exit(report_result(result, &format!("cloned into {dir}")));
         }
         // The web viewer takes over the process, like the TUI, so it runs on

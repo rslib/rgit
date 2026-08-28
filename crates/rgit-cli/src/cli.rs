@@ -319,7 +319,7 @@ pub enum Command {
     /// Tag management.
     Tag {
         #[command(subcommand)]
-        cmd: TagCmd,
+        cmd: Option<TagCmd>,
     },
     /// Remote management (no subcommand lists remotes).
     Remote {
@@ -392,6 +392,12 @@ pub enum Command {
         url: String,
         /// The target directory (defaults to the repository name).
         dir: Option<String>,
+        /// Check out this branch instead of the remote's default (git's -b).
+        #[arg(short = 'b', long)]
+        branch: Option<String>,
+        /// Shallow-clone this many commits of history (git's --depth).
+        #[arg(long, default_value_t = 0)]
+        depth: i32,
     },
     /// Submodule management: forwards to `git submodule <args>`.
     Submodule {
@@ -526,6 +532,8 @@ pub enum StashCmd {
 
 #[derive(Subcommand)]
 pub enum TagCmd {
+    /// List all tags, newest first (the default when `tag` has no subcommand).
+    List,
     /// Create a tag (annotated when a message is given).
     Create {
         /// The tag name.
@@ -1364,10 +1372,18 @@ pub fn run(
             Some(StashCmd::List) => render::stashes(&backend.status()?.stashes),
         },
         Command::Tag { cmd } => match cmd {
-            TagCmd::Create { name, message } => {
+            None | Some(TagCmd::List) => {
+                let names: Vec<String> = backend.all_tags()?.into_iter().map(|t| t.name).collect();
+                if names.is_empty() {
+                    "no tags".to_owned()
+                } else {
+                    names.join("\n")
+                }
+            }
+            Some(TagCmd::Create { name, message }) => {
                 ok(backend.create_tag(&name, message.as_deref().unwrap_or("")))
             }
-            TagCmd::Delete { name } => {
+            Some(TagCmd::Delete { name }) => {
                 let name = resolve(name, "a tag name", &|| {
                     crate::interactive::pick_tag(backend, "Delete which tag?")
                 })?;

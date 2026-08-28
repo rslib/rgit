@@ -2439,13 +2439,27 @@ pub fn init(path: &Path) -> Result<(), GitError> {
 
 /// Clone `url` into `path` (`git clone`), via libgit2, using the same
 /// credentials as fetch/push and reporting git-style progress.
-pub fn clone(url: &str, path: &Path, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
+/// Clone `url` into `path`. `branch` checks out that branch instead of the
+/// remote's default HEAD; `depth > 0` makes a shallow clone of that many commits.
+pub fn clone(
+    url: &str,
+    path: &Path,
+    branch: Option<&str>,
+    depth: i32,
+    report: &dyn Fn(OpProgress),
+) -> Result<(), GitError> {
     let ignored = std::sync::atomic::AtomicBool::new(false);
     let mut opts = FetchOptions::new();
     opts.remote_callbacks(remote_callbacks(report, &ignored, None));
-    git2::build::RepoBuilder::new()
-        .fetch_options(opts)
-        .clone(url, path)?;
+    if depth > 0 {
+        opts.depth(depth);
+    }
+    let mut builder = git2::build::RepoBuilder::new();
+    builder.fetch_options(opts);
+    if let Some(b) = branch {
+        builder.branch(b);
+    }
+    builder.clone(url, path)?;
     Ok(())
 }
 
