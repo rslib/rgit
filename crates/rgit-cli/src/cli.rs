@@ -1194,14 +1194,14 @@ pub fn run(
             (Some(h), l) if !l.is_empty() => backend.stage_lines(&path, h, l),
             (Some(h), _) => backend.stage_hunk(&path, h),
             (None, _) => backend.stage_file(&path),
-        }),
+        })?,
         Command::Unstage { path, hunk, lines } => ok(match (hunk, lines.as_slice()) {
             (Some(h), l) if !l.is_empty() => backend.unstage_lines(&path, h, l),
             (Some(h), _) => backend.unstage_hunk(&path, h),
             (None, _) => backend.unstage_file(&path),
-        }),
-        Command::StageAll => ok(backend.stage_all()),
-        Command::UnstageAll => ok(backend.unstage_all()),
+        })?,
+        Command::StageAll => ok(backend.stage_all())?,
+        Command::UnstageAll => ok(backend.unstage_all())?,
         Command::Discard { path, hunk, lines } => {
             let path = resolve(path, "a path", &|| {
                 crate::interactive::pick_file(backend, "Discard which file?")
@@ -1210,13 +1210,13 @@ pub fn run(
                 (Some(h), l) if !l.is_empty() => backend.discard_lines(&path, h, l),
                 (Some(h), _) => backend.discard_hunk(&path, h),
                 (None, _) => backend.discard_file(&path),
-            })
+            })?
         }
         Command::Resolve { path, ours, theirs } => {
             if !ours && !theirs {
                 anyhow::bail!("resolve needs --ours or --theirs");
             }
-            ok(backend.resolve_conflict(&path, ours))
+            ok(backend.resolve_conflict(&path, ours))?
         }
         Command::Commit {
             message,
@@ -1370,7 +1370,7 @@ pub fn run(
                     backend.checkout_detached(start)?;
                 }
                 backend.create_branch(&new)?;
-                ok(backend.checkout_branch(&new))
+                ok(backend.checkout_branch(&new))?
             } else {
                 let rev = resolve(rev, "a branch or revision", &|| {
                     crate::interactive::pick_branch(backend, "Check out which branch?")
@@ -1383,7 +1383,7 @@ pub fn run(
                     backend.checkout_branch(&rev)
                 } else {
                     backend.checkout_detached(&rev)
-                })
+                })?
             }
         }
         Command::Merge {
@@ -1393,7 +1393,7 @@ pub fn run(
             abort,
         } => {
             if abort {
-                ok(backend.merge_abort())
+                ok(backend.merge_abort())?
             } else {
                 let rev = resolve(rev, "a revision to merge", &|| {
                     crate::interactive::pick_branch(backend, "Merge which branch?")
@@ -1412,11 +1412,11 @@ pub fn run(
             abort,
         } => {
             if abort {
-                ok(backend.rebase_abort())
+                ok(backend.rebase_abort())?
             } else if cont {
-                ok(backend.rebase_continue())
+                ok(backend.rebase_continue())?
             } else if skip {
-                ok(backend.rebase_skip())
+                ok(backend.rebase_skip())?
             } else if let Some(newbase) = onto_new {
                 // `rebase --onto NEWBASE UPSTREAM`: replay UPSTREAM..HEAD onto NEWBASE.
                 let upstream = resolve(onto, "the upstream (after --onto NEWBASE)", &|| {
@@ -1437,7 +1437,7 @@ pub fn run(
                         "Rebase onto which commit? (edits the commits after it)",
                     )?,
                 };
-                ok(backend.rebase_interactive(Some(&onto)))
+                ok(backend.rebase_interactive(Some(&onto)))?
             } else {
                 let onto = resolve(
                     onto,
@@ -1484,20 +1484,20 @@ pub fn run(
             {
                 "cancelled".to_owned()
             } else {
-                ok(backend.reset(&rev, mode))
+                ok(backend.reset(&rev, mode))?
             }
         }
         Command::CherryPick { rev, no_commit } => {
             let rev = resolve(rev, "a commit to cherry-pick", &|| {
                 crate::interactive::pick_commit(backend, "Cherry-pick which commit?")
             })?;
-            ok(backend.cherry_pick(&rev, no_commit))
+            ok(backend.cherry_pick(&rev, no_commit))?
         }
         Command::Revert { rev, no_commit } => {
             let rev = resolve(rev, "a commit to revert", &|| {
                 crate::interactive::pick_commit(backend, "Revert which commit?")
             })?;
-            ok(backend.revert(&rev, no_commit))
+            ok(backend.revert(&rev, no_commit))?
         }
         Command::Branch { cmd, all, remotes } => match cmd {
             None if remotes => backend.remote_branches()?.join("\n"),
@@ -1509,10 +1509,10 @@ pub fn run(
                 }
                 render::branches(&names, current.as_deref())
             }
-            Some(BranchCmd::Create { name }) => ok(backend.create_branch(&name)),
-            Some(BranchCmd::Checkout { name }) => ok(backend.checkout_branch(&name)),
+            Some(BranchCmd::Create { name }) => ok(backend.create_branch(&name))?,
+            Some(BranchCmd::Checkout { name }) => ok(backend.checkout_branch(&name))?,
             Some(BranchCmd::Delete { name, force }) => match name {
-                Some(name) => ok(backend.delete_branch(&name, force)),
+                Some(name) => ok(backend.delete_branch(&name, force))?,
                 None if interactive => {
                     let names = crate::interactive::multiselect_branches(
                         backend,
@@ -1529,7 +1529,7 @@ pub fn run(
                 }
                 None => anyhow::bail!("a branch name required"),
             },
-            Some(BranchCmd::Rename { old, new }) => ok(backend.rename_branch(&old, &new)),
+            Some(BranchCmd::Rename { old, new }) => ok(backend.rename_branch(&old, &new))?,
             Some(BranchCmd::Prune { base }) => {
                 let deleted = backend.prune_merged(&base)?;
                 if deleted.is_empty() {
@@ -1540,33 +1540,33 @@ pub fn run(
             }
         },
         Command::Stash { cmd } => match cmd {
-            None => ok_msg(backend.stash_push(false)),
+            None => ok_msg(backend.stash_push(false))?,
             Some(StashCmd::Push {
                 message: None,
                 include_untracked,
-            }) => ok_msg(backend.stash_push(include_untracked)),
+            }) => ok_msg(backend.stash_push(include_untracked))?,
             Some(StashCmd::Push {
                 message: Some(message),
                 include_untracked,
-            }) => ok_msg(backend.stash_push_message(&message, include_untracked)),
+            }) => ok_msg(backend.stash_push_message(&message, include_untracked))?,
             Some(StashCmd::Pop { index }) => ok(backend.stash_pop(stash_index(
                 backend,
                 index,
                 interactive,
                 "Pop which stash?",
-            )?)),
+            )?))?,
             Some(StashCmd::Apply { index }) => ok(backend.stash_apply(stash_index(
                 backend,
                 index,
                 interactive,
                 "Apply which stash?",
-            )?)),
+            )?))?,
             Some(StashCmd::Drop { index }) => ok(backend.stash_drop(stash_index(
                 backend,
                 index,
                 interactive,
                 "Drop which stash?",
-            )?)),
+            )?))?,
             Some(StashCmd::List) => render::stashes(&backend.status()?.stashes),
         },
         Command::Tag {
@@ -1578,13 +1578,13 @@ pub fn run(
             list: _,
         } => {
             if let Some(del) = delete {
-                ok(backend.delete_tag(&del))
+                ok(backend.delete_tag(&del))?
             } else if let Some(name) = name {
                 // `-f` re-tags: drop an existing tag of the same name first.
                 if force {
                     let _ = backend.delete_tag(&name);
                 }
-                ok(backend.create_tag(&name, message.as_deref().unwrap_or("")))
+                ok(backend.create_tag(&name, message.as_deref().unwrap_or("")))?
             } else {
                 let names: Vec<String> = backend.all_tags()?.into_iter().map(|t| t.name).collect();
                 if names.is_empty() {
@@ -1596,10 +1596,10 @@ pub fn run(
         }
         Command::Remote { cmd } => match cmd {
             None => render::remotes(&backend.remotes()?),
-            Some(RemoteCmd::Add { name, url }) => ok(backend.add_remote(&name, &url)),
-            Some(RemoteCmd::Remove { name }) => ok(backend.remove_remote(&name)),
-            Some(RemoteCmd::SetUrl { name, url }) => ok(backend.set_remote_url(&name, &url)),
-            Some(RemoteCmd::Rename { old, new }) => ok(backend.rename_remote(&old, &new)),
+            Some(RemoteCmd::Add { name, url }) => ok(backend.add_remote(&name, &url))?,
+            Some(RemoteCmd::Remove { name }) => ok(backend.remove_remote(&name))?,
+            Some(RemoteCmd::SetUrl { name, url }) => ok(backend.set_remote_url(&name, &url))?,
+            Some(RemoteCmd::Rename { old, new }) => ok(backend.rename_remote(&old, &new))?,
         },
         Command::Flow { cmd } => match cmd {
             FlowCmd::Init { preset } => rgit_git::workflow::init(backend.as_ref(), &preset)?,
@@ -1641,8 +1641,8 @@ pub fn run(
         },
         Command::Worktree { cmd } => match cmd {
             None => render::worktrees(&backend.worktrees()?),
-            Some(WorktreeCmd::Add { name, path }) => ok(backend.add_worktree(&name, &path)),
-            Some(WorktreeCmd::Remove { name, force }) => ok(backend.remove_worktree(&name, force)),
+            Some(WorktreeCmd::Add { name, path }) => ok(backend.add_worktree(&name, &path))?,
+            Some(WorktreeCmd::Remove { name, force }) => ok(backend.remove_worktree(&name, force))?,
             Some(WorktreeCmd::Prune) => {
                 let pruned = backend.prune_worktrees()?;
                 if pruned.is_empty() {
@@ -1673,9 +1673,9 @@ pub fn run(
             let path = resolve(path, "a path", &|| {
                 crate::interactive::pick_file(backend, "Remove which file?")
             })?;
-            ok(backend.remove_path(&path, cached))
+            ok(backend.remove_path(&path, cached))?
         }
-        Command::Mv { from, to, force } => ok(backend.move_path(&from, &to, force)),
+        Command::Mv { from, to, force } => ok(backend.move_path(&from, &to, force))?,
         Command::Describe {
             rev,
             tags,
@@ -1708,19 +1708,13 @@ fn stash_index(
     }
 }
 
-fn ok(r: Result<(), GitError>) -> String {
-    match r {
-        Ok(()) => "ok".to_owned(),
-        Err(e) => e.to_string(),
-    }
+fn ok(r: Result<(), GitError>) -> anyhow::Result<String> {
+    r.map(|()| "ok".to_owned()).map_err(Into::into)
 }
 
 /// Like [`ok`], but prints the operation's own success line instead of "ok".
-fn ok_msg(r: Result<String, GitError>) -> String {
-    match r {
-        Ok(msg) => msg,
-        Err(e) => e.to_string(),
-    }
+fn ok_msg(r: Result<String, GitError>) -> anyhow::Result<String> {
+    r.map_err(Into::into)
 }
 
 fn diff_out(files: &[rgit_git::FileDiff], patch: bool, name_only: bool) -> String {

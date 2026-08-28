@@ -1435,13 +1435,23 @@ impl GitBackend for Git2Backend {
         abbrev: Option<u32>,
     ) -> Result<String, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
-        let obj = repo.revparse_single(rev)?;
         let mut opts = git2::DescribeOptions::new();
         if tags {
             opts.describe_tags();
         }
         opts.show_commit_oid_as_fallback(true);
-        let describe = obj.describe(&opts)?;
+        // git2's Object::describe never sets the dirty flag; only the workdir
+        // describe does. So when the target is HEAD (the only case --dirty is
+        // meaningful for), describe the workdir; otherwise describe the object.
+        let head_oid = repo.head().ok().and_then(|h| h.target());
+        let obj = repo.revparse_single(rev)?;
+        let is_head = rev == "HEAD"
+            || obj.peel_to_commit().map(|c| Some(c.id()) == head_oid).unwrap_or(false);
+        let describe = if is_head {
+            repo.describe(&opts)?
+        } else {
+            obj.describe(&opts)?
+        };
         let mut fmt = git2::DescribeFormatOptions::new();
         if dirty {
             fmt.dirty_suffix("-dirty");
