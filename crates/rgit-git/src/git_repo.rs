@@ -1354,9 +1354,12 @@ impl GitBackend for Git2Backend {
         self.run_git(&argv, &[])
     }
 
-    fn clean(&self) -> Result<(), GitError> {
-        self.snap("clean");
-        self.run_git(&["clean", "-fd"], &[]).map(drop)
+    fn clean(&self, dry_run: bool) -> Result<String, GitError> {
+        if !dry_run {
+            self.snap("clean");
+        }
+        // libgit2 has no clean; -nd lists, -fd removes (files and directories).
+        self.run_git(&["clean", if dry_run { "-nd" } else { "-fd" }], &[])
     }
 
     fn remove_path(&self, path: &str) -> Result<(), GitError> {
@@ -1563,10 +1566,25 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
-    fn delete_branch(&self, name: &str) -> Result<(), GitError> {
+    fn delete_branch(&self, name: &str, force: bool) -> Result<(), GitError> {
         self.snap("delete branch");
         let repo = self.repo.lock().expect("repo mutex");
-        repo.find_branch(name, BranchType::Local)?.delete()?;
+        let mut branch = repo.find_branch(name, BranchType::Local)?;
+        if !force {
+            let tip = branch.get().peel_to_commit()?.id();
+            let merged = repo
+                .head()
+                .ok()
+                .and_then(|h| h.peel_to_commit().ok())
+                .map(|head| head.id() == tip || repo.graph_descendant_of(head.id(), tip).unwrap_or(false))
+                .unwrap_or(false);
+            if !merged {
+                return Err(GitError::Other(format!(
+                    "branch {name} is not fully merged into HEAD; use --force to delete"
+                )));
+            }
+        }
+        branch.delete()?;
         Ok(())
     }
 

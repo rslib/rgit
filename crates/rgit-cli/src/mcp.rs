@@ -737,8 +737,8 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_branch_delete",
-            "Delete a local branch.",
-            &[("name", "string", true)],
+            "Delete a local branch. `force` deletes even if not fully merged.",
+            &[("name", "string", true), ("force", "boolean", false)],
         ),
         tool(
             "git_branch_rename",
@@ -777,8 +777,8 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_clean",
-            "Remove every untracked file and directory. Destructive.",
-            none,
+            "Remove every untracked file and directory. Destructive. `dry_run` lists what would be removed without deleting.",
+            &[("dry_run", "boolean", false)],
         ),
         tool(
             "git_rm",
@@ -1175,7 +1175,7 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
         "git_stash_drop" => done(backend.stash_drop(index())),
 
         "git_branch_create" => done(backend.create_branch(req("name")?)),
-        "git_branch_delete" => done(backend.delete_branch(req("name")?)),
+        "git_branch_delete" => done(backend.delete_branch(req("name")?, flag("force"))),
         "git_branch_rename" => done(backend.rename_branch(req("old")?, req("new")?)),
 
         "git_tag_create" => done(backend.create_tag(req("name")?, s("message").unwrap_or(""))),
@@ -1187,7 +1187,7 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
         "git_worktree_add" => done(backend.add_worktree(req("name")?, req("path")?)),
         "git_worktree_remove" => done(backend.remove_worktree(req("name")?)),
 
-        "git_clean" => done(backend.clean()),
+        "git_clean" => backend.clean(flag("dry_run")).map(|o| if flag("dry_run") { o } else { "ok".to_owned() }).map_err(emap),
         "git_rm" => done(backend.remove_path(req("path")?)),
         "git_mv" => done(backend.move_path(req("from")?, req("to")?)),
         "git_run" => backend.git(&str_vec("args")).map_err(emap),

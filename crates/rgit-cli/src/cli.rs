@@ -225,6 +225,9 @@ pub enum Command {
     Checkout {
         /// The branch or revision (prompted for if omitted on a terminal).
         rev: Option<String>,
+        /// Create a new branch and switch to it (git's -b), from `rev` or HEAD.
+        #[arg(short = 'b', value_name = "NEW_BRANCH")]
+        branch: Option<String>,
     },
     /// Merge a revision into the current branch.
     Merge {
@@ -341,7 +344,11 @@ pub enum Command {
     /// lines (blame-routed fixups + autosquash).
     Absorb,
     /// Remove all untracked files and directories.
-    Clean,
+    Clean {
+        /// List what would be removed without deleting (git's -n).
+        #[arg(short = 'n', long = "dry-run")]
+        dry_run: bool,
+    },
     /// Remove a tracked path from the index and working tree.
     Rm {
         /// The path to remove (prompted for if omitted on a terminal).
@@ -463,6 +470,9 @@ pub enum BranchCmd {
     Delete {
         /// The branch to delete.
         name: Option<String>,
+        /// Delete even if not fully merged (git's -D).
+        #[arg(short = 'D', long = "force")]
+        force: bool,
     },
     /// Rename a branch.
     Rename {
@@ -1149,19 +1159,28 @@ pub fn run(
         } => net(interactive, "push", |r| {
             backend.push(remote.as_deref(), force, force_with_lease, set_upstream, r)
         })?,
-        Command::Checkout { rev } => {
-            let rev = resolve(rev, "a branch or revision", &|| {
-                crate::interactive::pick_branch(backend, "Check out which branch?")
-            })?;
-            let is_branch = backend
-                .local_branches()
-                .map(|bs| bs.iter().any(|b| b == &rev))
-                .unwrap_or(false);
-            ok(if is_branch {
-                backend.checkout_branch(&rev)
+        Command::Checkout { rev, branch } => {
+            // `-b <new>`: create the branch (from rev/HEAD) and switch to it.
+            if let Some(new) = branch {
+                if let Some(start) = &rev {
+                    backend.checkout_detached(start)?;
+                }
+                backend.create_branch(&new)?;
+                ok(backend.checkout_branch(&new))
             } else {
-                backend.checkout_detached(&rev)
-            })
+                let rev = resolve(rev, "a branch or revision", &|| {
+                    crate::interactive::pick_branch(backend, "Check out which branch?")
+                })?;
+                let is_branch = backend
+                    .local_branches()
+                    .map(|bs| bs.iter().any(|b| b == &rev))
+                    .unwrap_or(false);
+                ok(if is_branch {
+                    backend.checkout_branch(&rev)
+                } else {
+                    backend.checkout_detached(&rev)
+                })
+            }
         }
         Command::Merge { rev, no_ff } => {
             let rev = resolve(rev, "a revision to merge", &|| {
@@ -1251,8 +1270,8 @@ pub fn run(
             }
             Some(BranchCmd::Create { name }) => ok(backend.create_branch(&name)),
             Some(BranchCmd::Checkout { name }) => ok(backend.checkout_branch(&name)),
-            Some(BranchCmd::Delete { name }) => match name {
-                Some(name) => ok(backend.delete_branch(&name)),
+            Some(BranchCmd::Delete { name, force }) => match name {
+                Some(name) => ok(backend.delete_branch(&name, force)),
                 None if interactive => {
                     let names = crate::interactive::multiselect_branches(
                         backend,
@@ -1262,7 +1281,7 @@ pub fn run(
                         "none selected".to_owned()
                     } else {
                         for n in &names {
-                            backend.delete_branch(n)?;
+                            backend.delete_branch(n, force)?;
                         }
                         format!("deleted {}", names.join(", "))
                     }
@@ -1355,13 +1374,21 @@ pub fn run(
             Some(WorktreeCmd::Add { name, path }) => ok(backend.add_worktree(&name, &path)),
             Some(WorktreeCmd::Remove { name }) => ok(backend.remove_worktree(&name)),
         },
-        Command::Clean => {
-            if interactive
+        Command::Clean { dry_run } => {
+            if dry_run {
+                let out = backend.clean(true)?;
+                if out.trim().is_empty() {
+                    "nothing to clean".to_owned()
+                } else {
+                    out.trim_end().to_owned()
+                }
+            } else if interactive
                 && !crate::interactive::confirm("Remove all untracked files and directories?")?
             {
                 "cancelled".to_owned()
             } else {
-                ok(backend.clean())
+                backend.clean(false)?;
+                "ok".to_owned()
             }
         }
         Command::Rm { path } => {

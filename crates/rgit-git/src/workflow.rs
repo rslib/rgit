@@ -215,7 +215,7 @@ pub fn finish(backend: &dyn GitBackend) -> Result<String, GitError> {
     backend.merge(&current, true, &|_| {})?;
     let mut note = format!("merged {current} into {target}");
     if p.delete_on_finish {
-        backend.delete_branch(&current)?;
+        backend.delete_branch(&current, true)?;
         note.push_str(" and deleted the branch");
     }
     Ok(note)
@@ -256,7 +256,7 @@ pub fn release(backend: &dyn GitBackend, version: &str, finish: bool) -> Result<
         }
     }
     if p.delete_on_finish {
-        backend.delete_branch(&branch)?;
+        backend.delete_branch(&branch, true)?;
         notes.push(format!("deleted {branch}"));
     }
     Ok(notes.join("\n"))

@@ -1205,7 +1205,7 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::ResolveConflict { path, ours } => backend.resolve_conflict(path, *ours),
         Mutation::CreateTag(name) => backend.create_tag(name, ""),
         Mutation::DeleteTag(name) => backend.delete_tag(name),
-        Mutation::DeleteBranch(name) => backend.delete_branch(name),
+        Mutation::DeleteBranch(name) => backend.delete_branch(name, true),
         Mutation::Reword { rev, message } => backend.reword(rev, message),
         Mutation::Squash(rev) => backend.squash(rev),
         Mutation::Uncommit(n) => backend.uncommit(*n),

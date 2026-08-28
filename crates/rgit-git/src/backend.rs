@@ -323,7 +323,9 @@ pub trait GitBackend: Send + Sync {
     fn bisect(&self, args: &[String]) -> Result<String, GitError>;
 
     /// Remove every untracked file and directory (`git clean -fd`).
-    fn clean(&self) -> Result<(), GitError>;
+    /// Remove untracked files and directories. With `dry_run` (git's `-n`),
+    /// report what would be removed without deleting. Returns git's output.
+    fn clean(&self, dry_run: bool) -> Result<String, GitError>;
 
     /// Remove a tracked path from the index and the working tree (`git rm`).
     fn remove_path(&self, path: &str) -> Result<(), GitError>;
@@ -386,7 +388,9 @@ pub trait GitBackend: Send + Sync {
     fn remove_worktree(&self, name: &str) -> Result<(), GitError>;
 
     /// Delete a local branch.
-    fn delete_branch(&self, name: &str) -> Result<(), GitError>;
+    /// Delete a local branch. With `force` false (git's `-d`), refuse a branch
+    /// not merged into HEAD; with `force` true (`-D`), delete regardless.
+    fn delete_branch(&self, name: &str, force: bool) -> Result<(), GitError>;
 
     /// Rename a local branch.
     fn rename_branch(&self, old: &str, new: &str) -> Result<(), GitError>;

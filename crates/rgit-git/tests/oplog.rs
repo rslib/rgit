@@ -110,7 +110,7 @@ fn undo_restores_a_deleted_branch() {
     git(&dir, &["branch", "feature"]);
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    backend.delete_branch("feature").unwrap();
+    backend.delete_branch("feature", true).unwrap();
     assert!(!backend.branch_exists("feature"), "feature deleted");
 
     backend.undo().unwrap();
