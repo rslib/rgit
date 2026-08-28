@@ -634,11 +634,13 @@ async fn run_msg(
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
+                    // Opening the lanes view enables lanes on first use, so it
+                    // works from the TUI without dropping to `rgit lanes init`.
                     if !backend.lanes_active() {
-                        let _ = msg_tx.send(Msg::LaneNotice(
-                            "lanes are off; run `rgit lanes init` first".into(),
-                        ));
-                        return;
+                        if let Err(e) = backend.lanes_init() {
+                            let _ = msg_tx.send(Msg::LaneNotice(format!("could not enable lanes: {e}")));
+                            return;
+                        }
                     }
                     match backend.lanes_state() {
                         Ok(state) => {
@@ -1042,7 +1044,7 @@ async fn op_console(
             set_upstream,
             remote,
         } => backend.push(remote.as_deref(), force, force_with_lease, set_upstream, &report),
-        ConsoleOp::Merge(rev) => backend.merge(&rev, false, false, &report),
+        ConsoleOp::Merge { rev, no_ff } => backend.merge(&rev, no_ff, false, &report),
         ConsoleOp::RebaseOnto(rev) => backend.rebase_onto(&rev, &report),
         ConsoleOp::Sync => backend.sync(&report).map(drop),
         ConsoleOp::Submit => backend.submit_stack(&report).map(|notes| {

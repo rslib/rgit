@@ -37,7 +37,10 @@ pub enum ConsoleOp {
         /// Target remote by name, or None to push to the branch's upstream.
         remote: Option<String>,
     },
-    Merge(String),
+    Merge {
+        rev: String,
+        no_ff: bool,
+    },
     RebaseOnto(String),
     /// Fetch, fast-forward branches to their upstreams, and restack the stack.
     Sync,
@@ -51,7 +54,7 @@ impl ConsoleOp {
             ConsoleOp::Fetch => "fetch",
             ConsoleOp::Pull => "pull",
             ConsoleOp::Push { .. } => "push",
-            ConsoleOp::Merge(_) => "merge",
+            ConsoleOp::Merge { .. } => "merge",
             ConsoleOp::RebaseOnto(_) => "rebase",
             ConsoleOp::Sync => "sync",
             ConsoleOp::Submit => "submit",
@@ -1026,7 +1029,11 @@ impl Transient {
     fn merge() -> Self {
         Self {
             title: "Merge".into(),
-            args: Vec::new(),
+            args: vec![ArgToggle {
+                key: 'n',
+                label: "--no-ff".into(),
+                on: false,
+            }],
             actions: vec![action('m', "merge a branch…", ActionKind::MergeBranch)],
         }
     }
@@ -1775,6 +1782,8 @@ pub struct App {
     /// Push toggles (force, force-with-lease, set-upstream) stashed while the
     /// user picks a remote for "push to other remote".
     pending_push: Option<(bool, bool, bool)>,
+    /// The merge transient's --no-ff toggle, stashed while the branch is picked.
+    pending_merge_no_ff: bool,
     pending_lane: Option<String>,
     /// The path targeted by a pending lane-assign prompt.
     pending_lane_path: Option<String>,
@@ -1856,6 +1865,7 @@ impl App {
             auto_restack: config.commit.auto_restack,
             pending_reword_rev: None,
             pending_push: None,
+            pending_merge_no_ff: false,
             pending_lane: None,
             pending_lane_path: None,
             pending_cred_reply: None,
@@ -3289,7 +3299,8 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
     }
     // Merge and rebase-onto stream their git-style output into the console.
     if let PromptAction::MergeBranch = prompt.action {
-        return open_op(app, ConsoleOp::Merge(value));
+        let no_ff = std::mem::take(&mut app.pending_merge_no_ff);
+        return open_op(app, ConsoleOp::Merge { rev: value, no_ff });
     }
     if let PromptAction::RebaseOnto = prompt.action {
         return open_op(app, ConsoleOp::RebaseOnto(value));
@@ -3445,6 +3456,7 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
     let t_force = t.arg_on('F');
     let set_upstream = t.arg_on('u');
     let t_all = t.arg_on('a');
+    let t_no_ff = t.arg_on('n');
     app.transient = None;
 
     match kind {
@@ -3520,6 +3532,7 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
             Vec::new()
         }
         ActionKind::MergeBranch => {
+            app.pending_merge_no_ff = t_no_ff;
             revision_prompt(app, "Merge", PromptAction::MergeBranch);
             Vec::new()
         }
