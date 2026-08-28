@@ -430,7 +430,7 @@ pub fn resolve_help_key(_key: KeyEvent) -> Option<Msg> {
 
 /// Key handling while the command palette is open.
 /// Keys while the live code-search finder is open: type to search, arrows or
-/// Ctrl-n/p to move, Tab to fold in the semantic index, Enter to open, Esc to
+/// Ctrl-n/p to move, Tab to fold in the semantic index, Enter to open, Ctrl-o to open in $EDITOR, Esc to
 /// close.
 pub fn resolve_finder_key(key: KeyEvent) -> Option<Msg> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -445,7 +445,7 @@ pub fn resolve_finder_key(key: KeyEvent) -> Option<Msg> {
         KeyCode::Char('p') if ctrl => Some(Msg::CodeFinderUp),
         KeyCode::Char('n') if ctrl => Some(Msg::CodeFinderDown),
         KeyCode::Char('s') if ctrl => Some(Msg::CodeFinderSemantic),
-        KeyCode::Char('e') if ctrl => Some(Msg::CodeFinderEditor),
+        KeyCode::Char('o') if ctrl => Some(Msg::CodeFinderEditor),
         KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
             Some(Msg::CodeFinderChar(c))
         }

@@ -457,12 +457,12 @@ fn render_code_finder(frame: &mut Frame, app: &App, input_area: Rect, list_area:
     let hint = if f.searching {
         " searching…".to_owned()
     } else if f.semantic {
-        format!("  {} hits (meaning + text)  ^e: editor", f.hits.len())
+        format!("  {} hits (meaning + text)  ^o: editor", f.hits.len())
     } else if f.hits.is_empty() {
         "  type to search, Tab for meaning".to_owned()
     } else {
         format!(
-            "  {} hits (text)  Tab: meaning  ^e: editor",
+            "  {} hits (text)  Tab: meaning  ^o: editor",
             f.hits.len()
         )
     };
