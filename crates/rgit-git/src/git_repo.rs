@@ -204,6 +204,17 @@ impl GitBackend for Git2Backend {
                 break;
             }
             let commit = repo.find_commit(oid?)?;
+            let when = commit.author().when().seconds();
+            if opts.since.map(|s| when < s).unwrap_or(false)
+                || opts.until.map(|u| when > u).unwrap_or(false)
+            {
+                continue;
+            }
+            if let Some(path) = &opts.path {
+                if !commit_touched_path(&repo, &commit, path) {
+                    continue;
+                }
+            }
             let author = commit.author();
             let author_name = author.name().unwrap_or("?").to_owned();
             if let Some(needle) = &author_needle {
@@ -3329,6 +3340,28 @@ fn finalize_sequenced(
 }
 
 /// A short relative age (`5s`, `12m`, `3h`, `9d`) from a commit time to now.
+/// Whether `commit`'s diff against its first parent touched `path`, matched as an
+/// exact path or a directory prefix. A root commit is compared to the empty tree.
+fn commit_touched_path(repo: &Repository, commit: &git2::Commit<'_>, path: &str) -> bool {
+    let Ok(tree) = commit.tree() else {
+        return false;
+    };
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) else {
+        return false;
+    };
+    let prefix = format!("{path}/");
+    (0..diff.deltas().len()).any(|i| {
+        diff.get_delta(i)
+            .and_then(|d| d.new_file().path().or_else(|| d.old_file().path()))
+            .map(|p| {
+                let s = p.to_string_lossy();
+                s == path || s.starts_with(&prefix)
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn relative_age(then: i64, now: i64) -> String {
     let delta = (now - then).max(0);
     match delta {

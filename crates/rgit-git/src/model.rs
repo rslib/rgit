@@ -230,6 +230,12 @@ pub struct LogOptions {
     pub author: Option<String>,
     /// Start the walk from this revision instead of HEAD (a branch/tag/sha).
     pub rev: Option<String>,
+    /// Keep only commits at or after this author time (unix seconds).
+    pub since: Option<i64>,
+    /// Keep only commits at or before this author time (unix seconds).
+    pub until: Option<i64>,
+    /// Keep only commits that touched this path (a pathspec prefix).
+    pub path: Option<String>,
 }
 
 impl Default for LogOptions {
@@ -240,6 +246,9 @@ impl Default for LogOptions {
             all: false,
             author: None,
             rev: None,
+            since: None,
+            until: None,
+            path: None,
         }
     }
 }

@@ -35,8 +35,8 @@ pub enum Command {
     Status,
     /// Recent commits as `sha subject` lines.
     Log {
-        /// Maximum number of commits to show.
-        #[arg(short, long, default_value_t = 20)]
+        /// Maximum number of commits to show (git's -n).
+        #[arg(short = 'n', short_alias = 'l', long = "max-count", visible_alias = "limit", default_value_t = 20)]
         limit: usize,
         /// Walk every ref, not just HEAD.
         #[arg(long)]
@@ -44,6 +44,22 @@ pub enum Command {
         /// Keep only commits whose author name/email contains this.
         #[arg(long)]
         author: Option<String>,
+        /// Only commits at or after this date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only commits at or before this date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS).
+        #[arg(long)]
+        until: Option<String>,
+        /// Accepted for git compatibility (rgit's log is already one line each).
+        #[arg(long)]
+        oneline: bool,
+        /// Start from this revision instead of HEAD, and/or limit to a path:
+        /// `rgit log <rev>` or `rgit log -- <path>` or `rgit log <rev> -- <path>`.
+        #[arg(value_name = "REV_OR_PATH")]
+        rev: Option<String>,
+        /// Limit to commits touching this path (after `--`).
+        #[arg(last = true, value_name = "PATH")]
+        path: Option<String>,
     },
     /// Diffstat of the staged changes, or between two revisions.
     Diff {
@@ -902,6 +918,36 @@ pub(crate) fn index_build(
     Ok(out.trim_end().to_owned())
 }
 
+/// Parse an ISO date (`YYYY-MM-DD`, optionally with `THH:MM:SS` or a space and a
+/// time) into a unix timestamp in UTC. A bare date is midnight UTC. Uses the
+/// days-from-civil algorithm rather than pulling in a date crate.
+fn parse_date(s: &str) -> anyhow::Result<i64> {
+    let err = || anyhow::anyhow!("bad date {s:?}; use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS");
+    let (date, time) = match s.split_once(['T', ' ']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (s, None),
+    };
+    let mut dp = date.split('-');
+    let mut next = || dp.next().ok_or_else(err)?.parse::<i64>().map_err(|_| err());
+    let (y, m, d) = (next()?, next()?, next()?);
+    if dp.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return Err(err());
+    }
+    // days_from_civil (Howard Hinnant, public domain): days since 1970-01-01.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let mut secs = (era * 146097 + doe - 719468) * 86400;
+    if let Some(t) = time {
+        let mut tp = t.split(':');
+        let mut part = || tp.next().unwrap_or("0").parse::<i64>().map_err(|_| err());
+        secs += part()? * 3600 + part()? * 60 + part()?;
+    }
+    Ok(secs)
+}
+
 /// Run a subcommand and return its compact output. When `interactive`, a
 /// missing required argument is prompted for; otherwise it errors. `Mcp` is
 /// handled by the caller (it takes over the process), so it is unreachable here.
@@ -929,11 +975,26 @@ pub fn run(
     Ok(match command {
         Command::Index { action } => index_cmd(backend, action)?,
         Command::Status => render::status(&backend.status()?),
-        Command::Log { limit, all, author } => {
+        Command::Log {
+            limit,
+            all,
+            author,
+            since,
+            until,
+            oneline: _,
+            rev,
+            path,
+        } => {
+            let since = since.as_deref().map(parse_date).transpose()?;
+            let until = until.as_deref().map(parse_date).transpose()?;
             render::log(&backend.log(&LogOptions {
                 limit,
                 all,
                 author,
+                rev,
+                since,
+                until,
+                path,
                 ..LogOptions::default()
             })?)
         }

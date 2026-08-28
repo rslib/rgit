@@ -837,6 +837,7 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
                 all: flag("all"),
                 author: s("author").map(str::to_owned),
                 rev: s("rev").map(str::to_owned),
+                ..LogOptions::default()
             };
             backend
                 .log(&opts)
