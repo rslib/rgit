@@ -58,6 +58,37 @@ impl Git2Backend {
         }
     }
 
+    /// Push arbitrary refspecs to `remote` (or the current branch's upstream
+    /// remote when `None`). Shared by tag and delete pushes; surfaces a refused
+    /// ref as an error the way [`push`] does.
+    fn push_refspecs(
+        &self,
+        remote: Option<&str>,
+        refspecs: &[String],
+        report: &dyn Fn(OpProgress),
+    ) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        let remote_name = match remote {
+            Some(r) => r.to_owned(),
+            None => upstream_remote(&repo)?.0,
+        };
+        let mut remote = repo.find_remote(&remote_name)?;
+        if let Ok(url) = remote.url() {
+            report(OpProgress::Line(format!("To {url}")));
+        }
+        let rejected = std::sync::atomic::AtomicBool::new(false);
+        let callbacks = remote_callbacks(report, &rejected, cred_guard.as_deref());
+        let mut opts = PushOptions::new();
+        opts.remote_callbacks(callbacks);
+        let specs: Vec<&str> = refspecs.iter().map(String::as_str).collect();
+        remote.push(&specs, Some(&mut opts))?;
+        if rejected.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(GitError::PushRejected);
+        }
+        Ok(())
+    }
+
     /// Run a `git` CLI command in the working directory, returning its stdout on
     /// success or its stderr as a `Cli` error. Used only for the few operations
     /// libgit2 cannot do (rebase continue/skip, bisect).
@@ -1526,6 +1557,17 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn merge_abort(&self) -> Result<(), GitError> {
+        self.snap("merge abort");
+        let repo = self.repo.lock().expect("repo mutex");
+        // A conflicted merge has not moved HEAD, so hard-resetting to it drops the
+        // half-merged index and worktree; cleanup_state clears MERGE_HEAD et al.
+        let head = repo.head()?.peel_to_commit()?;
+        repo.reset(head.as_object(), git2::ResetType::Hard, None)?;
+        repo.cleanup_state()?;
+        Ok(())
+    }
+
     fn resolve_conflict(&self, path: &str, ours: bool) -> Result<(), GitError> {
         self.snap("resolve");
         let repo = self.repo.lock().expect("repo mutex");
@@ -2363,6 +2405,39 @@ impl GitBackend for Git2Backend {
                 .set_upstream(Some(&format!("{remote_name}/{branch}")))?;
         }
         Ok(())
+    }
+
+    fn push_tags(
+        &self,
+        remote: Option<&str>,
+        report: &dyn Fn(OpProgress),
+    ) -> Result<(), GitError> {
+        // libgit2 rejects a wildcard push refspec, so enumerate the tags and push
+        // an explicit refspec for each.
+        let refspecs: Vec<String> = {
+            let repo = self.repo.lock().expect("repo mutex");
+            repo.tag_names(None)?
+                .iter()
+                .filter_map(|t| t.ok().flatten())
+                .map(|t| format!("refs/tags/{t}:refs/tags/{t}"))
+                .collect()
+        };
+        if refspecs.is_empty() {
+            report(OpProgress::Line("no tags to push".to_owned()));
+            return Ok(());
+        }
+        self.push_refspecs(remote, &refspecs, report)
+    }
+
+    fn push_delete(
+        &self,
+        remote: Option<&str>,
+        branch: &str,
+        report: &dyn Fn(OpProgress),
+    ) -> Result<(), GitError> {
+        self.snap("push delete");
+        // An empty source ref deletes the destination on the remote.
+        self.push_refspecs(remote, &[format!(":refs/heads/{branch}")], report)
     }
 }
 

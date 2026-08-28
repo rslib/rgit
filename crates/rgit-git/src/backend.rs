@@ -146,6 +146,23 @@ pub trait GitBackend: Send + Sync {
         report: &dyn Fn(crate::OpProgress),
     ) -> Result<(), GitError>;
 
+    /// Push all local tags to `remote` (or the upstream's remote), like
+    /// `git push --tags`.
+    fn push_tags(
+        &self,
+        remote: Option<&str>,
+        report: &dyn Fn(crate::OpProgress),
+    ) -> Result<(), GitError>;
+
+    /// Delete `branch` on `remote` (or the upstream's remote), like
+    /// `git push --delete`.
+    fn push_delete(
+        &self,
+        remote: Option<&str>,
+        branch: &str,
+        report: &dyn Fn(crate::OpProgress),
+    ) -> Result<(), GitError>;
+
     /// Local branch names, sorted.
     fn local_branches(&self) -> Result<Vec<String>, GitError>;
 
@@ -365,6 +382,10 @@ pub trait GitBackend: Send + Sync {
         ff_only: bool,
         report: &dyn Fn(crate::OpProgress),
     ) -> Result<(), GitError>;
+
+    /// Abort an in-progress merge, restoring the working tree and index to HEAD
+    /// (git's `merge --abort`).
+    fn merge_abort(&self) -> Result<(), GitError>;
 
     /// Resolve a conflicted path by taking our side (`ours`) or theirs, writing
     /// that version to the worktree and staging it.

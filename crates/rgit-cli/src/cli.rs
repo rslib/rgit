@@ -235,6 +235,12 @@ pub enum Command {
         /// Push to this named remote instead of the branch's upstream.
         #[arg(long)]
         remote: Option<String>,
+        /// Push all local tags (git's --tags).
+        #[arg(long)]
+        tags: bool,
+        /// Delete this branch on the remote (git's --delete).
+        #[arg(long, value_name = "BRANCH")]
+        delete: Option<String>,
     },
     /// Check out a branch or, for any other revision, a detached HEAD.
     Checkout {
@@ -254,6 +260,9 @@ pub enum Command {
         /// Refuse to merge unless it can fast-forward (git's --ff-only).
         #[arg(long = "ff-only")]
         ff_only: bool,
+        /// Abort an in-progress (conflicted) merge, restoring HEAD.
+        #[arg(long)]
+        abort: bool,
     },
     /// Rebase onto a revision, or continue/skip/abort an in-progress rebase.
     Rebase {
@@ -1218,8 +1227,16 @@ pub fn run(
             force_with_lease,
             set_upstream,
             remote,
+            tags,
+            delete,
         } => net(interactive, "push", |r| {
-            backend.push(remote.as_deref(), force, force_with_lease, set_upstream, r)
+            if let Some(branch) = &delete {
+                backend.push_delete(remote.as_deref(), branch, r)
+            } else if tags {
+                backend.push_tags(remote.as_deref(), r)
+            } else {
+                backend.push(remote.as_deref(), force, force_with_lease, set_upstream, r)
+            }
         })?,
         Command::Checkout { rev, branch } => {
             // `-b <new>`: create the branch (from rev/HEAD) and switch to it.
@@ -1248,13 +1265,18 @@ pub fn run(
             rev,
             no_ff,
             ff_only,
+            abort,
         } => {
-            let rev = resolve(rev, "a revision to merge", &|| {
-                crate::interactive::pick_branch(backend, "Merge which branch?")
-            })?;
-            net(interactive, "merge", |r| {
-                backend.merge(&rev, no_ff, ff_only, r)
-            })?
+            if abort {
+                ok(backend.merge_abort())
+            } else {
+                let rev = resolve(rev, "a revision to merge", &|| {
+                    crate::interactive::pick_branch(backend, "Merge which branch?")
+                })?;
+                net(interactive, "merge", |r| {
+                    backend.merge(&rev, no_ff, ff_only, r)
+                })?
+            }
         }
         Command::Rebase {
             onto,

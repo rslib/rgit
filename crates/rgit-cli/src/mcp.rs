@@ -467,12 +467,14 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_push",
-            "Push the current branch to its upstream, or to `remote` if given.",
+            "Push the current branch to its upstream, or to `remote` if given. `tags` pushes all tags; `delete` deletes that branch on the remote.",
             &[
                 ("force", "boolean", false),
                 ("force_with_lease", "boolean", false),
                 ("set_upstream", "boolean", false),
                 ("remote", "string", false),
+                ("tags", "boolean", false),
+                ("delete", "string", false),
             ],
         ),
         tool(
@@ -482,8 +484,8 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_merge",
-            "Merge a revision into the current branch (no_ff forces a merge commit).",
-            &[("rev", "string", true), ("no_ff", "boolean", false), ("ff_only", "boolean", false)],
+            "Merge a revision into the current branch (no_ff forces a merge commit, ff_only refuses a non-fast-forward, abort cancels a conflicted merge).",
+            &[("rev", "string", false), ("no_ff", "boolean", false), ("ff_only", "boolean", false), ("abort", "boolean", false)],
         ),
         tool(
             "git_rebase",
@@ -979,13 +981,21 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
         // The MCP surface has no console, so progress is discarded.
         "git_fetch" => done(backend.fetch(&|_| {})),
         "git_pull" => done(backend.pull(&|_| {})),
-        "git_push" => done(backend.push(
-            s("remote"),
-            flag("force"),
-            flag("force_with_lease"),
-            flag("set_upstream"),
-            &|_| {},
-        )),
+        "git_push" => {
+            if let Some(branch) = s("delete") {
+                done(backend.push_delete(s("remote"), branch, &|_| {}))
+            } else if flag("tags") {
+                done(backend.push_tags(s("remote"), &|_| {}))
+            } else {
+                done(backend.push(
+                    s("remote"),
+                    flag("force"),
+                    flag("force_with_lease"),
+                    flag("set_upstream"),
+                    &|_| {},
+                ))
+            }
+        }
 
         "git_checkout" => {
             let rev = req("rev")?;
@@ -999,7 +1009,13 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
                 backend.checkout_detached(rev)
             })
         }
-        "git_merge" => done(backend.merge(req("rev")?, flag("no_ff"), flag("ff_only"), &|_| {})),
+        "git_merge" => {
+            if flag("abort") {
+                done(backend.merge_abort())
+            } else {
+                done(backend.merge(req("rev")?, flag("no_ff"), flag("ff_only"), &|_| {}))
+            }
+        }
         "git_rebase" => done(backend.rebase_onto(req("onto")?, &|_| {})),
         "git_rebase_continue" => done(backend.rebase_continue()),
         "git_rebase_skip" => done(backend.rebase_skip()),
