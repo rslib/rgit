@@ -214,9 +214,23 @@ pub enum Command {
     /// Check out this branch's stack parent (move down the stack).
     Prev,
     /// Fetch the current branch's remote.
-    Fetch,
-    /// Fetch and fast-forward the current branch.
-    Pull,
+    Fetch {
+        /// Fetch from every remote (git's --all).
+        #[arg(long)]
+        all: bool,
+        /// Delete remote-tracking refs that no longer exist upstream (--prune).
+        #[arg(short = 'p', long)]
+        prune: bool,
+        /// Fetch this named remote instead of the branch's upstream.
+        #[arg(long)]
+        remote: Option<String>,
+    },
+    /// Fetch and integrate the current branch's upstream.
+    Pull {
+        /// Rebase local commits onto the upstream instead of fast-forwarding.
+        #[arg(short = 'r', long)]
+        rebase: bool,
+    },
     /// Fetch, fast-forward branches to their upstreams, and restack the stack.
     Sync,
     /// Push every branch in the stack and open a pull request per branch.
@@ -1208,8 +1222,10 @@ pub fn run(
             }
             _ => anyhow::bail!("pass exactly one of --before or --after"),
         },
-        Command::Fetch => net(interactive, "fetch", |r| backend.fetch(r))?,
-        Command::Pull => net(interactive, "pull", |r| backend.pull(r))?,
+        Command::Fetch { all, prune, remote } => net(interactive, "fetch", |r| {
+            backend.fetch(remote.as_deref(), all, prune, r)
+        })?,
+        Command::Pull { rebase } => net(interactive, "pull", |r| backend.pull(rebase, r))?,
         Command::Submit => backend.submit_stack(&|_| {})?.join("\n"),
         Command::Sync => {
             let outcome = backend.sync(&|_| {})?;

@@ -2020,7 +2020,7 @@ impl GitBackend for Git2Backend {
 
     fn sync(&self, report: &dyn Fn(OpProgress)) -> Result<crate::RestackOutcome, GitError> {
         self.snap("sync");
-        self.fetch(report)?;
+        self.fetch(None, false, false, report)?;
         {
             let repo = self.repo.lock().expect("repo mutex");
             let current_ref: Option<String> = repo
@@ -2317,20 +2317,54 @@ impl GitBackend for Git2Backend {
         self.amend(&message)
     }
 
-    fn fetch(&self, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
+    fn fetch(
+        &self,
+        remote: Option<&str>,
+        all: bool,
+        prune: bool,
+        report: &dyn Fn(OpProgress),
+    ) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let cred_guard = self.cred_prompt.lock().expect("cred mutex");
-        let (remote, _) = upstream_remote(&repo)?;
-        do_fetch(&repo, &remote, report, cred_guard.as_deref())
+        let cred = cred_guard.as_deref();
+        if all {
+            let names: Vec<String> = repo
+                .remotes()?
+                .iter()
+                .filter_map(|t| t.ok().flatten())
+                .map(|s| s.to_owned())
+                .collect();
+            for name in names {
+                do_fetch(&repo, &name, prune, report, cred)?;
+            }
+            Ok(())
+        } else {
+            let name = match remote {
+                Some(r) => r.to_owned(),
+                None => upstream_remote(&repo)?.0,
+            };
+            do_fetch(&repo, &name, prune, report, cred)
+        }
     }
 
-    fn pull(&self, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
+    fn pull(&self, rebase: bool, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
+        // Snapshot before locking (snap takes the repo lock itself) so a rebase
+        // pull is undoable.
+        if rebase {
+            self.snap("pull --rebase");
+        }
         let repo = self.repo.lock().expect("repo mutex");
         let cred_guard = self.cred_prompt.lock().expect("cred mutex");
         let cred = cred_guard.as_deref();
         let (remote, branch) = upstream_remote(&repo)?;
-        do_fetch(&repo, &remote, report, cred)?;
-        fast_forward(&repo, &remote, &branch, report)
+        do_fetch(&repo, &remote, false, report, cred)?;
+        if rebase {
+            let target = repo.refname_to_id(&format!("refs/remotes/{remote}/{branch}"))?;
+            let upstream = repo.find_annotated_commit(target)?;
+            run_rebase(&repo, &upstream, None, report)
+        } else {
+            fast_forward(&repo, &remote, &branch, report)
+        }
     }
 
     fn push(
@@ -2468,6 +2502,7 @@ fn upstream_remote(repo: &Repository) -> Result<(String, String), GitError> {
 fn do_fetch(
     repo: &Repository,
     remote: &str,
+    prune: bool,
     report: &dyn Fn(OpProgress),
     cred: Option<&dyn crate::CredentialPrompt>,
 ) -> Result<(), GitError> {
@@ -2478,6 +2513,9 @@ fn do_fetch(
     let ignored = std::sync::atomic::AtomicBool::new(false);
     let mut opts = FetchOptions::new();
     opts.remote_callbacks(remote_callbacks(report, &ignored, cred));
+    if prune {
+        opts.prune(git2::FetchPrune::On);
+    }
     remote.fetch::<&str>(&[], Some(&mut opts), None)?;
     Ok(())
 }

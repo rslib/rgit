@@ -127,10 +127,22 @@ pub trait GitBackend: Send + Sync {
 
     /// Fetch the current branch's remote, updating remote-tracking refs.
     /// `report` receives git-style progress lines and transfer counts.
-    fn fetch(&self, report: &dyn Fn(crate::OpProgress)) -> Result<(), GitError>;
+    /// Fetch from a remote. `remote` names one (else the branch's upstream
+    /// remote); `all` fetches every remote; `prune` removes remote-tracking refs
+    /// that no longer exist upstream (git's `--all` / `--prune`).
+    fn fetch(
+        &self,
+        remote: Option<&str>,
+        all: bool,
+        prune: bool,
+        report: &dyn Fn(crate::OpProgress),
+    ) -> Result<(), GitError>;
 
     /// Fetch and fast-forward the current branch; errors if not fast-forwardable.
-    fn pull(&self, report: &dyn Fn(crate::OpProgress)) -> Result<(), GitError>;
+    /// Fetch and integrate the upstream into the current branch. `rebase`
+    /// replays local commits onto the upstream (git's `pull --rebase`); otherwise
+    /// it fast-forwards.
+    fn pull(&self, rebase: bool, report: &dyn Fn(crate::OpProgress)) -> Result<(), GitError>;
 
     /// Push the current branch to its upstream remote. `force` overwrites
     /// unconditionally; `force_with_lease` overwrites only if the remote still

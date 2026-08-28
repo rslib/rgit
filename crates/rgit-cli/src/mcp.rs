@@ -459,11 +459,19 @@ fn tools() -> Vec<Tool> {
             "Amend HEAD with the current index, keeping its message (no editor).",
             none,
         ),
-        tool("git_fetch", "Fetch the current branch's remote.", none),
+        tool(
+            "git_fetch",
+            "Fetch a remote. `all` fetches every remote, `prune` drops stale remote-tracking refs, `remote` picks one.",
+            &[
+                ("all", "boolean", false),
+                ("prune", "boolean", false),
+                ("remote", "string", false),
+            ],
+        ),
         tool(
             "git_pull",
-            "Fetch and fast-forward the current branch.",
-            none,
+            "Fetch and integrate the current branch's upstream; `rebase` rebases instead of fast-forwarding.",
+            &[("rebase", "boolean", false)],
         ),
         tool(
             "git_push",
@@ -979,8 +987,8 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
         }
 
         // The MCP surface has no console, so progress is discarded.
-        "git_fetch" => done(backend.fetch(&|_| {})),
-        "git_pull" => done(backend.pull(&|_| {})),
+        "git_fetch" => done(backend.fetch(s("remote"), flag("all"), flag("prune"), &|_| {})),
+        "git_pull" => done(backend.pull(flag("rebase"), &|_| {})),
         "git_push" => {
             if let Some(branch) = s("delete") {
                 done(backend.push_delete(s("remote"), branch, &|_| {}))

@@ -762,11 +762,11 @@ fn push_fetch_and_pull_over_a_local_remote() {
 
     // B fetches: it should now see itself one commit behind.
     let backend_b = Git2Backend::discover(&b).unwrap();
-    backend_b.fetch(&|_| {}).unwrap();
+    backend_b.fetch(None, false, false, &|_| {}).unwrap();
     assert_eq!(backend_b.status().unwrap().head.behind, 1);
 
     // B pulls: fast-forwards and gains the second file.
-    backend_b.pull(&|_| {}).unwrap();
+    backend_b.pull(false, &|_| {}).unwrap();
     let st = backend_b.status().unwrap();
     assert_eq!(st.head.behind, 0);
     assert_eq!(st.recent.len(), 2);
