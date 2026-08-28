@@ -693,6 +693,13 @@ async fn run_msg(
                             rgit_git::workspace::create(backend.as_ref(), &name)
                         }
                         TextOp::StackNew(name) => backend.stack_new(&name),
+                        TextOp::PruneMerged(base) => backend.prune_merged(&base).map(|deleted| {
+                            if deleted.is_empty() {
+                                "no merged branches to prune".to_owned()
+                            } else {
+                                format!("pruned {}: {}", deleted.len(), deleted.join(", "))
+                            }
+                        }),
                     };
                     let _ = msg_tx.send(Msg::TextResult(result.map_err(|e| e.to_string())));
                 });
@@ -1037,6 +1044,12 @@ async fn op_console(
         } => backend.push(remote.as_deref(), force, force_with_lease, set_upstream, &report),
         ConsoleOp::Merge(rev) => backend.merge(&rev, false, false, &report),
         ConsoleOp::RebaseOnto(rev) => backend.rebase_onto(&rev, &report),
+        ConsoleOp::Sync => backend.sync(&report).map(drop),
+        ConsoleOp::Submit => backend.submit_stack(&report).map(|notes| {
+            for n in notes {
+                report(rgit_git::OpProgress::Line(n));
+            }
+        }),
     })
     .await;
 
@@ -1209,7 +1222,46 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::Reword { rev, message } => backend.reword(rev, message),
         Mutation::Squash(rev) => backend.squash(rev),
         Mutation::Uncommit(n) => backend.uncommit(*n),
+        Mutation::Clean => backend.clean(false).map(drop),
+        Mutation::StackNext => stack_move(backend, true),
+        Mutation::StackPrev => stack_move(backend, false),
     }
+}
+
+/// Check out the current branch's stacked child (`up`) or its parent, using the
+/// recorded stack relationships. A no-op error names the missing direction.
+fn stack_move(backend: &dyn GitBackend, up: bool) -> Result<(), GitError> {
+    let current = backend
+        .status()?
+        .head
+        .branch
+        .ok_or_else(|| GitError::Other("not on a branch".to_owned()))?;
+    let parents = backend.stack_parents()?;
+    let target = if up {
+        // The child is the branch whose stack parent is the current branch.
+        let children: Vec<&String> = parents
+            .iter()
+            .filter(|(_, p)| p.as_deref() == Some(current.as_str()))
+            .map(|(b, _)| b)
+            .collect();
+        match children.as_slice() {
+            [] => return Err(GitError::Other(format!("{current} has no branch stacked on it"))),
+            [one] => (*one).clone(),
+            many => {
+                return Err(GitError::Other(format!(
+                    "multiple children: {}",
+                    many.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                )));
+            }
+        }
+    } else {
+        parents
+            .into_iter()
+            .find(|(b, _)| *b == current)
+            .and_then(|(_, p)| p)
+            .ok_or_else(|| GitError::Other(format!("{current} has no stack parent")))?
+    };
+    backend.checkout_branch(&target)
 }
 
 /// Suspend the TUI and run `git <args>` in the user's terminal so it can drive

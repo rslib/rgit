@@ -39,6 +39,10 @@ pub enum ConsoleOp {
     },
     Merge(String),
     RebaseOnto(String),
+    /// Fetch, fast-forward branches to their upstreams, and restack the stack.
+    Sync,
+    /// Push every branch in the stack and open a pull request per branch.
+    Submit,
 }
 
 impl ConsoleOp {
@@ -49,6 +53,8 @@ impl ConsoleOp {
             ConsoleOp::Push { .. } => "push",
             ConsoleOp::Merge(_) => "merge",
             ConsoleOp::RebaseOnto(_) => "rebase",
+            ConsoleOp::Sync => "sync",
+            ConsoleOp::Submit => "submit",
         }
     }
 }
@@ -400,6 +406,8 @@ pub enum TextOp {
     FlowFinish,
     WorkspaceNew(String),
     StackNew(String),
+    /// Delete local branches merged into the given base; toast the result.
+    PruneMerged(String),
 }
 
 /// The current branch's forge status, shown in the REMOTE section.
@@ -814,6 +822,12 @@ pub enum Mutation {
     Squash(String),
     /// Undo the last `n` commits, keeping their changes in the working tree.
     Uncommit(usize),
+    /// Check out the branch stacked on the current one (up the stack).
+    StackNext,
+    /// Check out the current branch's stack parent (down the stack).
+    StackPrev,
+    /// Remove untracked files and directories (git clean -fd).
+    Clean,
 }
 
 /// A destructive action awaiting a yes/no answer in the status bar.
@@ -850,7 +864,7 @@ pub struct TransientAction {
     pub kind: ActionKind,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
     Push,
     PushElsewhere,
@@ -900,6 +914,12 @@ pub enum ActionKind {
     Reword,
     Squash,
     Uncommit,
+    OpSync,
+    OpSubmit,
+    OpPruneMerged,
+    OpClean,
+    OpStackNext,
+    OpStackPrev,
 }
 
 /// A transient popup: a title, sticky argument toggles, and suffix actions that
@@ -1052,6 +1072,12 @@ impl Transient {
                 action('e', "reword…", ActionKind::Reword),
                 action('q', "squash into parent…", ActionKind::Squash),
                 action('U', "uncommit (soft-reset HEAD~1)", ActionKind::Uncommit),
+                action('y', "sync (fetch, ff, restack)", ActionKind::OpSync),
+                action('S', "submit stack (push + PRs)", ActionKind::OpSubmit),
+                action('J', "next: up the stack", ActionKind::OpStackNext),
+                action('K', "prev: down the stack", ActionKind::OpStackPrev),
+                action('p', "prune merged branches", ActionKind::OpPruneMerged),
+                action('x', "clean untracked", ActionKind::OpClean),
                 action('f', "flow status", ActionKind::OpFlowStatus),
                 action('w', "workspaces", ActionKind::OpWorkspaces),
                 action('l', "lanes", ActionKind::OpLanes),
@@ -3538,6 +3564,31 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
             app.loading = true;
             vec![Effect::Mutate(Mutation::Uncommit(1))]
         }
+        ActionKind::OpSync => open_op(app, ConsoleOp::Sync),
+        ActionKind::OpSubmit => open_op(app, ConsoleOp::Submit),
+        ActionKind::OpStackNext => {
+            app.transient = None;
+            app.loading = true;
+            vec![Effect::Mutate(Mutation::StackNext)]
+        }
+        ActionKind::OpStackPrev => {
+            app.transient = None;
+            app.loading = true;
+            vec![Effect::Mutate(Mutation::StackPrev)]
+        }
+        ActionKind::OpPruneMerged => {
+            app.transient = None;
+            app.busy = Some("pruning".into());
+            vec![Effect::RunText(TextOp::PruneMerged("HEAD".into()))]
+        }
+        ActionKind::OpClean => {
+            app.transient = None;
+            app.confirm = Some(PendingConfirm {
+                prompt: "Remove all untracked files and directories?".into(),
+                mutation: Mutation::Clean,
+            });
+            Vec::new()
+        }
         ActionKind::OpFlowStatus => update(app, Msg::OpenFlowStatus),
         ActionKind::OpWorkspaces => update(app, Msg::OpenWorkspaces),
         ActionKind::OpLanes => update(app, Msg::OpenLanes),
@@ -4042,6 +4093,28 @@ fn build_remote_section(remote: Option<&RemoteSummary>, head: Option<&Head>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operations_menu_exposes_the_parity_ops_with_unique_keys() {
+        let t = Transient::operations();
+        let kinds: Vec<ActionKind> = t.actions.iter().map(|a| a.kind).collect();
+        for k in [
+            ActionKind::OpSync,
+            ActionKind::OpSubmit,
+            ActionKind::OpStackNext,
+            ActionKind::OpStackPrev,
+            ActionKind::OpPruneMerged,
+            ActionKind::OpClean,
+        ] {
+            assert!(kinds.contains(&k), "operations menu missing {k:?}");
+        }
+        // Every action key in the menu is distinct, or one shadows another.
+        let mut keys: Vec<char> = t.actions.iter().map(|a| a.key).collect();
+        let total = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), total, "duplicate action keys in the operations menu");
+    }
 
     #[test]
     fn remote_section_appears_only_when_loaded() {
