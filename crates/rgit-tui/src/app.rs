@@ -831,6 +831,16 @@ pub enum Mutation {
     StackPrev,
     /// Remove untracked files and directories (git clean -fd).
     Clean,
+    /// Move `rev` to just before `target` in the current branch's history.
+    Reorder {
+        rev: String,
+        target: String,
+    },
+    /// Split `rev` into two commits, `paths` going into the first.
+    Split {
+        rev: String,
+        paths: Vec<String>,
+    },
 }
 
 /// A destructive action awaiting a yes/no answer in the status bar.
@@ -923,6 +933,8 @@ pub enum ActionKind {
     OpClean,
     OpStackNext,
     OpStackPrev,
+    Reorder,
+    Split,
 }
 
 /// A transient popup: a title, sticky argument toggles, and suffix actions that
@@ -1079,6 +1091,8 @@ impl Transient {
                 action('e', "reword…", ActionKind::Reword),
                 action('q', "squash into parent…", ActionKind::Squash),
                 action('U', "uncommit (soft-reset HEAD~1)", ActionKind::Uncommit),
+                action('m', "move commit (reorder)…", ActionKind::Reorder),
+                action('v', "split commit by path…", ActionKind::Split),
                 action('y', "sync (fetch, ff, restack)", ActionKind::OpSync),
                 action('S', "submit stack (push + PRs)", ActionKind::OpSubmit),
                 action('J', "next: up the stack", ActionKind::OpStackNext),
@@ -1220,6 +1234,14 @@ pub enum PromptAction {
     Squash,
     /// Push to the remote named by the prompt value, with `pending_push` args.
     PushRemote,
+    /// Pick the commit to move; then prompt for the target it moves before.
+    ReorderRev,
+    /// Move `pending_reorder_rev` before the commit named by the prompt value.
+    ReorderTarget,
+    /// Pick the commit to split; then prompt for the paths for the first part.
+    SplitRev,
+    /// Split `pending_split_rev`, the prompt value's paths going in the first.
+    SplitPaths,
 }
 
 /// A minibuffer: a label, an editable input, and optional filterable candidates.
@@ -1784,6 +1806,9 @@ pub struct App {
     pending_push: Option<(bool, bool, bool)>,
     /// The merge transient's --no-ff toggle, stashed while the branch is picked.
     pending_merge_no_ff: bool,
+    /// The commit to reorder / split, stashed between the two chained prompts.
+    pending_reorder_rev: Option<String>,
+    pending_split_rev: Option<String>,
     pending_lane: Option<String>,
     /// The path targeted by a pending lane-assign prompt.
     pending_lane_path: Option<String>,
@@ -1866,6 +1891,8 @@ impl App {
             pending_reword_rev: None,
             pending_push: None,
             pending_merge_no_ff: false,
+            pending_reorder_rev: None,
+            pending_split_rev: None,
             pending_lane: None,
             pending_lane_path: None,
             pending_cred_reply: None,
@@ -3344,6 +3371,26 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
                 },
             );
         }
+        // Reorder is two steps: pick the commit, then the target it moves before.
+        PromptAction::ReorderRev => {
+            if value.trim().is_empty() {
+                return Vec::new();
+            }
+            app.pending_reorder_rev = Some(value);
+            revision_prompt(app, "Move it before which commit", PromptAction::ReorderTarget);
+            return Vec::new();
+        }
+        // Split is two steps: pick the commit, then the paths for the first part.
+        PromptAction::SplitRev => {
+            let rev = if value.trim().is_empty() {
+                "HEAD".to_owned()
+            } else {
+                value
+            };
+            app.pending_split_rev = Some(rev);
+            revision_prompt(app, "Paths for the first commit (comma-separated)", PromptAction::SplitPaths);
+            return Vec::new();
+        }
         // Reword is a two-step prompt: pick the commit, then its new message.
         PromptAction::RewordRev => {
             let rev = if value.trim().is_empty() {
@@ -3397,6 +3444,22 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             None => return Vec::new(),
         },
         PromptAction::Squash => Mutation::Squash(value),
+        PromptAction::ReorderTarget => match app.pending_reorder_rev.take() {
+            Some(rev) => Mutation::Reorder { rev, target: value },
+            None => return Vec::new(),
+        },
+        PromptAction::SplitPaths => match app.pending_split_rev.take() {
+            Some(rev) => Mutation::Split {
+                rev,
+                paths: value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            None => return Vec::new(),
+        },
         PromptAction::CreateTag => Mutation::CreateTag(value),
         PromptAction::DeleteTag => Mutation::DeleteTag(value),
         PromptAction::StashMessage => Mutation::StashPushMessage(value),
@@ -3419,6 +3482,8 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         | PromptAction::LaneStack
         | PromptAction::RewordRev
         | PromptAction::PushRemote
+        | PromptAction::ReorderRev
+        | PromptAction::SplitRev
         | PromptAction::Credential => {
             return Vec::new();
         }
@@ -3576,6 +3641,14 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
             app.transient = None;
             app.loading = true;
             vec![Effect::Mutate(Mutation::Uncommit(1))]
+        }
+        ActionKind::Reorder => {
+            revision_prompt(app, "Move which commit", PromptAction::ReorderRev);
+            Vec::new()
+        }
+        ActionKind::Split => {
+            revision_prompt(app, "Split which commit (empty = HEAD)", PromptAction::SplitRev);
+            Vec::new()
         }
         ActionKind::OpSync => open_op(app, ConsoleOp::Sync),
         ActionKind::OpSubmit => open_op(app, ConsoleOp::Submit),
