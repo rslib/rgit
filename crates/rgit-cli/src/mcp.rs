@@ -1333,4 +1333,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
     }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// The new git-compat flags reach the backend through `dispatch`.
+    #[test]
+    fn dispatch_wires_the_new_flags() {
+        let dir = init_repo("dispatch");
+        let backend: Arc<dyn GitBackend> = Arc::new(Git2Backend::discover(&dir).unwrap());
+        let run = |name: &str, args: Value| dispatch(&backend, name, &args);
+
+        // git_clean dry_run lists without deleting.
+        std::fs::write(dir.join("junk"), "j\n").unwrap();
+        let out = run("git_clean", json!({ "dry_run": true })).unwrap();
+        assert!(out.contains("junk"), "dry-run lists junk");
+        assert!(dir.join("junk").exists(), "dry-run does not delete");
+
+        // git_stash_push without include_untracked keeps the untracked file.
+        std::fs::write(dir.join("f.txt"), "x\nmore\n").unwrap();
+        run("git_stash_push", json!({})).unwrap();
+        assert!(dir.join("junk").exists(), "bare stash keeps untracked junk");
+        run("git_stash_pop", json!({})).unwrap();
+
+        // git_branch_delete refuses an unmerged branch without force.
+        git(&dir, &["checkout", "-qb", "feat"]);
+        std::fs::write(dir.join("f.txt"), "onfeat\n").unwrap();
+        git(&dir, &["commit", "-qam", "feat"]);
+        git(&dir, &["checkout", "-q", "main"]);
+        assert!(
+            run("git_branch_delete", json!({ "name": "feat" })).is_err(),
+            "unmerged delete without force errors"
+        );
+        assert!(
+            run("git_branch_delete", json!({ "name": "feat", "force": true })).is_ok(),
+            "force delete succeeds"
+        );
+
+        // git_remote_set_url / rename thread through.
+        run("git_remote_add", json!({ "name": "origin", "url": "https://e.com/a.git" })).unwrap();
+        run("git_remote_set_url", json!({ "name": "origin", "url": "https://e.com/b.git" })).unwrap();
+        assert!(backend.remotes().unwrap().iter().any(|r| r.url.contains("b.git")));
+        run("git_remote_rename", json!({ "old": "origin", "new": "up" })).unwrap();
+        assert!(backend.remotes().unwrap().iter().any(|r| r.name == "up"));
+
+        // git_describe --dirty appends the suffix; default does not.
+        run("git_tag_create", json!({ "name": "v1", "message": "one" })).unwrap();
+        std::fs::write(dir.join("f.txt"), "x\ndirty\n").unwrap();
+        assert_eq!(run("git_describe", json!({})).unwrap(), "v1");
+        assert_eq!(run("git_describe", json!({ "dirty": true })).unwrap(), "v1-dirty");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
