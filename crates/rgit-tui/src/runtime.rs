@@ -1229,6 +1229,8 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::StackPrev => stack_move(backend, false),
         Mutation::Reorder { rev, target } => backend.reorder(rev, target, true),
         Mutation::Split { rev, paths } => backend.split(rev, paths),
+        Mutation::RemovePath(path) => backend.remove_path(path, false),
+        Mutation::MovePath { from, to } => backend.move_path(from, to, false),
     }
 }
 

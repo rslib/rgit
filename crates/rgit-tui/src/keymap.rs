@@ -45,6 +45,10 @@ pub enum Command {
     Search,
     SearchNext,
     SearchPrev,
+    /// Remove the tracked file under the cursor (git rm).
+    RmFile,
+    /// Rename/move the tracked file under the cursor (git mv).
+    MvFile,
 }
 
 impl Command {
@@ -85,6 +89,8 @@ impl Command {
             Command::Search => Msg::SearchOpen,
             Command::SearchNext => Msg::SearchNext,
             Command::SearchPrev => Msg::SearchPrev,
+            Command::RmFile => Msg::RmAtCursor,
+            Command::MvFile => Msg::MvAtCursor,
         }
     }
 
@@ -126,6 +132,8 @@ impl Command {
             "search" => Command::Search,
             "search-next" => Command::SearchNext,
             "search-prev" => Command::SearchPrev,
+            "rm" | "rm-file" => Command::RmFile,
+            "mv" | "mv-file" => Command::MvFile,
             _ => return None,
         })
     }
@@ -168,6 +176,8 @@ const DEFAULTS: &[(char, Command)] = &[
     ('/', Command::Search),
     ('n', Command::SearchNext),
     ('N', Command::SearchPrev),
+    ('D', Command::RmFile),
+    ('R', Command::MvFile),
 ];
 
 static KEYMAP: OnceLock<HashMap<char, Command>> = OnceLock::new();
@@ -354,6 +364,8 @@ pub fn leader_entries() -> Vec<(char, &'static str)> {
         ('M', "remote"),
         ('W', "worktree"),
         ('O', "reset"),
+        ('D', "rm file"),
+        ('R', "mv file"),
         ('g', "refresh"),
         ('?', "help"),
     ]

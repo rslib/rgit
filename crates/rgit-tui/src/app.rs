@@ -523,6 +523,10 @@ pub enum Msg {
     StageAll,
     UnstageAll,
     Discard,
+    /// Remove the tracked file under the cursor (git rm), after a confirm.
+    RmAtCursor,
+    /// Rename the tracked file under the cursor (git mv); prompts for the name.
+    MvAtCursor,
     ConfirmAccept,
     ConfirmCancel,
     CommitMenu,
@@ -840,6 +844,13 @@ pub enum Mutation {
     Split {
         rev: String,
         paths: Vec<String>,
+    },
+    /// Remove a tracked path from the index and working tree (git rm).
+    RemovePath(String),
+    /// Rename a tracked path (git mv).
+    MovePath {
+        from: String,
+        to: String,
     },
 }
 
@@ -1242,6 +1253,8 @@ pub enum PromptAction {
     SplitRev,
     /// Split `pending_split_rev`, the prompt value's paths going in the first.
     SplitPaths,
+    /// Rename `pending_move_from` to the path named by the prompt value.
+    MoveFile,
 }
 
 /// A minibuffer: a label, an editable input, and optional filterable candidates.
@@ -1809,6 +1822,8 @@ pub struct App {
     /// The commit to reorder / split, stashed between the two chained prompts.
     pending_reorder_rev: Option<String>,
     pending_split_rev: Option<String>,
+    /// The file being renamed, stashed while the new name is entered.
+    pending_move_from: Option<String>,
     pending_lane: Option<String>,
     /// The path targeted by a pending lane-assign prompt.
     pending_lane_path: Option<String>,
@@ -1893,6 +1908,7 @@ impl App {
             pending_merge_no_ff: false,
             pending_reorder_rev: None,
             pending_split_rev: None,
+            pending_move_from: None,
             pending_lane: None,
             pending_lane_path: None,
             pending_cred_reply: None,
@@ -2442,6 +2458,20 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             return vec![Effect::Mutate(Mutation::UnstageAll)];
         }
         Msg::Discard => discard_at_cursor(app),
+        Msg::RmAtCursor => {
+            if let Some(Target::File { path, .. }) = app.buffer().target_at_cursor() {
+                app.confirm = Some(PendingConfirm {
+                    prompt: format!("Remove {path} from the index and working tree?"),
+                    mutation: Mutation::RemovePath(path),
+                });
+            }
+        }
+        Msg::MvAtCursor => {
+            if let Some(Target::File { path, .. }) = app.buffer().target_at_cursor() {
+                app.pending_move_from = Some(path.clone());
+                revision_prompt(app, &format!("Rename {path} to"), PromptAction::MoveFile);
+            }
+        }
         Msg::ConfirmAccept => {
             if let Some(pending) = app.confirm.take() {
                 app.loading = true;
@@ -3458,6 +3488,10 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
                     .map(str::to_owned)
                     .collect(),
             },
+            None => return Vec::new(),
+        },
+        PromptAction::MoveFile => match app.pending_move_from.take() {
+            Some(from) => Mutation::MovePath { from, to: value },
             None => return Vec::new(),
         },
         PromptAction::CreateTag => Mutation::CreateTag(value),
