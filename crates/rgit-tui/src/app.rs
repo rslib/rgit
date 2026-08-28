@@ -399,7 +399,6 @@ pub enum ViewKind {
     Stack,
     Lanes,
     Info,
-    CodeSearch,
 }
 
 /// One code-search result: a file location, its fused score, how it was found
@@ -539,10 +538,23 @@ pub enum Msg {
     RmAtCursor,
     /// Rename the tracked file under the cursor (git mv); prompts for the name.
     MvAtCursor,
-    /// Prompt for a code-search query.
-    CodeSearchPrompt,
-    /// The results of a code search, ready to render.
-    CodeSearchResults(Result<Vec<CodeHit>, String>),
+    /// Open the live code-search finder.
+    CodeFinderOpen,
+    CodeFinderChar(char),
+    CodeFinderBackspace,
+    CodeFinderUp,
+    CodeFinderDown,
+    CodeFinderCancel,
+    /// Open the file at the selected hit.
+    CodeFinderSubmit,
+    /// Fold the semantic index into the current query's results.
+    CodeFinderSemantic,
+    /// Search results for `query`; `semantic` is true when the index was used.
+    CodeFinderHits {
+        query: String,
+        semantic: bool,
+        hits: Result<Vec<CodeHit>, String>,
+    },
     ConfirmAccept,
     ConfirmCancel,
     CommitMenu,
@@ -1271,8 +1283,6 @@ pub enum PromptAction {
     SplitPaths,
     /// Rename `pending_move_from` to the path named by the prompt value.
     MoveFile,
-    /// Run a code search for the prompt value.
-    CodeSearch,
 }
 
 /// A minibuffer: a label, an editable input, and optional filterable candidates.
@@ -1611,6 +1621,18 @@ pub struct Palette {
     pub selected: usize,
 }
 
+/// The live code-search finder: an editable query, the current hits (lexical as
+/// you type, re-ranked with the semantic index on demand), and the selection.
+pub struct CodeFinder {
+    pub input: String,
+    pub selected: usize,
+    pub hits: Vec<CodeHit>,
+    /// True once the semantic index has been folded into `hits` for this query.
+    pub semantic: bool,
+    /// A search is in flight, for the spinner in the finder header.
+    pub searching: bool,
+}
+
 impl Palette {
     /// Entries whose label matches the input as a case-insensitive subsequence.
     pub fn matches(input: &str) -> Vec<&'static PaletteEntry> {
@@ -1668,7 +1690,9 @@ pub enum Effect {
     },
     /// Blame a file, then push the blame view.
     LoadBlame(String),
-    /// Run a code search (grep fused with the semantic index) for the query.
+    /// Grep-only search (instant), for the live finder as the query is typed.
+    CodeSearchLive(String),
+    /// Full search (grep fused with the semantic index) for the query.
     CodeSearch(String),
     /// Build a preview of `path` windowed around `line` for a code-search hit.
     BuildSnippetPreview {
@@ -1802,6 +1826,7 @@ pub struct App {
     pub transient: Option<Transient>,
     /// The fuzzy command palette, when open.
     pub palette: Option<Palette>,
+    pub code_finder: Option<CodeFinder>,
     /// The in-app commit editor, when open.
     pub commit_editor: Option<CommitEditor>,
     /// The live hook console for an in-progress `git commit`, when open.
@@ -1912,6 +1937,7 @@ impl App {
             prompt: None,
             transient: None,
             palette: None,
+            code_finder: None,
             commit_editor: None,
             hook_console: None,
             rebase_todo: None,
@@ -1995,6 +2021,14 @@ impl App {
     /// hunks), a commit, or a stash. `None` when the row has no previewable
     /// target.
     fn cursor_preview_key(&self) -> Option<PreviewKey> {
+        // The finder drives the preview from its own selection, not a buffer row.
+        if let Some(f) = &self.code_finder {
+            let h = f.hits.get(f.selected)?;
+            return Some(PreviewKey::Snippet {
+                path: h.path.clone(),
+                line: h.line,
+            });
+        }
         match self.buffer().target_at_cursor()? {
             Target::File { path, staged } => Some(PreviewKey::File { path, staged }),
             Target::Hunk { path, staged, .. } => Some(PreviewKey::File { path, staged }),
@@ -2508,18 +2542,74 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 revision_prompt(app, &format!("Rename {path} to"), PromptAction::MoveFile);
             }
         }
-        Msg::CodeSearchPrompt => {
-            revision_prompt(app, "Code search (meaning + text)", PromptAction::CodeSearch);
+        Msg::CodeFinderOpen => {
+            app.code_finder = Some(CodeFinder {
+                input: String::new(),
+                selected: 0,
+                hits: Vec::new(),
+                semantic: false,
+                searching: false,
+            });
         }
-        Msg::CodeSearchResults(Ok(hits)) => {
-            app.busy = None;
-            let mut buffer = Buffer::default();
-            buffer.set_content(build_code_search(&hits));
-            app.push_view(ViewKind::CodeSearch, buffer);
+        Msg::CodeFinderChar(c) => return code_finder_edit(app, |f| f.input.push(c)),
+        Msg::CodeFinderBackspace => {
+            return code_finder_edit(app, |f| {
+                f.input.pop();
+            });
         }
-        Msg::CodeSearchResults(Err(e)) => {
-            app.busy = None;
-            app.push_toast(ToastKind::Error, e);
+        Msg::CodeFinderUp => {
+            if let Some(f) = &mut app.code_finder {
+                f.selected = f.selected.saturating_sub(1);
+            }
+            return app.sync_preview();
+        }
+        Msg::CodeFinderDown => {
+            if let Some(f) = &mut app.code_finder {
+                f.selected = (f.selected + 1).min(f.hits.len().saturating_sub(1));
+            }
+            return app.sync_preview();
+        }
+        Msg::CodeFinderSemantic => {
+            if let Some(f) = &mut app.code_finder {
+                let q = f.input.trim().to_owned();
+                if !q.is_empty() {
+                    f.searching = true;
+                    return vec![Effect::CodeSearch(q)];
+                }
+            }
+        }
+        Msg::CodeFinderSubmit => {
+            if let Some(f) = app.code_finder.take() {
+                if let Some(h) = f.hits.get(f.selected) {
+                    return vec![Effect::LoadBlame(h.path.clone())];
+                }
+            }
+        }
+        Msg::CodeFinderCancel => app.code_finder = None,
+        Msg::CodeFinderHits {
+            query,
+            semantic,
+            hits,
+        } => {
+            match &mut app.code_finder {
+                // Ignore results for a query the user has since edited.
+                Some(f) if f.input.trim() == query => {
+                    f.searching = false;
+                    match hits {
+                        Ok(h) => {
+                            f.hits = h;
+                            f.semantic = semantic;
+                            f.selected = f.selected.min(f.hits.len().saturating_sub(1));
+                        }
+                        Err(e) => {
+                            f.hits.clear();
+                            app.error = Some(e);
+                        }
+                    }
+                }
+                _ => return Vec::new(),
+            }
+            return app.sync_preview();
         }
         Msg::ConfirmAccept => {
             if let Some(pending) = app.confirm.take() {
@@ -3225,6 +3315,26 @@ fn unstage_at_cursor(app: &mut App) -> Vec<Effect> {
 
 /// `x` asks to discard the unstaged region, file, or hunk under the cursor,
 /// arming a confirmation rather than acting immediately.
+/// Apply an edit to the code-finder query, then kick off a fresh lexical search
+/// (instant); an empty query just clears the results. The semantic flag resets
+/// so the user knows the shown hits are lexical until they re-rank.
+fn code_finder_edit(app: &mut App, edit: impl FnOnce(&mut CodeFinder)) -> Vec<Effect> {
+    let Some(f) = &mut app.code_finder else {
+        return Vec::new();
+    };
+    edit(f);
+    f.selected = 0;
+    f.semantic = false;
+    let q = f.input.trim().to_owned();
+    if q.is_empty() {
+        f.hits.clear();
+        f.searching = false;
+        return app.sync_preview();
+    }
+    f.searching = true;
+    vec![Effect::CodeSearchLive(q)]
+}
+
 fn discard_at_cursor(app: &mut App) {
     let (mutation, what) = if let Some(sel) = app.buffer().line_selection() {
         if sel.staged {
@@ -3451,13 +3561,6 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
                 },
             );
         }
-        PromptAction::CodeSearch => {
-            if value.trim().is_empty() {
-                return Vec::new();
-            }
-            app.busy = Some("searching".into());
-            return vec![Effect::CodeSearch(value)];
-        }
         // Reorder is two steps: pick the commit, then the target it moves before.
         PromptAction::ReorderRev => {
             if value.trim().is_empty() {
@@ -3575,7 +3678,6 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         | PromptAction::PushRemote
         | PromptAction::ReorderRev
         | PromptAction::SplitRev
-        | PromptAction::CodeSearch
         | PromptAction::Credential => {
             return Vec::new();
         }
@@ -3928,37 +4030,6 @@ fn build_smartlog(entries: &[SmartlogEntry]) -> Vec<Section> {
             }
             spans.push(Span::new(format!("  {}", e.when), Style::Dim));
             Section::leaf(format!("smartlog/{i}"), NodeKind::Info, spans)
-        })
-        .collect()
-}
-
-fn build_code_search(hits: &[CodeHit]) -> Vec<Section> {
-    use rgit_model::{NodeKind, Section, Span, Style, Target};
-    if hits.is_empty() {
-        return vec![Section::leaf(
-            "codesearch/empty",
-            NodeKind::Info,
-            vec![Span::new(
-                "no matches (build the index with `rgit index build` for meaning search)".to_owned(),
-                Style::Dim,
-            )],
-        )];
-    }
-    hits.iter()
-        .enumerate()
-        .map(|(i, h)| {
-            let spans = vec![
-                Span::new(format!("{:.3}  ", h.score), Style::Dim),
-                Span::new(format!("{}:{}", h.path, h.line), Style::Hash),
-                Span::new(format!("  [{}]  ", h.tag), Style::Branch),
-                Span::new(h.preview.clone(), Style::Plain),
-            ];
-            Section::leaf(format!("codesearch/{i}"), NodeKind::Info, spans).with_target(
-                Target::CodeHit {
-                    path: h.path.clone(),
-                    line: h.line,
-                },
-            )
         })
         .collect()
 }

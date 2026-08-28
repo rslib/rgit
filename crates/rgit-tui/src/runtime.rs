@@ -12,7 +12,8 @@ use crate::app::{App, Effect, InfoKind, LaneOp, Leader, Msg, Mutation, TextOp, u
 use crate::events::{Event, Events};
 use crate::keymap::{
     self, resolve_commit_key, resolve_confirm_key, resolve_help_key, resolve_key,
-    resolve_palette_key, resolve_prompt_key, resolve_rebase_key, resolve_search_key,
+    resolve_finder_key, resolve_palette_key, resolve_prompt_key, resolve_rebase_key,
+    resolve_search_key,
     resolve_transient_key,
 };
 use crate::ui;
@@ -289,6 +290,8 @@ async fn event_loop(
                     resolve_commit_key(key)
                 } else if app.palette.is_some() {
                     resolve_palette_key(key)
+                } else if app.code_finder.is_some() {
+                    resolve_finder_key(key)
                 } else if app.search.is_some() {
                     resolve_search_key(key)
                 } else if app.transient.is_some() {
@@ -372,6 +375,7 @@ fn mouse_msg(app: &App, m: crossterm::event::MouseEvent) -> Option<Msg> {
 fn overlay_active(app: &App) -> bool {
     app.help
         || app.palette.is_some()
+        || app.code_finder.is_some()
         || app.prompt.is_some()
         || app.transient.is_some()
         || app.confirm.is_some()
@@ -583,12 +587,28 @@ async fn run_msg(
                     }
                 });
             }
+            Effect::CodeSearchLive(query) => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let hits = grep_hits(&*backend, &query).map_err(|e| e.to_string());
+                    let _ = msg_tx.send(Msg::CodeFinderHits {
+                        query,
+                        semantic: false,
+                        hits,
+                    });
+                });
+            }
             Effect::CodeSearch(query) => {
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    let result = code_search(&*backend, &query).map_err(|e| e.to_string());
-                    let _ = msg_tx.send(Msg::CodeSearchResults(result));
+                    let hits = code_search(&*backend, &query).map_err(|e| e.to_string());
+                    let _ = msg_tx.send(Msg::CodeFinderHits {
+                        query,
+                        semantic: true,
+                        hits,
+                    });
                 });
             }
             Effect::LoadRefs => {
@@ -1285,6 +1305,28 @@ fn snippet_sections(dir: &Path, path: &str, line: usize) -> Vec<rgit_model::Sect
         .collect()
 }
 
+/// Instant lexical-only results for the finder's live typing: literal grep,
+/// mapped to code hits (tagged "text"), no index or embedder involved.
+fn grep_hits(backend: &dyn GitBackend, query: &str) -> Result<Vec<crate::app::CodeHit>, GitError> {
+    let matches = backend.grep_query(&rgit_git::GrepQuery {
+        pattern: query.to_owned(),
+        regex: false,
+        path: None,
+        exts: Vec::new(),
+    })?;
+    Ok(matches
+        .into_iter()
+        .take(50)
+        .map(|m| crate::app::CodeHit {
+            path: m.path,
+            line: m.line,
+            score: 0.0,
+            tag: "text",
+            preview: m.text,
+        })
+        .collect())
+}
+
 /// Fuse literal grep and semantic-index results with reciprocal-rank fusion,
 /// bucketed to the chunk window so a lexical and a semantic hit in the same
 /// region reinforce each other. History-boosts the semantic side, and degrades
@@ -1530,8 +1572,54 @@ fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, restack_note};
+    use super::{base64_encode, grep_hits, restack_note, snippet_sections};
     use rgit_git::RestackOutcome;
+
+    fn temp_repo(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rgit-finder-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for a in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(&a)
+                .status()
+                .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn grep_hits_finds_the_query_as_a_text_hit() {
+        let dir = temp_repo("grep");
+        std::fs::write(dir.join("f.rs"), "fn alpha() {}\nfn zztokenzz() {}\n").unwrap();
+        for a in [vec!["add", "f.rs"], vec!["commit", "-qm", "c"]] {
+            std::process::Command::new("git").arg("-C").arg(&dir).args(&a).status().unwrap();
+        }
+        let backend = rgit_git::Git2Backend::discover(&dir).unwrap();
+        let hits = grep_hits(&backend, "zztokenzz").unwrap();
+        assert!(
+            hits.iter().any(|h| h.path == "f.rs" && h.line == 2 && h.tag == "text"),
+            "grep_hits should find the token at f.rs:2"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snippet_sections_windows_around_the_hit_line() {
+        let dir = temp_repo("snippet");
+        let body: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.join("f.txt"), body).unwrap();
+        let sections = snippet_sections(&dir, "f.txt", 20);
+        // A +/-10 window around line 20 is at most 21 rows and is non-empty.
+        assert!(!sections.is_empty() && sections.len() <= 21);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn restack_note_summarizes_moves_and_conflicts() {

@@ -93,7 +93,7 @@ impl Command {
             Command::SearchPrev => Msg::SearchPrev,
             Command::RmFile => Msg::RmAtCursor,
             Command::MvFile => Msg::MvAtCursor,
-            Command::CodeSearch => Msg::CodeSearchPrompt,
+            Command::CodeSearch => Msg::CodeFinderOpen,
         }
     }
 
@@ -429,6 +429,29 @@ pub fn resolve_help_key(_key: KeyEvent) -> Option<Msg> {
 }
 
 /// Key handling while the command palette is open.
+/// Keys while the live code-search finder is open: type to search, arrows or
+/// Ctrl-n/p to move, Tab to fold in the semantic index, Enter to open, Esc to
+/// close.
+pub fn resolve_finder_key(key: KeyEvent) -> Option<Msg> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Enter => Some(Msg::CodeFinderSubmit),
+        KeyCode::Esc => Some(Msg::CodeFinderCancel),
+        KeyCode::Char('g') if ctrl => Some(Msg::CodeFinderCancel),
+        KeyCode::Tab => Some(Msg::CodeFinderSemantic),
+        KeyCode::Backspace => Some(Msg::CodeFinderBackspace),
+        KeyCode::Up => Some(Msg::CodeFinderUp),
+        KeyCode::Down => Some(Msg::CodeFinderDown),
+        KeyCode::Char('p') if ctrl => Some(Msg::CodeFinderUp),
+        KeyCode::Char('n') if ctrl => Some(Msg::CodeFinderDown),
+        KeyCode::Char('s') if ctrl => Some(Msg::CodeFinderSemantic),
+        KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+            Some(Msg::CodeFinderChar(c))
+        }
+        _ => None,
+    }
+}
+
 pub fn resolve_palette_key(key: KeyEvent) -> Option<Msg> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {

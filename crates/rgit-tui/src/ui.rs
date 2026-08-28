@@ -84,6 +84,33 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         return;
     }
 
+    // The live code finder takes over the body: a query line and results list on
+    // the left, a preview of the selected hit on the right.
+    if app.code_finder.is_some() {
+        let [top, body, action] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .areas(inner);
+        let split = body.width >= 90;
+        let [list_area, prev_area] = if split {
+            Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(body)
+        } else {
+            [body, Rect { width: 0, ..body }]
+        };
+        let has_preview = split && app.refresh_preview(prev_area.height.saturating_sub(1) as usize);
+        app.set_preview_visible(has_preview);
+        render_code_finder(frame, app, top, list_area);
+        if has_preview {
+            app.preview_top = prev_area.y + 1;
+            render_preview(frame, app, prev_area);
+        }
+        render_action_bar(frame, app, action);
+        render_toasts(frame, app, inner);
+        return;
+    }
+
     // The action bar sits directly above the bottom border, no separator row.
     let [body, action] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
     // When there's room, status and log views split into a navigator and a live
@@ -422,6 +449,57 @@ fn render_transfer_bar(frame: &mut Frame, area: Rect, received: usize, total: us
         ])),
         area,
     );
+}
+
+fn render_code_finder(frame: &mut Frame, app: &App, input_area: Rect, list_area: Rect) {
+    let Some(f) = &app.code_finder else { return };
+    // Query line: prompt caret, the text, a caret, then a state hint.
+    let hint = if f.searching {
+        " searching…".to_owned()
+    } else if f.semantic {
+        format!("  {} hits (meaning + text)", f.hits.len())
+    } else if f.hits.is_empty() {
+        "  type to search, Tab for meaning".to_owned()
+    } else {
+        format!("  {} hits (text)  Tab: meaning", f.hits.len())
+    };
+    let input_line = Line::from(vec![
+        RSpan::styled("code › ", RStyle::default().fg(theme::accent())),
+        RSpan::raw(f.input.clone()),
+        RSpan::styled("▏", RStyle::default().fg(theme::accent())),
+        RSpan::styled(hint, theme::resolve(Style::Dim)),
+    ]);
+    frame.render_widget(Paragraph::new(input_line), input_area);
+
+    let rows: Vec<Line> = f
+        .hits
+        .iter()
+        .take(list_area.height as usize)
+        .enumerate()
+        .map(|(i, h)| {
+            let selected = i == f.selected;
+            let loc = RSpan::styled(
+                format!("{}:{}", h.path, h.line),
+                theme::resolve(Style::Hash),
+            );
+            let tag = RSpan::styled(format!("  [{}]  ", h.tag), theme::resolve(Style::Branch));
+            let preview = RSpan::styled(
+                h.preview.clone(),
+                if selected {
+                    theme::resolve(Style::Plain)
+                } else {
+                    theme::resolve(Style::Dim)
+                },
+            );
+            let line = Line::from(vec![loc, tag, preview]);
+            if selected {
+                line.style(RStyle::default().bg(theme::select_bg()))
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), list_area);
 }
 
 fn render_palette(frame: &mut Frame, palette: &crate::app::Palette, area: Rect) {
@@ -1381,10 +1459,6 @@ fn context_hints(app: &App) -> (Option<String>, Vec<(&'static str, &'static str)
             ],
         ),
         ViewKind::Info => (None, vec![("q", "back")]),
-        ViewKind::CodeSearch => (
-            Some("code search".into()),
-            vec![("⏎", "open file"), ("q", "back")],
-        ),
         ViewKind::Blame
         | ViewKind::Remotes
         | ViewKind::Worktrees
