@@ -566,6 +566,14 @@ async fn run_msg(
                     let _ = msg_tx.send(Msg::PreviewBuilt { key, sections });
                 });
             }
+            Effect::BuildSnippetPreview { key, path, line } => {
+                let dir = app.backend().workdir().to_path_buf();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let sections = snippet_sections(&dir, &path, line);
+                    let _ = msg_tx.send(Msg::PreviewBuilt { key, sections });
+                });
+            }
             Effect::LoadBlame(path) => {
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
@@ -1240,6 +1248,41 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::RemovePath(path) => backend.remove_path(path, false),
         Mutation::MovePath { from, to } => backend.move_path(from, to, false),
     }
+}
+
+/// Render a window of `path` around `line` (1-based) as preview sections, with
+/// gutter line numbers and the hit line emphasized. Reads from the working tree.
+fn snippet_sections(dir: &Path, path: &str, line: usize) -> Vec<rgit_model::Section> {
+    use rgit_model::{NodeKind, Section, Span, Style};
+    const CONTEXT: usize = 10;
+    let Ok(text) = std::fs::read_to_string(dir.join(path)) else {
+        return vec![Section::leaf(
+            "snippet/none",
+            NodeKind::Info,
+            vec![Span::new("cannot read file".to_owned(), Style::Dim)],
+        )];
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let hit = line.saturating_sub(1);
+    let start = hit.saturating_sub(CONTEXT);
+    let end = (hit + CONTEXT + 1).min(lines.len());
+    let width = end.to_string().len();
+    (start..end)
+        .map(|i| {
+            let n = i + 1;
+            let is_hit = n == line;
+            let gutter = Style::Dim;
+            let body = if is_hit { Style::Added } else { Style::Plain };
+            Section::leaf(
+                format!("snippet/{n}"),
+                NodeKind::Info,
+                vec![
+                    Span::new(format!("{:>w$}  ", n, w = width), gutter),
+                    Span::new(lines.get(i).copied().unwrap_or("").to_owned(), body),
+                ],
+            )
+        })
+        .collect()
 }
 
 /// Fuse literal grep and semantic-index results with reciprocal-rank fusion,

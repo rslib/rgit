@@ -40,6 +40,11 @@ pub enum Target {
     Commit {
         id: String,
     },
+    /// A code-search hit: a file path and the 1-based line to open/preview at.
+    CodeHit {
+        path: String,
+        line: usize,
+    },
     /// A reference that can be checked out.
     Ref {
         name: String,

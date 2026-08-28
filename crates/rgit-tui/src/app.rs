@@ -1670,6 +1670,12 @@ pub enum Effect {
     LoadBlame(String),
     /// Run a code search (grep fused with the semantic index) for the query.
     CodeSearch(String),
+    /// Build a preview of `path` windowed around `line` for a code-search hit.
+    BuildSnippetPreview {
+        key: PreviewKey,
+        path: String,
+        line: usize,
+    },
     /// Load all refs, then push the refs view.
     LoadRefs,
     /// Load the smartlog, then push the smartlog view.
@@ -1751,6 +1757,8 @@ pub enum PreviewKey {
     File { path: String, staged: bool },
     Commit { id: String },
     Stash { index: usize },
+    /// A window of a file's content around a code-search hit.
+    Snippet { path: String, line: usize },
 }
 
 /// File diffs with more than this many lines are built off the main thread;
@@ -1767,7 +1775,7 @@ impl PreviewKey {
         match self {
             PreviewKey::Commit { id } => Some(id.clone()),
             PreviewKey::Stash { index } => Some(format!("stash@{{{index}}}")),
-            PreviewKey::File { .. } => None,
+            PreviewKey::File { .. } | PreviewKey::Snippet { .. } => None,
         }
     }
 }
@@ -1992,6 +2000,7 @@ impl App {
             Target::Hunk { path, staged, .. } => Some(PreviewKey::File { path, staged }),
             Target::Commit { id } => Some(PreviewKey::Commit { id }),
             Target::Stash { index } => Some(PreviewKey::Stash { index }),
+            Target::CodeHit { path, line } => Some(PreviewKey::Snippet { path, line }),
             Target::Ref { .. } => None,
         }
     }
@@ -2115,6 +2124,12 @@ impl App {
                     }
                     None => Vec::new(),
                 }
+            }
+            PreviewKey::Snippet { path, line } => {
+                let (path, line) = (path.clone(), *line);
+                self.set_preview_placeholder();
+                self.preview_key = Some(key.clone());
+                vec![Effect::BuildSnippetPreview { key, path, line }]
             }
             _ => {
                 let rev = key.rev().expect("commit/stash keys resolve to a rev");
@@ -2275,6 +2290,7 @@ impl App {
     pub fn preview_title(&self) -> String {
         match &self.preview_key {
             Some(PreviewKey::File { path, .. }) => path.clone(),
+            Some(PreviewKey::Snippet { path, line }) => format!("{path}:{line}"),
             Some(PreviewKey::Commit { id }) => id.clone(),
             Some(PreviewKey::Stash { index }) => format!("stash@{{{index}}}"),
             None => String::new(),
@@ -2544,6 +2560,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::Enter => match app.buffer().target_at_cursor() {
             Some(Target::Commit { id }) => return vec![Effect::LoadCommit(id)],
+            Some(Target::CodeHit { path, .. }) => return vec![Effect::LoadBlame(path)],
             Some(Target::File { path, .. }) => return vec![Effect::LoadBlame(path)],
             Some(Target::Ref { name, kind }) => {
                 app.pop_view();
@@ -3937,9 +3954,9 @@ fn build_code_search(hits: &[CodeHit]) -> Vec<Section> {
                 Span::new(h.preview.clone(), Style::Plain),
             ];
             Section::leaf(format!("codesearch/{i}"), NodeKind::Info, spans).with_target(
-                Target::File {
+                Target::CodeHit {
                     path: h.path.clone(),
-                    staged: false,
+                    line: h.line,
                 },
             )
         })
