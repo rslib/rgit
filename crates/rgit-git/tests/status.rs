@@ -356,7 +356,7 @@ fn stash_push_pop_and_drop() {
 
     // stash an edit, worktree returns to committed state
     std::fs::write(dir.join("a.txt"), "orig\nedit\n").unwrap();
-    backend.stash_push().unwrap();
+    backend.stash_push(false).unwrap();
     assert_eq!(backend.status().unwrap().stashes.len(), 1);
     assert_eq!(
         std::fs::read_to_string(dir.join("a.txt")).unwrap(),
@@ -372,7 +372,7 @@ fn stash_push_pop_and_drop() {
     );
 
     // drop removes a stash without applying it
-    backend.stash_push().unwrap();
+    backend.stash_push(false).unwrap();
     backend.stash_drop(0).unwrap();
     assert!(backend.status().unwrap().stashes.is_empty());
     assert_eq!(
@@ -390,7 +390,7 @@ fn stash_with_message_and_apply_keeps_the_stash() {
 
     let backend = Git2Backend::discover(&dir).unwrap();
     std::fs::write(dir.join("a.txt"), "orig\nedit\n").unwrap();
-    backend.stash_push_message("wip: my edit").unwrap();
+    backend.stash_push_message("wip: my edit", false).unwrap();
 
     let stashes = backend.status().unwrap().stashes;
     assert_eq!(stashes.len(), 1);

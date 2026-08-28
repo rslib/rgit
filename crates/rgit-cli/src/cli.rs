@@ -513,6 +513,9 @@ pub enum StashCmd {
     Push {
         /// A description for the stash.
         message: Option<String>,
+        /// Also stash untracked files (git's -u).
+        #[arg(short = 'u', long = "include-untracked")]
+        include_untracked: bool,
     },
     /// Apply a stash and drop it (prompted for if no index on a terminal).
     Pop {
@@ -1356,10 +1359,15 @@ pub fn run(
             Some(BranchCmd::Rename { old, new }) => ok(backend.rename_branch(&old, &new)),
         },
         Command::Stash { cmd } => match cmd {
-            None | Some(StashCmd::Push { message: None }) => ok_msg(backend.stash_push()),
+            None => ok_msg(backend.stash_push(false)),
+            Some(StashCmd::Push {
+                message: None,
+                include_untracked,
+            }) => ok_msg(backend.stash_push(include_untracked)),
             Some(StashCmd::Push {
                 message: Some(message),
-            }) => ok_msg(backend.stash_push_message(&message)),
+                include_untracked,
+            }) => ok_msg(backend.stash_push_message(&message, include_untracked)),
             Some(StashCmd::Pop { index }) => ok(backend.stash_pop(stash_index(
                 backend,
                 index,

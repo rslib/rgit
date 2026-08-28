@@ -712,8 +712,11 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_stash_push",
-            "Stash the working tree and index (with an optional message).",
-            &[("message", "string", false)],
+            "Stash the working tree and index (with an optional message). `include_untracked` also stashes untracked files.",
+            &[
+                ("message", "string", false),
+                ("include_untracked", "boolean", false),
+            ],
         ),
         tool(
             "git_stash_pop",
@@ -1168,8 +1171,8 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
         },
 
         "git_stash_push" => match s("message") {
-            Some(m) => backend.stash_push_message(m),
-            None => backend.stash_push(),
+            Some(m) => backend.stash_push_message(m, flag("include_untracked")),
+            None => backend.stash_push(flag("include_untracked")),
         }
         .map_err(emap),
         "git_stash_pop" => done(backend.stash_pop(index())),

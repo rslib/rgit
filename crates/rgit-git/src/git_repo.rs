@@ -129,23 +129,23 @@ impl GitBackend for Git2Backend {
         })
     }
 
-    fn stash_push(&self) -> Result<String, GitError> {
+    fn stash_push(&self, include_untracked: bool) -> Result<String, GitError> {
         self.snap("stash");
         let mut repo = self.repo.lock().expect("repo mutex");
         let sig = repo.signature()?;
-        repo.stash_save2(&sig, None, Some(git2::StashFlags::INCLUDE_UNTRACKED))?;
+        repo.stash_save2(&sig, None, stash_flags(include_untracked))?;
         Ok(stash_saved_line(&repo))
     }
 
-    fn stash_push_message(&self, message: &str) -> Result<String, GitError> {
+    fn stash_push_message(
+        &self,
+        message: &str,
+        include_untracked: bool,
+    ) -> Result<String, GitError> {
         self.snap("stash");
         let mut repo = self.repo.lock().expect("repo mutex");
         let sig = repo.signature()?;
-        repo.stash_save2(
-            &sig,
-            Some(message),
-            Some(git2::StashFlags::INCLUDE_UNTRACKED),
-        )?;
+        repo.stash_save2(&sig, Some(message), stash_flags(include_untracked))?;
         Ok(stash_saved_line(&repo))
     }
 
@@ -3403,6 +3403,16 @@ fn commit_touched_path(repo: &Repository, commit: &git2::Commit<'_>, path: &str)
             })
             .unwrap_or(false)
     })
+}
+
+/// Stash flags: always keep the index consistent; add untracked files only when
+/// asked (git's `-u`).
+fn stash_flags(include_untracked: bool) -> Option<git2::StashFlags> {
+    if include_untracked {
+        Some(git2::StashFlags::INCLUDE_UNTRACKED)
+    } else {
+        Some(git2::StashFlags::DEFAULT)
+    }
 }
 
 fn relative_age(then: i64, now: i64) -> String {

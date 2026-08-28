@@ -157,11 +157,17 @@ pub trait GitBackend: Send + Sync {
 
     /// Stash the working tree and index (including untracked files). Returns the
     /// git-style `Saved working directory and index state WIP on ...` line.
-    fn stash_push(&self) -> Result<String, GitError>;
+    /// Stash the working tree and index. With `include_untracked` (git's `-u`),
+    /// also stash untracked files; without it, leave them (git's default).
+    fn stash_push(&self, include_untracked: bool) -> Result<String, GitError>;
 
     /// Stash the working tree and index under a descriptive `message`. Returns
     /// the git-style `Saved working directory and index state ...` line.
-    fn stash_push_message(&self, message: &str) -> Result<String, GitError>;
+    fn stash_push_message(
+        &self,
+        message: &str,
+        include_untracked: bool,
+    ) -> Result<String, GitError>;
 
     /// Pop the stash at `index` (apply it and drop it).
     fn stash_pop(&self, index: usize) -> Result<(), GitError>;
