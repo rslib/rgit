@@ -795,13 +795,17 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_rm",
-            "Remove a tracked path from the index and the working tree.",
-            &[("path", "string", true)],
+            "Remove a tracked path from the index and the working tree. `cached` removes it from the index only.",
+            &[("path", "string", true), ("cached", "boolean", false)],
         ),
         tool(
             "git_mv",
-            "Rename/move a tracked path.",
-            &[("from", "string", true), ("to", "string", true)],
+            "Rename/move a tracked path. `force` overwrites an existing destination.",
+            &[
+                ("from", "string", true),
+                ("to", "string", true),
+                ("force", "boolean", false),
+            ],
         ),
         tool(
             "git_run",
@@ -1217,8 +1221,8 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
         "git_worktree_remove" => done(backend.remove_worktree(req("name")?)),
 
         "git_clean" => backend.clean(flag("dry_run")).map(|o| if flag("dry_run") { o } else { "ok".to_owned() }).map_err(emap),
-        "git_rm" => done(backend.remove_path(req("path")?)),
-        "git_mv" => done(backend.move_path(req("from")?, req("to")?)),
+        "git_rm" => done(backend.remove_path(req("path")?, flag("cached"))),
+        "git_mv" => done(backend.move_path(req("from")?, req("to")?, flag("force"))),
         "git_run" => backend.git(&str_vec("args")).map_err(emap),
 
         other => Err(format!("unknown tool: {other}")),

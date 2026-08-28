@@ -1393,24 +1393,31 @@ impl GitBackend for Git2Backend {
         self.run_git(&["clean", if dry_run { "-nd" } else { "-fd" }], &[])
     }
 
-    fn remove_path(&self, path: &str) -> Result<(), GitError> {
+    fn remove_path(&self, path: &str, cached: bool) -> Result<(), GitError> {
         self.snap("rm");
         let repo = self.repo.lock().expect("repo mutex");
         sync_index(&repo)?;
         let mut index = repo.index()?;
         index.remove_path(Path::new(path))?;
         index.write()?;
-        let full = self.workdir.join(path);
-        if full.exists() {
-            std::fs::remove_file(full)?;
+        if !cached {
+            let full = self.workdir.join(path);
+            if full.exists() {
+                std::fs::remove_file(full)?;
+            }
         }
         Ok(())
     }
 
-    fn move_path(&self, from: &str, to: &str) -> Result<(), GitError> {
+    fn move_path(&self, from: &str, to: &str, force: bool) -> Result<(), GitError> {
         self.snap("mv");
         let repo = self.repo.lock().expect("repo mutex");
         sync_index(&repo)?;
+        if !force && self.workdir.join(to).exists() {
+            return Err(GitError::Other(format!(
+                "destination {to} already exists; use --force to overwrite"
+            )));
+        }
         std::fs::rename(self.workdir.join(from), self.workdir.join(to))?;
         let mut index = repo.index()?;
         index.remove_path(Path::new(from))?;
@@ -2556,8 +2563,15 @@ fn fast_forward(
 }
 
 /// Create a new repository at `path` (`git init`), via libgit2.
-pub fn init(path: &Path) -> Result<(), GitError> {
-    Repository::init(path)?;
+/// Create a repository at `path`. `initial_branch` names the first branch
+/// (git's `-b`); `bare` makes a bare repository (git's `--bare`).
+pub fn init(path: &Path, initial_branch: Option<&str>, bare: bool) -> Result<(), GitError> {
+    let mut opts = git2::RepositoryInitOptions::new();
+    opts.bare(bare);
+    if let Some(b) = initial_branch {
+        opts.initial_head(b);
+    }
+    Repository::init_opts(path, &opts)?;
     Ok(())
 }
 

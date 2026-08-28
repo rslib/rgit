@@ -394,6 +394,9 @@ pub enum Command {
     Rm {
         /// The path to remove (prompted for if omitted on a terminal).
         path: Option<String>,
+        /// Remove only from the index, keeping the working-tree file (--cached).
+        #[arg(long)]
+        cached: bool,
     },
     /// Rename/move a tracked path.
     Mv {
@@ -401,6 +404,9 @@ pub enum Command {
         from: String,
         /// The new path.
         to: String,
+        /// Overwrite the destination if it exists (git's -f).
+        #[arg(short = 'f', long)]
+        force: bool,
     },
     /// Describe a revision relative to the nearest tag (default HEAD).
     Describe {
@@ -411,6 +417,12 @@ pub enum Command {
     Init {
         /// Where to create the repository (defaults to the current directory).
         path: Option<String>,
+        /// Name of the initial branch (git's -b/--initial-branch).
+        #[arg(short = 'b', long = "initial-branch")]
+        initial_branch: Option<String>,
+        /// Create a bare repository (git's --bare).
+        #[arg(long)]
+        bare: bool,
     },
     /// Clone a repository into a new directory.
     Clone {
@@ -1510,13 +1522,13 @@ pub fn run(
                 "ok".to_owned()
             }
         }
-        Command::Rm { path } => {
+        Command::Rm { path, cached } => {
             let path = resolve(path, "a path", &|| {
                 crate::interactive::pick_file(backend, "Remove which file?")
             })?;
-            ok(backend.remove_path(&path))
+            ok(backend.remove_path(&path, cached))
         }
-        Command::Mv { from, to } => ok(backend.move_path(&from, &to)),
+        Command::Mv { from, to, force } => ok(backend.move_path(&from, &to, force)),
         Command::Describe { rev } => backend.describe(rev.as_deref().unwrap_or("HEAD"))?,
         Command::Submodule { mut args } => {
             args.insert(0, "submodule".to_owned());

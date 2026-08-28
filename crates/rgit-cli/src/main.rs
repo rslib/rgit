@@ -25,10 +25,18 @@ fn main() -> ! {
         Some(Command::Mcp) => exit(mcp::serve(discover_or_exit())),
         // Repo creation runs before discovery (there is no repo yet); both use
         // libgit2 directly rather than shelling out.
-        Some(Command::Init { path }) => {
+        Some(Command::Init {
+            path,
+            initial_branch,
+            bare,
+        }) => {
             let path = path.unwrap_or_else(|| ".".to_owned());
             exit(report_result(
-                rgit_git::init(std::path::Path::new(&path)),
+                rgit_git::init(
+                    std::path::Path::new(&path),
+                    initial_branch.as_deref(),
+                    bare,
+                ),
                 "ok",
             ));
         }

@@ -363,10 +363,14 @@ pub trait GitBackend: Send + Sync {
     fn clean(&self, dry_run: bool) -> Result<String, GitError>;
 
     /// Remove a tracked path from the index and the working tree (`git rm`).
-    fn remove_path(&self, path: &str) -> Result<(), GitError>;
+    /// Remove `path` from the index. With `cached` (git's `--cached`), leave the
+    /// working-tree file in place; otherwise delete it too.
+    fn remove_path(&self, path: &str, cached: bool) -> Result<(), GitError>;
 
     /// Rename/move a tracked path (`git mv`).
-    fn move_path(&self, from: &str, to: &str) -> Result<(), GitError>;
+    /// Rename a tracked path. Without `force`, refuse to overwrite an existing
+    /// destination (git's default); `force` (git's `-f`) overwrites it.
+    fn move_path(&self, from: &str, to: &str, force: bool) -> Result<(), GitError>;
 
     /// Describe a revision relative to the nearest tag (`git describe`).
     fn describe(&self, rev: &str) -> Result<String, GitError>;
