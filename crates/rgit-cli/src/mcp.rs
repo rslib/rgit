@@ -960,6 +960,8 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
             let message = req("message")?;
             let r = if flag("amend") {
                 backend.amend(message)
+            } else if flag("no_verify") {
+                backend.commit_no_verify(message)
             } else {
                 backend.commit(message)
             };

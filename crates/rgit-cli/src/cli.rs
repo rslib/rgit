@@ -63,13 +63,22 @@ pub enum Command {
     },
     /// Diffstat of the staged changes, or between two revisions.
     Diff {
-        /// Diff FROM..TO; omit both for the staged diff.
+        /// Diff FROM..TO; omit both to diff the working tree.
         from: Option<String>,
         /// The second revision (defaults to HEAD when only FROM is given).
         to: Option<String>,
         /// Print the full unified patch instead of a diffstat.
         #[arg(short, long)]
         patch: bool,
+        /// Diff the staged changes (index vs HEAD), like git's --cached.
+        #[arg(long, visible_alias = "staged")]
+        cached: bool,
+        /// List only the names of changed files.
+        #[arg(long = "name-only")]
+        name_only: bool,
+        /// Show a diffstat (the default when neither --patch nor --name-only).
+        #[arg(long)]
+        stat: bool,
     },
     /// A commit's header and diffstat.
     Show {
@@ -139,6 +148,12 @@ pub enum Command {
         /// Amend the previous commit instead of creating a new one.
         #[arg(long)]
         amend: bool,
+        /// Stage all tracked, modified files before committing (git's -a).
+        #[arg(short = 'a', long = "all")]
+        all: bool,
+        /// Skip the pre-commit and commit-msg hooks (git's --no-verify).
+        #[arg(short = 'n', long = "no-verify")]
+        no_verify: bool,
     },
     /// Amend HEAD with the staged changes, keeping its message (no editor).
     Extend,
@@ -1008,12 +1023,24 @@ pub fn run(
                 ..LogOptions::default()
             })?)
         }
-        Command::Diff { from, to, patch } => match (from, to) {
-            (Some(from), Some(to)) => diff_out(&backend.diff_refs(&from, &to)?, patch),
-            (Some(rev), None) => diff_out(&backend.diff_refs(&rev, "HEAD")?, patch),
-            (None, _) if patch => backend.staged_patch()?,
-            (None, _) => render::diffstat(&backend.status()?.staged),
-        },
+        Command::Diff {
+            from,
+            to,
+            patch,
+            cached,
+            name_only,
+            stat: _,
+        } => {
+            // Bare `diff` shows the unstaged (worktree vs index) changes, like
+            // git; `--cached` shows the staged (index vs HEAD) changes.
+            let files = match (from, to) {
+                (Some(from), Some(to)) => backend.diff_refs(&from, &to)?,
+                (Some(rev), None) => backend.diff_refs(&rev, "HEAD")?,
+                (None, _) if cached => backend.status()?.staged,
+                (None, _) => backend.status()?.unstaged,
+            };
+            diff_out(&files, patch, name_only)
+        }
         Command::Show { rev } => render::commit_details(&backend.commit_details(&rev)?),
         Command::Blame { path } => render::blame(&backend.blame(&path)?),
         Command::Refs => render::refs(&backend.refs()?),
@@ -1045,12 +1072,33 @@ pub fn run(
             }
             ok(backend.resolve_conflict(&path, ours))
         }
-        Command::Commit { message, amend } => {
+        Command::Commit {
+            message,
+            amend,
+            all,
+            no_verify,
+        } => {
             let message = resolve(message, "a commit message", &|| {
                 crate::interactive::input("Commit message")
             })?;
+            // -a: stage worktree changes to tracked files (not untracked ones).
+            if all {
+                for e in backend.status()?.entries {
+                    if matches!(
+                        e.worktree,
+                        rgit_git::StatusCode::Modified
+                            | rgit_git::StatusCode::Deleted
+                            | rgit_git::StatusCode::Renamed
+                            | rgit_git::StatusCode::TypeChanged
+                    ) {
+                        backend.stage_file(&e.path)?;
+                    }
+                }
+            }
             if amend {
                 backend.amend(&message)?;
+            } else if no_verify {
+                backend.commit_no_verify(&message)?;
             } else {
                 backend.commit(&message)?;
             }
@@ -1439,8 +1487,14 @@ fn ok_msg(r: Result<String, GitError>) -> String {
     }
 }
 
-fn diff_out(files: &[rgit_git::FileDiff], patch: bool) -> String {
-    if patch {
+fn diff_out(files: &[rgit_git::FileDiff], patch: bool, name_only: bool) -> String {
+    if name_only {
+        files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else if patch {
         render::patch(files)
     } else {
         render::diffstat(files)
