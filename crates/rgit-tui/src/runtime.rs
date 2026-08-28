@@ -593,6 +593,15 @@ async fn run_msg(
                     }
                 });
             }
+            Effect::LoadPushRemotes => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(remotes) = backend.remotes() {
+                        let _ = msg_tx.send(Msg::PushRemotesLoaded(remotes));
+                    }
+                });
+            }
             Effect::LoadSmartlog => {
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
@@ -1024,7 +1033,8 @@ async fn op_console(
             force,
             force_with_lease,
             set_upstream,
-        } => backend.push(force, force_with_lease, set_upstream, &report),
+            remote,
+        } => backend.push(remote.as_deref(), force, force_with_lease, set_upstream, &report),
         ConsoleOp::Merge(rev) => backend.merge(&rev, false, &report),
         ConsoleOp::RebaseOnto(rev) => backend.rebase_onto(&rev, &report),
     })

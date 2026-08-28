@@ -467,11 +467,12 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_push",
-            "Push the current branch to its upstream.",
+            "Push the current branch to its upstream, or to `remote` if given.",
             &[
                 ("force", "boolean", false),
                 ("force_with_lease", "boolean", false),
                 ("set_upstream", "boolean", false),
+                ("remote", "string", false),
             ],
         ),
         tool(
@@ -973,6 +974,7 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
         "git_fetch" => done(backend.fetch(&|_| {})),
         "git_pull" => done(backend.pull(&|_| {})),
         "git_push" => done(backend.push(
+            s("remote"),
             flag("force"),
             flag("force_with_lease"),
             flag("set_upstream"),

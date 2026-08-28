@@ -1994,7 +1994,7 @@ impl GitBackend for Git2Backend {
             self.checkout_branch(branch)?;
             // force-with-lease + set upstream: a stack submit re-pushes rewritten
             // branches, but only when the remote still matches ours.
-            self.push(false, true, true, report)?;
+            self.push(None, false, true, true, report)?;
             notes.push(crate::workflow::open_pull_request(branch, base));
         }
         let _ = self.checkout_branch(&start);
@@ -2253,6 +2253,7 @@ impl GitBackend for Git2Backend {
 
     fn push(
         &self,
+        remote: Option<&str>,
         force: bool,
         force_with_lease: bool,
         set_upstream: bool,
@@ -2260,7 +2261,20 @@ impl GitBackend for Git2Backend {
     ) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let cred_guard = self.cred_prompt.lock().expect("cred mutex");
-        let (remote_name, branch) = upstream_remote(&repo)?;
+        // A named remote pushes the current branch to <remote>/<branch>; without
+        // one, fall back to the branch's configured upstream.
+        let (remote_name, branch) = match remote {
+            Some(r) => {
+                let head = repo.head()?;
+                let branch = head
+                    .shorthand()
+                    .ok()
+                    .map(str::to_owned)
+                    .ok_or_else(|| GitError::Other("HEAD is detached; not on a branch".to_owned()))?;
+                (r.to_owned(), branch)
+            }
+            None => upstream_remote(&repo)?,
+        };
         let branch_ref = format!("refs/heads/{branch}");
         let lease = repo
             .refname_to_id(&format!("refs/remotes/{remote_name}/{branch}"))

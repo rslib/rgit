@@ -757,7 +757,7 @@ fn push_fetch_and_pull_over_a_local_remote() {
     run(&a, &["commit", "-q", "-m", "second"]);
     Git2Backend::discover(&a)
         .unwrap()
-        .push(false, false, false, &|_| {})
+        .push(None, false, false, false, &|_| {})
         .unwrap();
 
     // B fetches: it should now see itself one commit behind.

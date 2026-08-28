@@ -34,6 +34,8 @@ pub enum ConsoleOp {
         force: bool,
         force_with_lease: bool,
         set_upstream: bool,
+        /// Target remote by name, or None to push to the branch's upstream.
+        remote: Option<String>,
     },
     Merge(String),
     RebaseOnto(String),
@@ -528,6 +530,8 @@ pub enum Msg {
     RefsLoaded(Vec<RefEntry>),
     RemoteMenu,
     RemotesLoaded(Vec<Remote>),
+    /// Remotes loaded specifically to pick a push target.
+    PushRemotesLoaded(Vec<Remote>),
     WorktreeMenu,
     WorktreesLoaded(Vec<Worktree>),
     Forge,
@@ -849,6 +853,7 @@ pub struct TransientAction {
 #[derive(Debug, Clone, Copy)]
 pub enum ActionKind {
     Push,
+    PushElsewhere,
     Commit,
     Amend,
     Extend,
@@ -926,11 +931,18 @@ impl Transient {
                     on: false,
                 },
             ],
-            actions: vec![TransientAction {
-                key: 'p',
-                label: "push to upstream".into(),
-                kind: ActionKind::Push,
-            }],
+            actions: vec![
+                TransientAction {
+                    key: 'p',
+                    label: "push to upstream".into(),
+                    kind: ActionKind::Push,
+                },
+                TransientAction {
+                    key: 'e',
+                    label: "push to other remote\u{2026}".into(),
+                    kind: ActionKind::PushElsewhere,
+                },
+            ],
         }
     }
 
@@ -1173,6 +1185,8 @@ pub enum PromptAction {
     RewordMessage,
     /// Squash the commit named by the prompt value into its parent.
     Squash,
+    /// Push to the remote named by the prompt value, with `pending_push` args.
+    PushRemote,
 }
 
 /// A minibuffer: a label, an editable input, and optional filterable candidates.
@@ -1593,6 +1607,8 @@ pub enum Effect {
     },
     /// Load configured remotes, then push the remotes view.
     LoadRemotes,
+    /// Load remotes, then open a picker to push the current branch to one.
+    LoadPushRemotes,
     /// Load linked worktrees, then push the worktrees view.
     LoadWorktrees,
     /// Load forge pull requests, then push the forge view.
@@ -1730,6 +1746,9 @@ pub struct App {
     auto_restack: bool,
     /// The lane targeted by a pending lane-commit prompt.
     pending_reword_rev: Option<String>,
+    /// Push toggles (force, force-with-lease, set-upstream) stashed while the
+    /// user picks a remote for "push to other remote".
+    pending_push: Option<(bool, bool, bool)>,
     pending_lane: Option<String>,
     /// The path targeted by a pending lane-assign prompt.
     pending_lane_path: Option<String>,
@@ -1810,6 +1829,7 @@ impl App {
             gpg_sign: config.commit.gpg_sign,
             auto_restack: config.commit.auto_restack,
             pending_reword_rev: None,
+            pending_push: None,
             pending_lane: None,
             pending_lane_path: None,
             pending_cred_reply: None,
@@ -2577,6 +2597,22 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             buffer.set_content(build_remotes(&remotes));
             app.push_view(ViewKind::Remotes, buffer);
         }
+        Msg::PushRemotesLoaded(remotes) => {
+            if remotes.is_empty() {
+                app.pending_push = None;
+                app.push_toast(ToastKind::Error, "no remotes configured".into());
+            } else {
+                app.prompt = Some(Prompt {
+                    label: "Push to remote".into(),
+                    input: String::new(),
+                    cursor: 0,
+                    candidates: remotes.into_iter().map(|r| r.name).collect(),
+                    selected: 0,
+                    action: PromptAction::PushRemote,
+                    masked: false,
+                });
+            }
+        }
         Msg::WorktreeMenu => app.transient = Some(Transient::worktree()),
         Msg::WorktreesLoaded(worktrees) => {
             let mut buffer = Buffer::default();
@@ -3259,6 +3295,18 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             }
             return Vec::new();
         }
+        PromptAction::PushRemote => {
+            let (force, force_with_lease, set_upstream) = app.pending_push.take().unwrap_or_default();
+            return open_op(
+                app,
+                ConsoleOp::Push {
+                    force,
+                    force_with_lease,
+                    set_upstream,
+                    remote: Some(value),
+                },
+            );
+        }
         // Reword is a two-step prompt: pick the commit, then its new message.
         PromptAction::RewordRev => {
             let rev = if value.trim().is_empty() {
@@ -3333,6 +3381,7 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         | PromptAction::LaneRename
         | PromptAction::LaneStack
         | PromptAction::RewordRev
+        | PromptAction::PushRemote
         | PromptAction::Credential => {
             return Vec::new();
         }
@@ -3379,8 +3428,14 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
                 force: t_force,
                 force_with_lease: t_lease,
                 set_upstream,
+                remote: None,
             },
         ),
+        ActionKind::PushElsewhere => {
+            // Stash the toggles; the remote is chosen in the next prompt.
+            app.pending_push = Some((t_force, t_lease, set_upstream));
+            vec![Effect::LoadPushRemotes]
+        }
         ActionKind::Commit => vec![Effect::OpenCommitEditor { amend: false }],
         ActionKind::Amend => vec![Effect::OpenCommitEditor { amend: true }],
         ActionKind::Extend => {

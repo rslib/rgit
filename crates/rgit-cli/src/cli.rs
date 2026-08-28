@@ -201,6 +201,9 @@ pub enum Command {
         /// Record the pushed branch as the upstream.
         #[arg(short = 'u', long)]
         set_upstream: bool,
+        /// Push to this named remote instead of the branch's upstream.
+        #[arg(long)]
+        remote: Option<String>,
     },
     /// Check out a branch or, for any other revision, a detached HEAD.
     Checkout {
@@ -1081,8 +1084,9 @@ pub fn run(
             force,
             force_with_lease,
             set_upstream,
+            remote,
         } => net(interactive, "push", |r| {
-            backend.push(force, force_with_lease, set_upstream, r)
+            backend.push(remote.as_deref(), force, force_with_lease, set_upstream, r)
         })?,
         Command::Checkout { rev } => {
             let rev = resolve(rev, "a branch or revision", &|| {

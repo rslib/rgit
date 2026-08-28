@@ -206,7 +206,7 @@ pub fn finish(backend: &dyn GitBackend) -> Result<String, GitError> {
     }
 
     if p.pull_request {
-        backend.push(false, false, true, &|_| {})?;
+        backend.push(None, false, false, true, &|_| {})?;
         return Ok(open_pull_request(&current, &p.main));
     }
 

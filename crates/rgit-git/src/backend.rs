@@ -135,8 +135,11 @@ pub trait GitBackend: Send + Sync {
     /// Push the current branch to its upstream remote. `force` overwrites
     /// unconditionally; `force_with_lease` overwrites only if the remote still
     /// matches our remote-tracking ref; `set_upstream` records tracking.
+    /// Push the current branch. `remote` picks the target remote by name; `None`
+    /// pushes to the branch's configured upstream (the default).
     fn push(
         &self,
+        remote: Option<&str>,
         force: bool,
         force_with_lease: bool,
         set_upstream: bool,
