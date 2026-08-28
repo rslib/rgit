@@ -356,6 +356,7 @@ pub trait GitBackend: Send + Sync {
         &self,
         rev: &str,
         no_ff: bool,
+        ff_only: bool,
         report: &dyn Fn(crate::OpProgress),
     ) -> Result<(), GitError>;
 

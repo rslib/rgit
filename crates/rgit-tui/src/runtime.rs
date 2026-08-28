@@ -1035,7 +1035,7 @@ async fn op_console(
             set_upstream,
             remote,
         } => backend.push(remote.as_deref(), force, force_with_lease, set_upstream, &report),
-        ConsoleOp::Merge(rev) => backend.merge(&rev, false, &report),
+        ConsoleOp::Merge(rev) => backend.merge(&rev, false, false, &report),
         ConsoleOp::RebaseOnto(rev) => backend.rebase_onto(&rev, &report),
     })
     .await;

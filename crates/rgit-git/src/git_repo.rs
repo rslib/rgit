@@ -1438,7 +1438,13 @@ impl GitBackend for Git2Backend {
         finalize_sequenced(&repo, &repo.signature()?, &message)
     }
 
-    fn merge(&self, rev: &str, no_ff: bool, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
+    fn merge(
+        &self,
+        rev: &str,
+        no_ff: bool,
+        ff_only: bool,
+        report: &dyn Fn(OpProgress),
+    ) -> Result<(), GitError> {
         self.snap("merge");
         let repo = self.repo.lock().expect("repo mutex");
         let source = repo.revparse_single(rev)?.peel_to_commit()?;
@@ -1448,6 +1454,11 @@ impl GitBackend for Git2Backend {
         if analysis.is_up_to_date() {
             report(OpProgress::Line("Already up to date.".to_owned()));
             return Ok(());
+        }
+        if ff_only && !analysis.is_fast_forward() {
+            return Err(GitError::Other(
+                "not possible to fast-forward; use a merge commit instead".to_owned(),
+            ));
         }
         if analysis.is_fast_forward() && !no_ff {
             if let Some(old) = repo.head().ok().and_then(|h| h.target()) {

@@ -249,8 +249,11 @@ pub enum Command {
         /// The branch or revision to merge (prompted for if omitted).
         rev: Option<String>,
         /// Always create a merge commit, even if a fast-forward is possible.
-        #[arg(long = "no-ff")]
+        #[arg(long = "no-ff", conflicts_with = "ff_only")]
         no_ff: bool,
+        /// Refuse to merge unless it can fast-forward (git's --ff-only).
+        #[arg(long = "ff-only")]
+        ff_only: bool,
     },
     /// Rebase onto a revision, or continue/skip/abort an in-progress rebase.
     Rebase {
@@ -1238,11 +1241,17 @@ pub fn run(
                 })
             }
         }
-        Command::Merge { rev, no_ff } => {
+        Command::Merge {
+            rev,
+            no_ff,
+            ff_only,
+        } => {
             let rev = resolve(rev, "a revision to merge", &|| {
                 crate::interactive::pick_branch(backend, "Merge which branch?")
             })?;
-            net(interactive, "merge", |r| backend.merge(&rev, no_ff, r))?
+            net(interactive, "merge", |r| {
+                backend.merge(&rev, no_ff, ff_only, r)
+            })?
         }
         Command::Rebase {
             onto,

@@ -212,7 +212,7 @@ pub fn finish(backend: &dyn GitBackend) -> Result<String, GitError> {
 
     let target = p.integration.clone().unwrap_or_else(|| p.main.clone());
     backend.checkout_branch(&target)?;
-    backend.merge(&current, true, &|_| {})?;
+    backend.merge(&current, true, false, &|_| {})?;
     let mut note = format!("merged {current} into {target}");
     if p.delete_on_finish {
         backend.delete_branch(&current, true)?;
@@ -248,7 +248,7 @@ pub fn release(backend: &dyn GitBackend, version: &str, finish: bool) -> Result<
     let mut notes = Vec::new();
     for (i, target) in p.release_merges_to.iter().enumerate() {
         backend.checkout_branch(target)?;
-        backend.merge(&branch, true, &|_| {})?;
+        backend.merge(&branch, true, false, &|_| {})?;
         notes.push(format!("merged {branch} into {target}"));
         if i == 0 && p.tag_on_release {
             backend.create_tag(version, "")?;

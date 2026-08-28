@@ -483,7 +483,7 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_merge",
             "Merge a revision into the current branch (no_ff forces a merge commit).",
-            &[("rev", "string", true), ("no_ff", "boolean", false)],
+            &[("rev", "string", true), ("no_ff", "boolean", false), ("ff_only", "boolean", false)],
         ),
         tool(
             "git_rebase",
@@ -996,7 +996,7 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
                 backend.checkout_detached(rev)
             })
         }
-        "git_merge" => done(backend.merge(req("rev")?, flag("no_ff"), &|_| {})),
+        "git_merge" => done(backend.merge(req("rev")?, flag("no_ff"), flag("ff_only"), &|_| {})),
         "git_rebase" => done(backend.rebase_onto(req("onto")?, &|_| {})),
         "git_rebase_continue" => done(backend.rebase_continue()),
         "git_rebase_skip" => done(backend.rebase_skip()),

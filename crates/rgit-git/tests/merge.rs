@@ -83,7 +83,7 @@ fn fast_forward_merge_moves_the_branch_tip() {
     git(&dir, &["checkout", "-q", "main"]);
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    backend.merge("feature", false, &|_| {}).unwrap();
+    backend.merge("feature", false, false, &|_| {}).unwrap();
 
     assert_eq!(head(&dir), feature_tip, "main should fast-forward to feature");
     assert_eq!(parent_count(&dir, "HEAD"), 1, "ff merge has no merge commit");
@@ -107,7 +107,7 @@ fn no_ff_merge_creates_a_merge_commit() {
     let main_tip = head(&dir);
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    backend.merge("feature", true, &|_| {}).unwrap();
+    backend.merge("feature", true, false, &|_| {}).unwrap();
 
     let new_head = head(&dir);
     assert_ne!(new_head, feature_tip, "no-ff must not just fast-forward");
@@ -135,7 +135,7 @@ fn divergent_merge_combines_both_sides() {
     git(&dir, &["commit", "-qm", "main side"]);
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    backend.merge("feature", false, &|_| {}).unwrap();
+    backend.merge("feature", false, false, &|_| {}).unwrap();
 
     let new_head = head(&dir);
     assert_eq!(parent_count(&dir, &new_head), 2);
@@ -164,7 +164,7 @@ fn conflicting_merge_leaves_the_repo_mid_merge_and_resolve_picks_ours() {
     git(&dir, &["commit", "-qm", "main edit"]);
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    let result = backend.merge("feature", false, &|_| {});
+    let result = backend.merge("feature", false, false, &|_| {});
     assert!(result.is_err(), "conflicting content must fail the merge");
 
     let status = backend.status().unwrap();
@@ -201,7 +201,7 @@ fn dirty_worktree_refuses_fast_forward_without_clobbering() {
     std::fs::write(dir.join("f.txt"), "uncommitted\n").unwrap();
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    let result = backend.merge("feature", false, &|_| {});
+    let result = backend.merge("feature", false, false, &|_| {});
     assert!(result.is_err(), "dirty ff must be refused");
 
     assert_eq!(head(&dir), main_tip_before, "HEAD must not move");
