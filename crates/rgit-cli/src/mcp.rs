@@ -514,12 +514,12 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_cherry_pick",
             "Cherry-pick a commit onto HEAD.",
-            &[("rev", "string", true)],
+            &[("rev", "string", true), ("no_commit", "boolean", false)],
         ),
         tool(
             "git_revert",
             "Revert a commit on HEAD.",
-            &[("rev", "string", true)],
+            &[("rev", "string", true), ("no_commit", "boolean", false)],
         ),
         tool(
             "git_reset",
@@ -1042,8 +1042,8 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
         "git_rebase_continue" => done(backend.rebase_continue()),
         "git_rebase_skip" => done(backend.rebase_skip()),
         "git_rebase_abort" => done(backend.rebase_abort()),
-        "git_cherry_pick" => done(backend.cherry_pick(req("rev")?)),
-        "git_revert" => done(backend.revert(req("rev")?)),
+        "git_cherry_pick" => done(backend.cherry_pick(req("rev")?, flag("no_commit"))),
+        "git_revert" => done(backend.revert(req("rev")?, flag("no_commit"))),
         "git_reset" => {
             let mode = match s("mode").unwrap_or("mixed") {
                 "soft" => ResetMode::Soft,

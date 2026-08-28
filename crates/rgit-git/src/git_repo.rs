@@ -1455,19 +1455,26 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
-    fn cherry_pick(&self, rev: &str) -> Result<(), GitError> {
+    fn cherry_pick(&self, rev: &str, no_commit: bool) -> Result<(), GitError> {
         self.snap("cherry-pick");
         let repo = self.repo.lock().expect("repo mutex");
         let source = repo.revparse_single(rev)?.peel_to_commit()?;
         repo.cherrypick(&source, None)?;
+        if no_commit {
+            // Leave the change staged; the caller commits when ready.
+            return Ok(());
+        }
         finalize_sequenced(&repo, &source.author(), source.message().unwrap_or(""))
     }
 
-    fn revert(&self, rev: &str) -> Result<(), GitError> {
+    fn revert(&self, rev: &str, no_commit: bool) -> Result<(), GitError> {
         self.snap("revert");
         let repo = self.repo.lock().expect("repo mutex");
         let source = repo.revparse_single(rev)?.peel_to_commit()?;
         repo.revert(&source, None)?;
+        if no_commit {
+            return Ok(());
+        }
         let summary = source.summary().ok().flatten().unwrap_or("commit");
         let message = format!(
             "Revert \"{summary}\"\n\nThis reverts commit {}.",

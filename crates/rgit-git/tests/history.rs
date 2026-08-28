@@ -205,7 +205,7 @@ fn cherry_pick_applies_another_branch_commit_as_a_new_commit() {
     let before = head(&dir);
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    backend.cherry_pick(&feature_commit).unwrap();
+    backend.cherry_pick(&feature_commit, false).unwrap();
 
     let after = head(&dir);
     assert_ne!(after, before, "cherry-pick should create a new commit");
@@ -231,7 +231,7 @@ fn revert_undoes_a_commit_with_a_new_commit() {
     let b = head(&dir);
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    backend.revert("HEAD").unwrap();
+    backend.revert("HEAD", false).unwrap();
 
     let after = head(&dir);
     assert_ne!(after, b, "revert should create a new commit");

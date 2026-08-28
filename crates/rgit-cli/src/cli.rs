@@ -286,8 +286,12 @@ pub enum Command {
     },
     /// Rebase onto a revision, or continue/skip/abort an in-progress rebase.
     Rebase {
-        /// The branch or revision to rebase onto (prompted for if omitted).
+        /// The upstream to rebase onto (prompted for if omitted). With --onto,
+        /// this is the upstream whose commits after it are replayed.
         onto: Option<String>,
+        /// Replay commits after <upstream> onto this new base (git's --onto).
+        #[arg(long = "onto", value_name = "NEWBASE")]
+        onto_new: Option<String>,
         /// Interactive rebase: opens the todo editor (needs a terminal).
         #[arg(short = 'i', long = "interactive")]
         edit: bool,
@@ -332,11 +336,17 @@ pub enum Command {
     CherryPick {
         /// The commit to cherry-pick (prompted for if omitted on a terminal).
         rev: Option<String>,
+        /// Apply the change without committing (git's -n/--no-commit).
+        #[arg(short = 'n', long = "no-commit")]
+        no_commit: bool,
     },
     /// Revert a commit on HEAD.
     Revert {
         /// The commit to revert (prompted for if omitted on a terminal).
         rev: Option<String>,
+        /// Apply the inverse without committing (git's -n/--no-commit).
+        #[arg(short = 'n', long = "no-commit")]
+        no_commit: bool,
     },
     /// Branch management (no subcommand lists local branches).
     Branch {
@@ -1352,6 +1362,7 @@ pub fn run(
         }
         Command::Rebase {
             onto,
+            onto_new,
             edit,
             cont,
             skip,
@@ -1363,6 +1374,14 @@ pub fn run(
                 ok(backend.rebase_continue())
             } else if skip {
                 ok(backend.rebase_skip())
+            } else if let Some(newbase) = onto_new {
+                // `rebase --onto NEWBASE UPSTREAM`: replay UPSTREAM..HEAD onto NEWBASE.
+                let upstream = resolve(onto, "the upstream (after --onto NEWBASE)", &|| {
+                    crate::interactive::pick_branch(backend, "Replay commits after which upstream?")
+                })?;
+                net(interactive, "rebase", |r| {
+                    backend.rebase_range(&upstream, &newbase, r)
+                })?
             } else if edit {
                 if !interactive {
                     anyhow::bail!("interactive rebase needs a terminal");
@@ -1413,17 +1432,17 @@ pub fn run(
                 ok(backend.reset(&rev, mode))
             }
         }
-        Command::CherryPick { rev } => {
+        Command::CherryPick { rev, no_commit } => {
             let rev = resolve(rev, "a commit to cherry-pick", &|| {
                 crate::interactive::pick_commit(backend, "Cherry-pick which commit?")
             })?;
-            ok(backend.cherry_pick(&rev))
+            ok(backend.cherry_pick(&rev, no_commit))
         }
-        Command::Revert { rev } => {
+        Command::Revert { rev, no_commit } => {
             let rev = resolve(rev, "a commit to revert", &|| {
                 crate::interactive::pick_commit(backend, "Revert which commit?")
             })?;
-            ok(backend.revert(&rev))
+            ok(backend.revert(&rev, no_commit))
         }
         Command::Branch { cmd, all, remotes } => match cmd {
             None if remotes => backend.remote_branches()?.join("\n"),

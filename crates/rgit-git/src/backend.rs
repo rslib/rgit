@@ -387,10 +387,14 @@ pub trait GitBackend: Send + Sync {
     fn reset(&self, rev: &str, mode: crate::ResetMode) -> Result<(), GitError>;
 
     /// Cherry-pick `rev` onto HEAD, committing when there are no conflicts.
-    fn cherry_pick(&self, rev: &str) -> Result<(), GitError>;
+    /// Cherry-pick `rev` onto HEAD. With `no_commit` (git's `-n`), apply it to
+    /// the index and working tree without committing.
+    fn cherry_pick(&self, rev: &str, no_commit: bool) -> Result<(), GitError>;
 
     /// Revert `rev` on HEAD, committing when there are no conflicts.
-    fn revert(&self, rev: &str) -> Result<(), GitError>;
+    /// Revert `rev` on HEAD. With `no_commit` (git's `-n`), apply the inverse to
+    /// the index and working tree without committing.
+    fn revert(&self, rev: &str, no_commit: bool) -> Result<(), GitError>;
 
     /// Merge `rev` into the current branch. Fast-forwards when possible unless
     /// `no_ff` forces a merge commit. `report` receives git-style progress lines
