@@ -1381,6 +1381,10 @@ fn context_hints(app: &App) -> (Option<String>, Vec<(&'static str, &'static str)
             ],
         ),
         ViewKind::Info => (None, vec![("q", "back")]),
+        ViewKind::CodeSearch => (
+            Some("code search".into()),
+            vec![("⏎", "open file"), ("q", "back")],
+        ),
         ViewKind::Blame
         | ViewKind::Remotes
         | ViewKind::Worktrees

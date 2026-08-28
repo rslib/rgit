@@ -3601,6 +3601,7 @@ dependencies = [
  "ratatui",
  "reqwest",
  "rgit-git",
+ "rgit-index",
  "rgit-model",
  "serde",
  "serde_json",

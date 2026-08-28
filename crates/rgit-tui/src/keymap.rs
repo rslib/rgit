@@ -49,6 +49,8 @@ pub enum Command {
     RmFile,
     /// Rename/move the tracked file under the cursor (git mv).
     MvFile,
+    /// Search the codebase by meaning (and text), opening a results view.
+    CodeSearch,
 }
 
 impl Command {
@@ -91,6 +93,7 @@ impl Command {
             Command::SearchPrev => Msg::SearchPrev,
             Command::RmFile => Msg::RmAtCursor,
             Command::MvFile => Msg::MvAtCursor,
+            Command::CodeSearch => Msg::CodeSearchPrompt,
         }
     }
 
@@ -134,6 +137,7 @@ impl Command {
             "search-prev" => Command::SearchPrev,
             "rm" | "rm-file" => Command::RmFile,
             "mv" | "mv-file" => Command::MvFile,
+            "code-search" | "search-code" => Command::CodeSearch,
             _ => return None,
         })
     }
@@ -178,6 +182,7 @@ const DEFAULTS: &[(char, Command)] = &[
     ('N', Command::SearchPrev),
     ('D', Command::RmFile),
     ('R', Command::MvFile),
+    ('C', Command::CodeSearch),
 ];
 
 static KEYMAP: OnceLock<HashMap<char, Command>> = OnceLock::new();
@@ -366,6 +371,7 @@ pub fn leader_entries() -> Vec<(char, &'static str)> {
         ('O', "reset"),
         ('D', "rm file"),
         ('R', "mv file"),
+        ('C', "code search"),
         ('g', "refresh"),
         ('?', "help"),
     ]

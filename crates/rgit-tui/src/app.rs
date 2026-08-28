@@ -399,6 +399,18 @@ pub enum ViewKind {
     Stack,
     Lanes,
     Info,
+    CodeSearch,
+}
+
+/// One code-search result: a file location, its fused score, how it was found
+/// (text/semantic/both), and a one-line preview.
+#[derive(Debug, Clone)]
+pub struct CodeHit {
+    pub path: String,
+    pub line: usize,
+    pub score: f32,
+    pub tag: &'static str,
+    pub preview: String,
 }
 
 /// A backend operation that returns a status string, shown as a toast.
@@ -527,6 +539,10 @@ pub enum Msg {
     RmAtCursor,
     /// Rename the tracked file under the cursor (git mv); prompts for the name.
     MvAtCursor,
+    /// Prompt for a code-search query.
+    CodeSearchPrompt,
+    /// The results of a code search, ready to render.
+    CodeSearchResults(Result<Vec<CodeHit>, String>),
     ConfirmAccept,
     ConfirmCancel,
     CommitMenu,
@@ -1255,6 +1271,8 @@ pub enum PromptAction {
     SplitPaths,
     /// Rename `pending_move_from` to the path named by the prompt value.
     MoveFile,
+    /// Run a code search for the prompt value.
+    CodeSearch,
 }
 
 /// A minibuffer: a label, an editable input, and optional filterable candidates.
@@ -1650,6 +1668,8 @@ pub enum Effect {
     },
     /// Blame a file, then push the blame view.
     LoadBlame(String),
+    /// Run a code search (grep fused with the semantic index) for the query.
+    CodeSearch(String),
     /// Load all refs, then push the refs view.
     LoadRefs,
     /// Load the smartlog, then push the smartlog view.
@@ -2471,6 +2491,19 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 app.pending_move_from = Some(path.clone());
                 revision_prompt(app, &format!("Rename {path} to"), PromptAction::MoveFile);
             }
+        }
+        Msg::CodeSearchPrompt => {
+            revision_prompt(app, "Code search (meaning + text)", PromptAction::CodeSearch);
+        }
+        Msg::CodeSearchResults(Ok(hits)) => {
+            app.busy = None;
+            let mut buffer = Buffer::default();
+            buffer.set_content(build_code_search(&hits));
+            app.push_view(ViewKind::CodeSearch, buffer);
+        }
+        Msg::CodeSearchResults(Err(e)) => {
+            app.busy = None;
+            app.push_toast(ToastKind::Error, e);
         }
         Msg::ConfirmAccept => {
             if let Some(pending) = app.confirm.take() {
@@ -3401,6 +3434,13 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
                 },
             );
         }
+        PromptAction::CodeSearch => {
+            if value.trim().is_empty() {
+                return Vec::new();
+            }
+            app.busy = Some("searching".into());
+            return vec![Effect::CodeSearch(value)];
+        }
         // Reorder is two steps: pick the commit, then the target it moves before.
         PromptAction::ReorderRev => {
             if value.trim().is_empty() {
@@ -3518,6 +3558,7 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         | PromptAction::PushRemote
         | PromptAction::ReorderRev
         | PromptAction::SplitRev
+        | PromptAction::CodeSearch
         | PromptAction::Credential => {
             return Vec::new();
         }
@@ -3870,6 +3911,37 @@ fn build_smartlog(entries: &[SmartlogEntry]) -> Vec<Section> {
             }
             spans.push(Span::new(format!("  {}", e.when), Style::Dim));
             Section::leaf(format!("smartlog/{i}"), NodeKind::Info, spans)
+        })
+        .collect()
+}
+
+fn build_code_search(hits: &[CodeHit]) -> Vec<Section> {
+    use rgit_model::{NodeKind, Section, Span, Style, Target};
+    if hits.is_empty() {
+        return vec![Section::leaf(
+            "codesearch/empty",
+            NodeKind::Info,
+            vec![Span::new(
+                "no matches (build the index with `rgit index build` for meaning search)".to_owned(),
+                Style::Dim,
+            )],
+        )];
+    }
+    hits.iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let spans = vec![
+                Span::new(format!("{:.3}  ", h.score), Style::Dim),
+                Span::new(format!("{}:{}", h.path, h.line), Style::Hash),
+                Span::new(format!("  [{}]  ", h.tag), Style::Branch),
+                Span::new(h.preview.clone(), Style::Plain),
+            ];
+            Section::leaf(format!("codesearch/{i}"), NodeKind::Info, spans).with_target(
+                Target::File {
+                    path: h.path.clone(),
+                    staged: false,
+                },
+            )
         })
         .collect()
 }

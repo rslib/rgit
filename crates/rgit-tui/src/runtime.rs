@@ -575,6 +575,14 @@ async fn run_msg(
                     }
                 });
             }
+            Effect::CodeSearch(query) => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = code_search(&*backend, &query).map_err(|e| e.to_string());
+                    let _ = msg_tx.send(Msg::CodeSearchResults(result));
+                });
+            }
             Effect::LoadRefs => {
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
@@ -1232,6 +1240,87 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::RemovePath(path) => backend.remove_path(path, false),
         Mutation::MovePath { from, to } => backend.move_path(from, to, false),
     }
+}
+
+/// Fuse literal grep and semantic-index results with reciprocal-rank fusion,
+/// bucketed to the chunk window so a lexical and a semantic hit in the same
+/// region reinforce each other. History-boosts the semantic side, and degrades
+/// to grep when there is no index. Mirrors the CLI's `code_search`.
+fn code_search(
+    backend: &dyn GitBackend,
+    query: &str,
+) -> Result<Vec<crate::app::CodeHit>, GitError> {
+    use std::collections::HashMap;
+    const K: f64 = 60.0;
+    const CHUNK_STEP: usize = 30;
+    const POOL: usize = 40;
+
+    let semantic = match rgit_index::load(&rgit_index::index_path(backend.workdir())) {
+        Some(index) => {
+            let boost = backend
+                .file_activity(500)
+                .map(|a| rgit_git::activity_weights(&a))
+                .unwrap_or_default();
+            rgit_index::Embedder::new()
+                .and_then(|e| rgit_index::search_boosted(&index, &e, query, POOL, &boost, 0.5))
+                .unwrap_or_default()
+        }
+        None => Vec::new(),
+    };
+    let lexical = backend
+        .grep_query(&rgit_git::GrepQuery {
+            pattern: query.to_owned(),
+            regex: false,
+            path: None,
+            exts: Vec::new(),
+        })
+        .unwrap_or_default();
+
+    #[derive(Default)]
+    struct Fused {
+        score: f64,
+        lexical: bool,
+        semantic: bool,
+        line: usize,
+        preview: String,
+    }
+    let bucket = |line: usize| (line.saturating_sub(1) / CHUNK_STEP) * CHUNK_STEP + 1;
+    let mut acc: HashMap<(String, usize), Fused> = HashMap::new();
+    for (rank, m) in lexical.iter().enumerate().take(POOL) {
+        let e = acc.entry((m.path.clone(), bucket(m.line))).or_default();
+        e.score += 1.0 / (K + rank as f64);
+        e.lexical = true;
+        if e.line == 0 {
+            e.line = m.line;
+            e.preview = m.text.clone();
+        }
+    }
+    for (rank, h) in semantic.iter().enumerate() {
+        let e = acc.entry((h.path.clone(), bucket(h.start_line))).or_default();
+        e.score += 1.0 / (K + rank as f64);
+        e.semantic = true;
+        if e.line == 0 {
+            e.line = h.start_line;
+            e.preview = h.preview.lines().next().unwrap_or("").to_owned();
+        }
+    }
+    let mut hits: Vec<crate::app::CodeHit> = acc
+        .into_iter()
+        .map(|((path, _), f)| crate::app::CodeHit {
+            path,
+            line: f.line,
+            score: f.score as f32,
+            tag: match (f.lexical, f.semantic) {
+                (true, true) => "both",
+                (false, true) => "semantic",
+                _ => "text",
+            },
+            preview: f.preview,
+        })
+        .collect();
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    hits.truncate(30);
+    Ok(hits)
 }
 
 /// Check out the current branch's stacked child (`up`) or its parent, using the
