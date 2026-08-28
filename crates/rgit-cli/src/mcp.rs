@@ -779,6 +779,16 @@ fn tools() -> Vec<Tool> {
             &[("name", "string", true)],
         ),
         tool(
+            "git_remote_set_url",
+            "Change a remote's URL.",
+            &[("name", "string", true), ("url", "string", true)],
+        ),
+        tool(
+            "git_remote_rename",
+            "Rename a remote.",
+            &[("old", "string", true), ("new", "string", true)],
+        ),
+        tool(
             "git_worktree_add",
             "Create a linked worktree at `path` on a new branch `name`.",
             &[("name", "string", true), ("path", "string", true)],
@@ -1216,6 +1226,8 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
 
         "git_remote_add" => done(backend.add_remote(req("name")?, req("url")?)),
         "git_remote_remove" => done(backend.remove_remote(req("name")?)),
+        "git_remote_set_url" => done(backend.set_remote_url(req("name")?, req("url")?)),
+        "git_remote_rename" => done(backend.rename_remote(req("old")?, req("new")?)),
 
         "git_worktree_add" => done(backend.add_worktree(req("name")?, req("path")?)),
         "git_worktree_remove" => done(backend.remove_worktree(req("name")?)),

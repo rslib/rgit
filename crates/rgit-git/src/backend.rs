@@ -426,6 +426,12 @@ pub trait GitBackend: Send + Sync {
     /// Remove the remote named `name`.
     fn remove_remote(&self, name: &str) -> Result<(), GitError>;
 
+    /// Change a remote's fetch URL (git's `remote set-url`).
+    fn set_remote_url(&self, name: &str, url: &str) -> Result<(), GitError>;
+
+    /// Rename a remote and its tracking refs (git's `remote rename`).
+    fn rename_remote(&self, old: &str, new: &str) -> Result<(), GitError>;
+
     /// Linked worktrees, sorted by name.
     fn worktrees(&self) -> Result<Vec<crate::Worktree>, GitError>;
 

@@ -616,6 +616,20 @@ pub enum RemoteCmd {
         /// The remote name.
         name: String,
     },
+    /// Change a remote's URL.
+    SetUrl {
+        /// The remote name.
+        name: String,
+        /// The new URL.
+        url: String,
+    },
+    /// Rename a remote.
+    Rename {
+        /// The current remote name.
+        old: String,
+        /// The new remote name.
+        new: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1496,6 +1510,8 @@ pub fn run(
             None => render::remotes(&backend.remotes()?),
             Some(RemoteCmd::Add { name, url }) => ok(backend.add_remote(&name, &url)),
             Some(RemoteCmd::Remove { name }) => ok(backend.remove_remote(&name)),
+            Some(RemoteCmd::SetUrl { name, url }) => ok(backend.set_remote_url(&name, &url)),
+            Some(RemoteCmd::Rename { old, new }) => ok(backend.rename_remote(&old, &new)),
         },
         Command::Flow { cmd } => match cmd {
             FlowCmd::Init { preset } => rgit_git::workflow::init(backend.as_ref(), &preset)?,

@@ -1676,6 +1676,19 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn set_remote_url(&self, name: &str, url: &str) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        repo.remote_set_url(name, url)?;
+        Ok(())
+    }
+
+    fn rename_remote(&self, old: &str, new: &str) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        // Returns the list of non-default refspecs it could not rename; ignore it.
+        repo.remote_rename(old, new)?;
+        Ok(())
+    }
+
     fn worktrees(&self) -> Result<Vec<crate::Worktree>, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let names = repo.worktrees()?;
