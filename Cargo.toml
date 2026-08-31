@@ -24,3 +24,11 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 octocrab = "0.44"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 toml = "0.8"
+
+# Release/install builds only (dev debug builds are untouched). A smaller binary
+# makes the one-time macOS code-signature check on first launch - the "slow
+# startup" - noticeably faster, and cuts cold page-in too.
+[profile.release]
+strip = true        # drop symbols
+lto = "fat"         # dead-code elimination + cross-crate inlining
+codegen-units = 1   # smaller, better-optimized code (slower release compile)
