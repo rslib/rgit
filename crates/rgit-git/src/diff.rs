@@ -2,6 +2,9 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
     pub path: String,
+    /// The source path when this file was renamed or copied (rename detection
+    /// on); `None` for a plain add/modify/delete. `path` is always the new side.
+    pub old_path: Option<String>,
     pub hunks: Vec<Hunk>,
     pub binary: bool,
 }

@@ -194,10 +194,14 @@ const TICK_HZ: f64 = 4.0;
 const FRAME_HZ: f64 = 30.0;
 
 /// Run the TUI to completion, restoring the terminal on exit.
-pub async fn run(backend: Arc<dyn GitBackend>) -> std::io::Result<()> {
+pub async fn run(backend: Arc<dyn GitBackend>, no_preview: bool) -> std::io::Result<()> {
     // Load config before touching the terminal so the theme is in place for the
     // very first frame; a config error is shown in-app, not fatal.
-    let (config, config_error) = crate::config::load();
+    let (mut config, config_error) = crate::config::load();
+    // The CLI flag is a hard override of the config toggle.
+    if no_preview {
+        config.ui.preview = false;
+    }
     crate::theme::init(crate::theme::Theme::from_config(&config.theme));
     crate::keymap::init(&config.keys, config.profile.as_deref());
     rgit_model::set_side_by_side(config.ui.side_by_side);
@@ -275,7 +279,26 @@ async fn event_loop(
         let redraw = match incoming {
             Incoming::Event(Event::Resize) => true,
             Incoming::Event(Event::Key(key)) => {
-                let msg = if app.prompt.is_some() {
+                // Emacs `C-x o` prefix chord: only in a normal buffer, never while
+                // a text-input overlay owns the keyboard.
+                let text_overlay = app.prompt.is_some()
+                    || app.palette.is_some()
+                    || app.code_finder.is_some()
+                    || app.search.is_some()
+                    || app.commit_editor.is_some();
+                let msg = if app.ctrl_x_pending {
+                    app.ctrl_x_pending = false;
+                    // The follow-up key resolves against the binding map (C-x o).
+                    keymap::resolve_prefixed(key)
+                } else if !text_overlay
+                    && key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                    && key.code == crossterm::event::KeyCode::Char('x')
+                {
+                    app.ctrl_x_pending = true;
+                    None
+                } else if app.prompt.is_some() {
                     // A minibuffer prompt is modal input; it takes priority even
                     // over the operation console (a credential prompt opens while
                     // a push/pull is running in the console).
@@ -570,15 +593,30 @@ async fn run_msg(
                     let _ = msg_tx.send(Msg::PreviewBuilt { key, sections });
                 });
             }
-            Effect::OpenInEditor { path, line } => {
-                // Hand the terminal to $EDITOR at the line, then take it back,
-                // the same suspend/resume the commit editor uses.
+            Effect::OpenInEditor { path, line, col } => {
+                // Best-effort: a diff line from a commit may name a file that has
+                // since moved or shrunk. Skip if it is gone, and clamp the line to
+                // the file's current length so the editor lands somewhere sane.
                 let full = app.backend().workdir().join(&path);
+                let line = match std::fs::read_to_string(&full) {
+                    Ok(text) => line.min(text.lines().count().max(1)),
+                    Err(_) => {
+                        app.push_toast(
+                            crate::app::ToastKind::Error,
+                            format!("{path} is not in the working tree"),
+                        );
+                        continue;
+                    }
+                };
+                // Hand the terminal to $EDITOR at the line/column, then take it
+                // back, the same suspend/resume the commit editor uses.
                 events.pause();
                 ratatui::restore();
                 let editor = editor_command();
-                let opened =
-                    tokio::task::spawn_blocking(move || run_editor_at(&editor, &full, line)).await;
+                let opened = tokio::task::spawn_blocking(move || {
+                    run_editor_at(&editor, &full, line, col)
+                })
+                .await;
                 *terminal = ratatui::init();
                 events.resume();
                 if !matches!(opened, Ok(Ok(true))) {
@@ -597,9 +635,11 @@ async fn run_msg(
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    if let Ok(lines) = backend.blame(&path) {
-                        let _ = msg_tx.send(Msg::BlameLoaded { path, lines });
-                    }
+                    let msg = match backend.blame(&path) {
+                        Ok(lines) => Msg::BlameLoaded { path, lines },
+                        Err(e) => Msg::BlameFailed(e.to_string()),
+                    };
+                    let _ = msg_tx.send(msg);
                 });
             }
             Effect::CodeSearchLive(query) => {
@@ -1254,6 +1294,8 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::RenameBranch { old, new } => backend.rename_branch(old, new),
         Mutation::AddRemote { name, url } => backend.add_remote(name, url),
         Mutation::RemoveRemote(name) => backend.remove_remote(name),
+        Mutation::SetRemoteUrl { name, url } => backend.set_remote_url(name, url),
+        Mutation::RenameRemote { old, new } => backend.rename_remote(old, new),
         Mutation::AddWorktree { name, path } => backend.add_worktree(name, path),
         Mutation::RemoveWorktree(name) => backend.remove_worktree(name, false),
         Mutation::Extend => backend.commit_extend(),
@@ -1531,15 +1573,44 @@ fn run_editor(editor: &str, path: &Path) -> std::io::Result<bool> {
 /// Open `path` in `editor` at `line`. The `+<line>` argument is understood by
 /// vim, nvim, emacs, nano, and most terminal editors; it degrades to opening the
 /// file at the top for the few that ignore it.
-fn run_editor_at(editor: &str, path: &Path, line: usize) -> std::io::Result<bool> {
-    let line = line.max(1);
+fn run_editor_at(editor: &str, path: &Path, line: usize, col: usize) -> std::io::Result<bool> {
     let status = std::process::Command::new("sh")
         .arg("-c")
-        .arg(format!("{editor} +{line} \"$1\""))
+        .arg(editor_open_command(editor, line.max(1), col.max(1)))
         .arg("sh")
         .arg(path)
         .status()?;
     Ok(status.success())
+}
+
+/// The shell command that opens `$1` at `line`:`col`, using each known editor's
+/// own jump syntax; unknown editors fall back to the near-universal `+line`
+/// (column dropped), which vi, nano, emacs, and most others accept.
+fn editor_open_command(editor: &str, line: usize, col: usize) -> String {
+    // Match on the program name (first word of $EDITOR), ignoring any flags.
+    let prog = editor
+        .split_whitespace()
+        .next()
+        .and_then(|p| p.rsplit(['/', '\\']).next())
+        .unwrap_or(editor);
+    match prog {
+        // VS Code / derivatives: `-g file:line:col`.
+        "code" | "code-insiders" | "codium" | "cursor" | "windsurf" => {
+            format!("{editor} -g \"$1\":{line}:{col}")
+        }
+        // Vim family: set the cursor to line/column after opening.
+        "vim" | "nvim" | "vi" | "view" | "gvim" => {
+            format!("{editor} \"+call cursor({line},{col})\" \"$1\"")
+        }
+        // Emacs accepts `+line:col`.
+        "emacs" | "emacsclient" => format!("{editor} +{line}:{col} \"$1\""),
+        // Nano uses `+line,col`.
+        "nano" => format!("{editor} +{line},{col} \"$1\""),
+        // Helix uses `file:line`.
+        "hx" | "helix" => format!("{editor} \"$1\":{line}"),
+        // Universal fallback: line only.
+        _ => format!("{editor} +{line} \"$1\""),
+    }
 }
 
 fn strip_comments(raw: &str) -> String {
@@ -1595,8 +1666,29 @@ fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, grep_hits, restack_note, snippet_sections};
+    use super::{base64_encode, editor_open_command, grep_hits, restack_note, snippet_sections};
     use rgit_git::RestackOutcome;
+
+    #[test]
+    fn editor_open_command_uses_each_editors_jump_syntax() {
+        assert_eq!(
+            editor_open_command("nvim", 12, 5),
+            "nvim \"+call cursor(12,5)\" \"$1\""
+        );
+        assert_eq!(editor_open_command("emacs", 12, 5), "emacs +12:5 \"$1\"");
+        assert_eq!(editor_open_command("nano", 12, 5), "nano +12,5 \"$1\"");
+        assert_eq!(
+            editor_open_command("code --wait", 12, 5),
+            "code --wait -g \"$1\":12:5"
+        );
+        // A full path to the program still matches on its basename.
+        assert_eq!(
+            editor_open_command("/usr/bin/vim", 3, 1),
+            "/usr/bin/vim \"+call cursor(3,1)\" \"$1\""
+        );
+        // Unknown editors fall back to the universal `+line` (column dropped).
+        assert_eq!(editor_open_command("ed", 7, 2), "ed +7 \"$1\"");
+    }
 
     fn temp_repo(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("rgit-finder-{}-{tag}", std::process::id()));

@@ -37,6 +37,41 @@ fn clone_base() -> Option<&'static str> {
     CLONE_BASE.get().and_then(|o| o.as_deref())
 }
 
+/// One MCP tool for the human-readable `/agent` reference page. Populated by the
+/// CLI (which owns the tool catalog) via [`set_mcp_tools`] before serving.
+#[derive(Debug, Clone)]
+pub struct McpTool {
+    pub name: String,
+    pub description: String,
+    /// True for a mutating tool: available over stdio, disabled on the read-only
+    /// HTTP endpoint.
+    pub writes: bool,
+    pub args: Vec<McpArg>,
+}
+
+/// One argument of an [`McpTool`].
+#[derive(Debug, Clone)]
+pub struct McpArg {
+    pub name: String,
+    pub ty: String,
+    pub required: bool,
+}
+
+static MCP_TOOLS: OnceLock<Vec<McpTool>> = OnceLock::new();
+
+/// Register the MCP tool catalog rendered on `/agent`. Call once before serving.
+pub fn set_mcp_tools(tools: Vec<McpTool>) {
+    let _ = MCP_TOOLS.set(tools);
+}
+
+fn mcp_tools() -> &'static [McpTool] {
+    MCP_TOOLS.get().map(Vec::as_slice).unwrap_or(&[])
+}
+
+async fn agent_page() -> Markup {
+    view::agent_tools(mcp_tools())
+}
+
 /// Repo metadata for the sidebar: branch/tag counts, a clone URL, and a
 /// description from `.git/description` if the repo set one.
 fn side_info(b: &dyn GitBackend, base: &str, repo: &str) -> view::SideInfo {
@@ -1100,6 +1135,7 @@ fn single_router(state: Shared) -> Router {
         .route("/prs", get(s_prs))
         .route("/search", get(s_search))
         .route("/semantic", get(s_semantic))
+        .route("/agent", get(agent_page))
         .route("/api/repos", get(g_repos))
         .with_state(state)
 }
@@ -1107,6 +1143,7 @@ fn single_router(state: Shared) -> Router {
 fn multi_router(state: Shared) -> Router {
     Router::new()
         .route("/", get(m_index))
+        .route("/agent", get(agent_page))
         .route("/search", get(g_search))
         .route("/semantic", get(g_semantic))
         .route("/api/repos", get(g_repos))
@@ -1154,12 +1191,13 @@ pub async fn serve(
     repo: String,
     addr: SocketAddr,
     clone_base: Option<String>,
+    mcp: Option<Router>,
 ) -> std::io::Result<()> {
     let _ = CLONE_BASE.set(clone_base);
     let state = Arc::new(AppState {
         repos: Repos::Single { backend, name: repo },
     });
-    run(single_router(state), addr).await
+    run(with_mcp(single_router(state), mcp), addr).await
 }
 
 /// Serve every repo under a managed root (index at `/`, repos at `/{repo}/...`).
@@ -1167,12 +1205,22 @@ pub async fn serve_root(
     root: PathBuf,
     addr: SocketAddr,
     clone_base: Option<String>,
+    mcp: Option<Router>,
 ) -> std::io::Result<()> {
     let _ = CLONE_BASE.set(clone_base);
     let state = Arc::new(AppState {
         repos: Repos::Multi(Registry::new(root)),
     });
-    run(multi_router(state), addr).await
+    run(with_mcp(multi_router(state), mcp), addr).await
+}
+
+/// Merge the optional MCP router (POST /mcp) into the site router. The caller
+/// (rgit-cli) owns the MCP handler, so it is passed in rather than built here.
+fn with_mcp(router: Router, mcp: Option<Router>) -> Router {
+    match mcp {
+        Some(mcp) => router.merge(mcp),
+        None => router,
+    }
 }
 
 #[cfg(test)]

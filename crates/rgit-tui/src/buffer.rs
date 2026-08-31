@@ -161,11 +161,14 @@ impl Buffer {
             if row.foldable {
                 continue;
             }
+            // Only working-tree hunks (staged = Some) are stageable; a read-only
+            // diff (a commit or diff between revs) has no staging.
             let Some(Target::Hunk {
                 path,
                 new_start,
-                staged,
-            }) = row.target
+                staged: Some(staged),
+                ..
+            }) = &row.target
             else {
                 continue;
             };
@@ -187,6 +190,26 @@ impl Buffer {
             }
         }
         sel.filter(|s| !s.lines.is_empty())
+    }
+
+    /// The diff line under the cursor, as `(path, new-side file line, caret
+    /// column)`. `None` unless the cursor is on a diff line (a leaf carrying a
+    /// `Target::Hunk`). The file line rides in the target, so this works in every
+    /// diff view (status, commit, diff) through one code path.
+    pub fn cursor_diff_line(&self) -> Option<(String, u32, usize)> {
+        let row = self.rows().nth(self.cursor)?;
+        if row.foldable {
+            return None;
+        }
+        let Target::Hunk { path, line, .. } = row.target? else {
+            return None;
+        };
+        Some((path.clone(), *line, self.col))
+    }
+
+    /// Whether the row under the cursor can fold (a file or section header).
+    pub fn cursor_is_foldable(&self) -> bool {
+        self.rows().nth(self.cursor).is_some_and(|r| r.foldable)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -684,7 +707,8 @@ mod tests {
         let target = Target::Hunk {
             path: "a".into(),
             new_start: 1,
-            staged: false,
+            line: 1,
+            staged: Some(false),
         };
         let lines = (0..3)
             .map(|j| {

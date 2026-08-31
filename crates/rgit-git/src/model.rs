@@ -594,6 +594,9 @@ pub struct CommitDetails {
 #[derive(Debug, Clone)]
 pub struct CommitFile {
     pub path: String,
+    /// The source path when the file was renamed or copied in this commit;
+    /// `None` otherwise. `path` is always the new side.
+    pub old_path: Option<String>,
     pub additions: usize,
     pub deletions: usize,
     pub binary: bool,

@@ -29,34 +29,138 @@ use rmcp::{
 /// `repo` argument, defaulting to the repo the server was started in.
 struct RgitMcp {
     registry: Registry,
+    /// When true (the HTTP transport, mirroring the read-only web viewer), only
+    /// inspection tools are listed and any mutating tool is refused. Stdio
+    /// (`rgit mcp`, run locally by the user) is never read-only.
+    read_only: bool,
 }
 
-/// Maps a tool call's `repo` argument to a backend. Empty/absent uses the repo
-/// the server started in; a value opens another repo on demand (cached).
+/// Tools that only inspect the repository - safe to expose over the read-only
+/// HTTP endpoint. Everything not listed mutates state (or the network) and is
+/// hidden and refused in read-only mode. New tools default to write (hidden)
+/// until explicitly added here.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "git_status",
+    "git_log",
+    "git_diff",
+    "git_show",
+    "git_blame",
+    "git_refs",
+    "git_tree",
+    "git_blob",
+    "git_files",
+    "git_grep",
+    "git_remotes",
+    "git_worktrees",
+    "git_describe",
+    "git_smartlog",
+    "git_oplog",
+    "git_stashes",
+    "git_branches",
+    "git_lanes_list",
+    "git_stack_list",
+    "git_workspace_list",
+    "git_flow_status",
+];
+
+/// Whether a tool only reads (may be served over the read-only HTTP endpoint).
+fn is_read_only(name: &str) -> bool {
+    READ_ONLY_TOOLS.contains(&name)
+}
+
+/// How a tool call's `repo` argument is resolved to a backend. The mode is
+/// chosen by transport: stdio is local and trusted, HTTP never is.
+enum Mode {
+    /// Local stdio (`rgit mcp`): `repo` is any filesystem path the process can
+    /// read. Safe because the user runs it in their own shell; never used over
+    /// the network.
+    LocalPath { default: Arc<dyn GitBackend> },
+    /// HTTP single-repo serve: only the one served repo, addressed by an empty
+    /// `repo` or its exact name. No path is ever accepted from the client.
+    Single {
+        name: String,
+        backend: Arc<dyn GitBackend>,
+    },
+    /// HTTP multi-repo serve (`--root`): `repo` is the name of a directory under
+    /// the root and may not escape it; no default repo.
+    Rooted { root: std::path::PathBuf },
+}
+
+/// Maps a tool call's `repo` argument to a backend, per the active [`Mode`].
 struct Registry {
-    default: Arc<dyn GitBackend>,
+    mode: Mode,
     cache: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Arc<dyn GitBackend>>>,
 }
 
 impl Registry {
+    /// Local stdio resolver: trusts arbitrary filesystem paths. NEVER mount this
+    /// over HTTP - use [`single`](Self::single) or [`rooted`](Self::rooted).
     fn new(default: Arc<dyn GitBackend>) -> Self {
+        Self::with_mode(Mode::LocalPath { default })
+    }
+
+    /// HTTP single-repo resolver: the client may address only the served repo by
+    /// name (or an empty `repo`); no filesystem paths are honored.
+    fn single(name: String, backend: Arc<dyn GitBackend>) -> Self {
+        Self::with_mode(Mode::Single { name, backend })
+    }
+
+    /// HTTP multi-repo resolver: `repo` names a directory under `root`, confined
+    /// to it. There is no default, so every call must name a repo.
+    fn rooted(root: std::path::PathBuf) -> Self {
+        Self::with_mode(Mode::Rooted { root })
+    }
+
+    fn with_mode(mode: Mode) -> Self {
         Self {
-            default,
+            mode,
             cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
-    /// Resolve the `repo` argument to a backend. NOTE: this is the local, trusted
-    /// resolver - a value is treated as a filesystem path. A hosted server must
-    /// replace it with name-within-a-managed-root lookup plus access control, and
-    /// never accept arbitrary paths.
     fn resolve(&self, repo: Option<&str>) -> Result<Arc<dyn GitBackend>, String> {
-        let path = match repo {
-            None => return Ok(self.default.clone()),
-            Some(p) if p.trim().is_empty() => return Ok(self.default.clone()),
-            Some(p) => p,
-        };
-        let canon = std::fs::canonicalize(path).map_err(|e| format!("no such repo {path:?}: {e}"))?;
+        let asked = repo.map(str::trim).filter(|s| !s.is_empty());
+        match &self.mode {
+            Mode::LocalPath { default } => match asked {
+                None => Ok(default.clone()),
+                Some(path) => self.open(std::path::PathBuf::from(path), path, None),
+            },
+            Mode::Single { name, backend } => match asked {
+                None => Ok(backend.clone()),
+                Some(n) if n == name => Ok(backend.clone()),
+                Some(n) => Err(format!(
+                    "unknown repo {n:?}: this server serves only {name:?}"
+                )),
+            },
+            Mode::Rooted { root } => match asked {
+                None => Err(
+                    "no default repo: this server was started with --root, so every call must set `repo`"
+                        .to_owned(),
+                ),
+                // A single path segment only: no separators, no parent refs.
+                Some(n) if n.contains('/') || n.contains('\\') || n.contains("..") => {
+                    Err(format!("invalid repo name {n:?}: expected a name under the root"))
+                }
+                Some(n) => self.open(root.join(n), n, Some(root)),
+            },
+        }
+    }
+
+    /// Canonicalize, optionally confine under `root`, then discover and cache.
+    fn open(
+        &self,
+        target: std::path::PathBuf,
+        name: &str,
+        confine: Option<&std::path::PathBuf>,
+    ) -> Result<Arc<dyn GitBackend>, String> {
+        let canon =
+            std::fs::canonicalize(&target).map_err(|e| format!("no such repo {name:?}: {e}"))?;
+        if let Some(root) = confine {
+            let root_canon = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+            if !canon.starts_with(&root_canon) {
+                return Err(format!("repo {name:?} is outside the served root"));
+            }
+        }
         if let Some(b) = self.cache.lock().expect("registry mutex").get(&canon) {
             return Ok(b.clone());
         }
@@ -97,11 +201,57 @@ pub fn serve(backend: Arc<dyn GitBackend>) -> i32 {
 async fn run(backend: Arc<dyn GitBackend>) -> anyhow::Result<()> {
     let service = RgitMcp {
         registry: Registry::new(backend),
+        // Local stdio, run by the user in their own shell: full read/write.
+        read_only: false,
     }
     .serve(stdio())
     .await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// An axum router exposing the same MCP surface over HTTP (POST /mcp, Streamable
+/// HTTP) so a running `rgit serve` feeds both the browser and agents. Confined
+/// to the one served repo, addressed by `name` or an empty `repo` - the client
+/// can never open an arbitrary filesystem path over the network.
+pub fn http_router(name: String, backend: Arc<dyn GitBackend>) -> axum::Router {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpService, session::local::LocalSessionManager,
+    };
+    // Plain text only over the wire, never ANSI color.
+    crate::render::set_color(false);
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(RgitMcp {
+                registry: Registry::single(name.clone(), backend.clone()),
+                // Network endpoint mirroring the read-only web viewer.
+                read_only: true,
+            })
+        },
+        Arc::new(LocalSessionManager::default()),
+        Default::default(),
+    );
+    axum::Router::new().nest_service("/mcp", service)
+}
+
+/// Like [`http_router`] but for a managed root serving many repos: there is no
+/// default repo, so each tool call names one via `repo` (resolved under `root`).
+pub fn http_router_rooted(root: std::path::PathBuf) -> axum::Router {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpService, session::local::LocalSessionManager,
+    };
+    crate::render::set_color(false);
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(RgitMcp {
+                registry: Registry::rooted(root.clone()),
+                read_only: true,
+            })
+        },
+        Arc::new(LocalSessionManager::default()),
+        Default::default(),
+    );
+    axum::Router::new().nest_service("/mcp", service)
 }
 
 impl ServerHandler for RgitMcp {
@@ -163,7 +313,11 @@ impl ServerHandler for RgitMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(tools()))
+        let mut items = tools();
+        if self.read_only {
+            items.retain(|t| is_read_only(&t.name));
+        }
+        Ok(ListToolsResult::with_all_items(items))
     }
 
     async fn call_tool(
@@ -172,6 +326,13 @@ impl ServerHandler for RgitMcp {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
+        // The read-only endpoint refuses mutating tools outright.
+        if self.read_only && !is_read_only(&name) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                "{name} is a write operation and is disabled on this read-only endpoint; run `rgit mcp` (stdio) for full access"
+            ))])
+            .into());
+        }
         let args = Value::Object(request.arguments.unwrap_or_default());
         let backend = match self
             .registry
@@ -302,6 +463,57 @@ fn schema(props: &[(&str, &str, bool)]) -> Map<String, Value> {
 
 fn tool(name: &'static str, description: &'static str, props: &[(&str, &str, bool)]) -> Tool {
     Tool::new(name, description, schema(props))
+}
+
+/// The tool catalog as plain data for the web `/agent` reference page, derived
+/// from the same [`tools`] declarations the MCP server serves. The implicit
+/// `repo` argument is dropped here (the page documents it once, globally).
+pub fn tool_catalog() -> Vec<rgit_web::McpTool> {
+    tools()
+        .into_iter()
+        .map(|t| {
+            let required: std::collections::HashSet<String> = t
+                .input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut args: Vec<rgit_web::McpArg> = t
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|props| {
+                    props
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != "repo")
+                        .map(|(k, v)| rgit_web::McpArg {
+                            name: k.clone(),
+                            ty: v
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_owned(),
+                            required: required.contains(k),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Required args first, then alphabetical, for a stable readable order.
+            args.sort_by(|a, b| b.required.cmp(&a.required).then_with(|| a.name.cmp(&b.name)));
+            let name = t.name.to_string();
+            let writes = !is_read_only(&name);
+            rgit_web::McpTool {
+                name,
+                description: t.description.map(|d| d.to_string()).unwrap_or_default(),
+                writes,
+                args,
+            }
+        })
+        .collect()
 }
 
 /// The full tool catalog, mirroring the CLI surface.

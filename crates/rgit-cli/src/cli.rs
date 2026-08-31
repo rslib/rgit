@@ -27,6 +27,11 @@ pub struct Cli {
     /// Never prompt; error if a required argument is missing (for scripts/agents).
     #[arg(long, global = true)]
     pub no_input: bool,
+
+    /// Open the TUI without the side preview pane (single column). Handy when
+    /// embedding rgit in a narrow editor split. Overrides `ui.preview`.
+    #[arg(long)]
+    pub no_preview: bool,
 }
 
 #[derive(Subcommand)]

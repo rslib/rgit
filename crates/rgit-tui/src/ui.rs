@@ -115,7 +115,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let [body, action] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
     // When there's room, status and log views split into a navigator and a live
     // preview of the file/commit under the cursor; otherwise a single column.
-    let wide = body.width >= 100 && matches!(app.active_kind(), ViewKind::Status | ViewKind::Log);
+    // List views whose rows point at previewable content (files, commits, refs)
+    // get the side preview; detail views (Diff, Commit, Blame) fill the width.
+    let previewable_view = matches!(
+        app.active_kind(),
+        ViewKind::Status
+            | ViewKind::Log
+            | ViewKind::Smartlog
+            | ViewKind::Stack
+            | ViewKind::Refs
+    );
+    let wide = app.preview_enabled && body.width >= 100 && previewable_view;
     let [nav, prev] =
         Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(body);
     let has_preview = wide && app.refresh_preview(prev.height.saturating_sub(1) as usize);
@@ -338,8 +348,6 @@ fn render_hook_console(
     area: Rect,
 ) {
     use crate::app::HookStatus;
-    let width = 96.min(area.width.saturating_sub(2));
-    let height = 24.min(area.height.saturating_sub(2)).max(6);
     let name = &console.title;
     let (title, title_style) = match console.status {
         HookStatus::Running => (
@@ -358,9 +366,16 @@ fn render_hook_console(
         ),
     };
 
-    dim_background(frame, area);
-    let rect = centered_rect(width, height, area);
-    draw_shadow(frame, rect);
+    // Dock the console as a full-width pane along the bottom, like an editor's
+    // integrated terminal - more intuitive for streaming output than a centered
+    // popup, and it leaves the view above visible.
+    let height = (area.height * 2 / 5).clamp(8, 18).min(area.height.saturating_sub(1));
+    let rect = Rect {
+        x: area.x,
+        y: area.y + area.height.saturating_sub(height),
+        width: area.width,
+        height,
+    };
     frame.render_widget(Clear, rect);
     let border = match console.status {
         HookStatus::Failed => theme::resolve(Style::Deleted),
@@ -413,11 +428,18 @@ fn render_hook_console(
     let dim = theme::resolve(Style::Dim);
     let footer_line = match console.status {
         HookStatus::Running => Line::from(RSpan::styled(" working…", dim)),
-        _ => Line::from(vec![
+        // Retry only applies to a failed run; a held success just dismisses.
+        HookStatus::Failed => Line::from(vec![
             RSpan::styled(" e ", keycap_style()),
             RSpan::styled(" retry   ", dim),
             RSpan::styled(" q ", keycap_style()),
             RSpan::styled(" dismiss   ", dim),
+            RSpan::styled("j/k", accent),
+            RSpan::styled(" scroll", dim),
+        ]),
+        HookStatus::Passed => Line::from(vec![
+            RSpan::styled(" q ", keycap_style()),
+            RSpan::styled(" close   ", dim),
             RSpan::styled("j/k", accent),
             RSpan::styled(" scroll", dim),
         ]),
@@ -466,10 +488,16 @@ fn render_code_finder(frame: &mut Frame, app: &App, input_area: Rect, list_area:
             f.hits.len()
         )
     };
+    // Split the query at the caret so it renders between the two halves.
+    let chars: Vec<char> = f.input.chars().collect();
+    let at = f.cursor.min(chars.len());
+    let before: String = chars[..at].iter().collect();
+    let after: String = chars[at..].iter().collect();
     let input_line = Line::from(vec![
         RSpan::styled("code › ", RStyle::default().fg(theme::accent())),
-        RSpan::raw(f.input.clone()),
-        RSpan::styled("▏", RStyle::default().fg(theme::accent())),
+        RSpan::raw(before),
+        RSpan::styled("\u{258f}", RStyle::default().fg(theme::accent())),
+        RSpan::raw(after),
         RSpan::styled(hint, theme::resolve(Style::Dim)),
     ]);
     frame.render_widget(Paragraph::new(input_line), input_area);
@@ -515,10 +543,16 @@ fn render_palette(frame: &mut Frame, palette: &crate::app::Palette, area: Rect) 
     let [input_area, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
 
+    // Split the query at the caret so it renders between the two halves.
+    let pchars: Vec<char> = palette.input.chars().collect();
+    let pat = palette.cursor.min(pchars.len());
+    let pbefore: String = pchars[..pat].iter().collect();
+    let pafter: String = pchars[pat..].iter().collect();
     let input_line = Line::from(vec![
         RSpan::styled("› ", RStyle::default().fg(theme::accent())),
-        RSpan::raw(palette.input.clone()),
-        RSpan::styled("▏", RStyle::default().fg(theme::accent())),
+        RSpan::raw(pbefore),
+        RSpan::styled("\u{258f}", RStyle::default().fg(theme::accent())),
+        RSpan::raw(pafter),
     ]);
     frame.render_widget(Paragraph::new(input_line), input_area);
 
@@ -1393,12 +1427,23 @@ fn context_hints(app: &App) -> (Option<String>, Vec<(&'static str, &'static str)
             Some(Target::File { path, staged: true }) => {
                 (Some(path), vec![("u", "unstage"), ("⏎", "diff")])
             }
-            Some(Target::Hunk { staged: false, .. }) => (
+            Some(Target::Hunk {
+                staged: Some(false),
+                ..
+            }) => (
                 Some("hunk".into()),
-                vec![("s", "stage"), ("v", "lines"), ("x", "discard")],
+                vec![("s", "stage"), ("v", "lines"), ("⏎", "editor"), ("x", "discard")],
             ),
-            Some(Target::Hunk { staged: true, .. }) => {
-                (Some("hunk".into()), vec![("u", "unstage")])
+            Some(Target::Hunk {
+                staged: Some(true),
+                ..
+            }) => (
+                Some("hunk".into()),
+                vec![("u", "unstage"), ("⏎", "editor")],
+            ),
+            // A read-only diff hunk (commit / diff view): open the file at the line.
+            Some(Target::Hunk { staged: None, .. }) => {
+                (Some("hunk".into()), vec![("⏎", "editor")])
             }
             Some(Target::Stash { .. }) => (
                 Some("stash".into()),
@@ -1462,11 +1507,10 @@ fn context_hints(app: &App) -> (Option<String>, Vec<(&'static str, &'static str)
             ],
         ),
         ViewKind::Info => (None, vec![("q", "back")]),
-        ViewKind::Blame
-        | ViewKind::Remotes
-        | ViewKind::Worktrees
-        | ViewKind::Forge
-        | ViewKind::Review => (None, vec![("q", "back")]),
+        ViewKind::Blame => (None, vec![("^o", "editor"), ("q", "back")]),
+        ViewKind::Remotes | ViewKind::Worktrees | ViewKind::Forge | ViewKind::Review => {
+            (None, vec![("q", "back")])
+        }
     }
 }
 
@@ -1476,6 +1520,11 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
         "Navigation",
         &[
             ("j / k · ^n / ^p", "move down / up"),
+            ("^f / ^b", "forward / back a character"),
+            ("^a / ^e", "start / end of line"),
+            ("M-f / M-b", "forward / back a word"),
+            ("^Spc", "set mark (start selection)"),
+            ("^x o · arrows", "switch nav / preview pane"),
             ("Tab", "fold / unfold section"),
             ("RET", "open commit · blame file · checkout ref"),
             ("v", "select line(s) for staging"),

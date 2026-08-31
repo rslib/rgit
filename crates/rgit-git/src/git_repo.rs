@@ -3,9 +3,9 @@ use std::sync::Mutex;
 
 use git2::build::CheckoutBuilder;
 use git2::{
-    ApplyLocation, ApplyOptions, BranchType, Cred, CredentialType, Diff, DiffOptions, ErrorCode,
-    FetchOptions, ObjectType, Oid, Patch, PushOptions, RemoteCallbacks, Repository, ResetType,
-    Status, StatusOptions,
+    ApplyLocation, ApplyOptions, BranchType, Cred, CredentialType, Delta, Diff, DiffFindOptions,
+    DiffOptions, ErrorCode, FetchOptions, ObjectType, Oid, Patch, PushOptions, RemoteCallbacks,
+    Repository, ResetType, Status, StatusOptions,
 };
 
 use crate::model::{RepoState, ResetMode};
@@ -144,10 +144,20 @@ impl GitBackend for Git2Backend {
         let head = collect_head(&repo, recent.first())?;
 
         let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-        let mut opts = DiffOptions::new();
-        let unstaged = extract(&repo.diff_index_to_workdir(None, Some(&mut opts))?)?;
-        let staged =
-            extract(&repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))?)?;
+        // Include untracked files (recursing into new directories) so a brand-new
+        // file shows its all-added diff in the preview, like `git diff` with
+        // --no-index would; without this untracked files have no diff to show.
+        let mut wt_opts = DiffOptions::new();
+        wt_opts
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            // Emit the file's lines as additions, not just a bare "new file" delta.
+            .show_untracked_content(true);
+        let unstaged = extract_with_renames(repo.diff_index_to_workdir(None, Some(&mut wt_opts))?)?;
+        let mut idx_opts = DiffOptions::new();
+        let staged = extract_with_renames(
+            repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut idx_opts))?,
+        )?;
 
         Ok(RepoStatus {
             head,
@@ -389,7 +399,7 @@ impl GitBackend for Git2Backend {
             email: commit.author().email().unwrap_or("").to_owned(),
             when: relative_age(commit.time().seconds(), now),
             message: commit.message().unwrap_or("").trim_end().to_owned(),
-            files: extract(&diff)?,
+            files: extract_with_renames(diff)?,
         })
     }
 
@@ -403,7 +413,12 @@ impl GitBackend for Git2Backend {
         let tree = commit.tree()?;
         let parent_tree = commit.parent(0).ok().map(|p| p.tree()).transpose()?;
         let mut opts = DiffOptions::new();
-        let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
+        let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
+        // Detect renames so a moved file lists once as "old -> new" with only its
+        // real +/- counts, matching the working-tree and detail views.
+        let mut fopts = DiffFindOptions::new();
+        fopts.renames(true);
+        diff.find_similar(Some(&mut fopts))?;
 
         let mut files = Vec::with_capacity(diff.deltas().len());
         for idx in 0..diff.deltas().len() {
@@ -414,6 +429,15 @@ impl GitBackend for Git2Backend {
                 .or_else(|| delta.old_file().path())
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            let old_path = matches!(delta.status(), Delta::Renamed | Delta::Copied)
+                .then(|| {
+                    delta
+                        .old_file()
+                        .path()
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
+                .flatten()
+                .filter(|old| *old != path);
             let binary = delta.flags().is_binary();
             let (additions, deletions) = if binary {
                 (0, 0)
@@ -428,6 +452,7 @@ impl GitBackend for Git2Backend {
             };
             files.push(crate::CommitFile {
                 path,
+                old_path,
                 additions,
                 deletions,
                 binary,
@@ -462,7 +487,7 @@ impl GitBackend for Git2Backend {
         let mut opts = DiffOptions::new();
         opts.pathspec(path);
         let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
-        Ok(extract(&diff)?.into_iter().find(|f| f.path == path))
+        Ok(extract_with_renames(diff)?.into_iter().find(|f| f.path == path))
     }
 
     fn diff_refs(&self, from: &str, to: &str) -> Result<Vec<crate::FileDiff>, GitError> {
@@ -471,7 +496,7 @@ impl GitBackend for Git2Backend {
         let to_tree = repo.revparse_single(to)?.peel_to_tree()?;
         let mut opts = DiffOptions::new();
         let diff = repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))?;
-        extract(&diff)
+        extract_with_renames(diff)
     }
 
     fn file_diff(&self, path: &str, staged: bool) -> Result<Option<crate::FileDiff>, GitError> {
@@ -483,11 +508,14 @@ impl GitBackend for Git2Backend {
             let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
             repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))?
         } else {
-            // Include untracked files so a brand-new file shows as an all-added diff.
-            opts.include_untracked(true).recurse_untracked_dirs(true);
+            // Include untracked files, with their content, so a brand-new file
+            // shows as an all-added diff rather than a bare "new file" delta.
+            opts.include_untracked(true)
+                .recurse_untracked_dirs(true)
+                .show_untracked_content(true);
             repo.diff_index_to_workdir(None, Some(&mut opts))?
         };
-        Ok(extract(&diff)?.into_iter().find(|f| f.path == path))
+        Ok(extract_with_renames(diff)?.into_iter().find(|f| f.path == path))
     }
 
     fn blame(&self, path: &str) -> Result<Vec<crate::BlameLine>, GitError> {
@@ -3786,6 +3814,17 @@ fn collect_recent(repo: &Repository) -> Vec<Commit> {
         .collect()
 }
 
+/// Run libgit2 rename detection over a display diff, then extract it. A moved
+/// file collapses from a delete+add pair into one renamed delta showing only its
+/// real content changes (none, for a pure move). Staging/patch-apply diffs skip
+/// this: they key on exact per-file paths.
+fn extract_with_renames(mut diff: Diff) -> Result<Vec<FileDiff>, GitError> {
+    let mut fopts = DiffFindOptions::new();
+    fopts.renames(true);
+    diff.find_similar(Some(&mut fopts))?;
+    extract(&diff)
+}
+
 fn extract(diff: &Diff) -> Result<Vec<FileDiff>, GitError> {
     let count = diff.deltas().len();
     let mut files = Vec::with_capacity(count);
@@ -3798,6 +3837,17 @@ fn extract(diff: &Diff) -> Result<Vec<FileDiff>, GitError> {
             .or_else(|| delta.old_file().path())
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // Rename/copy deltas carry a distinct source path; expose it so the UI
+        // can show "old -> new" instead of a full delete plus add.
+        let old_path = matches!(delta.status(), Delta::Renamed | Delta::Copied)
+            .then(|| {
+                delta
+                    .old_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
+            .flatten()
+            .filter(|old| *old != path);
         let binary = delta.flags().is_binary();
 
         let mut hunks = Vec::new();
@@ -3826,6 +3876,7 @@ fn extract(diff: &Diff) -> Result<Vec<FileDiff>, GitError> {
 
         files.push(FileDiff {
             path,
+            old_path,
             hunks,
             binary,
         });

@@ -150,8 +150,27 @@ a.aside{color:var(--dim);} a.aside:hover{color:var(--acc);}
 .copyrow code{font-family:var(--mono); font-size:11px; flex:1; overflow-x:auto; white-space:nowrap; color:var(--dim);}
 .copyrow button{border:0; background:transparent; color:var(--dim); cursor:pointer; font-size:13px;} .copyrow button:hover{color:var(--acc-ink);}
 .cpop .hint{margin:0; font-size:11px; color:var(--faint);} .cpop .dl2{margin-top:8px;}
-.chip-mcp{display:inline-flex; align-items:center; gap:6px; font-family:var(--mono); font-size:11px; height:28px; padding:0 10px; border-radius:6px; background:var(--acc-sb); color:var(--acc-ink); border:1px solid var(--acc-line);}
+.chip-mcp{position:relative; display:inline-flex; align-items:center; gap:6px; font-family:var(--mono); font-size:11px; height:28px; padding:0 10px; border-radius:6px; background:var(--acc-sb); color:var(--acc-ink); border:1px solid var(--acc-line); cursor:pointer; text-decoration:none;}
+.chip-mcp:hover{border-color:var(--acc); color:var(--acc-ink);}
 .chip-mcp .dot{width:6px; height:6px; border-radius:50%; background:var(--acc);}
+.chip-tip{position:absolute; top:calc(100% + 8px); right:0; width:250px; padding:11px 13px; background:var(--panel); border:1px solid var(--line2); border-radius:9px; box-shadow:var(--sh); font-family:var(--sans); font-size:11.5px; line-height:1.5; letter-spacing:0; text-transform:none; color:var(--dim); text-align:left; white-space:normal; display:flex; flex-direction:column; gap:6px; opacity:0; visibility:hidden; transform:translateY(-4px); transition:opacity .12s ease, transform .12s ease; pointer-events:none; z-index:60;}
+.chip-mcp:hover .chip-tip{opacity:1; visibility:visible; transform:translateY(0);}
+.chip-tip b{color:var(--ink); font-weight:600; font-size:12px;}
+.chip-tip .tiprow{display:flex; align-items:center; gap:7px;}
+.chip-tip .tipk{font-family:var(--mono); font-size:9.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--faint); width:32px; flex:none;}
+.chip-tip code{font-family:var(--mono); font-size:11px; color:var(--acc-ink); background:var(--bg); border:1px solid var(--line2); border-radius:5px; padding:1px 6px; word-break:break-all; min-width:0;}
+.chip-tip .tipro{font-family:var(--mono); font-size:9.5px; color:var(--faint); margin-left:auto; flex:none;}
+.chip-tip .tipmore{color:var(--acc-ink); font-size:11px; margin-top:1px;}
+.toollist{display:flex; flex-direction:column; gap:8px;}
+.toolrow{border:1px solid var(--line); border-radius:10px; background:var(--panel); padding:10px 13px;}
+.toolrow:hover{border-color:var(--acc-line);}
+.toolhd{display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin-bottom:4px;}
+.tooln{font-family:var(--mono); font-size:13px; font-weight:600; color:var(--acc-ink);}
+.targ{font-family:var(--mono); font-size:10.5px; padding:1px 6px; border-radius:5px; background:var(--sunk); color:var(--dim); border:1px solid var(--line2);}
+.targ.req{color:var(--acc-ink); border-color:var(--acc-line); background:var(--acc-sb);}
+.twrite{font-family:var(--mono); font-size:10px; letter-spacing:.04em; text-transform:uppercase; padding:1px 6px; border-radius:5px; color:var(--del); border:1px solid color-mix(in srgb,var(--del) 40%,transparent); background:color-mix(in srgb,var(--del) 10%,transparent);}
+.toolrow.writes .tooln{color:var(--ink);}
+.toold{margin:0 !important; color:var(--dim); font-size:12.5px !important; line-height:1.5;}
 
 /* scoped code search */
 .hsearch{position:relative; flex:1; margin:0;}
@@ -217,8 +236,15 @@ a.aside{color:var(--dim);} a.aside:hover{color:var(--acc);}
 .lane .onp{font-family:var(--mono); font-size:11px; color:var(--pend);}
 .lane .files{margin-top:4px; color:var(--dim); font-size:12px;} .lane .files .fp{font-family:var(--mono);} .lane .files .cm{color:var(--faint);}
 .agent{padding:14px;} .agent p{margin:0 0 11px; color:var(--dim); font-size:12.5px; line-height:1.5;} .agent code{font-family:var(--mono); color:var(--acc);}
-.agent .ep{font-family:var(--mono); font-size:12px; display:flex; justify-content:space-between; gap:8px; color:var(--ink); background:var(--bg); border:1px solid var(--line2); border-radius:8px; padding:8px 11px;}
+.agent .ep{font-family:var(--mono); font-size:12px; display:flex; flex-wrap:wrap; justify-content:flex-start; gap:4px 8px; color:var(--ink); background:var(--bg); border:1px solid var(--line2); border-radius:8px; padding:8px 11px; word-break:break-all;}
 .agent .ep .k{color:var(--acc);}
+.agent .ep code{word-break:break-all; min-width:0;}
+.mcpopt{margin:0 0 14px; padding:12px; border:1px solid var(--line2); border-radius:10px; background:var(--bg);}
+.mcphd{display:flex; align-items:center; gap:8px; font-weight:600; font-size:12.5px; margin-bottom:6px;}
+.mcphd .mcpn{display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:5px; background:var(--acc-sb); color:var(--acc-ink); border:1px solid var(--acc-line); font-family:var(--mono); font-size:11px; font-weight:700;}
+.mcpsub{margin:8px 0 6px !important; color:var(--dim); font-size:12px !important; line-height:1.5;}
+.mcpcmd{margin:0; background:var(--bg); border:1px solid var(--line2); border-radius:8px; padding:8px 11px;}
+.mcpcmd code{font-family:var(--mono); font-size:12px; color:var(--ink) !important; white-space:pre-wrap; word-break:break-word;}
 .prbadge{font-family:var(--mono); font-size:11px; color:var(--pend); border:1px solid color-mix(in srgb,var(--pend) 40%,transparent); border-radius:6px; padding:1px 7px; margin-left:7px;}
 .prbadge:hover{color:var(--acc);}
 .prbadge .ci.p{color:var(--add);} .prbadge .ci.f{color:var(--del);} .prbadge .ci.r{color:var(--pend);}
@@ -444,6 +470,8 @@ kbd{font-family:var(--mono); font-size:11px; color:var(--dim); background:var(--
 pub const JS: &str = r#"
 var root=document.documentElement;
 var BASE=(document.body&&document.body.getAttribute('data-base'))||'';
+// Fill the MCP endpoint URL in the header chip tooltip from this page's origin.
+Array.prototype.forEach.call(document.querySelectorAll('.mcpchipurl'),function(el){el.textContent=location.origin+'/mcp';});
 try{var s=localStorage.getItem('rgit-theme'); if(s) root.setAttribute('data-theme',s);}catch(e){}
 var tb=document.getElementById('theme');
 if(tb) tb.addEventListener('click',function(){

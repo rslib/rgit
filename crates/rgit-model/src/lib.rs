@@ -9,8 +9,8 @@ mod content;
 mod style;
 
 pub use build::{
-    GlyphMode, SyntaxColors, build, build_blame, build_commit, build_diff, build_log, build_refs,
-    highlight_code, highlight_file,
+    DIFF_GUTTER_COLS, GlyphMode, SyntaxColors, build, build_blame, build_commit, build_diff,
+    build_log, build_refs, diff_line_file_line, highlight_code, highlight_file,
     build_remotes, build_worktrees, glyph, glyph_mode, set_glyph_mode, set_side_by_side,
     set_syntax_colors, unicode,
 };
@@ -83,6 +83,7 @@ mod tests {
             entries: vec![entry("a.rs", StatusCode::Unmodified, StatusCode::Modified)],
             unstaged: vec![FileDiff {
                 path: "a.rs".into(),
+                old_path: None,
                 binary: false,
                 hunks: vec![Hunk {
                     header: "@@ -1,2 +1,2 @@".into(),
@@ -118,5 +119,52 @@ mod tests {
         let status = RepoStatus::default();
         let sections = build(&status);
         assert!(find(&sections, "info").is_some());
+    }
+
+    #[test]
+    fn an_untracked_file_folds_open_to_its_added_content() {
+        use rgit_git::{DiffLine, FileDiff, Hunk, LineOrigin};
+
+        // An untracked file: worktree=Untracked, and its content arrives as an
+        // all-added diff in the unstaged list (see the backend's status()).
+        let status = RepoStatus {
+            head: Head::default(),
+            entries: vec![entry(
+                "new.rs",
+                StatusCode::Unmodified,
+                StatusCode::Untracked,
+            )],
+            unstaged: vec![FileDiff {
+                path: "new.rs".into(),
+                old_path: None,
+                binary: false,
+                hunks: vec![Hunk {
+                    header: "@@ -0,0 +1,2 @@".into(),
+                    new_start: 1,
+                    lines: vec![
+                        DiffLine {
+                            origin: LineOrigin::Added,
+                            text: "one".into(),
+                        },
+                        DiffLine {
+                            origin: LineOrigin::Added,
+                            text: "two".into(),
+                        },
+                    ],
+                }],
+            }],
+            ..Default::default()
+        };
+
+        let sections = build(&status);
+        let untracked = find(&sections, "untracked").expect("untracked section");
+        assert!(untracked.is_foldable());
+        let file = &untracked.children[0];
+        assert_eq!(file.kind, NodeKind::File);
+        assert_eq!(file.id, "untracked/new.rs");
+        // The regression: the untracked file must fold open to its hunk/lines,
+        // not be a dead leaf with no diff (which is what happened before).
+        assert_eq!(file.children.len(), 1, "one hunk under the untracked file");
+        assert_eq!(file.children[0].children.len(), 2, "two added lines");
     }
 }

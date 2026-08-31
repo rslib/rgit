@@ -86,16 +86,25 @@ fn main() -> ! {
                     exit(1);
                 }
             };
+            // The /agent page renders this catalog; register it before serving.
+            rgit_web::set_mcp_tools(mcp::tool_catalog());
             let served = match root {
-                Some(dir) => runtime.block_on(rgit_web::serve_root(
-                    std::path::PathBuf::from(dir),
-                    addr,
-                    clone_base,
-                )),
+                Some(dir) => {
+                    let root_path = std::path::PathBuf::from(&dir);
+                    // The HTTP MCP endpoint resolves `repo` by name under the root.
+                    let mcp = mcp::http_router_rooted(root_path.clone());
+                    runtime.block_on(rgit_web::serve_root(
+                        root_path,
+                        addr,
+                        clone_base,
+                        Some(mcp),
+                    ))
+                }
                 None => {
                     let backend = discover_or_exit();
                     let repo = rgit_web::repo_name(backend.as_ref());
-                    runtime.block_on(rgit_web::serve(backend, repo, addr, clone_base))
+                    let mcp = mcp::http_router(repo.clone(), backend.clone());
+                    runtime.block_on(rgit_web::serve(backend, repo, addr, clone_base, Some(mcp)))
                 }
             };
             match served {
@@ -156,13 +165,13 @@ fn main() -> ! {
             };
             // Exit rather than drop the runtime: crossterm's EventStream parks a
             // blocking stdin read that a graceful shutdown would wait on forever.
-            exit(runtime.block_on(run_tui()));
+            exit(runtime.block_on(run_tui(cli.no_preview)));
         }
     }
 }
 
-async fn run_tui() -> i32 {
-    match rgit_tui::run(discover_or_exit()).await {
+async fn run_tui(no_preview: bool) -> i32 {
+    match rgit_tui::run(discover_or_exit(), no_preview).await {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("rgit: {e}");

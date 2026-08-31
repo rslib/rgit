@@ -914,3 +914,116 @@ fn rev_parse_and_archive() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn staged_rename_shows_as_one_renamed_diff_not_delete_plus_add() {
+    let dir = init_repo("rename-diff");
+    std::fs::write(dir.join("old.txt"), "one\ntwo\nthree\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "init"]);
+
+    // Move the file with a small content tweak, then stage the whole change.
+    std::fs::rename(dir.join("old.txt"), dir.join("new.txt")).unwrap();
+    std::fs::write(dir.join("new.txt"), "one\nTWO\nthree\n").unwrap();
+    git(&dir, &["add", "-A"]);
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let status = backend.status().unwrap();
+
+    // The staged diff collapses to a single renamed file, not a delete + add.
+    assert_eq!(status.staged.len(), 1, "one renamed file, not two");
+    let f = &status.staged[0];
+    assert_eq!(f.path, "new.txt");
+    assert_eq!(f.old_path.as_deref(), Some("old.txt"));
+    // Only the real content change survives (the tweaked line), not the whole
+    // file added and the whole file removed.
+    let removed: usize = f
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| matches!(l.origin, rgit_git::LineOrigin::Removed))
+        .count();
+    assert_eq!(removed, 1, "just the one changed line, not the whole file");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pure_move_shows_rename_with_no_content_hunks() {
+    let dir = init_repo("pure-move");
+    std::fs::write(dir.join("a.txt"), "same\ncontent\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "init"]);
+
+    git(&dir, &["mv", "a.txt", "b.txt"]);
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let status = backend.status().unwrap();
+
+    assert_eq!(status.staged.len(), 1);
+    let f = &status.staged[0];
+    assert_eq!(f.path, "b.txt");
+    assert_eq!(f.old_path.as_deref(), Some("a.txt"));
+    assert!(f.hunks.is_empty(), "a pure move has no content changes");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn commit_overview_detects_a_renamed_file_in_history() {
+    let dir = init_repo("overview-rename");
+    std::fs::write(dir.join("old.txt"), "one\ntwo\nthree\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "init"]);
+
+    // A commit that renames the file with a one-line tweak.
+    std::fs::rename(dir.join("old.txt"), dir.join("new.txt")).unwrap();
+    std::fs::write(dir.join("new.txt"), "one\nTWO\nthree\n").unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "-m", "move it"]);
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let ov = backend.commit_overview("HEAD").unwrap();
+
+    // One renamed file, not a delete plus an add.
+    assert_eq!(ov.files.len(), 1);
+    let f = &ov.files[0];
+    assert_eq!(f.path, "new.txt");
+    assert_eq!(f.old_path.as_deref(), Some("old.txt"));
+    // Only the real change counts, not the whole file added and removed.
+    assert_eq!((f.additions, f.deletions), (1, 1));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn untracked_file_shows_its_all_added_diff() {
+    let dir = init_repo("untracked-diff");
+    std::fs::write(dir.join("committed.txt"), "base\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "init"]);
+
+    // A brand-new, never-added file.
+    std::fs::write(dir.join("new.txt"), "line one\nline two\n").unwrap();
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let status = backend.status().unwrap();
+
+    // It is listed as untracked...
+    assert!(status.entries.iter().any(|e| e.path == "new.txt" && e.is_untracked()));
+    // ...and its content is available as an all-added diff in the unstaged list.
+    let diff = status
+        .unstaged
+        .iter()
+        .find(|f| f.path == "new.txt")
+        .expect("untracked file has an unstaged diff");
+    let added: usize = diff
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| matches!(l.origin, rgit_git::LineOrigin::Added))
+        .count();
+    assert_eq!(added, 2, "both new lines show as additions");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

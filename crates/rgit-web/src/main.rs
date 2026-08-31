@@ -19,7 +19,7 @@ async fn main() {
     };
     let repo = rgit_web::repo_name(backend.as_ref());
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
-    if let Err(e) = rgit_web::serve(backend, repo, addr, None).await {
+    if let Err(e) = rgit_web::serve(backend, repo, addr, None, None).await {
         eprintln!("rgit serve: {e}");
         std::process::exit(1);
     }

@@ -711,16 +711,27 @@ pub fn build_commit(details: &CommitDetails) -> Vec<Section> {
             .hunks
             .iter()
             .enumerate()
-            .map(|(hi, hunk)| readonly_hunk_node(&file_id, hi, hunk, ext_of(&file.path)))
+            .map(|(hi, hunk)| hunk_node(&file_id, &file.path, hi, hunk, ext_of(&file.path), HunkCtx::Historical))
             .collect();
         sections.push(Section::branch(
             file_id,
             NodeKind::File,
-            vec![Span::new(file.path.clone(), Style::Modified)],
+            diff_file_header(file),
             hunks,
         ));
     }
     sections
+}
+
+/// A diff file header: `old -> new` when renamed or copied, else just the path.
+fn diff_file_header(file: &FileDiff) -> Vec<Span> {
+    match &file.old_path {
+        Some(old) => vec![
+            Span::new(format!("{old} -> "), Style::Dim),
+            Span::new(file.path.clone(), Style::Modified),
+        ],
+        None => vec![Span::new(file.path.clone(), Style::Modified)],
+    }
 }
 
 /// Build a read-only diff view between two revisions: a header plus one
@@ -745,36 +756,84 @@ pub fn build_diff(title: &str, files: &[FileDiff]) -> Vec<Section> {
             .hunks
             .iter()
             .enumerate()
-            .map(|(hi, hunk)| readonly_hunk_node(&file_id, hi, hunk, ext_of(&file.path)))
+            .map(|(hi, hunk)| hunk_node(&file_id, &file.path, hi, hunk, ext_of(&file.path), HunkCtx::Historical))
             .collect();
         sections.push(Section::branch(
             file_id,
             NodeKind::File,
-            vec![Span::new(file.path.clone(), Style::Modified)],
+            diff_file_header(file),
             hunks,
         ));
     }
     sections
 }
 
-fn readonly_hunk_node(file_id: &str, index: usize, hunk: &Hunk, ext: Option<&str>) -> Section {
+/// How a diff hunk can be acted on, chosen by the view that renders it. This is
+/// what lets one renderer serve every diff view.
+#[derive(Clone, Copy)]
+enum HunkCtx {
+    /// Working tree (status view): stageable; the editor opens the working file.
+    Worktree { staged: bool },
+    /// A commit, or a diff between revs: read-only, but still foldable and
+    /// editor-openable (best effort - the file may have moved on).
+    Historical,
+}
+
+impl HunkCtx {
+    fn staged(self) -> Option<bool> {
+        match self {
+            HunkCtx::Worktree { staged } => Some(staged),
+            HunkCtx::Historical => None,
+        }
+    }
+}
+
+/// Render one hunk as a foldable section: a header plus one leaf per diff line.
+/// Every row carries a `Target::Hunk` with its own file line, so fold, Return,
+/// click, and (for the working tree) staging behave identically in every view -
+/// there is one diff component, not one per view.
+fn hunk_node(
+    file_id: &str,
+    path: &str,
+    index: usize,
+    hunk: &Hunk,
+    ext: Option<&str>,
+    ctx: HunkCtx,
+) -> Section {
     let hunk_id = format!("{file_id}#{index}");
-    let per_line = if side_by_side() {
+    let target = |line: u32| Target::Hunk {
+        path: path.to_owned(),
+        new_start: hunk.new_start,
+        line,
+        staged: ctx.staged(),
+    };
+
+    // Side-by-side rows do not map 1:1 to source lines, so they resolve to the
+    // hunk's start line; the default one-column layout gives each line exactly.
+    // Only read-only views go side by side (staging needs the one-column form).
+    let side_by_side = side_by_side() && matches!(ctx, HunkCtx::Historical);
+    let lines = if side_by_side {
         side_by_side_lines(hunk)
+            .into_iter()
+            .enumerate()
+            .map(|(j, spans)| {
+                Section::leaf(format!("{hunk_id}/{j}"), NodeKind::DiffLine, spans)
+                    .with_target(target(hunk.new_start))
+            })
+            .collect()
     } else {
         hunk_line_spans(hunk, ext)
+            .into_iter()
+            .enumerate()
+            .map(|(j, spans)| {
+                Section::leaf(format!("{hunk_id}/{j}"), NodeKind::DiffLine, spans)
+                    .with_target(target(diff_line_file_line(hunk, j)))
+            })
+            .collect()
     };
-    let lines = per_line
-        .into_iter()
-        .enumerate()
-        .map(|(j, spans)| Section::leaf(format!("{hunk_id}/{j}"), NodeKind::DiffLine, spans))
-        .collect();
-    Section::branch(
-        hunk_id,
-        NodeKind::Hunk,
-        hunk_header_spans(&hunk.header),
-        lines,
-    )
+
+    Section::branch(hunk_id, NodeKind::Hunk, hunk_header_spans(&hunk.header), lines)
+        .with_target(target(hunk.new_start))
 }
 
 fn diff_line_spans(line: &DiffLine) -> Vec<Span> {
@@ -809,6 +868,25 @@ fn diff_gutter(old: Option<u32>, new: Option<u32>, origin: LineOrigin) -> Span {
 /// Above this many lines a hunk is left unhighlighted; per-line syntect is too
 /// costly on huge diffs (e.g. lockfiles).
 const MAX_SYNTAX_LINES: usize = 400;
+
+/// The width of the diff line-number gutter (`{:>4} {:>4} `), so a caller can
+/// map a caret column on a rendered diff line back to a file column.
+pub const DIFF_GUTTER_COLS: usize = 10;
+
+/// The new-side file line number (1-based) of the diff line at `source_index`
+/// within `hunk` - what an editor should open at. A deleted line has no new-side
+/// number, so it resolves to the following new-side line (where it was removed).
+pub fn diff_line_file_line(hunk: &Hunk, source_index: usize) -> u32 {
+    let mut old = hunk_old_start(&hunk.header);
+    let mut new = hunk.new_start;
+    for (i, line) in hunk.lines.iter().enumerate() {
+        if i == source_index {
+            return new.max(1);
+        }
+        advance(line.origin, &mut old, &mut new);
+    }
+    new.max(1)
+}
 
 fn hunk_line_spans(hunk: &Hunk, ext: Option<&str>) -> Vec<Vec<Span>> {
     let syntax = ext
@@ -1067,7 +1145,9 @@ pub fn build(status: &RepoStatus) -> Vec<Section> {
             &untracked,
             |e| e.worktree,
             false,
-            |_| None,
+            // Untracked files now carry an all-added diff in the unstaged list,
+            // so they fold open to show their contents like any other change.
+            |p| status.unstaged_diff(p),
         ));
     }
     if !unstaged.is_empty() {
@@ -1341,36 +1421,134 @@ fn hunk_nodes(file_id: &str, path: &str, staged: bool, diff: &FileDiff) -> Vec<S
     diff.hunks
         .iter()
         .enumerate()
-        .map(|(i, hunk)| hunk_node(file_id, path, staged, i, hunk))
+        .map(|(i, hunk)| {
+            hunk_node(
+                file_id,
+                path,
+                i,
+                hunk,
+                ext_of(path),
+                HunkCtx::Worktree { staged },
+            )
+        })
         .collect()
 }
 
-fn hunk_node(file_id: &str, path: &str, staged: bool, index: usize, hunk: &Hunk) -> Section {
-    let hunk_id = format!("{file_id}#{index}");
-    let target = Target::Hunk {
-        path: path.to_owned(),
-        new_start: hunk.new_start,
-        staged,
+#[cfg(test)]
+mod hunk_component_tests {
+    use super::{build, build_commit, Target};
+    use rgit_git::{
+        CommitDetails, DiffLine, FileDiff, Head, Hunk, LineOrigin, RepoStatus, StatusCode,
+        StatusEntry,
     };
 
-    // hunk_line_spans preserves one entry per source line, so the index `j`
-    // still identifies the line for line-level staging.
-    let lines = hunk_line_spans(hunk, ext_of(path))
-        .into_iter()
-        .enumerate()
-        .map(|(j, spans)| {
-            Section::leaf(format!("{hunk_id}/{j}"), NodeKind::DiffLine, spans)
-                .with_target(target.clone())
-        })
-        .collect();
+    fn one_hunk_file(path: &str) -> FileDiff {
+        FileDiff {
+            path: path.into(),
+            old_path: None,
+            binary: false,
+            hunks: vec![Hunk {
+                header: "@@ -1,1 +1,2 @@".into(),
+                new_start: 1,
+                lines: vec![
+                    DiffLine {
+                        origin: LineOrigin::Context,
+                        text: "a".into(),
+                    },
+                    DiffLine {
+                        origin: LineOrigin::Added,
+                        text: "b".into(),
+                    },
+                ],
+            }],
+        }
+    }
 
-    Section::branch(
-        hunk_id,
-        NodeKind::Hunk,
-        hunk_header_spans(&hunk.header),
-        lines,
-    )
-    .with_target(target)
+    fn first_hunk_line_target(sections: &[super::Section]) -> Option<Target> {
+        // Walk into the first file -> first hunk -> first diff line.
+        fn dig(s: &super::Section) -> Option<Target> {
+            if s.kind == super::NodeKind::DiffLine {
+                return s.target.clone();
+            }
+            s.children.iter().find_map(dig)
+        }
+        sections.iter().find_map(dig)
+    }
+
+    #[test]
+    fn commit_and_status_diff_lines_share_the_targeted_component() {
+        // The commit view (read-only) and the status view (working tree) now go
+        // through one renderer, so both attach a Target::Hunk with a file line;
+        // they differ only in `staged` (None vs Some).
+        let commit = CommitDetails {
+            id: "abc".into(),
+            full_id: "abc".into(),
+            author: "t".into(),
+            email: "t".into(),
+            when: "now".into(),
+            message: "m".into(),
+            files: vec![one_hunk_file("a.rs")],
+        };
+        let sections = build_commit(&commit);
+        match first_hunk_line_target(&sections) {
+            Some(Target::Hunk {
+                staged: None, line, ..
+            }) => assert!(line >= 1, "commit diff line carries a file line"),
+            other => panic!("commit diff line should be a read-only Hunk target: {other:?}"),
+        }
+
+        // The status view: same component, but stageable (staged = Some).
+        let status = RepoStatus {
+            head: Head::default(),
+            entries: vec![StatusEntry {
+                path: "a.rs".into(),
+                orig_path: None,
+                index: StatusCode::Unmodified,
+                worktree: StatusCode::Modified,
+            }],
+            unstaged: vec![one_hunk_file("a.rs")],
+            ..Default::default()
+        };
+        let sections = build(&status);
+        assert!(matches!(
+            first_hunk_line_target(&sections),
+            Some(Target::Hunk {
+                staged: Some(false),
+                ..
+            })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod diff_line_tests {
+    use super::diff_line_file_line;
+    use rgit_git::{DiffLine, Hunk, LineOrigin};
+
+    #[test]
+    fn maps_a_source_index_to_its_new_side_file_line() {
+        // @@ -10,3 +20,4 @@ : context, removed, added, context.
+        let line = |origin, text: &str| DiffLine {
+            origin,
+            text: text.into(),
+        };
+        let hunk = Hunk {
+            header: "@@ -10,3 +20,4 @@".into(),
+            new_start: 20,
+            lines: vec![
+                line(LineOrigin::Context, "a"), // new line 20
+                line(LineOrigin::Removed, "b"), // old only
+                line(LineOrigin::Added, "c"),   // new line 21
+                line(LineOrigin::Context, "d"), // new line 22
+            ],
+        };
+        assert_eq!(diff_line_file_line(&hunk, 0), 20, "context = new_start");
+        // A removed line has no new-side number, so it resolves to the next
+        // new-side line (where the deletion lands in the working file).
+        assert_eq!(diff_line_file_line(&hunk, 1), 21, "removed -> next new line");
+        assert_eq!(diff_line_file_line(&hunk, 2), 21, "the added line");
+        assert_eq!(diff_line_file_line(&hunk, 3), 22, "context after");
+    }
 }
 
 #[cfg(test)]

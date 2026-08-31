@@ -496,6 +496,12 @@ impl LogFilter {
 pub struct View {
     pub kind: ViewKind,
     pub buffer: Buffer,
+    /// The file this view is about, if any, so "open in editor" knows the path
+    /// (blame and file views set it; list views leave it None).
+    pub path: Option<String>,
+    /// A code finder to restore when this view is popped, so the finder ->
+    /// blame -> `q` path returns to the live search instead of the root.
+    pub resume_finder: Option<CodeFinder>,
 }
 
 /// A message: a user intent resolved from a key, or an async result. Everything
@@ -513,6 +519,8 @@ pub enum Msg {
     LeaderOpen,
     FocusPreview,
     FocusNav,
+    /// Emacs `C-x o`: cycle focus between the nav and preview panes.
+    OtherWindow,
     ToggleFold,
     /// Linewise visual selection (vim V, magit v).
     ToggleSelect,
@@ -540,8 +548,8 @@ pub enum Msg {
     MvAtCursor,
     /// Open the live code-search finder.
     CodeFinderOpen,
-    CodeFinderChar(char),
-    CodeFinderBackspace,
+    /// A line-editing key for the query (text, readline motions and kills).
+    CodeFinderInput(crossterm::event::KeyEvent),
     CodeFinderUp,
     CodeFinderDown,
     CodeFinderCancel,
@@ -549,6 +557,8 @@ pub enum Msg {
     CodeFinderSubmit,
     /// Open the selected hit in $EDITOR at its line.
     CodeFinderEditor,
+    /// Open the active file view (blame) in $EDITOR at the cursor line.
+    OpenEditor,
     /// Fold the semantic index into the current query's results.
     CodeFinderSemantic,
     /// Search results for `query`; `semantic` is true when the index was used.
@@ -574,6 +584,7 @@ pub enum Msg {
         path: String,
         lines: Vec<BlameLine>,
     },
+    BlameFailed(String),
     Refs,
     RefsLoaded(Vec<RefEntry>),
     RemoteMenu,
@@ -711,8 +722,7 @@ pub enum Msg {
     TransientChar(char),
     TransientCancel,
     PaletteOpen,
-    PaletteChar(char),
-    PaletteBackspace,
+    PaletteInput(crossterm::event::KeyEvent),
     PaletteUp,
     PaletteDown,
     PaletteSubmit,
@@ -847,6 +857,14 @@ pub enum Mutation {
         url: String,
     },
     RemoveRemote(String),
+    SetRemoteUrl {
+        name: String,
+        url: String,
+    },
+    RenameRemote {
+        old: String,
+        new: String,
+    },
     AddWorktree {
         name: String,
         path: String,
@@ -952,6 +970,8 @@ pub enum ActionKind {
     RemoteList,
     RemoteAdd,
     RemoteRemove,
+    RemoteSetUrl,
+    RemoteRename,
     WorktreeList,
     WorktreeAdd,
     WorktreeRemove,
@@ -1186,6 +1206,8 @@ impl Transient {
                 action('l', "list", ActionKind::RemoteList),
                 action('a', "add…", ActionKind::RemoteAdd),
                 action('k', "remove…", ActionKind::RemoteRemove),
+                action('u', "set-url…", ActionKind::RemoteSetUrl),
+                action('r', "rename…", ActionKind::RemoteRename),
             ],
         }
     }
@@ -1249,6 +1271,8 @@ pub enum PromptAction {
     DeleteBranch,
     AddRemote,
     RemoveRemote,
+    SetRemoteUrl,
+    RenameRemote,
     AddWorktree,
     RemoveWorktree,
     LogAuthor,
@@ -1307,66 +1331,7 @@ impl Prompt {
     /// Apply an editing key to the single-line input: text entry plus emacs/
     /// readline motions and kills. Any edit resets the candidate selection.
     pub fn apply(&mut self, key: KeyEvent) {
-        use crossterm::event::KeyModifiers;
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let mut chars: Vec<char> = self.input.chars().collect();
-        let len = chars.len();
-        self.cursor = self.cursor.min(len);
-        if ctrl {
-            match key.code {
-                KeyCode::Char('a') => self.cursor = 0,
-                KeyCode::Char('e') => self.cursor = len,
-                KeyCode::Char('f') => self.cursor = (self.cursor + 1).min(len),
-                KeyCode::Char('b') => self.cursor = self.cursor.saturating_sub(1),
-                KeyCode::Char('d') => {
-                    if self.cursor < len {
-                        chars.remove(self.cursor);
-                    }
-                }
-                KeyCode::Char('k') => chars.truncate(self.cursor),
-                KeyCode::Char('u') => {
-                    chars.drain(..self.cursor);
-                    self.cursor = 0;
-                }
-                KeyCode::Char('w') => {
-                    let start = word_start(&chars, self.cursor);
-                    chars.drain(start..self.cursor);
-                    self.cursor = start;
-                }
-                _ => {}
-            }
-        } else if alt {
-            match key.code {
-                KeyCode::Char('b') => self.cursor = word_start(&chars, self.cursor),
-                KeyCode::Char('f') => self.cursor = word_end(&chars, self.cursor),
-                KeyCode::Backspace => {
-                    let start = word_start(&chars, self.cursor);
-                    chars.drain(start..self.cursor);
-                    self.cursor = start;
-                }
-                _ => {}
-            }
-        } else {
-            match key.code {
-                KeyCode::Char(c) => {
-                    chars.insert(self.cursor, c);
-                    self.cursor += 1;
-                }
-                KeyCode::Backspace => {
-                    if self.cursor > 0 {
-                        chars.remove(self.cursor - 1);
-                        self.cursor -= 1;
-                    }
-                }
-                KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-                KeyCode::Right => self.cursor = (self.cursor + 1).min(len),
-                KeyCode::Home => self.cursor = 0,
-                KeyCode::End => self.cursor = len,
-                _ => {}
-            }
-        }
-        self.input = chars.into_iter().collect();
+        edit_line(&mut self.input, &mut self.cursor, key);
         self.selected = 0;
     }
 
@@ -1623,6 +1588,8 @@ pub static PALETTE: &[PaletteEntry] = &[
 /// The fuzzy command palette overlay.
 pub struct Palette {
     pub input: String,
+    /// Caret position (char index) in the query, for emacs/readline editing.
+    pub cursor: usize,
     pub selected: usize,
 }
 
@@ -1630,6 +1597,8 @@ pub struct Palette {
 /// you type, re-ranked with the semantic index on demand), and the selection.
 pub struct CodeFinder {
     pub input: String,
+    /// Caret position (char index) in the query, for emacs/readline editing.
+    pub cursor: usize,
     pub selected: usize,
     pub hits: Vec<CodeHit>,
     /// True once the semantic index has been folded into `hits` for this query.
@@ -1705,10 +1674,11 @@ pub enum Effect {
         path: String,
         line: usize,
     },
-    /// Suspend the TUI and open `path` in $EDITOR at `line`.
+    /// Suspend the TUI and open `path` in $EDITOR at `line`:`col` (both 1-based).
     OpenInEditor {
         path: String,
         line: usize,
+        col: usize,
     },
     /// Load all refs, then push the refs view.
     LoadRefs,
@@ -1837,6 +1807,12 @@ pub struct App {
     /// The fuzzy command palette, when open.
     pub palette: Option<Palette>,
     pub code_finder: Option<CodeFinder>,
+    /// True after `C-x`, waiting for the second key of an emacs prefix chord
+    /// (only `C-x o` is bound today). Reset on the next key press.
+    pub ctrl_x_pending: bool,
+    /// The finder set aside while a view it launched (blame) is on top, so
+    /// popping that view can restore the live search. See [`App::pop_view`].
+    pub finder_resume: Option<CodeFinder>,
     /// The in-app commit editor, when open.
     pub commit_editor: Option<CommitEditor>,
     /// The live hook console for an in-progress `git commit`, when open.
@@ -1915,6 +1891,12 @@ pub struct App {
     pub preview_focus: bool,
     /// Whether the split preview is on screen (set each frame by the renderer).
     pub preview_visible: bool,
+    /// User toggle (config `ui.preview` / `--no-preview`): when false the split
+    /// preview is never drawn, giving a single full-width column.
+    pub preview_enabled: bool,
+    /// Config `ui.console_hold`: keep the operation console open on success until
+    /// a key is pressed, instead of closing it automatically.
+    pub console_hold: bool,
     /// Left column of the preview pane when the split is on screen, so a mouse
     /// wheel can scroll whichever pane the pointer is over.
     pub split_x: Option<u16>,
@@ -1937,6 +1919,8 @@ impl App {
             views: vec![View {
                 kind: ViewKind::Status,
                 buffer: Buffer::default(),
+                path: None,
+                resume_finder: None,
             }],
             head: None,
             state: RepoState::Clean,
@@ -1948,6 +1932,8 @@ impl App {
             transient: None,
             palette: None,
             code_finder: None,
+            ctrl_x_pending: false,
+            finder_resume: None,
             commit_editor: None,
             hook_console: None,
             rebase_todo: None,
@@ -1986,6 +1972,8 @@ impl App {
             preview_followed_hunk: None,
             preview_focus: false,
             preview_visible: false,
+            preview_enabled: config.ui.preview,
+            console_hold: config.ui.console_hold,
             split_x: None,
             body_top: 1,
             preview_top: 1,
@@ -2041,11 +2029,20 @@ impl App {
         }
         match self.buffer().target_at_cursor()? {
             Target::File { path, staged } => Some(PreviewKey::File { path, staged }),
-            Target::Hunk { path, staged, .. } => Some(PreviewKey::File { path, staged }),
+            // A working-tree hunk previews its file; a read-only diff's hunk has
+            // no separate preview (that view fills the width already).
+            Target::Hunk {
+                path,
+                staged: Some(staged),
+                ..
+            } => Some(PreviewKey::File { path, staged }),
+            Target::Hunk { staged: None, .. } => None,
             Target::Commit { id } => Some(PreviewKey::Commit { id }),
             Target::Stash { index } => Some(PreviewKey::Stash { index }),
             Target::CodeHit { path, line } => Some(PreviewKey::Snippet { path, line }),
-            Target::Ref { .. } => None,
+            // Preview a ref by its tip commit; revparse resolves the branch, tag,
+            // or remote name to the commit whose diff the preview shows.
+            Target::Ref { name, .. } => Some(PreviewKey::Commit { id: name }),
         }
     }
 
@@ -2281,6 +2278,16 @@ impl App {
         }
     }
 
+    /// Whether `path` is an untracked file in the last snapshot. Untracked files
+    /// have no history, so blame is not meaningful for them.
+    fn is_untracked(&self, path: &str) -> bool {
+        self.snapshot.as_ref().is_some_and(|s| {
+            s.entries
+                .iter()
+                .any(|e| e.path == path && e.is_untracked())
+        })
+    }
+
     fn set_preview_placeholder(&mut self) {
         self.preview_buf = Buffer::default();
         self.preview_loading = true;
@@ -2417,13 +2424,22 @@ impl App {
 
     /// Push a new screen onto the stack.
     pub fn push_view(&mut self, kind: ViewKind, buffer: Buffer) {
-        self.views.push(View { kind, buffer });
+        self.views.push(View {
+            kind,
+            buffer,
+            path: None,
+            resume_finder: None,
+        });
     }
 
     /// Pop the active screen; returns false if already at the status root.
+    /// A view that carried a finder to resume reopens it as it leaves.
     pub fn pop_view(&mut self) -> bool {
         if self.views.len() > 1 {
-            self.views.pop();
+            let popped = self.views.pop().expect("checked len > 1");
+            if let Some(finder) = popped.resume_finder {
+                self.code_finder = Some(finder);
+            }
             true
         } else {
             false
@@ -2486,6 +2502,14 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::FocusNav => app.preview_focus = false,
+        Msg::OtherWindow => {
+            if app.preview_focus {
+                app.preview_focus = false;
+            } else if app.preview_visible {
+                app.preview_focus = true;
+                app.preview_buf.cursor_to_first_foldable();
+            }
+        }
         // Fold whichever pane is focused: hunks in the preview, sections in nav.
         Msg::ToggleFold => app.active_buffer_mut().toggle_fold(),
         Msg::ToggleSelect => app.active_buffer_mut().toggle_selection(),
@@ -2555,18 +2579,14 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::CodeFinderOpen => {
             app.code_finder = Some(CodeFinder {
                 input: String::new(),
+                cursor: 0,
                 selected: 0,
                 hits: Vec::new(),
                 semantic: false,
                 searching: false,
             });
         }
-        Msg::CodeFinderChar(c) => return code_finder_edit(app, |f| f.input.push(c)),
-        Msg::CodeFinderBackspace => {
-            return code_finder_edit(app, |f| {
-                f.input.pop();
-            });
-        }
+        Msg::CodeFinderInput(key) => return code_finder_edit(app, key),
         Msg::CodeFinderUp => {
             if let Some(f) = &mut app.code_finder {
                 f.selected = f.selected.saturating_sub(1);
@@ -2591,7 +2611,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::CodeFinderSubmit => {
             if let Some(f) = app.code_finder.take() {
                 if let Some(h) = f.hits.get(f.selected) {
-                    return vec![Effect::LoadBlame(h.path.clone())];
+                    let path = h.path.clone();
+                    // Keep the finder aside so `q` from the blame view resumes it.
+                    app.finder_resume = Some(f);
+                    return vec![Effect::LoadBlame(path)];
                 }
             }
         }
@@ -2601,9 +2624,21 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     return vec![Effect::OpenInEditor {
                         path: h.path.clone(),
                         line: h.line,
+                        col: 1,
                     }];
                 }
             }
+        }
+        Msg::OpenEditor => {
+            if let Some(view) = app.views.last() {
+                if let Some(path) = view.path.clone() {
+                    // Blame renders one file line per row, so the row index is the
+                    // zero-based line; editors want it one-based.
+                    let line = app.buffer().cursor() + 1;
+                    return vec![Effect::OpenInEditor { path, line, col: 1 }];
+                }
+            }
+            app.push_toast(ToastKind::Error, "nothing to open in editor here".into());
         }
         Msg::CodeFinderCancel => app.code_finder = None,
         Msg::CodeFinderHits {
@@ -2668,9 +2703,20 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 return vec![Effect::UndoTimes(steps)];
             }
         }
-        Msg::Enter => match app.buffer().target_at_cursor() {
+        Msg::Enter => {
+            // On a working-tree hunk (a diff line, or a hunk header), open the
+            // editor at that line/column instead of any target action.
+            if let Some(effect) = editor_at_hunk(app) {
+                return vec![effect];
+            }
+            match app.buffer().target_at_cursor() {
             Some(Target::Commit { id }) => return vec![Effect::LoadCommit(id)],
             Some(Target::CodeHit { path, .. }) => return vec![Effect::LoadBlame(path)],
+            // An untracked file has no history to blame; visit it in the editor
+            // (its all-added diff already shows in the preview pane).
+            Some(Target::File { path, .. }) if app.is_untracked(&path) => {
+                return vec![Effect::OpenInEditor { path, line: 1, col: 1 }];
+            }
             Some(Target::File { path, .. }) => return vec![Effect::LoadBlame(path)],
             Some(Target::Ref { name, kind }) => {
                 app.pop_view();
@@ -2682,7 +2728,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 return vec![Effect::Mutate(mutation)];
             }
             _ => {}
-        },
+            }
+        }
         Msg::Refs => return vec![Effect::LoadRefs],
         Msg::RefsLoaded(refs) => {
             let mut buffer = Buffer::default();
@@ -2900,6 +2947,18 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             let mut buffer = Buffer::default();
             buffer.set_content(build_blame(&path, &lines));
             app.push_view(ViewKind::Blame, buffer);
+            let resume = app.finder_resume.take();
+            if let Some(top) = app.views.last_mut() {
+                top.path = Some(path);
+                top.resume_finder = resume;
+            }
+        }
+        Msg::BlameFailed(err) => {
+            // Blame never opened, so bring the finder back if one was launching it.
+            if let Some(f) = app.finder_resume.take() {
+                app.code_finder = Some(f);
+            }
+            app.push_toast(ToastKind::Error, format!("blame failed: {err}"));
         }
         Msg::BranchesLoaded(candidates) => {
             app.prompt = Some(Prompt {
@@ -3061,19 +3120,15 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::PaletteOpen => {
             app.palette = Some(Palette {
                 input: String::new(),
+                cursor: 0,
                 selected: 0,
             })
         }
-        Msg::PaletteChar(c) => {
+        Msg::PaletteInput(key) => {
             if let Some(p) = &mut app.palette {
-                p.input.push(c);
-                p.selected = 0;
-            }
-        }
-        Msg::PaletteBackspace => {
-            if let Some(p) = &mut app.palette {
-                p.input.pop();
-                p.selected = 0;
+                if edit_line(&mut p.input, &mut p.cursor, key) {
+                    p.selected = 0;
+                }
             }
         }
         Msg::PaletteUp => {
@@ -3114,13 +3169,21 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::ScrollPreview(delta) => app.preview_buf.scroll_by(delta),
         Msg::ClickRow(offset) => {
-            // A click in the navigator moves the cursor there and takes focus; a
-            // double-click folds or expands the row under it.
+            // A single click moves the cursor and takes focus. A double-click
+            // activates the row by type: a hunk or diff line opens the editor, a
+            // foldable file/section folds, anything else acts like Return.
             app.preview_focus = false;
             let idx = app.buffer().scroll() + offset;
             app.buffer_mut().set_cursor(idx);
             if app.is_double_click(false, idx) {
-                app.buffer_mut().toggle_fold();
+                if let Some(effect) = editor_at_hunk(app) {
+                    return vec![effect];
+                }
+                if app.buffer().cursor_is_foldable() {
+                    app.buffer_mut().toggle_fold();
+                    return app.after_cursor_move();
+                }
+                return update(app, Msg::Enter);
             }
             return app.after_cursor_move();
         }
@@ -3220,9 +3283,12 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 };
             }
             if ok {
-                // Committed: close the console, echo the git-style result, and
-                // refresh the working tree.
-                app.hook_console = None;
+                // Succeeded: echo the git-style result and refresh the working
+                // tree. With console_hold the console stays open so all output
+                // is readable (dismiss with q/Esc); otherwise it closes now.
+                if !app.console_hold {
+                    app.hook_console = None;
+                }
                 if let Some(summary) = summary {
                     app.push_toast(ToastKind::Success, summary);
                 }
@@ -3279,6 +3345,41 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
 
 /// `s` stages the unstaged region, file, or hunk under the cursor; on an
 /// already-staged target it does nothing.
+/// If the cursor sits on a diff line, the effect to open its file in the editor
+/// at that line and column; `None` otherwise. The file line comes from the row's
+/// target, so this is identical in every diff view.
+fn editor_at_diff_line(app: &App) -> Option<Effect> {
+    let (path, line, col) = app.active_buffer().cursor_diff_line()?;
+    // The caret column is measured on the rendered row, which starts with a
+    // fixed line-number gutter; subtract it to get the 1-based file column.
+    let file_col = col.saturating_sub(rgit_model::DIFF_GUTTER_COLS) + 1;
+    Some(Effect::OpenInEditor {
+        path,
+        line: line as usize,
+        col: file_col,
+    })
+}
+
+/// The editor effect for the cursor when it is on a hunk: an exact line/column on
+/// a diff line, or the hunk's first line on its header. `None` for anything else
+/// (a file row, a commit, ...), so the caller can fall back to folding or a
+/// target action. Works in every diff view; opening is best-effort (the runtime
+/// checks the file still exists).
+fn editor_at_hunk(app: &App) -> Option<Effect> {
+    if let Some(effect) = editor_at_diff_line(app) {
+        return Some(effect);
+    }
+    // A hunk header (foldable, so cursor_diff_line skipped it): open at its start.
+    if let Some(Target::Hunk { path, line, .. }) = app.active_buffer().target_at_cursor() {
+        return Some(Effect::OpenInEditor {
+            path,
+            line: line as usize,
+            col: 1,
+        });
+    }
+    None
+}
+
 fn stage_at_cursor(app: &mut App) -> Vec<Effect> {
     if let Some(sel) = app.buffer().line_selection() {
         if !sel.staged {
@@ -3299,7 +3400,8 @@ fn stage_at_cursor(app: &mut App) -> Vec<Effect> {
         Some(Target::Hunk {
             path,
             new_start,
-            staged: false,
+            staged: Some(false),
+            ..
         }) => Mutation::StageHunk { path, new_start },
         _ => return Vec::new(),
     };
@@ -3325,7 +3427,8 @@ fn unstage_at_cursor(app: &mut App) -> Vec<Effect> {
         Some(Target::Hunk {
             path,
             new_start,
-            staged: true,
+            staged: Some(true),
+            ..
         }) => Mutation::UnstageHunk { path, new_start },
         _ => return Vec::new(),
     };
@@ -3335,14 +3438,18 @@ fn unstage_at_cursor(app: &mut App) -> Vec<Effect> {
 
 /// `x` asks to discard the unstaged region, file, or hunk under the cursor,
 /// arming a confirmation rather than acting immediately.
-/// Apply an edit to the code-finder query, then kick off a fresh lexical search
-/// (instant); an empty query just clears the results. The semantic flag resets
-/// so the user knows the shown hits are lexical until they re-rank.
-fn code_finder_edit(app: &mut App, edit: impl FnOnce(&mut CodeFinder)) -> Vec<Effect> {
+/// Apply a readline editing key to the finder query. A content change kicks off a
+/// fresh lexical search (instant); a cursor-only motion just re-previews. An empty
+/// query clears results. The semantic flag resets so the user knows the shown hits
+/// are lexical until they re-rank.
+fn code_finder_edit(app: &mut App, key: crossterm::event::KeyEvent) -> Vec<Effect> {
     let Some(f) = &mut app.code_finder else {
         return Vec::new();
     };
-    edit(f);
+    let changed = edit_line(&mut f.input, &mut f.cursor, key);
+    if !changed {
+        return app.sync_preview();
+    }
     f.selected = 0;
     f.semantic = false;
     let q = f.input.trim().to_owned();
@@ -3382,7 +3489,8 @@ fn discard_at_cursor(app: &mut App) {
             Some(Target::Hunk {
                 path,
                 new_start,
-                staged: false,
+                staged: Some(false),
+                ..
             }) => (
                 Mutation::DiscardHunk {
                     path: path.clone(),
@@ -3421,6 +3529,76 @@ fn prompt_edit(app: &mut App, edit: impl FnOnce(&mut Prompt)) {
 }
 
 /// Char index of the start of the word before `pos` (skip spaces, then word).
+/// Apply one emacs/readline editing key to a `(text, caret)` pair: text entry,
+/// Ctrl-a/e/f/b/d/k/u/w, Alt-b/f, Alt-Backspace, arrows, Home/End. Returns true
+/// when the text content changed (not a cursor-only motion), so an incremental
+/// search re-runs only when it needs to. Shared by every single-line input.
+pub fn edit_line(input: &mut String, cursor: &mut usize, key: KeyEvent) -> bool {
+    use crossterm::event::KeyModifiers;
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let mut chars: Vec<char> = input.chars().collect();
+    let original = chars.clone();
+    let len = chars.len();
+    *cursor = (*cursor).min(len);
+    if ctrl {
+        match key.code {
+            KeyCode::Char('a') => *cursor = 0,
+            KeyCode::Char('e') => *cursor = len,
+            KeyCode::Char('f') => *cursor = (*cursor + 1).min(len),
+            KeyCode::Char('b') => *cursor = cursor.saturating_sub(1),
+            KeyCode::Char('d') => {
+                if *cursor < len {
+                    chars.remove(*cursor);
+                }
+            }
+            KeyCode::Char('k') => chars.truncate(*cursor),
+            KeyCode::Char('u') => {
+                chars.drain(..*cursor);
+                *cursor = 0;
+            }
+            KeyCode::Char('w') => {
+                let start = word_start(&chars, *cursor);
+                chars.drain(start..*cursor);
+                *cursor = start;
+            }
+            _ => {}
+        }
+    } else if alt {
+        match key.code {
+            KeyCode::Char('b') => *cursor = word_start(&chars, *cursor),
+            KeyCode::Char('f') => *cursor = word_end(&chars, *cursor),
+            KeyCode::Backspace => {
+                let start = word_start(&chars, *cursor);
+                chars.drain(start..*cursor);
+                *cursor = start;
+            }
+            _ => {}
+        }
+    } else {
+        match key.code {
+            KeyCode::Char(c) => {
+                chars.insert(*cursor, c);
+                *cursor += 1;
+            }
+            KeyCode::Backspace => {
+                if *cursor > 0 {
+                    chars.remove(*cursor - 1);
+                    *cursor -= 1;
+                }
+            }
+            KeyCode::Left => *cursor = cursor.saturating_sub(1),
+            KeyCode::Right => *cursor = (*cursor + 1).min(len),
+            KeyCode::Home => *cursor = 0,
+            KeyCode::End => *cursor = len,
+            _ => {}
+        }
+    }
+    let changed = chars != original;
+    *input = chars.into_iter().collect();
+    changed
+}
+
 fn word_start(chars: &[char], pos: usize) -> usize {
     let mut i = pos.min(chars.len());
     while i > 0 && chars[i - 1].is_whitespace() {
@@ -3473,6 +3651,40 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             }
             _ => {
                 app.error = Some("expected: <name> <url>".into());
+                return Vec::new();
+            }
+        }
+    }
+    // "name url" changes a remote's fetch URL (git's remote set-url).
+    if let PromptAction::SetRemoteUrl = prompt.action {
+        let mut parts = value.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some(name), Some(url)) => {
+                app.loading = true;
+                return vec![Effect::Mutate(Mutation::SetRemoteUrl {
+                    name: name.to_owned(),
+                    url: url.to_owned(),
+                })];
+            }
+            _ => {
+                app.error = Some("expected: <name> <url>".into());
+                return Vec::new();
+            }
+        }
+    }
+    // "old new" renames a remote (git's remote rename).
+    if let PromptAction::RenameRemote = prompt.action {
+        let mut parts = value.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some(old), Some(new)) => {
+                app.loading = true;
+                return vec![Effect::Mutate(Mutation::RenameRemote {
+                    old: old.to_owned(),
+                    new: new.to_owned(),
+                })];
+            }
+            _ => {
+                app.error = Some("expected: <old> <new>".into());
                 return Vec::new();
             }
         }
@@ -3681,6 +3893,8 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         PromptAction::RemoveWorktree => Mutation::RemoveWorktree(value),
         // Handled above via an early return.
         PromptAction::AddRemote
+        | PromptAction::SetRemoteUrl
+        | PromptAction::RenameRemote
         | PromptAction::AddWorktree
         | PromptAction::LogAuthor
         | PromptAction::DiffRefs
@@ -3921,6 +4135,14 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
         }
         ActionKind::RemoteRemove => {
             revision_prompt(app, "Remove remote", PromptAction::RemoveRemote);
+            Vec::new()
+        }
+        ActionKind::RemoteSetUrl => {
+            revision_prompt(app, "Set remote URL (name url)", PromptAction::SetRemoteUrl);
+            Vec::new()
+        }
+        ActionKind::RemoteRename => {
+            revision_prompt(app, "Rename remote (old new)", PromptAction::RenameRemote);
             Vec::new()
         }
         ActionKind::WorktreeList => {
@@ -4393,6 +4615,43 @@ fn build_remote_section(remote: Option<&RemoteSummary>, head: Option<&Head>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn edit_line_supports_emacs_motions() {
+        let mut s = String::from("hello world");
+        let mut cur = s.chars().count();
+        // Ctrl-a to start, Ctrl-e to end, Ctrl-b back, Ctrl-f forward.
+        assert!(!edit_line(&mut s, &mut cur, ctrl('a')));
+        assert_eq!(cur, 0);
+        edit_line(&mut s, &mut cur, ctrl('e'));
+        assert_eq!(cur, 11);
+        edit_line(&mut s, &mut cur, ctrl('b'));
+        assert_eq!(cur, 10);
+        edit_line(&mut s, &mut cur, ctrl('f'));
+        assert_eq!(cur, 11);
+        // Ctrl-a then Ctrl-k kills to end of line.
+        edit_line(&mut s, &mut cur, ctrl('a'));
+        assert!(edit_line(&mut s, &mut cur, ctrl('k')));
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn edit_line_inserts_at_the_caret() {
+        let mut s = String::from("ac");
+        let mut cur = 1;
+        assert!(edit_line(
+            &mut s,
+            &mut cur,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)
+        ));
+        assert_eq!(s, "abc");
+        assert_eq!(cur, 2);
+    }
 
     #[test]
     fn operations_menu_exposes_the_parity_ops_with_unique_keys() {
@@ -4562,6 +4821,51 @@ mod tests {
         assert_eq!(p.input, "f-eature");
         p.apply(ctrl('u')); // kill to start
         assert_eq!(p.input, "");
+    }
+
+    #[test]
+    fn finder_submit_to_blame_and_back_resumes_the_search() {
+        let mut app = App::new(
+            Arc::new(rgit_git::Git2Backend::discover(".").unwrap()),
+            crate::config::Config::default(),
+        );
+        app.code_finder = Some(CodeFinder {
+            input: "needle".into(),
+            cursor: 6,
+            selected: 0,
+            hits: vec![CodeHit {
+                path: "src/lib.rs".into(),
+                line: 4,
+                score: 1.0,
+                tag: "text",
+                preview: "let needle = 1;".into(),
+            }],
+            semantic: false,
+            searching: false,
+        });
+
+        // Enter opens blame and stashes the finder aside.
+        let fx = update(&mut app, Msg::CodeFinderSubmit);
+        assert!(app.code_finder.is_none());
+        assert!(app.finder_resume.is_some());
+        assert!(matches!(fx.as_slice(), [Effect::LoadBlame(p)] if p == "src/lib.rs"));
+
+        // Blame view carries the file path (for ^o) and the resume finder.
+        update(
+            &mut app,
+            Msg::BlameLoaded {
+                path: "src/lib.rs".into(),
+                lines: Vec::new(),
+            },
+        );
+        assert_eq!(app.active_kind(), ViewKind::Blame);
+        assert_eq!(app.views.last().unwrap().path.as_deref(), Some("src/lib.rs"));
+        assert!(app.finder_resume.is_none());
+
+        // `q` pops blame and reopens the finder with its query intact.
+        update(&mut app, Msg::Quit);
+        assert_eq!(app.active_kind(), ViewKind::Status);
+        assert_eq!(app.code_finder.as_ref().map(|f| f.input.as_str()), Some("needle"));
     }
 
     #[test]

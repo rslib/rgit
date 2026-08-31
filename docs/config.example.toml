@@ -41,6 +41,15 @@ name = "rose-pine"
 [ui]
 # How many commits the log view walks by default.
 log_limit = 200
+# Show the side preview pane (status and log views). Set false, or pass
+# --no-preview, for a single full-width column - handy when embedding rgit in a
+# narrow editor split (vim/lazygit style).
+preview = true
+# Keep the operation console (push/pull/fetch/commit output, shown as a docked
+# bottom pane) open after a SUCCESSFUL run until you press q/Esc, so all output
+# stays readable. A failed run always stays open. Default false = a successful
+# run closes the pane automatically.
+console_hold = false
 # Glyph palette (three choices):
 #   "unicode" (default) - unicode symbols (fold chevrons, bars, arrows), no
 #                         nerd-font icons
@@ -51,8 +60,11 @@ glyphs = "unicode"
 # Deprecated: nerd_fonts = true is equivalent to glyphs = "nerd" (used only when
 # `glyphs` is unset).
 # nerd_fonts = false
-# Accept mouse events (click-to-focus, wheel scroll).
-mouse = false
+# Capture mouse events: wheel scroll, click-to-focus, and double-click (which
+# acts like Return - open the commit/file/diff line). On by default (like
+# lazygit) so the wheel scrolls rgit rather than the host terminal/editor when
+# embedded. Set false to keep the terminal's native text selection.
+mouse = true
 # Render read-only diffs (commit / diff views) side by side.
 side_by_side = false
 # Which regions let the terminal background show through:
@@ -77,9 +89,28 @@ gpg_sign = false
 # commit onto its new tip (jj/Sapling style). Set false to keep amend local.
 auto_restack = true
 
-# Rebind any action to a different key.
+# Rebind any action to a different key. The value is a key spec: a bare
+# character, or a chord using
+#   C- or ^   ctrl        (e.g. "C-f", "^f")
+#   M- or A-  alt          (e.g. "M-b")
+#   C-x <k>   emacs prefix (e.g. "C-x o")
+#   named keys: Up Down Left Right RET Tab Esc Spc Home End
+# Action names use hyphens. Unknown names or unparseable keys are ignored.
 # [keys]
-# stage       = "s"
-# commit      = "c"
-# rebase_menu = "r"
-# palette     = ":"
+# stage        = "s"
+# commit       = "c"
+# rebase-menu  = "r"
+# palette      = ":"
+#
+# Navigation (magit/emacs profile defaults shown; all are rebindable):
+# forward-char  = "C-f"   # move point right a character
+# backward-char = "C-b"   # move point left a character
+# line-start    = "C-a"   # beginning of line
+# line-end      = "C-e"   # end of line
+# word-forward  = "M-f"
+# word-back     = "M-b"
+# set-mark      = "C-Spc"  # start a charwise selection
+# other-window  = "C-x o"  # switch nav <-> preview pane
+# open-editor   = "C-o"    # open the file at point in $EDITOR
+# focus-preview = "Right"
+# focus-nav     = "Left"

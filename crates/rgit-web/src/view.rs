@@ -172,7 +172,16 @@ pub fn layout(
                             div.dl2 { a.dl href=(side.archive) { "\u{2193} source.tar.gz" } }
                         }
                     }
-                    span.chip-mcp title="Exposed to agents over MCP: run `rgit mcp`" { span.dot {} "MCP" }
+                    a.chip-mcp href="/agent" {
+                        span.dot {}
+                        "MCP"
+                        span.chip-tip {
+                            b { "Connect an agent (MCP)" }
+                            span.tiprow { span.tipk { "HTTP" } code.mcpchipurl { "/mcp" } span.tipro { "read-only" } }
+                            span.tiprow { span.tipk { "stdio" } code { "rgit mcp" } span.tipro { "full" } }
+                            span.tipmore { "Click for all tools and setup \u{2192}" }
+                        }
+                    }
                     button.ib id="theme" title="Theme" { "\u{25d1}" }
                 }
                 nav.tabs {
@@ -407,6 +416,16 @@ fn plain_layout(title: &str, content: Markup, sidebar: Markup) -> Markup {
                 header {
                     a.logo.m href="/" { "r" b { "git" } " " span style="color:var(--dim);font-weight:400" { "serve" } }
                     (search_box("/search", None, "search all repos\u{2026}"))
+                    a.chip-mcp href="/agent" {
+                        span.dot {}
+                        "MCP"
+                        span.chip-tip {
+                            b { "Connect an agent (MCP)" }
+                            span.tiprow { span.tipk { "HTTP" } code.mcpchipurl { "/mcp" } span.tipro { "read-only" } }
+                            span.tiprow { span.tipk { "stdio" } code { "rgit mcp" } span.tipro { "full" } }
+                            span.tipmore { "Click for all tools and setup \u{2192}" }
+                        }
+                    }
                     button.ib id="theme" title="Theme" { "\u{25d1}" }
                 }
                 main.shell {
@@ -486,6 +505,14 @@ pub fn index(repos: &[RepoCard]) -> Markup {
                 }
             }
         }
+        div.card {
+            div.ch { "Drive with an agent (MCP)" }
+            div.cb {
+                p.mcpsub { "Any MCP client can operate these repos. Add rgit to its config (stdio, runs in the repo):" }
+                pre.mcpcmd { code { "{ \"mcpServers\": { \"rgit\": {\n  \"command\": \"rgit\", \"args\": [\"mcp\"] } } }" } }
+                p.mcpsub { "Serving a single repo (" code { "rgit serve" } " in it) also exposes a " code { "POST /mcp" } " HTTP endpoint - open that repo's page for the URL and config." }
+            }
+        }
     };
     let content = html! {
         div.idxhead {
@@ -519,6 +546,64 @@ pub fn index(repos: &[RepoCard]) -> Markup {
         }
     };
     plain_layout("rgit / repositories", content, sidebar)
+}
+
+/// The `/agent` page: the full MCP tool catalog with per-tool instructions, and
+/// the connection setup in the sidebar. Each row shows the tool name, its args,
+/// and its description; hovering shows the full argument signature.
+pub fn agent_tools(tools: &[crate::McpTool]) -> Markup {
+    let content = html! {
+        div.idxhead {
+            h1 { "MCP tools" }
+            span.idxcount { (tools.len()) }
+            span.sp {}
+            input.repofilter id="tool-filter" placeholder="filter tools\u{2026}" autocomplete="off";
+        }
+        p.mcpsub style="margin:0 0 14px !important" { "Every tool an agent can call over MCP. Each also takes an optional " code { "repo" } " to target another repository. The " b { "write" } " tools (marked below) mutate the repo: they run over local stdio (" code { "rgit mcp" } ") but are " b { "disabled on this server's read-only HTTP endpoint" } ". Writes are auto-snapshotted (" code { "git_undo" } " reverses the last one)." }
+        @if tools.is_empty() {
+            div.sec { div.body { div.binary { "tool catalog unavailable" } } }
+        }
+        div.toollist {
+            @for t in tools {
+                div class=(if t.writes { "toolrow writes" } else { "toolrow" }) data-name=(format!("{} {}", t.name, t.description).to_lowercase()) title=(tool_hover(t)) {
+                    div.toolhd {
+                        code.tooln { (t.name) }
+                        @if t.writes { span.twrite title="mutates the repo; stdio only, not on the read-only HTTP endpoint" { "write" } }
+                        @for a in &t.args {
+                            span class=(if a.required { "targ req" } else { "targ" }) title=(format!("{}{}", a.ty, if a.required { ", required" } else { ", optional" })) { (a.name) }
+                        }
+                    }
+                    p.toold { (t.description) }
+                }
+            }
+        }
+        script { (PreEscaped(r#"(function(){var f=document.getElementById('tool-filter');if(!f)return;f.addEventListener('input',function(){var q=f.value.toLowerCase();Array.prototype.forEach.call(document.querySelectorAll('.toolrow'),function(c){c.style.display=(c.getAttribute('data-name')||'').indexOf(q)>=0?'':'none';});});})();"#)) }
+    };
+    let sidebar = html! {
+        div.card {
+            div.ch { "Connect an agent" }
+            (agent_body())
+        }
+    };
+    plain_layout("rgit / mcp tools", content, sidebar)
+}
+
+/// Hover text for a tool row: its description plus the full argument signature.
+fn tool_hover(t: &crate::McpTool) -> String {
+    let mut sig: Vec<String> = t
+        .args
+        .iter()
+        .map(|a| {
+            format!(
+                "{}: {}{}",
+                a.name,
+                a.ty,
+                if a.required { " (required)" } else { "" }
+            )
+        })
+        .collect();
+    sig.push("repo: string (optional; target another repo)".to_owned());
+    format!("{}\nargs: {}", t.description, sig.join(", "))
 }
 
 /// The refs decorating one commit, collapsed via [`group_decorations`].
@@ -684,10 +769,34 @@ fn lanes_body(l: &LanesState) -> Markup {
 }
 
 fn agent_body() -> Markup {
+    // Generic MCP client config. Nearly every client (Claude, Cursor, Windsurf,
+    // Zed, Continue, VS Code, ...) reads this `mcpServers` shape; a few want a
+    // `type`/`transport` field or a plain URL box in their UI.
+    let stdio_json = "{\n  \"mcpServers\": {\n    \"rgit\": { \"command\": \"rgit\", \"args\": [\"mcp\"] }\n  }\n}";
+    let http_json = "{\n  \"mcpServers\": {\n    \"rgit\": { \"url\": \"<URL>/mcp\" }\n  }\n}";
     html! {
         div.agent {
-            p { "The same repository, exposed to agents over MCP - the browser and the agent see the same data. Reads are open; run " code { "rgit mcp" } " to expose it." }
-            div.ep { span { span.k { "POST" } " /mcp" } span style="color:var(--dim)" { "streamable-http" } }
+            p { "Point any MCP client at this repository - it sees exactly what the browser sees. Reads are open; every write is auto-snapshotted, so " code { "git_undo" } " reverses the last operation." }
+
+            div.mcpopt {
+                div.mcphd { span.mcpn { "A" } "Local spawn (stdio)" }
+                p.mcpsub { "The client runs the binary in the repo; no server needed. Works in any repo, any MCP client. Drop this in the client's config:" }
+                pre.mcpcmd { code { (stdio_json) } }
+            }
+
+            div.mcpopt {
+                div.mcphd { span.mcpn { "B" } "This running server (HTTP)" }
+                p.mcpsub { "Streamable HTTP at this site's " code { "/mcp" } " - browser and agent share one process. Endpoint:" }
+                div.ep { span.k { "POST" } " " code id="mcp-url" { "/mcp" } }
+                p.mcpsub { "Config for a URL-based client:" }
+                pre.mcpcmd { code id="mcp-http-json" { (http_json) } }
+            }
+
+            p.mcpsub { "CLI shortcuts, if your client has one: Claude Code " code { "claude mcp add rgit -- rgit mcp" } " (stdio) or " code { "claude mcp add --transport http rgit <URL>/mcp" } "; others take the JSON above." }
+            p.mcpsub { "Full tool set either way (status, log, diff, blame, stage, commit, branch, stash, rebase, remotes, ...). Inspect first (" code { "git_status" } ", " code { "git_log" } "), then act." }
+
+            // Fill the HTTP endpoint from the page's own origin so it is copy-paste ready.
+            script { (maud::PreEscaped(r#"(function(){var o=location.origin;var u=document.getElementById('mcp-url');if(u)u.textContent=o+'/mcp';var j=document.getElementById('mcp-http-json');if(j)j.textContent=j.textContent.replace('<URL>/mcp',o+'/mcp');})();"#)) }
         }
     }
 }
@@ -1000,7 +1109,10 @@ pub fn commit(repo: &str, base: &str, side: &SideInfo, d: &CommitOverview) -> Ma
                         data-point
                         data-file=(i)
                         data-diff=(href(base, &format!("/commit/{}/diff/{}", d.id, f.path))) {
-                        span.dfp { (f.path) }
+                        span.dfp {
+                            @if let Some(o) = &f.old_path { span.storig { (o) " \u{2192} " } }
+                            (f.path)
+                        }
                         span.dfs { b.p { "+" (f.additions) } " " b.m { "\u{2212}" (f.deletions) } }
                     }
                 }

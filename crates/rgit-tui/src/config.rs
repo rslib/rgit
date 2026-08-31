@@ -24,8 +24,11 @@ pub struct Config {
     /// nav) or `"vim"` (hjkl motion, visual select, Space leader). Unknown
     /// names fall back to the default.
     pub profile: Option<String>,
-    /// Action-name to key overrides, e.g. `stage = "s"`. Consumed by the keymap
-    /// once remapping lands; unknown action names are simply ignored there.
+    /// Action-name to key overrides under `[keys]`, e.g. `stage = "s"`,
+    /// `forward-char = "C-l"`, `other-window = "C-x o"`. The value is a key spec:
+    /// a bare character, or a chord with `C-`/`^` (ctrl), `M-`/`A-` (alt), the
+    /// `C-x` prefix, or a named key (`Up`, `RET`, `Tab`, `Spc`, ...). An unknown
+    /// action name or an unparseable key is ignored, never fatal.
     pub keys: HashMap<String, String>,
 }
 
@@ -78,12 +81,22 @@ pub struct ThemeConfig {
 pub struct UiConfig {
     /// How many commits the log view walks by default.
     pub log_limit: usize,
+    /// Show the side preview pane in the status and log views. Off gives a
+    /// single full-width column; `--no-preview` also forces this off.
+    pub preview: bool,
+    /// Keep the operation console (push/pull/fetch/commit output) open after a
+    /// successful run until a key is pressed, so all output stays readable. When
+    /// false (default) a successful run closes the console automatically; a
+    /// failed run always stays open regardless.
+    pub console_hold: bool,
     /// Glyph palette: `ascii`, `unicode`, or `nerd`. Unset falls back to
     /// `nerd_fonts` for backward compatibility.
     pub glyphs: Option<GlyphMode>,
     /// Deprecated: `true` is equivalent to `glyphs = "nerd"`.
     pub nerd_fonts: bool,
-    /// Accept mouse events (click-to-focus, wheel scroll).
+    /// Capture mouse events (wheel scroll, click-to-focus, double-click). On by
+    /// default (like lazygit) so the wheel scrolls rgit rather than the host
+    /// terminal/editor. Set false to keep the terminal's native text selection.
     pub mouse: bool,
     /// Render read-only diffs side by side.
     pub side_by_side: bool,
@@ -134,9 +147,11 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             log_limit: 200,
+            preview: true,
+            console_hold: false,
             glyphs: None,
             nerd_fonts: false,
-            mouse: false,
+            mouse: true,
             side_by_side: false,
             transparent: Transparency::Off,
         }

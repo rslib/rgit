@@ -28,10 +28,19 @@ pub enum Target {
         path: String,
         staged: bool,
     },
+    /// A hunk header or one of its diff lines. Shared by every diff view; the
+    /// context fields say how it can be acted on.
     Hunk {
         path: String,
+        /// New-side start line of the owning hunk (for hunk-level staging/fold).
         new_start: u32,
-        staged: bool,
+        /// This row's new-side file line (equals `new_start` on the hunk header),
+        /// precomputed so the editor can open at it in any view without a lookup.
+        line: u32,
+        /// The working-tree side for staging: `Some(staged)` for the status view,
+        /// `None` for a read-only diff (a commit or a diff between revs), which is
+        /// foldable and editor-openable but not stageable.
+        staged: Option<bool>,
     },
     Stash {
         index: usize,
