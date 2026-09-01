@@ -30,6 +30,9 @@ pub struct Git2Backend {
 impl Git2Backend {
     /// Discover the repository containing `start` and validate it has a worktree.
     pub fn discover(start: impl AsRef<Path>) -> Result<Self, GitError> {
+        // Install the in-process, ssh-config-aware ssh transport (idempotent).
+        #[cfg(feature = "ssh")]
+        crate::ssh::register();
         let start = start.as_ref();
         let repo = Repository::discover(start).map_err(|e| match e.code() {
             ErrorCode::NotFound => GitError::NotARepository(start.to_path_buf()),

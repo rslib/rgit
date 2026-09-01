@@ -13,7 +13,20 @@ mod error;
 mod git_repo;
 mod model;
 mod oplog;
+#[cfg(feature = "ssh")]
+mod ssh;
 pub mod workflow;
+
+/// Install a callback that supplies an SSH password when key-based auth over an
+/// `ssh://` remote fails and no ControlMaster socket is available to reuse. The
+/// argument is a human-readable prompt; return `None` to decline. No-op when the
+/// `ssh` feature is disabled.
+#[cfg(feature = "ssh")]
+pub use ssh::set_password_provider;
+
+#[cfg(not(feature = "ssh"))]
+pub fn set_password_provider(_ask: impl Fn(&str) -> Option<String> + Send + Sync + 'static) {}
+
 pub mod workspace;
 
 pub use backend::GitBackend;

@@ -18,6 +18,9 @@ mod stack;
 
 fn main() -> ! {
     logging::init();
+    // The in-process ssh transport falls back to a password prompt when key auth
+    // fails and no ControlMaster socket exists to reuse.
+    rgit_git::set_password_provider(creds::ssh_password);
     let cli = Cli::parse();
 
     match cli.command {

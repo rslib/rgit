@@ -23,6 +23,13 @@ impl CredentialPrompt for TerminalPrompt {
     }
 }
 
+/// Ask for an SSH password on the terminal (hidden), for the in-process ssh
+/// transport's fallback when key auth fails and no ControlMaster is available.
+/// Returns `None` off a terminal, so scripted runs fail instead of blocking.
+pub fn ssh_password(label: &str) -> Option<String> {
+    prompt(label, true)
+}
+
 /// Print `label` to stderr and read one line from stdin. With `hidden`, echo is
 /// disabled around the read (via `stty`, a terminal-control escape hatch) so a
 /// secret is not shown. Returns `None` off a terminal or on EOF/empty.
