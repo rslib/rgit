@@ -73,13 +73,15 @@ side_by_side = false
 #   "full"           - fully transparent
 transparent = "off"
 
-# Keybinding profile:
-#   "magit" (default) - single-letter actions plus emacs/readline navigation
+# Active keybinding profile:
+#   "magit" / "emacs" (default) - single-letter actions plus emacs/readline
+#                       navigation; C-Spc set-mark, M-w copy.
 #   "vim"             - hjkl motion, gg/G, Ctrl-d/u, and a Space leader
 #                       (which-key) for every git action. <Space>w h/l moves
 #                       between panes; v starts a visual line selection and y
 #                       yanks it to the system clipboard via OSC 52 (inside
 #                       tmux, enable `set -g set-clipboard on`).
+#   "<custom>"        - a profile you define under [profiles.<name>] below.
 # profile = "vim"
 
 [commit]
@@ -89,28 +91,36 @@ gpg_sign = false
 # commit onto its new tip (jj/Sapling style). Set false to keep amend local.
 auto_restack = true
 
-# Rebind any action to a different key. The value is a key spec: a bare
+# Rebind actions PER PROFILE, under [keys.<profile>]. Each profile has its own
+# table, so you can configure emacs and vim independently in one file - only the
+# active profile's overrides take effect. The value is a key spec: a bare
 # character, or a chord using
 #   C- or ^   ctrl        (e.g. "C-f", "^f")
 #   M- or A-  alt          (e.g. "M-b")
 #   C-x <k>   emacs prefix (e.g. "C-x o")
 #   named keys: Up Down Left Right RET Tab Esc Spc Home End
 # Action names use hyphens. Unknown names or unparseable keys are ignored.
-# [keys]
-# stage        = "s"
-# commit       = "c"
-# rebase-menu  = "r"
-# palette      = ":"
 #
-# Navigation (magit/emacs profile defaults shown; all are rebindable):
-# forward-char  = "C-f"   # move point right a character
-# backward-char = "C-b"   # move point left a character
-# line-start    = "C-a"   # beginning of line
-# line-end      = "C-e"   # end of line
-# word-forward  = "M-f"
-# word-back     = "M-b"
-# set-mark      = "C-Spc"  # start a charwise selection
-# other-window  = "C-x o"  # switch nav <-> preview pane
-# open-editor   = "C-o"    # open the file at point in $EDITOR
-# focus-preview = "Right"
-# focus-nav     = "Left"
+# [keys.emacs]
+# set-mark  = "M-Spc"      # move set-mark off C-Spc (e.g. it's your tmux leader)
+# copy      = "M-w"        # copy the region (defaults: M-w and C-w)
+# open-editor = "C-o"
+#
+# [keys.vim]
+# copy = "Y"
+# stage = "s"
+#
+# Every action is rebindable. Some common ones:
+#   stage unstage discard commit rebase-menu merge-menu palette search
+#   forward-char backward-char line-start line-end word-forward word-back
+#   set-mark copy next-line prev-line other-window open-editor focus-preview
+#
+# Define YOUR OWN profile: base it on a built-in with `extends`, then customize
+# its [keys.<name>]. Set `profile = "<name>"` above to use it.
+#
+# profile = "mine"
+# [profiles.mine]
+# extends = "emacs"        # inherit emacs bindings, then override below
+# [keys.mine]
+# stage = "S"
+# set-mark = "M-Spc"

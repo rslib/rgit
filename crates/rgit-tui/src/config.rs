@@ -20,16 +20,71 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub ui: UiConfig,
     pub commit: CommitConfig,
-    /// Keybinding profile: `"magit"` (default, single-letter actions + emacs
-    /// nav) or `"vim"` (hjkl motion, visual select, Space leader). Unknown
-    /// names fall back to the default.
+    /// The active keybinding profile: a built-in (`"magit"`/`"emacs"` or
+    /// `"vim"`) or a custom profile named under `[profiles.<name>]`. Defaults to
+    /// magit.
     pub profile: Option<String>,
-    /// Action-name to key overrides under `[keys]`, e.g. `stage = "s"`,
-    /// `forward-char = "C-l"`, `other-window = "C-x o"`. The value is a key spec:
-    /// a bare character, or a chord with `C-`/`^` (ctrl), `M-`/`A-` (alt), the
-    /// `C-x` prefix, or a named key (`Up`, `RET`, `Tab`, `Spc`, ...). An unknown
-    /// action name or an unparseable key is ignored, never fatal.
-    pub keys: HashMap<String, String>,
+    /// Per-profile key overrides, grouped by profile name: `[keys.emacs]`,
+    /// `[keys.vim]`, or `[keys.<custom>]`. Each entry maps an action name to a
+    /// key spec - a bare character, or a chord with `C-`/`^` (ctrl), `M-`/`A-`
+    /// (alt), the `C-x` prefix, or a named key (`Up`, `RET`, `Tab`, `Spc`, ...).
+    /// A custom profile inherits its base's bindings, then applies its own. An
+    /// unknown action or an unparseable key is ignored, never fatal.
+    pub keys: HashMap<String, HashMap<String, String>>,
+    /// User-defined profiles: `[profiles.<name>] extends = "emacs"` bases a new
+    /// profile on a built-in (or another custom profile), which its own
+    /// `[keys.<name>]` then customizes.
+    pub profiles: HashMap<String, ProfileDef>,
+}
+
+/// One custom profile: a base to inherit from, then its own `[keys.<name>]`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfileDef {
+    /// The profile this one is based on (`"emacs"`/`"magit"`, `"vim"`, or
+    /// another custom name). Defaults to magit when omitted.
+    pub extends: Option<String>,
+}
+
+impl Config {
+    /// Resolve the configured profile into the built-in base it rests on and the
+    /// flat action->key overrides to apply (a custom profile's inheritance chain
+    /// merged base-first, so the most-derived binding wins). Cycles are broken.
+    pub fn resolved_keymap(&self) -> (String, HashMap<String, String>) {
+        let is_builtin = |n: &str| matches!(n, "magit" | "emacs" | "vim");
+        let active = self.profile.clone().unwrap_or_else(|| "magit".to_owned());
+
+        // Walk the extends chain from the active profile toward a built-in.
+        let mut chain = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut name = active;
+        while seen.insert(name.clone()) {
+            chain.push(name.clone());
+            if is_builtin(&name) {
+                break;
+            }
+            match self.profiles.get(&name).and_then(|p| p.extends.clone()) {
+                Some(base) => name = base,
+                None => break, // a custom profile with no base falls back to magit
+            }
+        }
+
+        let base = chain
+            .iter()
+            .rev()
+            .find(|n| is_builtin(n))
+            .cloned()
+            .unwrap_or_else(|| "magit".to_owned());
+
+        // Apply overrides base-first so derived profiles win.
+        let mut overrides = HashMap::new();
+        for profile in chain.iter().rev() {
+            if let Some(map) = self.keys.get(profile) {
+                overrides.extend(map.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+        }
+        (base, overrides)
+    }
 }
 
 /// Commit behavior.
@@ -195,6 +250,57 @@ pub fn load() -> (Config, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_profile_keys_apply_to_the_active_profile() {
+        let cfg: Config = toml::from_str(
+            r##"
+            profile = "vim"
+            [keys.emacs]
+            set-mark = "M-Spc"
+            [keys.vim]
+            copy = "Y"
+            "##,
+        )
+        .unwrap();
+        let (base, keys) = cfg.resolved_keymap();
+        assert_eq!(base, "vim");
+        // Only the vim overrides apply while vim is active.
+        assert_eq!(keys.get("copy").map(String::as_str), Some("Y"));
+        assert!(!keys.contains_key("set-mark"));
+    }
+
+    #[test]
+    fn a_custom_profile_inherits_its_base_then_overrides() {
+        let cfg: Config = toml::from_str(
+            r##"
+            profile = "mine"
+            [profiles.mine]
+            extends = "emacs"
+            [keys.emacs]
+            set-mark = "M-Spc"
+            stage = "s"
+            [keys.mine]
+            stage = "S"
+            "##,
+        )
+        .unwrap();
+        let (base, keys) = cfg.resolved_keymap();
+        // "emacs" is the magit built-in under another name; keymap::init treats
+        // both the same.
+        assert_eq!(base, "emacs");
+        // Inherited from the emacs base...
+        assert_eq!(keys.get("set-mark").map(String::as_str), Some("M-Spc"));
+        // ...and the derived profile wins where they overlap.
+        assert_eq!(keys.get("stage").map(String::as_str), Some("S"));
+    }
+
+    #[test]
+    fn no_profile_defaults_to_magit_with_no_overrides() {
+        let (base, keys) = Config::default().resolved_keymap();
+        assert_eq!(base, "magit");
+        assert!(keys.is_empty());
+    }
 
     #[test]
     fn parses_a_partial_config() {

@@ -203,7 +203,10 @@ pub async fn run(backend: Arc<dyn GitBackend>, no_preview: bool) -> std::io::Res
         config.ui.preview = false;
     }
     crate::theme::init(crate::theme::Theme::from_config(&config.theme));
-    crate::keymap::init(&config.keys, config.profile.as_deref());
+    // Resolve the active profile (built-in or custom) into its base + the merged
+    // per-profile key overrides.
+    let (base_profile, key_overrides) = config.resolved_keymap();
+    crate::keymap::init(&key_overrides, Some(&base_profile));
     rgit_model::set_side_by_side(config.ui.side_by_side);
     rgit_model::set_glyph_mode(config.ui.glyph_mode());
     rgit_model::set_syntax_colors(crate::theme::syntax_colors());
