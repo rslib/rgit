@@ -502,6 +502,10 @@ pub struct View {
     /// A code finder to restore when this view is popped, so the finder ->
     /// blame -> `q` path returns to the live search instead of the root.
     pub resume_finder: Option<CodeFinder>,
+    /// The working directory this view's paths are relative to, when it is not
+    /// the main repo - a worktree inspector sets it so "open in editor" opens
+    /// the file inside that worktree, not the main checkout.
+    pub base: Option<std::path::PathBuf>,
 }
 
 /// A message: a user intent resolved from a key, or an async result. Everything
@@ -593,6 +597,12 @@ pub enum Msg {
     PushRemotesLoaded(Vec<Remote>),
     WorktreeMenu,
     WorktreesLoaded(Vec<Worktree>),
+    /// A worktree's changes, ready to show in a read-only inspection view.
+    WorktreeInspected {
+        title: String,
+        base: std::path::PathBuf,
+        files: Vec<rgit_git::FileDiff>,
+    },
     Forge,
     ForgeLoaded(Result<Vec<PullRequest>, String>),
     DiffPrompt,
@@ -1709,6 +1719,12 @@ pub enum Effect {
     LoadPushRemotes,
     /// Load linked worktrees, then push the worktrees view.
     LoadWorktrees,
+    /// Open the worktree at `path` and load its changes, then push a read-only
+    /// inspection view titled with `name`.
+    InspectWorktree {
+        name: String,
+        path: String,
+    },
     /// Load forge pull requests, then push the forge view.
     LoadForge,
     /// Open the in-app commit editor (loading the HEAD message when amending).
@@ -1921,6 +1937,7 @@ impl App {
                 buffer: Buffer::default(),
                 path: None,
                 resume_finder: None,
+                base: None,
             }],
             head: None,
             state: RepoState::Clean,
@@ -2043,6 +2060,8 @@ impl App {
             // Preview a ref by its tip commit; revparse resolves the branch, tag,
             // or remote name to the commit whose diff the preview shows.
             Target::Ref { name, .. } => Some(PreviewKey::Commit { id: name }),
+            // A worktree opens its changes on Return; no inline preview.
+            Target::Worktree { .. } => None,
         }
     }
 
@@ -2422,6 +2441,12 @@ impl App {
         self.views.last().expect("nonempty view stack").kind
     }
 
+    /// The root the active view's paths are relative to (a worktree's own dir),
+    /// or `None` for the main repo.
+    pub fn active_base(&self) -> Option<std::path::PathBuf> {
+        self.views.last().and_then(|v| v.base.clone())
+    }
+
     /// Push a new screen onto the stack.
     pub fn push_view(&mut self, kind: ViewKind, buffer: Buffer) {
         self.views.push(View {
@@ -2429,6 +2454,7 @@ impl App {
             buffer,
             path: None,
             resume_finder: None,
+            base: None,
         });
     }
 
@@ -2727,6 +2753,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 };
                 return vec![Effect::Mutate(mutation)];
             }
+            Some(Target::Worktree { name, path }) => {
+                app.loading = true;
+                return vec![Effect::InspectWorktree { name, path }];
+            }
             _ => {}
             }
         }
@@ -2918,6 +2948,17 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             let mut buffer = Buffer::default();
             buffer.set_content(build_worktrees(&worktrees));
             app.push_view(ViewKind::Worktrees, buffer);
+        }
+        Msg::WorktreeInspected { title, base, files } => {
+            app.loading = false;
+            let mut buffer = Buffer::default();
+            buffer.set_content(rgit_model::build_diff(&title, &files));
+            app.push_view(ViewKind::Diff, buffer);
+            // Record the worktree's own root so "open in editor" opens the file
+            // inside that worktree, not the main checkout.
+            if let Some(top) = app.views.last_mut() {
+                top.base = Some(base);
+            }
         }
         Msg::Forge => return vec![Effect::LoadForge],
         Msg::ForgeLoaded(Ok(prs)) => {

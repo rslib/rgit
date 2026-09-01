@@ -1757,17 +1757,49 @@ impl GitBackend for Git2Backend {
 
     fn worktrees(&self) -> Result<Vec<crate::Worktree>, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
-        let names = repo.worktrees()?;
         let mut out = Vec::new();
-        for name in names.iter().filter_map(|n| n.ok().flatten()) {
-            if let Ok(wt) = repo.find_worktree(name) {
-                out.push(crate::Worktree {
-                    name: name.to_owned(),
-                    path: wt.path().to_string_lossy().into_owned(),
-                });
-            }
+
+        // The main worktree first, described from this repository directly.
+        if let Some(dir) = repo.workdir() {
+            let (branch, head) = worktree_head(&repo);
+            out.push(crate::Worktree {
+                name: "(main)".to_owned(),
+                path: dir.to_string_lossy().into_owned(),
+                branch,
+                head,
+                dirty: repo_is_dirty(&repo),
+                locked: false,
+                is_main: true,
+            });
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Each linked worktree, opened on its own path for branch/HEAD/dirty.
+        let names = repo.worktrees()?;
+        for name in names.iter().filter_map(|n| n.ok().flatten()) {
+            let Ok(wt) = repo.find_worktree(name) else {
+                continue;
+            };
+            let path = wt.path().to_path_buf();
+            let locked = !matches!(wt.is_locked(), Ok(git2::WorktreeLockStatus::Unlocked));
+            let (branch, head, dirty) = match Repository::open(&path) {
+                Ok(wtr) => {
+                    let (b, h) = worktree_head(&wtr);
+                    (b, h, repo_is_dirty(&wtr))
+                }
+                Err(_) => (None, None, false),
+            };
+            out.push(crate::Worktree {
+                name: name.to_owned(),
+                path: path.to_string_lossy().into_owned(),
+                branch,
+                head,
+                dirty,
+                locked,
+                is_main: false,
+            });
+        }
+
+        out.sort_by(|a, b| b.is_main.cmp(&a.is_main).then(a.name.cmp(&b.name)));
         Ok(out)
     }
 
@@ -3815,6 +3847,38 @@ fn collect_recent(repo: &Repository) -> Vec<Commit> {
             unpushed: unpushed.contains(&commit.id()),
         })
         .collect()
+}
+
+/// The branch name (only when HEAD points at a branch) and the abbreviated HEAD
+/// commit id for a repository/worktree. Both are `None` on an unborn branch.
+fn worktree_head(repo: &Repository) -> (Option<String>, Option<String>) {
+    let Ok(head) = repo.head() else {
+        return (None, None);
+    };
+    let branch = head
+        .is_branch()
+        .then(|| head.shorthand().ok())
+        .flatten()
+        .map(str::to_owned);
+    let short = head
+        .peel_to_commit()
+        .ok()
+        .and_then(|c| c.as_object().short_id().ok())
+        .and_then(|b| b.as_str().ok().map(str::to_owned));
+    (branch, short)
+}
+
+/// Whether a repository/worktree has any uncommitted change: tracked edits,
+/// staged files, or new (untracked) files. Ignored files do not count.
+fn repo_is_dirty(repo: &Repository) -> bool {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true).include_ignored(false);
+    match repo.statuses(Some(&mut opts)) {
+        Ok(statuses) => statuses
+            .iter()
+            .any(|e| !e.status().is_empty() && !e.status().contains(Status::IGNORED)),
+        Err(_) => false,
+    }
 }
 
 /// Run libgit2 rename detection over a display diff, then extract it. A moved

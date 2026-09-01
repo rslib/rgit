@@ -597,7 +597,11 @@ async fn run_msg(
                 // Best-effort: a diff line from a commit may name a file that has
                 // since moved or shrunk. Skip if it is gone, and clamp the line to
                 // the file's current length so the editor lands somewhere sane.
-                let full = app.backend().workdir().join(&path);
+                // A worktree inspection view resolves paths against its own root.
+                let root = app
+                    .active_base()
+                    .unwrap_or_else(|| app.backend().workdir().to_path_buf());
+                let full = root.join(&path);
                 let line = match std::fs::read_to_string(&full) {
                     Ok(text) => line.min(text.lines().count().max(1)),
                     Err(_) => {
@@ -818,6 +822,37 @@ async fn run_msg(
                     if let Ok(worktrees) = backend.worktrees() {
                         let _ = msg_tx.send(Msg::WorktreesLoaded(worktrees));
                     }
+                });
+            }
+            Effect::InspectWorktree { name, path } => {
+                // Open the worktree as its own repo and read its working-tree
+                // changes, off the UI thread.
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let base = std::path::PathBuf::from(&path);
+                    let msg = match rgit_git::Git2Backend::discover(&base)
+                        .and_then(|b| b.status())
+                    {
+                        Ok(status) => {
+                            let changed = status.unstaged.len();
+                            let head = status.head.oid.as_deref().unwrap_or("unborn");
+                            let branch = status.head.branch.as_deref().unwrap_or("detached");
+                            let title = format!(
+                                "worktree {name} \u{b7} {branch} @ {head} \u{b7} {changed} changed"
+                            );
+                            Msg::WorktreeInspected {
+                                title,
+                                base,
+                                files: status.unstaged,
+                            }
+                        }
+                        Err(e) => Msg::WorktreeInspected {
+                            title: format!("worktree {name}: {e}"),
+                            base,
+                            files: Vec::new(),
+                        },
+                    };
+                    let _ = msg_tx.send(msg);
                 });
             }
             Effect::LoadForge => {

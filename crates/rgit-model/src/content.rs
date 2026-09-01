@@ -59,6 +59,11 @@ pub enum Target {
         name: String,
         kind: RefTarget,
     },
+    /// A worktree that can be opened to inspect its changes.
+    Worktree {
+        name: String,
+        path: String,
+    },
 }
 
 /// Which kind of reference a [`Target::Ref`] points at.

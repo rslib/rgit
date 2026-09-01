@@ -1455,6 +1455,9 @@ fn context_hints(app: &App) -> (Option<String>, Vec<(&'static str, &'static str)
             Some(Target::Ref { .. }) => {
                 (Some("ref".into()), vec![("⏎", "checkout"), ("x", "delete")])
             }
+            Some(Target::Worktree { .. }) => {
+                (Some("worktree".into()), vec![("⏎", "inspect changes")])
+            }
             _ => (
                 None,
                 vec![

@@ -376,13 +376,28 @@ pub fn build_worktrees(worktrees: &[Worktree]) -> Vec<Section> {
     worktrees
         .iter()
         .map(|w| {
-            Section::leaf(
-                format!("worktrees/{}", w.name),
-                NodeKind::Commit,
-                vec![
-                    Span::new(format!("{:<16}", w.name), Style::Branch),
-                    Span::new(w.path.clone(), Style::Dim),
-                ],
+            let mut spans = vec![Span::new(format!("{:<18}", w.name), Style::Branch)];
+            // branch @ short-head, then flags, then the path.
+            match (&w.branch, &w.head) {
+                (Some(b), Some(h)) => {
+                    spans.push(Span::new(format!("{b} "), Style::Branch));
+                    spans.push(Span::new(format!("{h}  "), Style::Hash));
+                }
+                (None, Some(h)) => spans.push(Span::new(format!("detached {h}  "), Style::Hash)),
+                _ => spans.push(Span::new("(unborn)  ".to_owned(), Style::Dim)),
+            }
+            if w.dirty {
+                spans.push(Span::new("\u{25cf} dirty  ".to_owned(), Style::Modified));
+            }
+            if w.locked {
+                spans.push(Span::new("\u{f023} locked  ".to_owned(), Style::Deleted));
+            }
+            spans.push(Span::new(w.path.clone(), Style::Dim));
+            Section::leaf(format!("worktrees/{}", w.name), NodeKind::Commit, spans).with_target(
+                Target::Worktree {
+                    name: w.name.clone(),
+                    path: w.path.clone(),
+                },
             )
         })
         .collect()

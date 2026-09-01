@@ -512,19 +512,27 @@ fn add_list_and_remove_worktrees() {
     git(&dir, &["commit", "-q", "-m", "seed"]);
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    assert!(backend.worktrees().unwrap().is_empty());
+    // worktrees() includes the main worktree; the linked list starts empty.
+    let linked = |b: &Git2Backend| {
+        b.worktrees()
+            .unwrap()
+            .into_iter()
+            .filter(|w| !w.is_main)
+            .collect::<Vec<_>>()
+    };
+    assert!(linked(&backend).is_empty());
 
     let wt_path = scratch("worktrees-linked");
     let _ = std::fs::remove_dir_all(&wt_path);
     backend
         .add_worktree("feature-wt", wt_path.to_str().unwrap())
         .unwrap();
-    let worktrees = backend.worktrees().unwrap();
+    let worktrees = linked(&backend);
     assert_eq!(worktrees.len(), 1);
     assert_eq!(worktrees[0].name, "feature-wt");
 
     backend.remove_worktree("feature-wt", false).unwrap();
-    assert!(backend.worktrees().unwrap().is_empty());
+    assert!(linked(&backend).is_empty());
 }
 
 #[test]

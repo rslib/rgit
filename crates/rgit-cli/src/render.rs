@@ -334,7 +334,27 @@ pub fn worktrees(list: &[Worktree]) -> String {
         return "no worktrees".to_owned();
     }
     list.iter()
-        .map(|w| format!("{} {}", paint(&w.name, CYAN), paint(&w.path, DIM)))
+        .map(|w| {
+            let head = match (&w.branch, &w.head) {
+                (Some(b), Some(h)) => format!("{b} {h}"),
+                (None, Some(h)) => format!("detached {h}"),
+                _ => "(unborn)".to_owned(),
+            };
+            let mut flags = String::new();
+            if w.dirty {
+                flags.push_str(" dirty");
+            }
+            if w.locked {
+                flags.push_str(" locked");
+            }
+            format!(
+                "{}  {}{}  {}",
+                paint(&w.name, CYAN),
+                head,
+                paint(&flags, DIM),
+                paint(&w.path, DIM)
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

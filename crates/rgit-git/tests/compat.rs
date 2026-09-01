@@ -585,11 +585,62 @@ fn remove_worktree_drops_it_from_the_list() {
     let backend = Git2Backend::discover(&dir).unwrap();
     let wt_path = scratch("remove-worktree-linked");
     let _ = std::fs::remove_dir_all(&wt_path);
+    // worktrees() lists the main worktree too, so assert on the linked ones.
+    let linked = |b: &Git2Backend| {
+        b.worktrees()
+            .unwrap()
+            .into_iter()
+            .filter(|w| !w.is_main)
+            .collect::<Vec<_>>()
+    };
     backend.add_worktree("side", wt_path.to_str().unwrap()).unwrap();
-    assert_eq!(backend.worktrees().unwrap().len(), 1);
+    let after_add = linked(&backend);
+    assert_eq!(after_add.len(), 1);
+    assert_eq!(after_add[0].name, "side");
 
     backend.remove_worktree("side", true).unwrap();
-    assert!(backend.worktrees().unwrap().is_empty());
+    assert!(linked(&backend).is_empty());
+    // The main worktree is always present.
+    assert!(backend.worktrees().unwrap().iter().any(|w| w.is_main));
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn worktrees_report_branch_head_and_dirty_state() {
+    let dir = init_repo("worktree-inspect");
+    commit(&dir, "a.txt", "x\n", "seed");
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let wt_path = scratch("worktree-inspect-linked");
+    let _ = std::fs::remove_dir_all(&wt_path);
+    backend
+        .add_worktree("feature", wt_path.to_str().unwrap())
+        .unwrap();
+
+    let list = backend.worktrees().unwrap();
+    let main = list.iter().find(|w| w.is_main).expect("main worktree");
+    assert!(main.head.is_some(), "main has a HEAD commit");
+    assert!(!main.dirty, "seeded main is clean");
+
+    let side = list
+        .iter()
+        .find(|w| w.name == "feature")
+        .expect("linked worktree");
+    assert_eq!(side.branch.as_deref(), Some("feature"));
+    assert!(side.head.is_some());
+    assert!(!side.dirty, "fresh worktree is clean");
+
+    // Dirty the linked worktree; it should now report dirty.
+    std::fs::write(wt_path.join("new.txt"), "hello\n").unwrap();
+    let side = backend
+        .worktrees()
+        .unwrap()
+        .into_iter()
+        .find(|w| w.name == "feature")
+        .unwrap();
+    assert!(side.dirty, "an untracked file makes the worktree dirty");
+
+    backend.remove_worktree("feature", true).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

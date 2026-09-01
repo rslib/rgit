@@ -210,11 +210,22 @@ pub struct Remote {
     pub url: String,
 }
 
-/// A linked worktree of the repository.
+/// A worktree of the repository (the main one, or a linked worktree), with
+/// enough state to inspect it at a glance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Worktree {
     pub name: String,
     pub path: String,
+    /// The checked-out branch, or `None` when detached.
+    pub branch: Option<String>,
+    /// Abbreviated HEAD commit id, or `None` for an unborn branch.
+    pub head: Option<String>,
+    /// Whether the worktree has uncommitted changes (tracked, staged, or new).
+    pub dirty: bool,
+    /// Whether the worktree is locked (`git worktree lock`).
+    pub locked: bool,
+    /// The primary worktree (the repository's own working directory).
+    pub is_main: bool,
 }
 
 /// Filters for the commit log view.
