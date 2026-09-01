@@ -1011,7 +1011,11 @@ fn row_hl(
     // While a selection is live, drop the full-row cursor tint so the highlight
     // (a similar background) stands out; keep the block caret on the cursor row.
     let cursorline = on_cursor && !buf.has_selection();
-    let caret = (vim && on_cursor).then(|| buf.char_col());
+    // Draw the block caret whenever the char caret is engaged - always in vim,
+    // and in the magit/emacs profile once the caret leaves column 0 (C-f/C-b) or
+    // a selection is active - so character movement is visible in both profiles.
+    let caret_engaged = vim || buf.char_col() > 0 || buf.has_selection();
+    let caret = (on_cursor && caret_engaged).then(|| buf.char_col());
 
     if let Some(((r0, c0), (r1, c1))) = buf.char_selection() {
         let sel = if idx < r0 || idx > r1 {
@@ -1526,7 +1530,8 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("^f / ^b", "forward / back a character"),
             ("^a / ^e", "start / end of line"),
             ("M-f / M-b", "forward / back a word"),
-            ("^Spc", "set mark (start selection)"),
+            ("^Spc / v", "set mark (char / line selection)"),
+            ("M-w · ^w", "copy the selection (vim: y)"),
             ("^x o · arrows", "switch nav / preview pane"),
             ("Tab", "fold / unfold section"),
             ("RET", "open commit · blame file · checkout ref"),

@@ -71,6 +71,8 @@ pub enum Command {
     OpenEditor,
     FocusPreview,
     FocusNav,
+    /// Copy the selected region to the clipboard (emacs M-w; vim uses `y`).
+    Copy,
 }
 
 impl Command {
@@ -133,6 +135,7 @@ impl Command {
             Command::OpenEditor => Msg::OpenEditor,
             Command::FocusPreview => Msg::FocusPreview,
             Command::FocusNav => Msg::FocusNav,
+            Command::Copy => Msg::Yank,
         }
     }
 
@@ -196,6 +199,7 @@ impl Command {
             "open-editor" | "editor" => Command::OpenEditor,
             "focus-preview" => Command::FocusPreview,
             "focus-nav" => Command::FocusNav,
+            "copy" | "yank" => Command::Copy,
             _ => return None,
         })
     }
@@ -403,6 +407,10 @@ fn nav_defaults(profile: Profile) -> Vec<(Chord, Command)> {
             (ctrl('a'), Command::LineStart),
             (ctrl('e'), Command::LineEnd),
             (ctrl(' '), Command::SetMark),
+            // Copy the region: emacs M-w, and C-w (kill-region; on a read-only
+            // view it just copies).
+            (alt('w'), Command::Copy),
+            (ctrl('w'), Command::Copy),
             (alt('f'), Command::WordForward),
             (alt('b'), Command::WordBack),
             (key(ChordCode::Down), Command::NextLine),
@@ -751,6 +759,9 @@ mod tests {
         // M-f/M-b move by word.
         assert!(matches!(resolve_key(alt('f')), Some(Msg::ColWordForward)));
         assert!(matches!(resolve_key(alt('b')), Some(Msg::ColWordBack)));
+        // M-w / C-w copy the region (emacs), like vim's `y`.
+        assert!(matches!(resolve_key(alt('w')), Some(Msg::Yank)));
+        assert!(matches!(resolve_key(ctrl('w')), Some(Msg::Yank)));
     }
 
     #[test]
