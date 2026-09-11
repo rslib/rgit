@@ -405,15 +405,20 @@ pub fn build_worktrees(worktrees: &[Worktree]) -> Vec<Section> {
 
 /// Build the blame view: each file line prefixed with its commit and author.
 pub fn build_blame(path: &str, lines: &[BlameLine]) -> Vec<Section> {
+    // A never-committed file (newly added, staged or not) has no blame at all,
+    // so the hash/author gutter would be blank on every row - just wasted space.
+    // Drop it and show the code alone in that case.
+    let has_blame = lines.iter().any(|bl| !bl.short_id.is_empty());
     lines
         .iter()
         .enumerate()
         .map(|(i, bl)| {
-            let author: String = bl.author.chars().take(12).collect();
-            let mut spans = vec![
-                Span::new(format!("{:>7} ", bl.short_id), Style::Hash),
-                Span::new(format!("{author:<12} "), Style::Dim),
-            ];
+            let mut spans = Vec::new();
+            if has_blame {
+                let author: String = bl.author.chars().take(12).collect();
+                spans.push(Span::new(format!("{:>7} ", bl.short_id), Style::Hash));
+                spans.push(Span::new(format!("{author:<12} "), Style::Dim));
+            }
             spans.extend(highlight_code(path, &bl.line));
             Section::leaf(format!("blame/{i}"), NodeKind::DiffLine, spans)
         })
@@ -1367,12 +1372,14 @@ fn file_section<'a>(
         })
         .collect();
 
+    let paths = entries.iter().map(|e| e.path.clone()).collect();
     Section::branch(
         id,
         NodeKind::Section,
         section_header(title, entries.len()),
         files,
     )
+    .with_target(Target::Section { staged, paths })
 }
 
 /// A dim uppercase section title with an accent count, e.g. `UNSTAGED  3`.

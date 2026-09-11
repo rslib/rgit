@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
@@ -212,10 +213,9 @@ pub async fn run(backend: Arc<dyn GitBackend>, no_preview: bool) -> std::io::Res
     rgit_model::set_syntax_colors(crate::theme::syntax_colors());
 
     let mouse = config.ui.mouse;
+    MOUSE_CAPTURE.store(mouse, Ordering::Relaxed);
     let mut terminal = ratatui::init();
-    if mouse {
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
-    }
+    enable_mouse_capture();
     install_panic_hook(mouse);
     let result = event_loop(&mut terminal, backend, config, config_error).await;
     if mouse {
@@ -223,6 +223,18 @@ pub async fn run(backend: Arc<dyn GitBackend>, no_preview: bool) -> std::io::Res
     }
     ratatui::restore();
     result
+}
+
+/// Mouse capture is a distinct terminal mode from raw mode and the alternate
+/// screen, so `ratatui::init()` does not restore it. Track whether the user
+/// wants it and re-enable it after every suspend/resume around an external
+/// program (editor, git console); otherwise the mouse stops working on return.
+static MOUSE_CAPTURE: AtomicBool = AtomicBool::new(false);
+
+fn enable_mouse_capture() {
+    if MOUSE_CAPTURE.load(Ordering::Relaxed) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    }
 }
 
 /// Restore the terminal on panic before the default hook prints the message, so
@@ -625,6 +637,7 @@ async fn run_msg(
                 })
                 .await;
                 *terminal = ratatui::init();
+                enable_mouse_capture();
                 events.resume();
                 if !matches!(opened, Ok(Ok(true))) {
                     app.push_toast(crate::app::ToastKind::Error, "editor exited abnormally".into());
@@ -1236,6 +1249,7 @@ async fn commit_flow(
     let edit_path = path.clone();
     let edited = tokio::task::spawn_blocking(move || run_editor(&editor, &edit_path)).await;
     *terminal = ratatui::init();
+    enable_mouse_capture();
     events.resume();
 
     if !matches!(edited, Ok(Ok(true))) {
@@ -1302,6 +1316,8 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::UnstageAll => backend.unstage_all(),
         Mutation::StageFile(path) => backend.stage_file(path),
         Mutation::UnstageFile(path) => backend.unstage_file(path),
+        Mutation::StageFiles(paths) => paths.iter().try_for_each(|p| backend.stage_file(p)),
+        Mutation::UnstageFiles(paths) => paths.iter().try_for_each(|p| backend.unstage_file(p)),
         Mutation::StageHunk { path, new_start } => backend.stage_hunk(path, *new_start),
         Mutation::UnstageHunk { path, new_start } => backend.unstage_hunk(path, *new_start),
         Mutation::StageLines {
@@ -1570,6 +1586,7 @@ async fn git_console_env(
     })
     .await;
     *terminal = ratatui::init();
+    enable_mouse_capture();
     events.resume();
 
     match ran {

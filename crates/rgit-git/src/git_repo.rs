@@ -523,13 +523,17 @@ impl GitBackend for Git2Backend {
 
     fn blame(&self, path: &str) -> Result<Vec<crate::BlameLine>, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
-        let blame = repo.blame_file(Path::new(path), None)?;
         let content = std::fs::read_to_string(self.workdir.join(path))?;
+        // libgit2 blames committed history only, so a file that exists solely in
+        // the index or working tree (newly added, never committed) has nothing to
+        // blame and errors with "path does not exist". Match `git blame` and mark
+        // every line not-yet-committed rather than failing.
+        let blame = repo.blame_file(Path::new(path), None).ok();
 
         let lines = content
             .lines()
             .enumerate()
-            .map(|(i, text)| match blame.get_line(i + 1) {
+            .map(|(i, text)| match blame.as_ref().and_then(|b| b.get_line(i + 1)) {
                 Some(hunk) => crate::BlameLine {
                     short_id: hunk.final_commit_id().to_string().chars().take(7).collect(),
                     author: hunk

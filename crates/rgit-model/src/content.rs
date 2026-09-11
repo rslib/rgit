@@ -64,6 +64,15 @@ pub enum Target {
         name: String,
         path: String,
     },
+    /// A staging section heading (Untracked/Unstaged/Staged). magit-style, `s`
+    /// on the Untracked/Unstaged heading stages exactly that section's files and
+    /// `u` on the Staged heading unstages them - untracked files are their own
+    /// section, so staging Unstaged never pulls them in. `staged` is true only
+    /// for the Staged heading; `paths` are the files that heading covers.
+    Section {
+        staged: bool,
+        paths: Vec<String>,
+    },
 }
 
 /// Which kind of reference a [`Target::Ref`] points at.

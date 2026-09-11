@@ -794,6 +794,10 @@ pub enum Msg {
 pub enum Mutation {
     StageFile(String),
     UnstageFile(String),
+    /// Stage an explicit set of files (a whole Unstaged/Untracked section).
+    StageFiles(Vec<String>),
+    /// Unstage an explicit set of files (the whole Staged section).
+    UnstageFiles(Vec<String>),
     StageHunk {
         path: String,
         new_start: u32,
@@ -1930,6 +1934,19 @@ pub struct App {
 
 impl App {
     pub fn new(backend: Arc<dyn GitBackend>, config: crate::config::Config) -> Self {
+        // libgit2 never signs commits and ignores git's commit.gpgsign, so honor
+        // that setting here: sign whenever rgit's own config asks or git config
+        // does. A signed commit is routed through `git commit -S`, which uses the
+        // user's gpg.format/user.signingkey (see CommitEditorSubmit).
+        let git_wants_sign = matches!(
+            backend
+                .config_get("commit.gpgsign")
+                .ok()
+                .flatten()
+                .as_deref(),
+            Some("true" | "yes" | "on" | "1")
+        );
+        let gpg_sign = config.commit.gpg_sign || git_wants_sign;
         Self {
             backend,
             views: vec![View {
@@ -1968,7 +1985,7 @@ impl App {
             log_loading: false,
             log_filter: LogFilter::All,
             oplog_len: 0,
-            gpg_sign: config.commit.gpg_sign,
+            gpg_sign,
             auto_restack: config.commit.auto_restack,
             pending_reword_rev: None,
             pending_push: None,
@@ -2062,6 +2079,8 @@ impl App {
             Target::Ref { name, .. } => Some(PreviewKey::Commit { id: name }),
             // A worktree opens its changes on Return; no inline preview.
             Target::Worktree { .. } => None,
+            // A staging heading acts on the whole section; nothing to preview.
+            Target::Section { .. } => None,
         }
     }
 
@@ -3444,6 +3463,13 @@ fn stage_at_cursor(app: &mut App) -> Vec<Effect> {
             staged: Some(false),
             ..
         }) => Mutation::StageHunk { path, new_start },
+        // magit-style: `s` on the Unstaged or Untracked heading stages exactly
+        // that section's files - untracked is a separate heading, so staging
+        // Unstaged does not pull in untracked files.
+        Some(Target::Section {
+            staged: false,
+            paths,
+        }) if !paths.is_empty() => Mutation::StageFiles(paths),
         _ => return Vec::new(),
     };
     app.loading = true;
@@ -3471,6 +3497,11 @@ fn unstage_at_cursor(app: &mut App) -> Vec<Effect> {
             staged: Some(true),
             ..
         }) => Mutation::UnstageHunk { path, new_start },
+        // magit-style: `u` on the Staged heading unstages that section's files.
+        Some(Target::Section {
+            staged: true,
+            paths,
+        }) if !paths.is_empty() => Mutation::UnstageFiles(paths),
         _ => return Vec::new(),
     };
     app.loading = true;
