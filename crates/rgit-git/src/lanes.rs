@@ -493,7 +493,7 @@ pub fn commit(repo: &Repository, lane_name: &str, message: &str) -> Result<Strin
     let tree = repo.find_tree(tree_oid)?;
 
     let sig = signature(repo)?;
-    let msg = change_id::ensure(message);
+    let msg = change_id::ensure(repo, message);
     let branch_ref = format!("refs/heads/{}", lane.branch);
     let new = repo.commit(Some(&branch_ref), &sig, &sig, &msg, &tree, &[&parent])?;
 

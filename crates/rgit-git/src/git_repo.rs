@@ -2456,7 +2456,7 @@ impl GitBackend for Git2Backend {
                     msg.push_str("\n\n");
                 }
                 let msg =
-                    crate::change_id::preserve(head.message().unwrap_or(""), msg.trim_end());
+                    crate::change_id::preserve(&repo, head.message().unwrap_or(""), msg.trim_end());
                 let sig = repo.signature()?;
                 let new = repo.commit(None, &head.author(), &sig, &msg, &head.tree()?, &[&base])?;
                 repo.reference(&branch_ref, new, true, "rgit squash range")?;
@@ -2485,7 +2485,7 @@ impl GitBackend for Git2Backend {
                     target.message().unwrap_or("").trim_end()
                 );
                 let combined =
-                    crate::change_id::preserve(parent.message().unwrap_or(""), &combined);
+                    crate::change_id::preserve(&repo, parent.message().unwrap_or(""), &combined);
                 let sig = repo.signature()?;
                 let grandparents: Vec<git2::Commit> = (0..parent.parent_count())
                     .filter_map(|k| parent.parent(k).ok())
@@ -3088,9 +3088,9 @@ fn make_commit(
     if verify {
         run_commit_hooks(repo, &mut msg)?;
     }
-    // After the commit-msg hook (which a Gerrit setup may use to add its own
-    // Change-Id), stamp one if none is present so the change has a stable id.
-    let msg = crate::change_id::ensure(&msg);
+    // After the commit-msg hook, which a Gerrit setup may use to add its own
+    // Change-Id, so rgit never stamps a second one.
+    let msg = crate::change_id::ensure(repo, &msg);
 
     let mut index = repo.index()?;
     let tree_oid = index.write_tree()?;
@@ -3188,7 +3188,7 @@ fn make_amend(repo: &Repository, message: &str, verify: bool) -> Result<(), GitE
     }
     // Amend rewrites the commit; carry the original change id forward so the
     // logical change keeps its identity even though the oid changes.
-    let msg = crate::change_id::preserve(&old_msg, &msg);
+    let msg = crate::change_id::preserve(repo, &old_msg, &msg);
 
     sync_index(repo)?;
     let mut index = repo.index()?;
@@ -3258,7 +3258,7 @@ fn reword_commit(repo: &Repository, target: Oid, new_message: &str) -> Result<()
     for commit in chain.iter().rev() {
         let is_target = commit.id() == target;
         let message = if is_target {
-            crate::change_id::preserve(commit.message().unwrap_or(""), new_message)
+            crate::change_id::preserve(repo, commit.message().unwrap_or(""), new_message)
         } else {
             commit.message().unwrap_or("").to_owned()
         };

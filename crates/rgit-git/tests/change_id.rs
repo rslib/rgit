@@ -10,7 +10,15 @@ fn scratch(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("rgit-changeid-{}-{name}", std::process::id()))
 }
 
+/// A repo with Change-Id stamping turned on (`rgit.changeId`).
 fn init_repo(name: &str) -> std::path::PathBuf {
+    let dir = init_repo_default(name);
+    git(&dir, &["config", "rgit.changeId", "true"]);
+    dir
+}
+
+/// A repo with rgit's defaults: no Change-Id stamping.
+fn init_repo_default(name: &str) -> std::path::PathBuf {
     let dir = scratch(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -144,5 +152,71 @@ fn rebase_preserves_the_change_id() {
         "the change id rides along with the message through rebase"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn message(dir: &Path, rev: &str) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["log", "-1", "--format=%B", rev])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim_end().to_owned()
+}
+
+// The message with its trailing `Change-Id: I...` line replaced by a fixed one.
+fn masked(msg: &str) -> String {
+    let (head, _) = msg
+        .rsplit_once("Change-Id: I")
+        .expect("a change id trailer");
+    format!("{head}Change-Id: I")
+}
+
+#[test]
+fn change_id_trailer_is_set_off_from_the_body() {
+    let dir = init_repo("trailer-sep");
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let cases = [
+        (
+            "fix: a colon subject",
+            "fix: a colon subject\n\nChange-Id: I",
+        ),
+        ("subject\n\n", "subject\n\nChange-Id: I"),
+        ("feat: x\n\nbody\n", "feat: x\n\nbody\n\nChange-Id: I"),
+        (
+            "feat: x\n\nSigned-off-by: A <a@b>\n",
+            "feat: x\n\nSigned-off-by: A <a@b>\nChange-Id: I",
+        ),
+    ];
+    for (i, (msg, want)) in cases.iter().enumerate() {
+        std::fs::write(dir.join("f.txt"), format!("{i}\n")).unwrap();
+        backend.stage_all().unwrap();
+        backend.commit(msg).unwrap();
+        assert_eq!(masked(&message(&dir, "HEAD")), *want, "commit {msg:?}");
+    }
+
+    backend.amend("chore: amended").unwrap();
+    assert_eq!(
+        masked(&message(&dir, "HEAD")),
+        "chore: amended\n\nChange-Id: I"
+    );
+    backend.reword("HEAD", "docs: reworded\n").unwrap();
+    assert_eq!(
+        masked(&message(&dir, "HEAD")),
+        "docs: reworded\n\nChange-Id: I"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn default_commit_has_no_change_id() {
+    let dir = init_repo_default("default-off");
+    std::fs::write(dir.join("f"), "x\n").unwrap();
+    git(&dir, &["add", "f"]);
+    commit_via_backend(&dir, "fix: subject only");
+    assert_eq!(change_id(&dir, "HEAD"), None);
+    assert_eq!(message(&dir, "HEAD").trim_end(), "fix: subject only");
     let _ = std::fs::remove_dir_all(&dir);
 }
