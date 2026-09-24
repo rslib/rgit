@@ -112,7 +112,16 @@ pub fn run(
             name_only,
         } => show(&backend.commit_details(&rev)?, patch, name_only),
         Command::Blame { path, lines } => {
-            let all = backend.blame(&path)?;
+            let all = backend.blame(&path).map_err(|e| match e {
+                rgit_git::GitError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                    anyhow::Error::new(crate::cli::CliError {
+                        message: format!("no file {path} in this repository"),
+                        help: Some("Run `rgit git ls-files` to list tracked files".to_owned()),
+                        code: 1,
+                    })
+                }
+                other => other.into(),
+            })?;
             let (start, end) = match lines {
                 Some(spec) => crate::cli::parse_line_range(&spec)?,
                 None => (1, BLAME_LINES),

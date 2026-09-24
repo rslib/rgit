@@ -827,3 +827,18 @@ fn toon_mutations_suggest_the_next_step() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn toon_fields_on_empty_table_and_blame_missing_file() {
+    let dir = repo("empty-fields");
+    commit(&dir, "f", "x\n", "init");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "status", "--fields", "from"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("files: 0 changes"), "{out}");
+    let (out, _, ok) = rgit(&dir, &["--toon", "blame", "nope.rs"]);
+    assert!(!ok);
+    assert!(out.starts_with("error: no file nope.rs"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

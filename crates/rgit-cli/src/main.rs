@@ -328,48 +328,8 @@ fn finish(result: anyhow::Result<impl Into<Output>>, emit: &Emit) -> ! {
 }
 
 fn die(error: anyhow::Error, emit: &Emit) -> ! {
-    let (message, help, code) = translate(&error);
+    let (message, help, code) = output::translate(&error);
     fail(message, help, code, emit.mode)
-}
-
-/// An error's message, fix-it hints, and exit code, with library noise removed.
-fn translate(error: &anyhow::Error) -> (String, Vec<String>, i32) {
-    use rgit_git::GitError;
-    if let Some(e) = error.downcast_ref::<CliError>() {
-        return (e.message.clone(), e.help.iter().cloned().collect(), e.code);
-    }
-    let Some(e) = error.downcast_ref::<GitError>() else {
-        return (error.to_string(), Vec::new(), 1);
-    };
-    let help = match e {
-        GitError::NotARepository(_) => "Run `rgit init` to create one here",
-        GitError::NothingToCommit => "Run `rgit stage <path>` to stage changes first",
-        GitError::NotFastForward => "Run `rgit pull --rebase` to integrate upstream commits",
-        GitError::PushRejected => "Run `rgit pull --rebase`, then `rgit push`",
-        GitError::DetachedHead => "Run `rgit checkout <branch>` to get on a branch",
-        GitError::HunkNotFound { .. } => "Run `rgit diff --patch` to see the current hunks",
-        GitError::Conflict(_) => "Run `rgit status` to see the conflicted files",
-        _ => "",
-    };
-    let message = match e {
-        GitError::Git(g) => g.message().to_owned(),
-        GitError::Cli(text) => text
-            .lines()
-            .map(|l| {
-                l.trim_start_matches("fatal: ")
-                    .trim_start_matches("error: ")
-            })
-            .filter(|l| !l.trim().is_empty() && !l.starts_with("hint: "))
-            .collect::<Vec<_>>()
-            .join("; "),
-        other => other.to_string(),
-    };
-    let help = if help.is_empty() {
-        Vec::new()
-    } else {
-        vec![help.to_owned()]
-    };
-    (message, help, 1)
 }
 
 /// Report an error on stdout in the output format, or on stderr for humans.
@@ -739,7 +699,7 @@ fn home() -> Output {
             out
         }
         Err(error) => {
-            let (message, help, _) = translate(&error);
+            let (message, help, _) = output::translate(&error);
             data.push(("status".to_owned(), sanitize(message).into()));
             let mut out = Output::new(String::new());
             out.data = data;
@@ -763,9 +723,7 @@ fn json(value: Obj) -> String {
     serde_json::to_string(&Node::Obj(value)).unwrap_or_default()
 }
 
-fn sanitize(s: impl AsRef<str>) -> String {
-    s.as_ref().replace('\u{2191}', "^")
-}
+use output::sanitize;
 
 fn discover_or_exit() -> Arc<dyn GitBackend> {
     let discovered = std::env::current_dir()

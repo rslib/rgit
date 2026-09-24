@@ -3,15 +3,23 @@
 //!
 //! The transport, protocol handshake, and framing come from the official `rmcp`
 //! SDK; `ServerHandler` is implemented by hand so the whole tool catalog and the
-//! `dispatch` map (tool name + JSON args -> backend call + rendered result) stay
-//! in one place. `dispatch` is synchronous, so each call runs on a blocking task
-//! rather than stalling the async runtime. The tool surface mirrors the CLI
-//! (minus interactive prompts and the TUI).
+//! `dispatch` map stay in one place. A tool with a CLI equivalent builds that
+//! `cli::Command` and runs it through `axi::run`, so its result (TOON text plus
+//! the same data as structured content) matches `rgit --toon <cmd>`. `dispatch`
+//! is synchronous, so each call runs on a blocking task rather than stalling the
+//! async runtime. Tools never prompt.
 
 use std::sync::Arc;
 
-use rgit_git::{Git2Backend, GitBackend, GrepQuery, LogOptions, ResetMode};
+use rgit_git::{Git2Backend, GitBackend, GrepQuery};
 use serde_json::{Map, Value, json};
+
+use crate::cli::{
+    BranchCmd, CliError, Command, FlowCmd, IndexCmd, LanesCmd, RemoteCmd, StackCmd, StashCmd,
+    WorkspaceCmd, WorktreeCmd,
+};
+use crate::output::Output;
+use crate::toon::{Node, Obj};
 
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -177,7 +185,7 @@ impl Registry {
 /// Serve MCP over stdio until the client disconnects. Returns a process exit
 /// code.
 pub fn serve(backend: Arc<dyn GitBackend>) -> i32 {
-    // The MCP surface is always plain text - never ANSI color.
+    // The MCP surface never carries ANSI color.
     crate::render::set_color(false);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -218,7 +226,7 @@ pub fn http_router(name: String, backend: Arc<dyn GitBackend>) -> axum::Router {
     use rmcp::transport::streamable_http_server::{
         StreamableHttpService, session::local::LocalSessionManager,
     };
-    // Plain text only over the wire, never ANSI color.
+    // No ANSI color over the wire.
     crate::render::set_color(false);
     let service = StreamableHttpService::new(
         move || {
@@ -268,13 +276,17 @@ impl ServerHandler for RgitMcp {
         )
         .with_server_info(info)
         .with_instructions(
-            "Drive a git repository. Each tool maps to a git operation; results are compact plain \
-             text, one item per line. Key flows: inspect with git_status / git_smartlog / git_log \
-             before acting; stage (git_stage / git_stage_all) then git_commit with a clear message; \
-             sync with git_fetch then git_pull or git_rebase. Every destructive tool is auto-\
+            "Drive a git repository. Results are TOON, the same output as `rgit --toon <command>`, \
+             with the same data attached as structured content. Lists come back as tables with \
+             counts and an explicit empty state; `fields` adds columns and `full` turns off \
+             truncation where a tool takes them. A `help` list gives next steps, and errors come \
+             back as `error` plus `help`. Repeating a create or delete that is already done is a \
+             no-op, not an error. Key flows: inspect with git_status / git_smartlog / git_log \
+             before acting; stage (git_stage / git_stage_all) then git_commit with a clear \
+             message; sync with git_fetch then git_pull or git_rebase. Every destructive tool is \
              snapshotted, so git_undo reverses the last operation (recovering uncommitted work), \
-             git_redo replays it, and git_oplog lists the history. For step-by-step playbooks, read \
-             the prompts (embedded skills): commit_changes, sync_with_remote, resolve_conflicts, \
+             git_redo replays it, and git_oplog lists the history. For step-by-step playbooks, \
+             read the prompts: commit_changes, sync_with_remote, resolve_conflicts, \
              safe_experiment, review_local_work, start_feature.",
         )
     }
@@ -326,12 +338,15 @@ impl ServerHandler for RgitMcp {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
-        // The read-only endpoint refuses mutating tools outright.
         if self.read_only && !is_read_only(&name) {
-            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "{name} is a write operation and is disabled on this read-only endpoint; run `rgit mcp` (stdio) for full access"
-            ))])
-            .into());
+            let refused = anyhow::Error::new(CliError {
+                message: format!(
+                    "{name} is a write operation and is disabled on this read-only endpoint"
+                ),
+                help: Some("Run `rgit mcp` (stdio) for full access".to_owned()),
+                code: 1,
+            });
+            return Ok(reply(failure(&refused), true).into());
         }
         let args = Value::Object(request.arguments.unwrap_or_default());
         let backend = match self
@@ -339,17 +354,40 @@ impl ServerHandler for RgitMcp {
             .resolve(args.get("repo").and_then(Value::as_str))
         {
             Ok(b) => b,
-            Err(e) => return Ok(CallToolResult::error(vec![ContentBlock::text(e)]).into()),
+            Err(e) => return Ok(reply(failure(&anyhow::anyhow!(e)), true).into()),
         };
         let result = tokio::task::spawn_blocking(move || dispatch(&backend, &name, &args))
             .await
             .map_err(|e| McpError::internal_error(format!("task join: {e}"), None))?;
         let call = match result {
-            Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
-            Err(text) => CallToolResult::error(vec![ContentBlock::text(text)]),
+            Ok(value) => reply(value, false),
+            Err(error) => reply(failure(&error), true),
         };
         Ok(call.into())
     }
+}
+
+/// A tool result: the TOON text as content and the same object as structured
+/// content.
+fn reply(value: Obj, is_error: bool) -> CallToolResult {
+    let content = vec![ContentBlock::text(crate::toon::encode(&value))];
+    let mut result = if is_error {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    };
+    result.structured_content = serde_json::to_value(Node::Obj(value)).ok();
+    result
+}
+
+/// An error as `error` plus `help`, the shape `rgit --toon` prints on failure.
+fn failure(error: &anyhow::Error) -> Obj {
+    let (message, help, _) = crate::output::translate(error);
+    let mut value = crate::obj! { "error" => message };
+    if !help.is_empty() {
+        value.push(("help".to_owned(), help.into()));
+    }
+    value
 }
 
 /// Embedded skills: guided, multi-step playbooks exposed as MCP prompts, so an
@@ -413,8 +451,8 @@ const SKILLS: &[(&str, &str, &str)] = &[
          1. git_smartlog shows your local/draft commits and the trunk they branch from (marks HEAD \
          and the trunk) - the fastest way to see your work.\n\
          2. git_status shows uncommitted changes and the current branch.\n\
-         3. git_diff (patch=true) shows staged changes; git_log shows recent history; git_show a \
-         revision for one commit's detail.\n\
+         3. git_diff shows unstaged changes (cached=true for staged, patch=true for the patch); \
+         git_log shows recent history; git_show a revision for one commit's detail.\n\
          Start here before any change so you act on facts, not assumptions.",
     ),
     (
@@ -429,17 +467,30 @@ const SKILLS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Optional table columns beyond a tool's defaults.
+const FIELDS: (&str, &str, bool) = ("fields", "string[]", false);
+/// Optional switch that turns off truncation of long text and lists.
+const FULL: (&str, &str, bool) = ("full", "boolean", false);
+
 /// Build a tool's JSON Schema from `(field, type, required)` triples. `type` is
 /// a JSON Schema type, or `string[]`/`integer[]` for arrays.
 fn schema(props: &[(&str, &str, bool)]) -> Map<String, Value> {
     let mut properties = Map::new();
     let mut required = Vec::new();
     for (field, ty, req) in props {
-        let field_schema = match *ty {
+        let mut field_schema = match *ty {
             "string[]" => json!({ "type": "array", "items": { "type": "string" } }),
             "integer[]" => json!({ "type": "array", "items": { "type": "integer" } }),
             t => json!({ "type": t }),
         };
+        let about = match *field {
+            "fields" => Some("Extra table columns to return beyond the defaults."),
+            "full" => Some("Return long text and long lists without truncation."),
+            _ => None,
+        };
+        if let (Some(about), Some(obj)) = (about, field_schema.as_object_mut()) {
+            obj.insert("description".to_owned(), json!(about));
+        }
         properties.insert((*field).to_owned(), field_schema);
         if *req {
             required.push(json!(field));
@@ -526,116 +577,173 @@ fn tools() -> Vec<Tool> {
     vec![
         tool(
             "git_status",
-            "Working-tree status: branch, ahead/behind, and changed files grouped by state.",
-            none,
+            "Working-tree status: branch, upstream ahead/behind, change counts, and a files table \
+             (path, staged, unstaged) that says so when the tree is clean. Ends with next-step help.",
+            &[FIELDS],
         ),
         tool(
             "git_log",
-            "Recent commits, newest first.",
+            "Commits newest first (limit, default 20): a table of id, summary, author, when, with a \
+             count when more exist. Filter with author, since, until, path; rev or all picks the \
+             start. Extra fields: oid, parents, refs, unpushed.",
             &[
                 ("limit", "integer", false),
                 ("all", "boolean", false),
                 ("author", "string", false),
+                ("since", "string", false),
+                ("until", "string", false),
+                ("rev", "string", false),
+                ("path", "string", false),
+                FIELDS,
             ],
         ),
         tool(
             "git_diff",
-            "Diff. With no revs: staged changes (patch=true for a unified patch, else a diffstat). With `from`/`to`: that ref range.",
+            "Changes as a diffstat table (path, added, removed) with totals. Default is unstaged \
+             changes; cached=true for staged; from/to for a ref range. patch=true returns the \
+             unified patch (truncated unless full); name_only=true returns only paths.",
             &[
                 ("from", "string", false),
                 ("to", "string", false),
+                ("cached", "boolean", false),
                 ("patch", "boolean", false),
+                ("name_only", "boolean", false),
+                FIELDS,
+                FULL,
             ],
         ),
         tool(
             "git_show",
-            "A commit's metadata and diffstat against its first parent.",
-            &[("rev", "string", true)],
+            "One commit: id, author, when, subject, body, totals, and a changed-files table. \
+             patch=true returns its patch instead (truncated unless full).",
+            &[
+                ("rev", "string", true),
+                ("patch", "boolean", false),
+                ("name_only", "boolean", false),
+                FIELDS,
+                FULL,
+            ],
         ),
         tool(
             "git_blame",
-            "Blame a working-tree file: each line with the commit that last touched it.",
-            &[("path", "string", true)],
+            "Blame a working-tree file: a table of line, id, author, text. Shows the first 200 \
+             lines; `lines` takes START,END, and help names the next range.",
+            &[("path", "string", true), ("lines", "string", false), FIELDS],
         ),
         tool(
             "git_refs",
-            "All references: local branches, remote branches, and tags.",
-            none,
+            "All references as a table of name, kind (local/remote/tag), head.",
+            &[FIELDS],
         ),
         tool(
             "git_tree",
-            "List one directory of a revision's tree (rev defaults to HEAD, path to the root).",
-            &[("rev", "string", false), ("path", "string", false)],
+            "One directory of a revision's tree (rev defaults to HEAD, path to the root): a table \
+             of name, kind (dir/file), size.",
+            &[("rev", "string", false), ("path", "string", false), FIELDS],
         ),
         tool(
             "git_blob",
-            "Read a file's contents at a revision (rev defaults to HEAD).",
-            &[("path", "string", true), ("rev", "string", false)],
+            "A file's contents at a revision (rev defaults to HEAD) with its path and size. Long \
+             content is truncated unless full.",
+            &[("path", "string", true), ("rev", "string", false), FULL],
         ),
         tool(
             "git_files",
-            "Every file path in a revision's tree (rev defaults to HEAD).",
-            &[("rev", "string", false)],
+            "Every file path in a revision's tree (rev defaults to HEAD). The first 200 unless full.",
+            &[("rev", "string", false), FULL],
         ),
         tool(
             "git_grep",
-            "Search the working tree for a literal string (case-insensitive, parallel, gitignore-aware). Returns path:line: text matches. Optionally scope the search with `regex`, `path`, and `ext`.",
+            "Search the working tree for a literal string (case-insensitive, gitignore-aware); \
+             `regex`, `path`, and `ext` narrow it. A table of path, line, text; the first 100 \
+             matches unless full.",
             &[
                 ("pattern", "string", true),
                 ("regex", "boolean", false),
                 ("path", "string", false),
                 ("ext", "string[]", false),
+                FIELDS,
+                FULL,
             ],
         ),
         tool(
             "index_build",
-            "Build (or incrementally rebuild) the semantic index. Local by default (the current repo, or `repo`); `root` builds every git repo directly under a directory (global). Incremental: unchanged files are reused by git blob OID, only edited files are re-embedded. Reports per-repo chunk counts.",
-            &[("repo", "string", false), ("root", "string", false)],
+            "Build or incrementally rebuild the semantic index: this repo, or every git repo \
+             directly under `root`. Unchanged files are reused by blob OID. Reports chunk counts \
+             per repo.",
+            &[("root", "string", false)],
         ),
         tool(
             "code_search",
-            "Best general code search: fuses literal grep and semantic ranking (reciprocal-rank fusion), then re-ranks by git history (churn and recency) so hot files surface first, and tags each hit lexical/semantic/both. Prefer this over git_grep or semantic_search alone. Local by default; `root` searches every repo under a directory (global). Needs an index (`index_build`); without it, degrades to grep. Returns score, path:line, and the tag.",
+            "Best general code search: fuses literal grep with semantic ranking, re-ranked by git \
+             history. A table of path, line, source (lexical/semantic/both); extra field score. \
+             Without an index (index_build) it degrades to grep. `root` searches every repo \
+             under a directory.",
             &[
                 ("query", "string", true),
-                ("limit", "number", false),
+                ("limit", "integer", false),
                 ("root", "string", false),
+                FIELDS,
             ],
         ),
         tool(
             "semantic_search",
-            "Search the codebase by meaning only, using the local embedding index (build it first with index_build), re-ranked by git history (churn and recency). Prefer code_search for general use; use this for purely conceptual matches. Local by default; `root` searches every repo under a directory (global). Returns score, path, and line range per hit.",
+            "Search by meaning only, using the semantic index, re-ranked by git history. A table \
+             of path, lines, score; extra field preview. Errors with help when there is no index. \
+             `root` searches every repo under a directory.",
             &[
                 ("query", "string", true),
-                ("limit", "number", false),
+                ("limit", "integer", false),
                 ("root", "string", false),
+                FIELDS,
             ],
         ),
         tool(
             "git_branches",
-            "Local branch names, marking the current one.",
-            none,
+            "Branches as a table of name, current. `all` adds remote-tracking branches; `remotes` \
+             lists only those.",
+            &[
+                ("all", "boolean", false),
+                ("remotes", "boolean", false),
+                FIELDS,
+            ],
         ),
-        tool("git_stashes", "The stash list.", none),
+        tool(
+            "git_tags",
+            "Tags as a table of name, when; extra field message.",
+            &[FIELDS],
+        ),
+        tool(
+            "git_stashes",
+            "The stash list as a table of index, message.",
+            &[FIELDS],
+        ),
         tool(
             "git_remotes",
-            "Configured remotes and their fetch URLs.",
-            none,
+            "Configured remotes as a table of name, url.",
+            &[FIELDS],
         ),
-        tool("git_worktrees", "Linked worktrees.", none),
+        tool(
+            "git_worktrees",
+            "Worktrees as a table of name, branch, path; extra fields head, dirty, locked, main.",
+            &[FIELDS],
+        ),
         tool(
             "git_describe",
-            "Describe a revision relative to the nearest tag (default HEAD). `tags` uses lightweight tags too, `dirty` appends -dirty, `long` forces long format, `abbrev` sets the oid length.",
+            "Describe a revision relative to the nearest tag (default HEAD). `tags` uses \
+             lightweight tags too, `dirty` appends -dirty, `long` forces long format, `abbrev` \
+             sets the oid length.",
             &[
                 ("rev", "string", false),
                 ("tags", "boolean", false),
                 ("dirty", "boolean", false),
                 ("long", "boolean", false),
-                ("abbrev", "number", false),
+                ("abbrev", "integer", false),
             ],
         ),
         tool(
             "git_stage",
-            "Stage a path, or one hunk (`hunk` = new-side start line), or specific `lines` within that hunk.",
+            "Stage a path, one hunk (`hunk` = new-side start line), or `lines` within that hunk.",
             &[
                 ("path", "string", true),
                 ("hunk", "integer", false),
@@ -644,7 +752,7 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_unstage",
-            "Unstage a path, or one hunk, or specific lines within that hunk.",
+            "Unstage a path, one hunk, or specific lines within that hunk.",
             &[
                 ("path", "string", true),
                 ("hunk", "integer", false),
@@ -659,7 +767,8 @@ fn tools() -> Vec<Tool> {
         tool("git_unstage_all", "Unstage everything back to HEAD.", none),
         tool(
             "git_discard",
-            "Discard a path's unstaged changes (or a hunk/lines). Destructive.",
+            "Discard a path's unstaged changes (or a hunk/lines). Destructive; git_undo restores \
+             them.",
             &[
                 ("path", "string", true),
                 ("hunk", "integer", false),
@@ -673,17 +782,24 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_commit",
-            "Commit the index with a message (runs hooks). `amend` replaces HEAD.",
-            &[("message", "string", true), ("amend", "boolean", false)],
+            "Commit the index with a message (runs hooks). `amend` replaces HEAD, `all` stages \
+             tracked changes first, `no_verify` skips hooks. Returns the commit report.",
+            &[
+                ("message", "string", true),
+                ("amend", "boolean", false),
+                ("all", "boolean", false),
+                ("no_verify", "boolean", false),
+            ],
         ),
         tool(
             "git_extend",
-            "Amend HEAD with the current index, keeping its message (no editor).",
+            "Amend HEAD with the current index, keeping its message.",
             none,
         ),
         tool(
             "git_fetch",
-            "Fetch a remote. `all` fetches every remote, `prune` drops stale remote-tracking refs, `remote` picks one.",
+            "Fetch a remote. `all` fetches every remote, `prune` drops stale remote-tracking refs, \
+             `remote` picks one.",
             &[
                 ("all", "boolean", false),
                 ("prune", "boolean", false),
@@ -692,12 +808,14 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_pull",
-            "Fetch and integrate the current branch's upstream; `rebase` rebases instead of fast-forwarding.",
+            "Fetch and integrate the current branch's upstream; `rebase` rebases instead of \
+             fast-forwarding.",
             &[("rebase", "boolean", false)],
         ),
         tool(
             "git_push",
-            "Push the current branch to its upstream, or to `remote` if given. `tags` pushes all tags; `delete` deletes that branch on the remote.",
+            "Push the current branch to its upstream, or to `remote`. `tags` pushes all tags; \
+             `delete` deletes that branch on the remote.",
             &[
                 ("force", "boolean", false),
                 ("force_with_lease", "boolean", false),
@@ -709,12 +827,13 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_checkout",
-            "Check out a branch (or a revision/tag as detached HEAD).",
+            "Check out a branch (or a revision/tag as detached HEAD). A no-op when already on it.",
             &[("rev", "string", true)],
         ),
         tool(
             "git_merge",
-            "Merge a revision into the current branch (no_ff forces a merge commit, ff_only refuses a non-fast-forward, abort cancels a conflicted merge).",
+            "Merge a revision into the current branch. `no_ff` forces a merge commit, `ff_only` \
+             refuses a non-fast-forward, `abort` cancels a conflicted merge.",
             &[
                 ("rev", "string", false),
                 ("no_ff", "boolean", false),
@@ -724,7 +843,7 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_rebase",
-            "Rebase the current branch onto a revision (aborts on conflict).",
+            "Rebase the current branch onto a revision.",
             &[("onto", "string", true)],
         ),
         tool(
@@ -755,48 +874,54 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_undo",
-            "Undo the last operation from the op-log, restoring HEAD and the working tree (recovers uncommitted work).",
+            "Undo the last operation from the op-log, restoring HEAD and the working tree \
+             (recovers uncommitted work).",
             none,
         ),
         tool("git_redo", "Redo the operation most recently undone.", none),
         tool(
             "git_oplog",
-            "The operation log (undo stack), newest first.",
-            none,
+            "The operation log (undo stack), newest first: a table of id, label, head, when.",
+            &[FIELDS],
         ),
         tool(
             "git_smartlog",
-            "Smartlog: your local/draft commits and the trunk they branch from.",
-            none,
+            "Your local/draft commits and the trunk they branch from: a table of id, mark \
+             (head/trunk/draft), summary, refs; extra fields when, author, change.",
+            &[FIELDS],
         ),
         tool(
             "git_absorb",
-            "Fold each modified file's changes into the newest local commit that touched it (fixup + autosquash).",
+            "Fold each modified file's changes into the newest local commit that touched it \
+             (fixup + autosquash).",
             none,
         ),
         tool(
             "git_reword",
-            "Change a commit's message (default HEAD) and restack descendants. Op-log-safe.",
+            "Change a commit's message (default HEAD) and restack descendants.",
             &[("message", "string", true), ("rev", "string", false)],
         ),
         tool(
             "git_uncommit",
-            "Undo the last commit(s), keeping the changes staged (default 1).",
-            &[("n", "number", false)],
+            "Undo the last `n` commits (default 1), keeping the changes staged.",
+            &[("n", "integer", false)],
         ),
         tool(
             "git_squash",
-            "Fold a commit into its parent (default HEAD); with `from`, fold every commit after `from` up to HEAD into one. Restacks descendants.",
+            "Fold a commit into its parent (default HEAD); with `from`, fold every commit after \
+             `from` up to HEAD into one. Restacks descendants.",
             &[("rev", "string", false), ("from", "string", false)],
         ),
         tool(
             "git_split",
-            "Split a commit (default HEAD) into two by path: the given `paths`' changes first, the rest second. Restacks descendants.",
+            "Split a commit (default HEAD) into two by path: the given `paths`' changes first, the \
+             rest second. Restacks descendants.",
             &[("paths", "string[]", true), ("rev", "string", false)],
         ),
         tool(
             "git_move",
-            "Reorder a commit before or after another in the current branch's history. Pass exactly one of `before`/`after`.",
+            "Reorder a commit before or after another in the current branch's history. Pass \
+             exactly one of `before`/`after`.",
             &[
                 ("rev", "string", true),
                 ("before", "string", false),
@@ -805,7 +930,8 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_prune",
-            "Delete local branches fully merged into a base (default HEAD).",
+            "Delete local branches fully merged into a base (default HEAD). Returns the deleted \
+             names.",
             &[("base", "string", false)],
         ),
         tool(
@@ -815,7 +941,8 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_submit",
-            "Push every branch in the current stack and open a pull request per branch (via gh/glab).",
+            "Push every branch in the current stack and open a pull request per branch (via \
+             gh/glab).",
             none,
         ),
         tool(
@@ -840,22 +967,23 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_flow_status",
-            "Show the active workflow and its policy.",
+            "The active workflow and its policy fields; errors with help when none is set.",
             none,
         ),
         tool(
             "git_workspace_new",
-            "Create a copy-on-write clone of the repo on a new branch (parallel isolated work).",
+            "Create a copy-on-write clone of the repo on a new branch (parallel isolated work). A \
+             no-op when it exists.",
             &[("name", "string", true)],
         ),
         tool(
             "git_workspace_list",
-            "List this repo's copy-on-write workspaces.",
-            none,
+            "This repo's copy-on-write workspaces as a table of name, branch, path.",
+            &[FIELDS],
         ),
         tool(
             "git_workspace_remove",
-            "Remove a copy-on-write workspace.",
+            "Remove a copy-on-write workspace. A no-op when it does not exist.",
             &[("name", "string", true)],
         ),
         tool(
@@ -865,8 +993,8 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_stack_list",
-            "List local branches with their stacked-branch parent.",
-            none,
+            "The current branch's stack from tip to base: a table of branch, parent, current.",
+            &[FIELDS],
         ),
         tool(
             "git_stack_restack",
@@ -875,8 +1003,8 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_lanes_list",
-            "List the lanes and the uncommitted files each owns.",
-            none,
+            "Lanes as a table of name, branch, files, commits; says so when lanes are off.",
+            &[FIELDS],
         ),
         tool(
             "git_lanes_init",
@@ -890,7 +1018,7 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_lanes_new",
-            "Create a new lane that commits to a same-named branch.",
+            "Create a new lane that commits to a same-named branch. A no-op when it exists.",
             &[("name", "string", true)],
         ),
         tool(
@@ -900,11 +1028,12 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_lanes_assign",
-            "Assign a worktree path to a lane, or a single hunk with `hunk` set to its new-file start line.",
+            "Assign a worktree path to a lane, or a single hunk with `hunk` set to its new-file \
+             start line.",
             &[
                 ("lane", "string", true),
                 ("path", "string", true),
-                ("hunk", "number", false),
+                ("hunk", "integer", false),
             ],
         ),
         tool(
@@ -924,7 +1053,8 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_lanes_delete",
-            "Delete a lane (its changes return to default; its branch is kept).",
+            "Delete a lane (its changes return to default; its branch is kept). A no-op when it \
+             does not exist.",
             &[("name", "string", true)],
         ),
         tool(
@@ -939,17 +1069,20 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_lanes_restack",
-            "Move each stacked lane onto its parent lane's new tip (in the odb; the worktree is untouched).",
+            "Move each stacked lane onto its parent lane's new tip (in the odb; the worktree is \
+             untouched).",
             none,
         ),
         tool(
             "git_bisect",
-            "Run a `git bisect` subcommand (e.g. [\"start\",\"<bad>\",\"<good>\"], [\"good\"], [\"bad\"], [\"reset\"]).",
-            &[("args", "string[]", true)],
+            "Run a `git bisect` subcommand (e.g. [\"start\",\"<bad>\",\"<good>\"], [\"good\"], \
+             [\"bad\"], [\"reset\"]).",
+            &[("args", "string[]", true), FULL],
         ),
         tool(
             "git_stash_push",
-            "Stash the working tree and index (with an optional message). `include_untracked` also stashes untracked files.",
+            "Stash the working tree and index (with an optional message). `include_untracked` \
+             also stashes untracked files.",
             &[
                 ("message", "string", false),
                 ("include_untracked", "boolean", false),
@@ -972,12 +1105,13 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_branch_create",
-            "Create a branch at HEAD and check it out.",
+            "Create a branch at HEAD and check it out. A no-op when it exists.",
             &[("name", "string", true)],
         ),
         tool(
             "git_branch_delete",
-            "Delete a local branch. `force` deletes even if not fully merged.",
+            "Delete a local branch; `force` deletes it even if not fully merged. A no-op when it \
+             does not exist.",
             &[("name", "string", true), ("force", "boolean", false)],
         ),
         tool(
@@ -987,22 +1121,27 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_tag_create",
-            "Create a tag at HEAD (annotated when `message` is given).",
-            &[("name", "string", true), ("message", "string", false)],
+            "Create a tag at HEAD (annotated when `message` is given; `force` replaces one). A \
+             no-op when it exists.",
+            &[
+                ("name", "string", true),
+                ("message", "string", false),
+                ("force", "boolean", false),
+            ],
         ),
         tool(
             "git_tag_delete",
-            "Delete a tag.",
+            "Delete a tag. A no-op when it does not exist.",
             &[("name", "string", true)],
         ),
         tool(
             "git_remote_add",
-            "Add a remote.",
+            "Add a remote. A no-op when it already points at that url.",
             &[("name", "string", true), ("url", "string", true)],
         ),
         tool(
             "git_remote_remove",
-            "Remove a remote.",
+            "Remove a remote. A no-op when it does not exist.",
             &[("name", "string", true)],
         ),
         tool(
@@ -1017,12 +1156,13 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_worktree_add",
-            "Create a linked worktree at `path` on a new branch `name`.",
+            "Create a linked worktree at `path` on a new branch `name`. A no-op when it exists.",
             &[("name", "string", true), ("path", "string", true)],
         ),
         tool(
             "git_worktree_remove",
-            "Remove a linked worktree. `force` removes it even if locked.",
+            "Remove a linked worktree; `force` removes it even if locked. A no-op when it does \
+             not exist.",
             &[("name", "string", true), ("force", "boolean", false)],
         ),
         tool(
@@ -1032,12 +1172,14 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_clean",
-            "Remove every untracked file and directory. Destructive. `dry_run` lists what would be removed without deleting.",
+            "Remove every untracked file and directory. Destructive. `dry_run` lists what would be \
+             removed without deleting.",
             &[("dry_run", "boolean", false)],
         ),
         tool(
             "git_rm",
-            "Remove a tracked path from the index and the working tree. `cached` removes it from the index only.",
+            "Remove a tracked path from the index and the working tree. `cached` removes it from \
+             the index only.",
             &[("path", "string", true), ("cached", "boolean", false)],
         ),
         tool(
@@ -1051,479 +1193,597 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_run",
-            "Run any git subcommand and return its stdout (the escape hatch).",
-            &[("args", "string[]", true)],
+            "Run any git subcommand and return its output as lines (the escape hatch); the first \
+             200 lines unless full.",
+            &[("args", "string[]", true), FULL],
         ),
     ]
 }
 
-/// Map a tool name and its arguments to a backend call and a rendered result.
-fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<String, String> {
-    let s = |k: &str| args.get(k).and_then(Value::as_str);
-    let req = |k: &str| s(k).ok_or_else(|| format!("{k} required"));
-    let flag = |k: &str| args.get(k).and_then(Value::as_bool).unwrap_or(false);
-    let hunk = args.get("hunk").and_then(Value::as_u64).map(|n| n as u32);
-    let lines: Vec<usize> = args
-        .get("lines")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_u64().map(|n| n as usize))
-                .collect()
-        })
-        .unwrap_or_default();
-    let str_vec = |k: &str| -> Vec<String> {
-        args.get(k)
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default()
+/// Stands in for the CLI invocation in `finalize`, so its `--full` hints can be
+/// rewritten into the MCP `full` argument.
+const RERUN: &str = "\u{1}";
+const GREP_SHOWN: usize = 100;
+const FILES_SHOWN: usize = 200;
+
+/// Run one tool call to the object `rgit --toon` would print for it.
+fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> anyhow::Result<Obj> {
+    let a = Args { tool: name, args };
+    let fields = a.strings("fields")?;
+    let full = a.flag("full");
+    let output = match command(&a)? {
+        Some(command) => crate::axi::run(backend, command, false)?,
+        None => local(backend, &a, full)?,
     };
-    let index = || args.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-
-    match name {
-        "git_status" => backend
-            .status()
-            .map(|s| crate::render::status(&s))
-            .map_err(emap),
-        "git_log" => {
-            let opts = LogOptions {
-                limit: args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize,
-                offset: args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize,
-                all: flag("all"),
-                author: s("author").map(str::to_owned),
-                rev: s("rev").map(str::to_owned),
-                ..LogOptions::default()
-            };
-            backend
-                .log(&opts)
-                .map(|e| crate::render::log(&e))
-                .map_err(emap)
-        }
-        "git_diff" => {
-            let patch = flag("patch");
-            match (s("from"), s("to")) {
-                (Some(from), Some(to)) => diff_out(backend.diff_refs(from, to), patch),
-                (Some(rev), None) => diff_out(backend.diff_refs(rev, "HEAD"), patch),
-                (None, _) if patch => backend.staged_patch().map_err(emap),
-                (None, _) => backend
-                    .status()
-                    .map(|s| crate::render::diffstat(&s.staged))
-                    .map_err(emap),
+    let mut value = output.finalize(&fields, full, RERUN)?;
+    if let Some((_, Node::List(help))) = value.iter_mut().find(|(k, _)| k == "help") {
+        let cli = format!("Run `{RERUN} --full`");
+        let mcp = format!("Call {name} with full=true");
+        for line in help {
+            if let Node::Str(text) = line {
+                *text = text.replace(&cli, &mcp);
             }
         }
-        "git_show" => backend
-            .commit_details(req("rev")?)
-            .map(|c| crate::render::commit_details(&c))
-            .map_err(emap),
-        "git_blame" => backend
-            .blame(req("path")?)
-            .map(|b| crate::render::blame(&b))
-            .map_err(emap),
-        "git_refs" => backend
-            .refs()
-            .map(|r| crate::render::refs(&r))
-            .map_err(emap),
-        "git_tree" => backend
-            .list_tree(s("rev").unwrap_or("HEAD"), s("path").unwrap_or(""))
-            .map(|t| crate::render::tree(&t))
-            .map_err(emap),
-        "git_blob" => backend
-            .read_blob(s("rev").unwrap_or("HEAD"), req("path")?)
-            .map(|b| crate::render::blob(&b))
-            .map_err(emap),
-        "git_files" => backend
-            .list_files(s("rev").unwrap_or("HEAD"))
-            .map(|f| f.join("\n"))
-            .map_err(emap),
-        "git_grep" => {
-            let exts: Vec<String> = match args.get("ext") {
-                Some(Value::Array(_)) => str_vec("ext"),
-                Some(Value::String(s)) => s
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-                _ => Vec::new(),
-            }
-            .iter()
-            .map(|e| e.trim_start_matches('.').to_lowercase())
-            .collect();
-            let q = GrepQuery {
-                pattern: req("pattern")?.to_owned(),
-                regex: flag("regex"),
-                path: s("path").map(str::to_owned),
-                exts,
-            };
-            backend
-                .grep_query(&q)
-                .map(|m| crate::render::grep(&m))
-                .map_err(emap)
-        }
-        "index_build" => crate::cli::index_build(backend, s("root")).map_err(|e| e.to_string()),
-        "code_search" => {
-            let query = req("query")?;
-            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
-            crate::cli::code_search(backend, s("root"), query, limit).map_err(|e| e.to_string())
-        }
-        "semantic_search" => {
-            let query = req("query")?;
-            let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(8) as usize;
-            crate::cli::semantic_search(backend, s("root"), query, limit).map_err(|e| e.to_string())
-        }
-        "git_branches" => {
-            let current = backend.status().ok().and_then(|s| s.head.branch);
-            backend
-                .local_branches()
-                .map(|b| crate::render::branches(&b, current.as_deref()))
-                .map_err(emap)
-        }
-        "git_stashes" => backend
-            .status()
-            .map(|s| crate::render::stashes(&s.stashes))
-            .map_err(emap),
-        "git_remotes" => backend
-            .remotes()
-            .map(|r| crate::render::remotes(&r))
-            .map_err(emap),
-        "git_worktrees" => backend
-            .worktrees()
-            .map(|w| crate::render::worktrees(&w))
-            .map_err(emap),
-        "git_describe" => backend
-            .describe(
-                s("rev").unwrap_or("HEAD"),
-                flag("tags"),
-                flag("dirty"),
-                flag("long"),
-                args.get("abbrev").and_then(Value::as_u64).map(|n| n as u32),
-            )
-            .map_err(emap),
+    }
+    Ok(value)
+}
 
-        "git_stage" => done(match (hunk, lines.as_slice()) {
-            (Some(h), l) if !l.is_empty() => backend.stage_lines(req("path")?, h, l),
-            (Some(h), _) => backend.stage_hunk(req("path")?, h),
-            (None, _) => backend.stage_file(req("path")?),
-        }),
-        "git_unstage" => done(match (hunk, lines.as_slice()) {
-            (Some(h), l) if !l.is_empty() => backend.unstage_lines(req("path")?, h, l),
-            (Some(h), _) => backend.unstage_hunk(req("path")?, h),
-            (None, _) => backend.unstage_file(req("path")?),
-        }),
-        "git_stage_all" => done(backend.stage_all()),
-        "git_unstage_all" => done(backend.unstage_all()),
-        "git_discard" => done(match (hunk, lines.as_slice()) {
-            (Some(h), l) if !l.is_empty() => backend.discard_lines(req("path")?, h, l),
-            (Some(h), _) => backend.discard_hunk(req("path")?, h),
-            (None, _) => backend.discard_file(req("path")?),
-        }),
-        "git_resolve" => done(backend.resolve_conflict(req("path")?, flag("ours"))),
+/// Typed access to a tool call's JSON arguments; bad input is a usage error.
+struct Args<'a> {
+    tool: &'a str,
+    args: &'a Value,
+}
 
-        "git_commit" => {
-            let message = req("message")?;
-            let r = if flag("amend") {
-                backend.amend(message)
-            } else if flag("no_verify") {
-                backend.commit_no_verify(message)
-            } else {
-                backend.commit(message)
-            };
-            r.map_err(emap)?;
-            Ok(backend.commit_report().join("\n"))
+impl Args<'_> {
+    fn get(&self, key: &str) -> Option<&Value> {
+        self.args.get(key).filter(|v| !v.is_null())
+    }
+
+    fn str(&self, key: &str) -> Option<String> {
+        self.get(key).and_then(Value::as_str).map(str::to_owned)
+    }
+
+    fn or(&self, key: &str, default: &str) -> String {
+        self.str(key).unwrap_or_else(|| default.to_owned())
+    }
+
+    fn req(&self, key: &str) -> anyhow::Result<String> {
+        self.str(key).ok_or_else(|| self.missing(key))
+    }
+
+    fn flag(&self, key: &str) -> bool {
+        self.get(key).and_then(Value::as_bool).unwrap_or(false)
+    }
+
+    fn num(&self, key: &str) -> anyhow::Result<Option<u64>> {
+        let Some(v) = self.get(key) else {
+            return Ok(None);
+        };
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+            .map(Some)
+            .ok_or_else(|| self.invalid(key, "a non-negative integer"))
+    }
+
+    fn nums(&self, key: &str) -> anyhow::Result<Vec<usize>> {
+        match self.get(key) {
+            None => Ok(Vec::new()),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_u64()
+                        .map(|n| n as usize)
+                        .ok_or_else(|| self.invalid(key, "an array of integers"))
+                })
+                .collect(),
+            Some(_) => Err(self.invalid(key, "an array of integers")),
         }
-        "git_extend" => {
-            backend.commit_extend().map_err(emap)?;
-            Ok(backend.commit_report().join("\n"))
+    }
+
+    /// An array of strings, or one comma-separated string.
+    fn strings(&self, key: &str) -> anyhow::Result<Vec<String>> {
+        match self.get(key) {
+            None => Ok(Vec::new()),
+            Some(Value::String(s)) => Ok(s
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| self.invalid(key, "an array of strings"))
+                })
+                .collect(),
+            Some(_) => Err(self.invalid(key, "an array of strings")),
         }
+    }
 
-        // The MCP surface has no console, so progress is discarded.
-        "git_fetch" => done(backend.fetch(s("remote"), flag("all"), flag("prune"), &|_| {})),
-        "git_pull" => done(backend.pull(flag("rebase"), &|_| {})),
-        "git_push" => {
-            if let Some(branch) = s("delete") {
-                done(backend.push_delete(s("remote"), branch, &|_| {}))
-            } else if flag("tags") {
-                done(backend.push_tags(s("remote"), &|_| {}))
-            } else {
-                done(backend.push(
-                    s("remote"),
-                    flag("force"),
-                    flag("force_with_lease"),
-                    flag("set_upstream"),
-                    &|_| {},
-                ))
-            }
+    fn req_strings(&self, key: &str) -> anyhow::Result<Vec<String>> {
+        let items = self.strings(key)?;
+        if items.is_empty() {
+            return Err(self.missing(key));
         }
+        Ok(items)
+    }
 
-        "git_checkout" => {
-            let rev = req("rev")?;
-            let is_branch = backend
-                .local_branches()
-                .map(|bs| bs.iter().any(|b| b == rev))
-                .unwrap_or(false);
-            done(if is_branch {
-                backend.checkout_branch(rev)
-            } else {
-                backend.checkout_detached(rev)
-            })
-        }
-        "git_merge" => {
-            if flag("abort") {
-                done(backend.merge_abort())
-            } else {
-                done(backend.merge(req("rev")?, flag("no_ff"), flag("ff_only"), &|_| {}))
-            }
-        }
-        "git_rebase" => done(backend.rebase_onto(req("onto")?, &|_| {})),
-        "git_rebase_continue" => done(backend.rebase_continue()),
-        "git_rebase_skip" => done(backend.rebase_skip()),
-        "git_rebase_abort" => done(backend.rebase_abort()),
-        "git_cherry_pick" => done(backend.cherry_pick(req("rev")?, flag("no_commit"))),
-        "git_revert" => done(backend.revert(req("rev")?, flag("no_commit"))),
-        "git_reset" => {
-            let mode = match s("mode").unwrap_or("mixed") {
-                "soft" => ResetMode::Soft,
-                "hard" => ResetMode::Hard,
-                _ => ResetMode::Mixed,
-            };
-            done(backend.reset(req("rev")?, mode))
-        }
-        "git_undo" => backend.undo().map_err(emap),
-        "git_redo" => backend.redo().map_err(emap),
-        "git_oplog" => backend
-            .oplog()
-            .map(|e| crate::render::oplog(&e))
-            .map_err(emap),
-        "git_smartlog" => backend
-            .smartlog()
-            .map(|e| crate::render::smartlog(&e))
-            .map_err(emap),
-        "git_absorb" => backend.absorb().map_err(emap),
-        "git_reword" => done(backend.reword(s("rev").unwrap_or("HEAD"), req("message")?)),
-        "git_uncommit" => {
-            done(backend.uncommit(args.get("n").and_then(Value::as_u64).unwrap_or(1) as usize))
-        }
-        "git_squash" => match s("from") {
-            Some(from) => done(backend.squash_range(from)),
-            None => done(backend.squash(s("rev").unwrap_or("HEAD"))),
-        },
-        "git_split" => done(backend.split(s("rev").unwrap_or("HEAD"), &str_vec("paths"))),
-        "git_move" => match (s("before"), s("after")) {
-            (Some(t), None) => done(backend.reorder(req("rev")?, t, true)),
-            (None, Some(t)) => done(backend.reorder(req("rev")?, t, false)),
-            _ => Err("pass exactly one of before or after".to_owned()),
-        },
-        "git_prune" => backend
-            .prune_merged(s("base").unwrap_or("HEAD"))
-            .map(|d| {
-                if d.is_empty() {
-                    "no merged branches".to_owned()
-                } else {
-                    format!("deleted: {}", d.join(", "))
-                }
-            })
-            .map_err(emap),
-        "git_sync" => backend
-            .sync(&|_| {})
-            .map(|o| {
-                let mut m = "synced".to_owned();
-                if !o.restacked.is_empty() {
-                    m.push_str(&format!("; restacked {}", o.restacked.join(", ")));
-                }
-                if !o.conflicted.is_empty() {
-                    m.push_str(&format!("; conflicts in {}", o.conflicted.join(", ")));
-                }
-                m
-            })
-            .map_err(emap),
-        "git_submit" => backend
-            .submit_stack(&|_| {})
-            .map(|n| n.join("\n"))
-            .map_err(emap),
+    fn missing(&self, key: &str) -> anyhow::Error {
+        anyhow::Error::new(CliError {
+            message: format!("{key} required"),
+            help: Some(format!("Call {} with `{key}` set", self.tool)),
+            code: 2,
+        })
+    }
 
-        "git_flow_init" => rgit_git::workflow::init(backend.as_ref(), req("preset")?).map_err(emap),
-        "git_flow_start" => rgit_git::workflow::start(backend.as_ref(), req("name")?).map_err(emap),
-        "git_flow_finish" => rgit_git::workflow::finish(backend.as_ref()).map_err(emap),
-        "git_flow_release" => {
-            rgit_git::workflow::release(backend.as_ref(), req("version")?, flag("finish"))
-                .map_err(emap)
-        }
-        "git_flow_status" => rgit_git::workflow::status(backend.as_ref()).map_err(emap),
-
-        "git_workspace_new" => {
-            rgit_git::workspace::create(backend.as_ref(), req("name")?).map_err(emap)
-        }
-        "git_workspace_list" => rgit_git::workspace::list(backend.as_ref()).map_err(emap),
-        "git_workspace_remove" => {
-            rgit_git::workspace::remove(backend.as_ref(), req("name")?).map_err(emap)
-        }
-
-        "git_stack_new" => backend.stack_new(req("name")?).map_err(emap),
-        "git_stack_list" => backend
-            .stack_parents()
-            .map(|parents| {
-                let lines: Vec<String> = parents
-                    .iter()
-                    .map(|(b, p)| match p {
-                        Some(p) => format!("{b} (on {p})"),
-                        None => format!("{b} (base)"),
-                    })
-                    .collect();
-                if lines.is_empty() {
-                    "no branches".to_owned()
-                } else {
-                    lines.join("\n")
-                }
-            })
-            .map_err(emap),
-        "git_stack_restack" => backend
-            .restack()
-            .map(|o| crate::stack::render_restack(&o))
-            .map_err(emap),
-        "git_lanes_list" => backend
-            .lanes_state()
-            .map(|state| {
-                let mut lines = Vec::new();
-                for lane in &state.lanes {
-                    lines.push(format!("{} [{}]", lane.name, lane.branch));
-                    for (short, summary) in &lane.commits {
-                        lines.push(format!("  * {short} {summary}"));
-                    }
-                    for path in &lane.paths {
-                        lines.push(format!("  {path}"));
-                    }
-                    for h in &lane.hunks {
-                        let short: String = h.anchor.chars().take(7).collect();
-                        lines.push(format!("  {} (hunk {short})", h.path));
-                    }
-                }
-                if lines.is_empty() {
-                    "no lanes".to_owned()
-                } else {
-                    lines.join("\n")
-                }
-            })
-            .map_err(emap),
-        "git_lanes_init" => backend
-            .lanes_init()
-            .map(|()| "lanes on".to_owned())
-            .map_err(emap),
-        "git_lanes_off" => backend
-            .lanes_off()
-            .map(|()| "lanes off".to_owned())
-            .map_err(emap),
-        "git_lanes_new" => backend
-            .lane_new(req("name")?)
-            .map(|()| "ok".to_owned())
-            .map_err(emap),
-        "git_lanes_stack" => backend
-            .lane_stack(req("name")?, req("on")?)
-            .map(|()| "ok".to_owned())
-            .map_err(emap),
-        "git_lanes_assign" => match hunk {
-            Some(new_start) => backend.lane_assign_hunk(req("lane")?, req("path")?, new_start),
-            None => backend.lane_assign(req("lane")?, req("path")?),
-        }
-        .map(|()| "ok".to_owned())
-        .map_err(emap),
-        "git_lanes_unassign" => backend
-            .lane_unassign(req("path")?)
-            .map(|()| "ok".to_owned())
-            .map_err(emap),
-        "git_lanes_commit" => backend
-            .lane_commit(req("lane")?, req("message")?)
-            .map_err(emap),
-        "git_lanes_rename" => backend
-            .lane_rename(req("old")?, req("new")?)
-            .map(|()| "ok".to_owned())
-            .map_err(emap),
-        "git_lanes_delete" => backend
-            .lane_delete(req("name")?)
-            .map(|()| "ok".to_owned())
-            .map_err(emap),
-        "git_lanes_push" => backend.lane_push(req("lane")?).map_err(emap),
-        "git_lanes_pr" => backend.lane_pr(req("lane")?).map_err(emap),
-        "git_lanes_restack" => backend
-            .lane_restack()
-            .map(|o| crate::stack::render_restack(&o))
-            .map_err(emap),
-        "git_bisect" => match backend.bisect(&str_vec("args")) {
-            Ok(out) if out.is_empty() => Ok("ok".to_owned()),
-            Ok(out) => Ok(out),
-            Err(e) => Err(e.to_string()),
-        },
-
-        "git_stash_push" => match s("message") {
-            Some(m) => backend.stash_push_message(m, flag("include_untracked")),
-            None => backend.stash_push(flag("include_untracked")),
-        }
-        .map_err(emap),
-        "git_stash_pop" => done(backend.stash_pop(index())),
-        "git_stash_apply" => done(backend.stash_apply(index())),
-        "git_stash_drop" => done(backend.stash_drop(index())),
-
-        "git_branch_create" => done(backend.create_branch(req("name")?)),
-        "git_branch_delete" => done(backend.delete_branch(req("name")?, flag("force"))),
-        "git_branch_rename" => done(backend.rename_branch(req("old")?, req("new")?)),
-
-        "git_tag_create" => done(backend.create_tag(req("name")?, s("message").unwrap_or(""))),
-        "git_tag_delete" => done(backend.delete_tag(req("name")?)),
-
-        "git_remote_add" => done(backend.add_remote(req("name")?, req("url")?)),
-        "git_remote_remove" => done(backend.remove_remote(req("name")?)),
-        "git_remote_set_url" => done(backend.set_remote_url(req("name")?, req("url")?)),
-        "git_remote_rename" => done(backend.rename_remote(req("old")?, req("new")?)),
-
-        "git_worktree_add" => done(backend.add_worktree(req("name")?, req("path")?)),
-        "git_worktree_remove" => done(backend.remove_worktree(req("name")?, flag("force"))),
-        "git_worktree_prune" => backend
-            .prune_worktrees()
-            .map(|p| {
-                if p.is_empty() {
-                    "nothing to prune".to_owned()
-                } else {
-                    format!("pruned {}", p.join(", "))
-                }
-            })
-            .map_err(emap),
-
-        "git_clean" => backend
-            .clean(flag("dry_run"))
-            .map(|o| if flag("dry_run") { o } else { "ok".to_owned() })
-            .map_err(emap),
-        "git_rm" => done(backend.remove_path(req("path")?, flag("cached"))),
-        "git_mv" => done(backend.move_path(req("from")?, req("to")?, flag("force"))),
-        "git_run" => backend.git(&str_vec("args")).map_err(emap),
-
-        other => Err(format!("unknown tool: {other}")),
+    fn invalid(&self, key: &str, want: &str) -> anyhow::Error {
+        anyhow::Error::new(CliError {
+            message: format!("{key} must be {want}"),
+            help: Some(format!("Call {} with `{key}` as {want}", self.tool)),
+            code: 2,
+        })
     }
 }
 
-fn emap(e: rgit_git::GitError) -> String {
-    e.to_string()
-}
+/// The CLI command a tool stands for, or `None` for a tool with no CLI twin.
+fn command(a: &Args) -> anyhow::Result<Option<Command>> {
+    let branch = |cmd| Command::Branch {
+        cmd: Some(cmd),
+        all: false,
+        remotes: false,
+    };
+    let rebase = |onto, cont, skip, abort| Command::Rebase {
+        onto,
+        onto_new: None,
+        edit: false,
+        cont,
+        skip,
+        abort,
+    };
+    let stash = |cmd| Command::Stash { cmd: Some(cmd) };
+    let remote = |cmd| Command::Remote { cmd: Some(cmd) };
+    let worktree = |cmd| Command::Worktree { cmd: Some(cmd) };
+    let workspace = |cmd| Command::Workspace { cmd: Some(cmd) };
+    let stack = |cmd| Command::Stack { cmd: Some(cmd) };
+    let lanes = |cmd| Command::Lanes { cmd: Some(cmd) };
+    let flow = |cmd| Command::Flow { cmd };
+    let index = |action| Command::Index { action };
+    let tag = |name, message, force, delete| Command::Tag {
+        name,
+        message,
+        annotate: false,
+        force,
+        delete,
+        list: false,
+    };
+    let stash_index = || a.num("index").map(|n| n.map(|n| n as usize));
+    Ok(Some(match a.tool {
+        "git_status" => Command::Status {
+            porcelain: None,
+            short: false,
+            branch: false,
+            z: false,
+        },
+        "git_log" => Command::Log {
+            limit: a.num("limit")?.map_or(20, |n| n as usize),
+            all: a.flag("all"),
+            author: a.str("author"),
+            since: a.str("since"),
+            until: a.str("until"),
+            oneline: false,
+            rev: a.str("rev"),
+            path: a.str("path"),
+        },
+        "git_diff" => Command::Diff {
+            from: a.str("from"),
+            to: a.str("to"),
+            patch: a.flag("patch"),
+            cached: a.flag("cached"),
+            name_only: a.flag("name_only"),
+            stat: false,
+        },
+        "git_show" => Command::Show {
+            rev: a.req("rev")?,
+            patch: a.flag("patch"),
+            name_only: a.flag("name_only"),
+        },
+        "git_blame" => Command::Blame {
+            path: a.req("path")?,
+            lines: a.str("lines"),
+        },
+        "git_refs" => Command::Refs,
+        "git_branches" => Command::Branch {
+            cmd: None,
+            all: a.flag("all"),
+            remotes: a.flag("remotes"),
+        },
+        "git_tags" => tag(None, None, false, None),
+        "git_stashes" => stash(StashCmd::List),
+        "git_remotes" => Command::Remote { cmd: None },
+        "git_worktrees" => Command::Worktree { cmd: None },
+        "git_describe" => Command::Describe {
+            rev: a.str("rev"),
+            tags: a.flag("tags"),
+            dirty: a.flag("dirty"),
+            long: a.flag("long"),
+            abbrev: a.num("abbrev")?.map(|n| n as u32),
+        },
+        "index_build" => index(IndexCmd::Build {
+            root: a.str("root"),
+        }),
+        "code_search" => index(IndexCmd::Code {
+            query: a.req("query")?,
+            limit: a.num("limit")?.map_or(8, |n| n as usize),
+            root: a.str("root"),
+        }),
+        "semantic_search" => index(IndexCmd::Search {
+            query: a.req("query")?,
+            limit: a.num("limit")?.map_or(8, |n| n as usize),
+            root: a.str("root"),
+        }),
 
-fn done(r: Result<(), rgit_git::GitError>) -> Result<String, String> {
-    r.map(|()| "ok".to_owned()).map_err(emap)
-}
-
-fn diff_out(
-    files: Result<Vec<rgit_git::FileDiff>, rgit_git::GitError>,
-    patch: bool,
-) -> Result<String, String> {
-    files
-        .map(|f| {
-            if patch {
-                crate::render::patch(&f)
-            } else {
-                crate::render::diffstat(&f)
+        "git_stage" => Command::Stage {
+            path: a.req("path")?,
+            hunk: a.num("hunk")?.map(|n| n as u32),
+            lines: a.nums("lines")?,
+        },
+        "git_unstage" => Command::Unstage {
+            path: a.req("path")?,
+            hunk: a.num("hunk")?.map(|n| n as u32),
+            lines: a.nums("lines")?,
+        },
+        "git_stage_all" => Command::StageAll,
+        "git_unstage_all" => Command::UnstageAll,
+        "git_discard" => Command::Discard {
+            path: Some(a.req("path")?),
+            hunk: a.num("hunk")?.map(|n| n as u32),
+            lines: a.nums("lines")?,
+        },
+        "git_resolve" => Command::Resolve {
+            path: a.req("path")?,
+            ours: a.flag("ours"),
+            theirs: !a.flag("ours"),
+        },
+        "git_commit" => Command::Commit {
+            message: Some(a.req("message")?),
+            amend: a.flag("amend"),
+            all: a.flag("all"),
+            no_verify: a.flag("no_verify"),
+        },
+        "git_extend" => Command::Extend,
+        "git_fetch" => Command::Fetch {
+            all: a.flag("all"),
+            prune: a.flag("prune"),
+            remote: a.str("remote"),
+        },
+        "git_pull" => Command::Pull {
+            rebase: a.flag("rebase"),
+        },
+        "git_push" => Command::Push {
+            force: a.flag("force"),
+            force_with_lease: a.flag("force_with_lease"),
+            set_upstream: a.flag("set_upstream"),
+            remote: a.str("remote"),
+            tags: a.flag("tags"),
+            delete: a.str("delete"),
+        },
+        "git_checkout" => Command::Checkout {
+            rev: Some(a.req("rev")?),
+            branch: None,
+        },
+        "git_merge" => Command::Merge {
+            rev: a.str("rev"),
+            no_ff: a.flag("no_ff"),
+            ff_only: a.flag("ff_only"),
+            abort: a.flag("abort"),
+        },
+        "git_rebase" => rebase(Some(a.req("onto")?), false, false, false),
+        "git_rebase_continue" => rebase(None, true, false, false),
+        "git_rebase_skip" => rebase(None, false, true, false),
+        "git_rebase_abort" => rebase(None, false, false, true),
+        "git_cherry_pick" => Command::CherryPick {
+            rev: Some(a.req("rev")?),
+            no_commit: a.flag("no_commit"),
+        },
+        "git_revert" => Command::Revert {
+            rev: Some(a.req("rev")?),
+            no_commit: a.flag("no_commit"),
+        },
+        "git_reset" => {
+            let (soft, hard) = match a.str("mode").as_deref() {
+                None | Some("mixed") => (false, false),
+                Some("soft") => (true, false),
+                Some("hard") => (false, true),
+                Some(_) => return Err(a.invalid("mode", "one of soft, mixed, hard")),
+            };
+            Command::Reset {
+                rev: Some(a.req("rev")?),
+                soft,
+                hard,
+                paths: Vec::new(),
             }
-        })
-        .map_err(emap)
+        }
+        "git_undo" => Command::Undo,
+        "git_redo" => Command::Redo,
+        "git_oplog" => Command::Oplog,
+        "git_smartlog" => Command::Smartlog,
+        "git_absorb" => Command::Absorb,
+        "git_reword" => Command::Reword {
+            message: a.req("message")?,
+            rev: a.or("rev", "HEAD"),
+        },
+        "git_uncommit" => Command::Uncommit {
+            n: a.num("n")?.map_or(1, |n| n as usize),
+        },
+        "git_squash" => Command::Squash {
+            rev: a.or("rev", "HEAD"),
+            from: a.str("from"),
+        },
+        "git_split" => Command::Split {
+            rev: a.or("rev", "HEAD"),
+            paths: a.req_strings("paths")?,
+        },
+        "git_move" => Command::Move {
+            rev: a.req("rev")?,
+            before: a.str("before"),
+            after: a.str("after"),
+        },
+        "git_prune" => branch(BranchCmd::Prune {
+            base: a.or("base", "HEAD"),
+        }),
+        "git_sync" => Command::Sync,
+        "git_submit" => Command::Submit,
+
+        "git_flow_init" => flow(FlowCmd::Init {
+            preset: a.req("preset")?,
+        }),
+        "git_flow_start" => flow(FlowCmd::Start {
+            name: a.req("name")?,
+        }),
+        "git_flow_finish" => flow(FlowCmd::Finish),
+        "git_flow_release" => flow(FlowCmd::Release {
+            version: a.req("version")?,
+            finish: a.flag("finish"),
+        }),
+        "git_flow_status" => flow(FlowCmd::Status),
+
+        "git_workspace_new" => workspace(WorkspaceCmd::New {
+            name: a.req("name")?,
+        }),
+        "git_workspace_list" => workspace(WorkspaceCmd::List),
+        "git_workspace_remove" => workspace(WorkspaceCmd::Remove {
+            name: a.req("name")?,
+        }),
+
+        "git_stack_new" => stack(StackCmd::New {
+            name: a.req("name")?,
+        }),
+        "git_stack_list" => stack(StackCmd::List),
+        "git_stack_restack" => stack(StackCmd::Restack),
+
+        "git_lanes_list" => lanes(LanesCmd::List),
+        "git_lanes_init" => lanes(LanesCmd::Init),
+        "git_lanes_off" => lanes(LanesCmd::Off),
+        "git_lanes_new" => lanes(LanesCmd::New {
+            name: a.req("name")?,
+        }),
+        "git_lanes_stack" => lanes(LanesCmd::Stack {
+            name: a.req("name")?,
+            on: a.req("on")?,
+        }),
+        "git_lanes_assign" => lanes(LanesCmd::Assign {
+            lane: a.req("lane")?,
+            path: a.req("path")?,
+            hunk: a.num("hunk")?.map(|n| n as u32),
+        }),
+        "git_lanes_unassign" => lanes(LanesCmd::Unassign {
+            path: a.req("path")?,
+        }),
+        "git_lanes_commit" => lanes(LanesCmd::Commit {
+            lane: a.req("lane")?,
+            message: a.req("message")?,
+        }),
+        "git_lanes_rename" => lanes(LanesCmd::Rename {
+            old: a.req("old")?,
+            new: a.req("new")?,
+        }),
+        "git_lanes_delete" => lanes(LanesCmd::Delete {
+            name: a.req("name")?,
+        }),
+        "git_lanes_push" => lanes(LanesCmd::Push {
+            lane: a.req("lane")?,
+        }),
+        "git_lanes_pr" => lanes(LanesCmd::Pr {
+            lane: a.req("lane")?,
+        }),
+        "git_lanes_restack" => lanes(LanesCmd::Restack),
+        "git_bisect" => Command::Bisect {
+            args: a.req_strings("args")?,
+        },
+
+        "git_stash_push" => stash(StashCmd::Push {
+            message: a.str("message"),
+            include_untracked: a.flag("include_untracked"),
+        }),
+        "git_stash_pop" => stash(StashCmd::Pop {
+            index: stash_index()?,
+        }),
+        "git_stash_apply" => stash(StashCmd::Apply {
+            index: stash_index()?,
+        }),
+        "git_stash_drop" => stash(StashCmd::Drop {
+            index: stash_index()?,
+        }),
+
+        "git_branch_create" => branch(BranchCmd::Create {
+            name: a.req("name")?,
+        }),
+        "git_branch_delete" => branch(BranchCmd::Delete {
+            name: Some(a.req("name")?),
+            force: a.flag("force"),
+        }),
+        "git_branch_rename" => branch(BranchCmd::Rename {
+            old: a.req("old")?,
+            new: a.req("new")?,
+        }),
+
+        "git_tag_create" => tag(
+            Some(a.req("name")?),
+            a.str("message"),
+            a.flag("force"),
+            None,
+        ),
+        "git_tag_delete" => tag(None, None, false, Some(a.req("name")?)),
+
+        "git_remote_add" => remote(RemoteCmd::Add {
+            name: a.req("name")?,
+            url: a.req("url")?,
+        }),
+        "git_remote_remove" => remote(RemoteCmd::Remove {
+            name: a.req("name")?,
+        }),
+        "git_remote_set_url" => remote(RemoteCmd::SetUrl {
+            name: a.req("name")?,
+            url: a.req("url")?,
+        }),
+        "git_remote_rename" => remote(RemoteCmd::Rename {
+            old: a.req("old")?,
+            new: a.req("new")?,
+        }),
+
+        "git_worktree_add" => worktree(WorktreeCmd::Add {
+            name: a.req("name")?,
+            path: a.req("path")?,
+        }),
+        "git_worktree_remove" => worktree(WorktreeCmd::Remove {
+            name: a.req("name")?,
+            force: a.flag("force"),
+        }),
+        "git_worktree_prune" => worktree(WorktreeCmd::Prune),
+
+        "git_clean" => Command::Clean {
+            dry_run: a.flag("dry_run"),
+        },
+        "git_rm" => Command::Rm {
+            path: Some(a.req("path")?),
+            cached: a.flag("cached"),
+        },
+        "git_mv" => Command::Mv {
+            from: a.req("from")?,
+            to: a.req("to")?,
+            force: a.flag("force"),
+        },
+        "git_run" => Command::Git {
+            args: a.req_strings("args")?,
+        },
+        _ => return Ok(None),
+    }))
+}
+
+/// Tools that read the object store directly and have no CLI command.
+fn local(backend: &Arc<dyn GitBackend>, a: &Args, full: bool) -> anyhow::Result<Output> {
+    Ok(match a.tool {
+        "git_tree" => {
+            let rev = a.or("rev", "HEAD");
+            let path = a.or("path", "");
+            let entries = backend.list_tree(&rev, &path)?;
+            let rows = entries
+                .iter()
+                .map(|e| {
+                    crate::obj! {
+                        "name" => e.name,
+                        "kind" => if e.is_dir { "dir" } else { "file" },
+                        "size" => e.size as usize,
+                        "path" => e.path,
+                    }
+                })
+                .collect();
+            let at = if path.is_empty() {
+                rev
+            } else {
+                format!("{rev}:{path}")
+            };
+            Output::new(crate::render::tree(&entries))
+                .list(
+                    "entries",
+                    rows,
+                    &["name", "kind", "size"],
+                    format!("0 entries at {at}"),
+                )
+                .help("Call git_blob with a file's path to read it")
+                .help("Call git_tree with a dir's path to list it")
+        }
+        "git_blob" => {
+            let blob = backend.read_blob(&a.or("rev", "HEAD"), &a.req("path")?)?;
+            let out = Output::new(crate::render::blob(&blob))
+                .with("path", blob.path.as_str())
+                .with("size", blob.size as usize);
+            match blob.text {
+                Some(text) => out.long("content", text),
+                None => out.with("content", format!("binary file, {} bytes", blob.size)),
+            }
+        }
+        "git_files" => {
+            let rev = a.or("rev", "HEAD");
+            let mut files = backend.list_files(&rev)?;
+            let out = Output::new(files.join("\n"));
+            let total = files.len();
+            if total == 0 {
+                return Ok(out.with("files", format!("0 files in {rev}")));
+            }
+            if full || total <= FILES_SHOWN {
+                return Ok(out.with("count", total).with("files", files));
+            }
+            files.truncate(FILES_SHOWN);
+            out.with("count", format!("{FILES_SHOWN} of {total} files"))
+                .with("files", files)
+                .help(format!(
+                    "Call git_files with full=true to see all {total} files"
+                ))
+        }
+        "git_grep" => {
+            let query = GrepQuery {
+                pattern: a.req("pattern")?,
+                regex: a.flag("regex"),
+                path: a.str("path"),
+                exts: a
+                    .strings("ext")?
+                    .iter()
+                    .map(|e| e.trim_start_matches('.').to_lowercase())
+                    .collect(),
+            };
+            let matches = backend.grep_query(&query)?;
+            let total = matches.len();
+            let shown = if full { total } else { total.min(GREP_SHOWN) };
+            let rows = matches[..shown]
+                .iter()
+                .map(|m| crate::obj! { "path" => m.path, "line" => m.line, "text" => m.text })
+                .collect();
+            let mut out = Output::new(crate::render::grep(&matches));
+            if shown < total {
+                out = out
+                    .with("count", format!("{shown} of {total} matches"))
+                    .help(format!(
+                        "Call git_grep with full=true to see all {total} matches"
+                    ));
+            }
+            out.list(
+                "matches",
+                rows,
+                &["path", "line", "text"],
+                format!("0 matches for {:?}", query.pattern),
+            )
+        }
+        other => {
+            return Err(anyhow::Error::new(CliError {
+                message: format!("unknown tool: {other}"),
+                help: Some("Call tools/list to see the available tools".to_owned()),
+                code: 2,
+            }));
+        }
+    })
 }
 
 #[cfg(test)]
@@ -1540,58 +1800,12 @@ mod tests {
             vec!["config", "user.email", "t@e"],
             vec!["config", "user.name", "t"],
         ] {
-            assert!(
-                Command::new("git")
-                    .arg("-C")
-                    .arg(&dir)
-                    .args(&args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            git(&dir, &args);
         }
         std::fs::write(dir.join("f.txt"), "x\n").unwrap();
-        for args in [vec!["add", "f.txt"], vec!["commit", "-qm", "c0"]] {
-            assert!(
-                Command::new("git")
-                    .arg("-C")
-                    .arg(&dir)
-                    .args(&args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
+        git(&dir, &["add", "f.txt"]);
+        git(&dir, &["commit", "-qm", "c0"]);
         dir
-    }
-
-    #[test]
-    fn registry_defaults_to_bound_repo_and_opens_others_by_path() {
-        let a = init_repo("reg-a");
-        let b = init_repo("reg-b");
-        let default: Arc<dyn GitBackend> = Arc::new(Git2Backend::discover(&a).unwrap());
-        let reg = Registry::new(default);
-
-        // Empty / absent resolves to the bound repo.
-        let canon_a = std::fs::canonicalize(&a).unwrap();
-        assert_eq!(reg.resolve(None).unwrap().workdir(), canon_a);
-        assert_eq!(reg.resolve(Some("")).unwrap().workdir(), canon_a);
-
-        // A path opens that repo, and a second resolve is cached (same Arc).
-        let canon_b = std::fs::canonicalize(&b).unwrap();
-        let first = reg.resolve(Some(b.to_str().unwrap())).unwrap();
-        assert_eq!(first.workdir(), canon_b);
-        let second = reg.resolve(Some(b.to_str().unwrap())).unwrap();
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "same repo resolves to a cached backend"
-        );
-
-        // A missing path errors instead of panicking.
-        assert!(reg.resolve(Some("/no/such/repo/xyzzy")).is_err());
-
-        let _ = std::fs::remove_dir_all(&a);
-        let _ = std::fs::remove_dir_all(&b);
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {
@@ -1606,26 +1820,62 @@ mod tests {
         );
     }
 
-    /// The new git-compat flags reach the backend through `dispatch`.
+    fn open(dir: &std::path::Path) -> Arc<dyn GitBackend> {
+        Arc::new(Git2Backend::discover(dir).unwrap())
+    }
+
+    /// A call's TOON text, or its TOON error, as the client would see it.
+    fn call(backend: &Arc<dyn GitBackend>, name: &str, args: Value) -> Result<String, String> {
+        dispatch(backend, name, &args)
+            .map(|v| crate::toon::encode(&v))
+            .map_err(|e| crate::toon::encode(&failure(&e)))
+    }
+
+    fn field<'a>(value: &'a Obj, key: &str) -> Option<&'a Node> {
+        value.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    #[test]
+    fn registry_defaults_to_bound_repo_and_opens_others_by_path() {
+        let a = init_repo("reg-a");
+        let b = init_repo("reg-b");
+        let reg = Registry::new(open(&a));
+
+        let canon_a = std::fs::canonicalize(&a).unwrap();
+        assert_eq!(reg.resolve(None).unwrap().workdir(), canon_a);
+        assert_eq!(reg.resolve(Some("")).unwrap().workdir(), canon_a);
+
+        let canon_b = std::fs::canonicalize(&b).unwrap();
+        let first = reg.resolve(Some(b.to_str().unwrap())).unwrap();
+        assert_eq!(first.workdir(), canon_b);
+        let second = reg.resolve(Some(b.to_str().unwrap())).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same repo resolves to a cached backend"
+        );
+
+        assert!(reg.resolve(Some("/no/such/repo/xyzzy")).is_err());
+
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
     #[test]
     fn dispatch_wires_the_new_flags() {
         let dir = init_repo("dispatch");
-        let backend: Arc<dyn GitBackend> = Arc::new(Git2Backend::discover(&dir).unwrap());
-        let run = |name: &str, args: Value| dispatch(&backend, name, &args);
+        let backend = open(&dir);
+        let run = |name: &str, args: Value| call(&backend, name, args);
 
-        // git_clean dry_run lists without deleting.
         std::fs::write(dir.join("junk"), "j\n").unwrap();
         let out = run("git_clean", json!({ "dry_run": true })).unwrap();
-        assert!(out.contains("junk"), "dry-run lists junk");
+        assert!(out.contains("junk"), "dry-run lists junk: {out}");
         assert!(dir.join("junk").exists(), "dry-run does not delete");
 
-        // git_stash_push without include_untracked keeps the untracked file.
         std::fs::write(dir.join("f.txt"), "x\nmore\n").unwrap();
         run("git_stash_push", json!({})).unwrap();
         assert!(dir.join("junk").exists(), "bare stash keeps untracked junk");
         run("git_stash_pop", json!({})).unwrap();
 
-        // git_branch_delete refuses an unmerged branch without force.
         git(&dir, &["checkout", "-qb", "feat"]);
         std::fs::write(dir.join("f.txt"), "onfeat\n").unwrap();
         git(&dir, &["commit", "-qam", "feat"]);
@@ -1634,16 +1884,16 @@ mod tests {
             run("git_branch_delete", json!({ "name": "feat" })).is_err(),
             "unmerged delete without force errors"
         );
+        let deleted = run(
+            "git_branch_delete",
+            json!({ "name": "feat", "force": true }),
+        )
+        .unwrap();
         assert!(
-            run(
-                "git_branch_delete",
-                json!({ "name": "feat", "force": true })
-            )
-            .is_ok(),
-            "force delete succeeds"
+            deleted.starts_with("result: deleted branch feat"),
+            "{deleted}"
         );
 
-        // git_remote_set_url / rename thread through.
         run(
             "git_remote_add",
             json!({ "name": "origin", "url": "https://e.com/a.git" }),
@@ -1664,15 +1914,151 @@ mod tests {
         run("git_remote_rename", json!({ "old": "origin", "new": "up" })).unwrap();
         assert!(backend.remotes().unwrap().iter().any(|r| r.name == "up"));
 
-        // git_describe --dirty appends the suffix; default does not.
         run("git_tag_create", json!({ "name": "v1", "message": "one" })).unwrap();
         std::fs::write(dir.join("f.txt"), "x\ndirty\n").unwrap();
-        assert_eq!(run("git_describe", json!({})).unwrap(), "v1");
+        assert_eq!(run("git_describe", json!({})).unwrap(), "result: v1");
         assert_eq!(
             run("git_describe", json!({ "dirty": true })).unwrap(),
-            "v1-dirty"
+            "result: v1-dirty"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tool with a CLI twin prints exactly what `axi::run` + `finalize` does.
+    #[test]
+    fn tools_match_the_cli_agent_output() {
+        let dir = init_repo("parity");
+        let backend = open(&dir);
+        std::fs::write(dir.join("new.txt"), "n\n").unwrap();
+        let cli = |command: crate::cli::Command| {
+            crate::toon::encode(
+                &crate::axi::run(&backend, command, false)
+                    .unwrap()
+                    .finalize(&[], false, "rgit")
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            call(&backend, "git_status", json!({})).unwrap(),
+            cli(crate::cli::Command::Status {
+                porcelain: None,
+                short: false,
+                branch: false,
+                z: false,
+            })
+        );
+        assert_eq!(
+            call(&backend, "git_smartlog", json!({})).unwrap(),
+            cli(crate::cli::Command::Smartlog)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fields_full_and_no_ops() {
+        let dir = init_repo("fields");
+        let backend = open(&dir);
+
+        let log = dispatch(&backend, "git_log", &json!({ "fields": ["oid"] })).unwrap();
+        let Some(Node::List(rows)) = field(&log, "commits") else {
+            panic!("commits table");
+        };
+        let Node::Obj(row) = &rows[0] else {
+            panic!("row");
+        };
+        let columns: Vec<&str> = row.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(columns, ["id", "summary", "author", "when", "oid"]);
+
+        let err = call(&backend, "git_log", json!({ "fields": "nope" })).unwrap_err();
+        assert!(err.contains("unknown field nope"), "{err}");
+        assert!(err.contains("valid fields for commits"), "{err}");
+
+        std::fs::write(dir.join("f.txt"), "y\n".repeat(2000)).unwrap();
+        let patch = call(&backend, "git_diff", json!({ "patch": true })).unwrap();
+        assert!(patch.contains("truncated"), "{patch}");
+        assert!(
+            patch.contains("Call git_diff with full=true to see the complete patch"),
+            "{patch}"
+        );
+        let whole = call(&backend, "git_diff", json!({ "patch": true, "full": true })).unwrap();
+        assert!(!whole.contains("truncated"));
+
+        let created = call(&backend, "git_branch_create", json!({ "name": "b1" })).unwrap();
+        assert!(
+            created.starts_with("result: created and checked out branch b1"),
+            "{created}"
+        );
+        let again = call(&backend, "git_branch_create", json!({ "name": "b1" })).unwrap();
+        assert!(
+            again.starts_with("result: branch b1 already exists (no-op)"),
+            "{again}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn errors_carry_help() {
+        let dir = init_repo("errors");
+        let backend = open(&dir);
+
+        let missing = call(&backend, "git_show", json!({})).unwrap_err();
+        assert_eq!(
+            missing,
+            "error: rev required\nhelp[1]: Call git_show with `rev` set"
+        );
+
+        let nothing = call(&backend, "git_commit", json!({ "message": "m" })).unwrap_err();
+        assert!(nothing.starts_with("error: "), "{nothing}");
+        assert!(nothing.contains("rgit stage <path>"), "{nothing}");
+
+        let unknown = call(&backend, "git_nope", json!({})).unwrap_err();
+        assert!(unknown.contains("tools/list"), "{unknown}");
+
+        let bad = call(&backend, "git_reset", json!({ "rev": "HEAD", "mode": "x" })).unwrap_err();
+        assert!(
+            bad.contains("mode must be one of soft, mixed, hard"),
+            "{bad}"
+        );
+
+        let result = reply(failure(&anyhow::anyhow!("boom")), true);
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.structured_content, Some(json!({ "error": "boom" })));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_tools_print_toon() {
+        let dir = init_repo("local");
+        let backend = open(&dir);
+        let tree = call(&backend, "git_tree", json!({})).unwrap();
+        assert!(tree.starts_with("entries[1]{name,kind,size}:"), "{tree}");
+        let files = call(&backend, "git_files", json!({})).unwrap();
+        assert!(files.starts_with("count: 1\nfiles[1]: f.txt"), "{files}");
+        let grep = call(&backend, "git_grep", json!({ "pattern": "zzz" })).unwrap();
+        assert!(grep.starts_with("matches: \"0 matches for "), "{grep}");
+        let blob = call(&backend, "git_blob", json!({ "path": "f.txt" })).unwrap();
+        assert!(blob.contains("path: f.txt"), "{blob}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_tool_is_wired() {
+        const LOCAL: &[&str] = &["git_tree", "git_blob", "git_files", "git_grep"];
+        for t in tools() {
+            let args = json!({});
+            let wired = command(&Args {
+                tool: &t.name,
+                args: &args,
+            });
+            assert!(
+                !matches!(wired, Ok(None)) || LOCAL.contains(&t.name.as_ref()),
+                "{} is not wired",
+                t.name
+            );
+        }
+        for name in READ_ONLY_TOOLS {
+            assert!(tools().iter().any(|t| t.name == *name), "{name} is listed");
+        }
     }
 }

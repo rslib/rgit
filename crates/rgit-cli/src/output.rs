@@ -16,6 +16,7 @@ pub struct Output {
     pub data: Obj,
     pub help: Vec<String>,
     lists: Vec<(String, &'static [&'static str])>,
+    has_table: bool,
     long: Vec<String>,
 }
 
@@ -26,6 +27,7 @@ impl Output {
             data: Obj::new(),
             help: Vec::new(),
             lists: Vec::new(),
+            has_table: false,
             long: Vec::new(),
         }
     }
@@ -78,6 +80,7 @@ impl Output {
         defaults: &'static [&'static str],
         empty: impl Into<String>,
     ) -> Self {
+        self.has_table = true;
         if rows.is_empty() {
             self.set(key, empty.into());
         } else {
@@ -104,7 +107,7 @@ impl Output {
     /// a size note, and `help` last. `rerun` is the current invocation; hints
     /// re-run it with `--full` placed right after `rgit`.
     pub fn finalize(mut self, fields: &[String], full: bool, rerun: &str) -> anyhow::Result<Obj> {
-        if !fields.is_empty() && self.lists.is_empty() {
+        if !fields.is_empty() && !self.has_table {
             return Err(CliError::usage(
                 "--fields applies only to commands that print a table",
             ));
@@ -195,4 +198,53 @@ impl From<&str> for Output {
     fn from(text: &str) -> Self {
         Output::message(text)
     }
+}
+
+/// An error's message, fix-it hints, and exit code, with library noise removed.
+pub fn translate(error: &anyhow::Error) -> (String, Vec<String>, i32) {
+    use rgit_git::GitError;
+    if let Some(e) = error.downcast_ref::<CliError>() {
+        return (
+            sanitize(&e.message),
+            e.help.iter().cloned().collect(),
+            e.code,
+        );
+    }
+    let Some(e) = error.downcast_ref::<GitError>() else {
+        return (sanitize(error.to_string()), Vec::new(), 1);
+    };
+    let help = match e {
+        GitError::NotARepository(_) => "Run `rgit init` to create one here",
+        GitError::NothingToCommit => "Run `rgit stage <path>` to stage changes first",
+        GitError::NotFastForward => "Run `rgit pull --rebase` to integrate upstream commits",
+        GitError::PushRejected => "Run `rgit pull --rebase`, then `rgit push`",
+        GitError::DetachedHead => "Run `rgit checkout <branch>` to get on a branch",
+        GitError::HunkNotFound { .. } => "Run `rgit diff --patch` to see the current hunks",
+        GitError::Conflict(_) => "Run `rgit status` to see the conflicted files",
+        _ => "",
+    };
+    let message = match e {
+        GitError::Git(g) => g.message().to_owned(),
+        GitError::Cli(text) => text
+            .lines()
+            .map(|l| {
+                l.trim_start_matches("fatal: ")
+                    .trim_start_matches("error: ")
+            })
+            .filter(|l| !l.trim().is_empty() && !l.starts_with("hint: "))
+            .collect::<Vec<_>>()
+            .join("; "),
+        other => other.to_string(),
+    };
+    let help = if help.is_empty() {
+        Vec::new()
+    } else {
+        vec![help.to_owned()]
+    };
+    (sanitize(message), help, 1)
+}
+
+/// ASCII stand-ins for the glyphs human output uses.
+pub fn sanitize(s: impl AsRef<str>) -> String {
+    s.as_ref().replace('\u{2191}', "^")
 }
