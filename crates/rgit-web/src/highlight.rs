@@ -32,7 +32,8 @@ pub fn highlight(path: &str, text: &str) -> String {
 /// first line / plain text.
 fn pick_syntax(path: &str, text: &str) -> &'static SyntaxReference {
     let ss = syntaxes();
-    if let Some(syntax) = detect_language(path, text).and_then(|lang| syntax_for_language(ss, &lang))
+    if let Some(syntax) =
+        detect_language(path, text).and_then(|lang| syntax_for_language(ss, &lang))
     {
         return syntax;
     }

@@ -503,7 +503,11 @@ pub fn tool_catalog() -> Vec<rgit_web::McpTool> {
                 })
                 .unwrap_or_default();
             // Required args first, then alphabetical, for a stable readable order.
-            args.sort_by(|a, b| b.required.cmp(&a.required).then_with(|| a.name.cmp(&b.name)));
+            args.sort_by(|a, b| {
+                b.required
+                    .cmp(&a.required)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
             let name = t.name.to_string();
             let writes = !is_read_only(&name);
             rgit_web::McpTool {
@@ -711,7 +715,12 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_merge",
             "Merge a revision into the current branch (no_ff forces a merge commit, ff_only refuses a non-fast-forward, abort cancels a conflicted merge).",
-            &[("rev", "string", false), ("no_ff", "boolean", false), ("ff_only", "boolean", false), ("abort", "boolean", false)],
+            &[
+                ("rev", "string", false),
+                ("no_ff", "boolean", false),
+                ("ff_only", "boolean", false),
+                ("abort", "boolean", false),
+            ],
         ),
         tool(
             "git_rebase",
@@ -1185,7 +1194,15 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
             .worktrees()
             .map(|w| crate::render::worktrees(&w))
             .map_err(emap),
-        "git_describe" => backend.describe(s("rev").unwrap_or("HEAD"), flag("tags"), flag("dirty"), flag("long"), args.get("abbrev").and_then(Value::as_u64).map(|n| n as u32)).map_err(emap),
+        "git_describe" => backend
+            .describe(
+                s("rev").unwrap_or("HEAD"),
+                flag("tags"),
+                flag("dirty"),
+                flag("long"),
+                args.get("abbrev").and_then(Value::as_u64).map(|n| n as u32),
+            )
+            .map_err(emap),
 
         "git_stage" => done(match (hunk, lines.as_slice()) {
             (Some(h), l) if !l.is_empty() => backend.stage_lines(req("path")?, h, l),
@@ -1287,9 +1304,9 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
             .map_err(emap),
         "git_absorb" => backend.absorb().map_err(emap),
         "git_reword" => done(backend.reword(s("rev").unwrap_or("HEAD"), req("message")?)),
-        "git_uncommit" => done(backend.uncommit(
-            args.get("n").and_then(Value::as_u64).unwrap_or(1) as usize,
-        )),
+        "git_uncommit" => {
+            done(backend.uncommit(args.get("n").and_then(Value::as_u64).unwrap_or(1) as usize))
+        }
         "git_squash" => match s("from") {
             Some(from) => done(backend.squash_range(from)),
             None => done(backend.squash(s("rev").unwrap_or("HEAD"))),
@@ -1323,7 +1340,10 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
                 m
             })
             .map_err(emap),
-        "git_submit" => backend.submit_stack(&|_| {}).map(|n| n.join("\n")).map_err(emap),
+        "git_submit" => backend
+            .submit_stack(&|_| {})
+            .map(|n| n.join("\n"))
+            .map_err(emap),
 
         "git_flow_init" => rgit_git::workflow::init(backend.as_ref(), req("preset")?).map_err(emap),
         "git_flow_start" => rgit_git::workflow::start(backend.as_ref(), req("name")?).map_err(emap),
@@ -1388,8 +1408,14 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
                 }
             })
             .map_err(emap),
-        "git_lanes_init" => backend.lanes_init().map(|()| "lanes on".to_owned()).map_err(emap),
-        "git_lanes_off" => backend.lanes_off().map(|()| "lanes off".to_owned()).map_err(emap),
+        "git_lanes_init" => backend
+            .lanes_init()
+            .map(|()| "lanes on".to_owned())
+            .map_err(emap),
+        "git_lanes_off" => backend
+            .lanes_off()
+            .map(|()| "lanes off".to_owned())
+            .map_err(emap),
         "git_lanes_new" => backend
             .lane_new(req("name")?)
             .map(|()| "ok".to_owned())
@@ -1465,7 +1491,10 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> Result<S
             })
             .map_err(emap),
 
-        "git_clean" => backend.clean(flag("dry_run")).map(|o| if flag("dry_run") { o } else { "ok".to_owned() }).map_err(emap),
+        "git_clean" => backend
+            .clean(flag("dry_run"))
+            .map(|o| if flag("dry_run") { o } else { "ok".to_owned() })
+            .map_err(emap),
         "git_rm" => done(backend.remove_path(req("path")?, flag("cached"))),
         "git_mv" => done(backend.move_path(req("from")?, req("to")?, flag("force"))),
         "git_run" => backend.git(&str_vec("args")).map_err(emap),
@@ -1511,11 +1540,27 @@ mod tests {
             vec!["config", "user.email", "t@e"],
             vec!["config", "user.name", "t"],
         ] {
-            assert!(Command::new("git").arg("-C").arg(&dir).args(&args).status().unwrap().success());
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
         }
         std::fs::write(dir.join("f.txt"), "x\n").unwrap();
         for args in [vec!["add", "f.txt"], vec!["commit", "-qm", "c0"]] {
-            assert!(Command::new("git").arg("-C").arg(&dir).args(&args).status().unwrap().success());
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
         }
         dir
     }
@@ -1537,7 +1582,10 @@ mod tests {
         let first = reg.resolve(Some(b.to_str().unwrap())).unwrap();
         assert_eq!(first.workdir(), canon_b);
         let second = reg.resolve(Some(b.to_str().unwrap())).unwrap();
-        assert!(Arc::ptr_eq(&first, &second), "same repo resolves to a cached backend");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same repo resolves to a cached backend"
+        );
 
         // A missing path errors instead of panicking.
         assert!(reg.resolve(Some("/no/such/repo/xyzzy")).is_err());
@@ -1587,14 +1635,32 @@ mod tests {
             "unmerged delete without force errors"
         );
         assert!(
-            run("git_branch_delete", json!({ "name": "feat", "force": true })).is_ok(),
+            run(
+                "git_branch_delete",
+                json!({ "name": "feat", "force": true })
+            )
+            .is_ok(),
             "force delete succeeds"
         );
 
         // git_remote_set_url / rename thread through.
-        run("git_remote_add", json!({ "name": "origin", "url": "https://e.com/a.git" })).unwrap();
-        run("git_remote_set_url", json!({ "name": "origin", "url": "https://e.com/b.git" })).unwrap();
-        assert!(backend.remotes().unwrap().iter().any(|r| r.url.contains("b.git")));
+        run(
+            "git_remote_add",
+            json!({ "name": "origin", "url": "https://e.com/a.git" }),
+        )
+        .unwrap();
+        run(
+            "git_remote_set_url",
+            json!({ "name": "origin", "url": "https://e.com/b.git" }),
+        )
+        .unwrap();
+        assert!(
+            backend
+                .remotes()
+                .unwrap()
+                .iter()
+                .any(|r| r.url.contains("b.git"))
+        );
         run("git_remote_rename", json!({ "old": "origin", "new": "up" })).unwrap();
         assert!(backend.remotes().unwrap().iter().any(|r| r.name == "up"));
 
@@ -1602,7 +1668,10 @@ mod tests {
         run("git_tag_create", json!({ "name": "v1", "message": "one" })).unwrap();
         std::fs::write(dir.join("f.txt"), "x\ndirty\n").unwrap();
         assert_eq!(run("git_describe", json!({})).unwrap(), "v1");
-        assert_eq!(run("git_describe", json!({ "dirty": true })).unwrap(), "v1-dirty");
+        assert_eq!(
+            run("git_describe", json!({ "dirty": true })).unwrap(),
+            "v1-dirty"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

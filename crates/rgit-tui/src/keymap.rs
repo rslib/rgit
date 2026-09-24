@@ -319,7 +319,10 @@ fn parse_chord(spec: &str) -> Option<Chord> {
         if let Some(r) = token.strip_prefix("C-").or_else(|| token.strip_prefix("^")) {
             ctrl = true;
             token = r;
-        } else if let Some(r) = token.strip_prefix("M-").or_else(|| token.strip_prefix("A-")) {
+        } else if let Some(r) = token
+            .strip_prefix("M-")
+            .or_else(|| token.strip_prefix("A-"))
+        {
             alt = true;
             token = r;
         } else {
@@ -388,10 +391,30 @@ pub fn init(overrides: &HashMap<String, String>, profile: Option<&str>) {
 /// The emacs point-motion, selection, and pane chords shared by both profiles,
 /// plus the profile's own scroll/arrow bindings.
 fn nav_defaults(profile: Profile) -> Vec<(Chord, Command)> {
-    let ctrl = |c| Chord { prefix: false, ctrl: true, alt: false, code: ChordCode::Char(c) };
-    let alt = |c| Chord { prefix: false, ctrl: false, alt: true, code: ChordCode::Char(c) };
-    let key = |code| Chord { prefix: false, ctrl: false, alt: false, code };
-    let cx = |c| Chord { prefix: true, ctrl: false, alt: false, code: ChordCode::Char(c) };
+    let ctrl = |c| Chord {
+        prefix: false,
+        ctrl: true,
+        alt: false,
+        code: ChordCode::Char(c),
+    };
+    let alt = |c| Chord {
+        prefix: false,
+        ctrl: false,
+        alt: true,
+        code: ChordCode::Char(c),
+    };
+    let key = |code| Chord {
+        prefix: false,
+        ctrl: false,
+        alt: false,
+        code,
+    };
+    let cx = |c| Chord {
+        prefix: true,
+        ctrl: false,
+        alt: false,
+        code: ChordCode::Char(c),
+    };
     let mut v = vec![
         (ctrl('c'), Command::Quit),
         (ctrl('n'), Command::NextLine),
@@ -418,10 +441,7 @@ fn nav_defaults(profile: Profile) -> Vec<(Chord, Command)> {
             (key(ChordCode::Right), Command::FocusPreview),
             (key(ChordCode::Left), Command::FocusNav),
         ]),
-        Profile::Vim => v.extend([
-            (ctrl('d'), Command::HalfDown),
-            (ctrl('u'), Command::HalfUp),
-        ]),
+        Profile::Vim => v.extend([(ctrl('d'), Command::HalfDown), (ctrl('u'), Command::HalfUp)]),
     }
     v
 }
@@ -753,7 +773,10 @@ mod tests {
         assert!(matches!(resolve_key(ctrl('b')), Some(Msg::ColLeft)));
         assert!(matches!(resolve_key(ctrl('a')), Some(Msg::ColLineStart)));
         assert!(matches!(resolve_key(ctrl('e')), Some(Msg::ColLineEnd)));
-        assert!(matches!(resolve_key(ctrl(' ')), Some(Msg::ToggleCharSelect)));
+        assert!(matches!(
+            resolve_key(ctrl(' ')),
+            Some(Msg::ToggleCharSelect)
+        ));
         assert!(matches!(resolve_key(ctrl('n')), Some(Msg::CursorDown)));
         assert!(matches!(resolve_key(ctrl('p')), Some(Msg::CursorUp)));
         // M-f/M-b move by word.
@@ -772,8 +795,14 @@ mod tests {
         assert!(matches!(resolve_vim_key(key(' ')), Some(Msg::LeaderOpen)));
         assert!(matches!(resolve_vim_key(key('j')), Some(Msg::CursorDown)));
         assert!(matches!(resolve_vim_key(key('G')), Some(Msg::CursorBottom)));
-        assert!(matches!(resolve_vim_key(key('w')), Some(Msg::ColWordForward)));
-        assert!(matches!(resolve_vim_key(key('v')), Some(Msg::ToggleCharSelect)));
+        assert!(matches!(
+            resolve_vim_key(key('w')),
+            Some(Msg::ColWordForward)
+        ));
+        assert!(matches!(
+            resolve_vim_key(key('v')),
+            Some(Msg::ToggleCharSelect)
+        ));
         assert!(matches!(resolve_vim_key(key('V')), Some(Msg::ToggleSelect)));
         assert!(matches!(resolve_vim_key(key('y')), Some(Msg::Yank)));
     }
@@ -797,27 +826,57 @@ mod tests {
         let ch = |c| ChordCode::Char(c);
         assert_eq!(
             parse_chord("s"),
-            Some(Chord { prefix: false, ctrl: false, alt: false, code: ch('s') })
+            Some(Chord {
+                prefix: false,
+                ctrl: false,
+                alt: false,
+                code: ch('s')
+            })
         );
         assert_eq!(
             parse_chord("C-f"),
-            Some(Chord { prefix: false, ctrl: true, alt: false, code: ch('f') })
+            Some(Chord {
+                prefix: false,
+                ctrl: true,
+                alt: false,
+                code: ch('f')
+            })
         );
         assert_eq!(
             parse_chord("M-b"),
-            Some(Chord { prefix: false, ctrl: false, alt: true, code: ch('b') })
+            Some(Chord {
+                prefix: false,
+                ctrl: false,
+                alt: true,
+                code: ch('b')
+            })
         );
         assert_eq!(
             parse_chord("C-x o"),
-            Some(Chord { prefix: true, ctrl: false, alt: false, code: ch('o') })
+            Some(Chord {
+                prefix: true,
+                ctrl: false,
+                alt: false,
+                code: ch('o')
+            })
         );
         assert_eq!(
             parse_chord("C-Spc"),
-            Some(Chord { prefix: false, ctrl: true, alt: false, code: ch(' ') })
+            Some(Chord {
+                prefix: false,
+                ctrl: true,
+                alt: false,
+                code: ch(' ')
+            })
         );
         assert_eq!(
             parse_chord("Up"),
-            Some(Chord { prefix: false, ctrl: false, alt: false, code: ChordCode::Up })
+            Some(Chord {
+                prefix: false,
+                ctrl: false,
+                alt: false,
+                code: ChordCode::Up
+            })
         );
         // Two bare chars are not a chord.
         assert_eq!(parse_chord("ab"), None);
@@ -831,8 +890,18 @@ mod tests {
         overrides.insert("log".to_string(), "G".to_string());
         overrides.insert("forward-char".to_string(), "C-l".to_string());
         let map = build_map(Profile::Magit, &overrides);
-        let bare = |c| Chord { prefix: false, ctrl: false, alt: false, code: ChordCode::Char(c) };
-        let ctrl = |c| Chord { prefix: false, ctrl: true, alt: false, code: ChordCode::Char(c) };
+        let bare = |c| Chord {
+            prefix: false,
+            ctrl: false,
+            alt: false,
+            code: ChordCode::Char(c),
+        };
+        let ctrl = |c| Chord {
+            prefix: false,
+            ctrl: true,
+            alt: false,
+            code: ChordCode::Char(c),
+        };
         assert!(matches!(map.get(&bare('G')), Some(Command::Log)));
         assert!(matches!(map.get(&ctrl('l')), Some(Command::ForwardChar)));
         // Untouched defaults survive, and the emacs C-f default is still there.

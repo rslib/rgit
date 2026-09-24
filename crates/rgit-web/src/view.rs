@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use rgit_git::{
     BlameLine, Blob, CommitOverview, CommitRef, Deco, FileDiff, GrepMatch, Head, LanesState,
-    LastCommit, LineOrigin, LogEntry, RefEntry, RefKind, RepoStatus, StatusEntry, TagInfo, TreeEntry,
-    group_decorations,
+    LastCommit, LineOrigin, LogEntry, RefEntry, RefKind, RepoStatus, StatusEntry, TagInfo,
+    TreeEntry, group_decorations,
 };
 
 use crate::{assets, highlight};
@@ -50,7 +50,11 @@ pub struct SideInfo {
 /// summary root.
 fn href(base: &str, rest: &str) -> String {
     if rest.is_empty() {
-        if base.is_empty() { "/".to_owned() } else { base.to_owned() }
+        if base.is_empty() {
+            "/".to_owned()
+        } else {
+            base.to_owned()
+        }
     } else {
         format!("{base}{rest}")
     }
@@ -294,9 +298,21 @@ fn file_header(
 /// The `code | blame | raw` tabs for a file at `rev`, with one marked active.
 fn file_tabs(base: &str, path: &str, rev: &str, active: &str) -> Vec<(&'static str, String, bool)> {
     vec![
-        ("code", at(base, rev, &format!("/blob/{path}?src=1")), active == "code"),
-        ("blame", href(base, &format!("/blame/{path}")), active == "blame"),
-        ("raw", at(base, rev, &format!("/blob/{path}?raw=1")), active == "raw"),
+        (
+            "code",
+            at(base, rev, &format!("/blob/{path}?src=1")),
+            active == "code",
+        ),
+        (
+            "blame",
+            href(base, &format!("/blame/{path}")),
+            active == "blame",
+        ),
+        (
+            "raw",
+            at(base, rev, &format!("/blob/{path}?raw=1")),
+            active == "raw",
+        ),
     ]
 }
 
@@ -305,7 +321,9 @@ fn q_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -455,7 +473,8 @@ pub struct RepoCard {
 pub fn index(repos: &[RepoCard]) -> Markup {
     let total_branches: usize = repos.iter().map(|r| r.branches).sum();
     let total_tags: usize = repos.iter().map(|r| r.tags).sum();
-    let mut lang_counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut lang_counts: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
     for r in repos {
         if let Some(l) = &r.language {
             *lang_counts.entry(l.as_str()).or_default() += 1;
@@ -631,7 +650,15 @@ fn refs_markup(refs: &[CommitRef]) -> Markup {
 }
 
 /// One commit row: mono graph node, hash, refs, subject, author/age.
-fn commit_row(base: &str, hash: &str, refs: &[CommitRef], subject: &str, meta: &str, head: bool, unpushed: bool) -> Markup {
+fn commit_row(
+    base: &str,
+    hash: &str,
+    refs: &[CommitRef],
+    subject: &str,
+    meta: &str,
+    head: bool,
+    unpushed: bool,
+) -> Markup {
     html! {
         div class=(if head { "row commit-row head" } else { "row commit-row" }) data-point {
             span.node { "\u{25cf}" }
@@ -695,12 +722,28 @@ pub fn summary(
     let card = ctx_card(
         "Head",
         &[
-            ("branch", head.branch.clone().unwrap_or_else(|| "detached".into())),
+            (
+                "branch",
+                head.branch.clone().unwrap_or_else(|| "detached".into()),
+            ),
             ("tip", head.oid.clone().unwrap_or_default()),
-            ("upstream", head.upstream.clone().unwrap_or_else(|| "-".into())),
+            (
+                "upstream",
+                head.upstream.clone().unwrap_or_else(|| "-".into()),
+            ),
         ],
     );
-    layout(repo, base, "summary", "", side, &ctx_line, Some(card), "HEAD", body)
+    layout(
+        repo,
+        base,
+        "summary",
+        "",
+        side,
+        &ctx_line,
+        Some(card),
+        "HEAD",
+        body,
+    )
 }
 
 /// A collapsible magit-style section: a caret + title header over a body.
@@ -994,10 +1037,17 @@ pub fn tree(
         }
       }
     };
-    let disp = if path.is_empty() { "/".to_owned() } else { format!("/{path}") };
+    let disp = if path.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{path}")
+    };
     let card = ctx_card(
         "This dir",
-        &[("path", disp.clone()), ("entries", entries.len().to_string())],
+        &[
+            ("path", disp.clone()),
+            ("entries", entries.len().to_string()),
+        ],
     );
     layout(repo, base, "tree", "", side, &disp, Some(card), rev, body)
 }
@@ -1019,14 +1069,23 @@ pub fn blob(
     let size = human_size(blob.size);
     let mut tabs: Vec<(&str, String, bool)> = Vec::new();
     if previewable {
-        tabs.push(("preview", at(base, rev, &format!("/blob/{}", blob.path)), rendered.is_some()));
-        tabs.push(("code", at(base, rev, &format!("/blob/{}?src=1", blob.path)), rendered.is_none()));
+        tabs.push((
+            "preview",
+            at(base, rev, &format!("/blob/{}", blob.path)),
+            rendered.is_some(),
+        ));
+        tabs.push((
+            "code",
+            at(base, rev, &format!("/blob/{}?src=1", blob.path)),
+            rendered.is_none(),
+        ));
     } else {
         tabs.push(("code", at(base, rev, &format!("/blob/{}", blob.path)), true));
     }
     tabs.push(("blame", href(base, &format!("/blame/{}", blob.path)), false));
     tabs.push(("raw", raw.clone(), false));
-    let permalink = html! { a data-copy="#permalink" href="#" title="copy permalink" { "permalink" } };
+    let permalink =
+        html! { a data-copy="#permalink" href="#" title="copy permalink" { "permalink" } };
     let body = html! {
       div.treegrid {
         (explorer_aside(base, rev, files, dir, &blob.path))
@@ -1062,11 +1121,23 @@ pub fn blob(
             ("lines", lines.to_string()),
         ],
     );
-    layout(repo, base, "tree", perma, side, &blob.path, Some(card), rev, body)
+    layout(
+        repo,
+        base,
+        "tree",
+        perma,
+        side,
+        &blob.path,
+        Some(card),
+        rev,
+        body,
+    )
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn code_block(path: &str, text: &str) -> Markup {
@@ -1092,10 +1163,9 @@ fn code_block(path: &str, text: &str) -> Markup {
 
 pub fn commit(repo: &str, base: &str, side: &SideInfo, d: &CommitOverview) -> Markup {
     let perma = href(base, &format!("/commit/{}", d.full_id));
-    let (add, del) = d
-        .files
-        .iter()
-        .fold((0usize, 0usize), |(a, r), f| (a + f.additions, r + f.deletions));
+    let (add, del) = d.files.iter().fold((0usize, 0usize), |(a, r), f| {
+        (a + f.additions, r + f.deletions)
+    });
     let files_side = html! {
         aside.difffiles data-pane="files" {
             div.dfh { span.dft { "Changed files" } span.dfn { (d.files.len()) } }
@@ -1151,7 +1221,17 @@ pub fn commit(repo: &str, base: &str, side: &SideInfo, d: &CommitOverview) -> Ma
             ("author", d.author.clone()),
         ],
     );
-    layout(repo, base, "log", &perma, side, &d.id, Some(card), "HEAD", body)
+    layout(
+        repo,
+        base,
+        "log",
+        &perma,
+        side,
+        &d.id,
+        Some(card),
+        "HEAD",
+        body,
+    )
 }
 
 /// The rendered diff for one file, returned as a fragment for on-demand loading.
@@ -1198,8 +1278,21 @@ pub fn worktree_diff(
             None => div.sec { div.body { div.binary { "no " (label) " changes for this file" } } }
         }
     };
-    let card = ctx_card("Working change", &[("file", path.to_owned()), ("state", label.to_owned())]);
-    layout(repo, base, "summary", "", side, path, Some(card), "HEAD", body)
+    let card = ctx_card(
+        "Working change",
+        &[("file", path.to_owned()), ("state", label.to_owned())],
+    );
+    layout(
+        repo,
+        base,
+        "summary",
+        "",
+        side,
+        path,
+        Some(card),
+        "HEAD",
+        body,
+    )
 }
 
 fn diff_counts(f: &FileDiff) -> (usize, usize) {
@@ -1359,7 +1452,11 @@ fn group_by_file(matches: &[GrepMatch]) -> Vec<(&str, Vec<&GrepMatch>)> {
 
 /// One search-result run of files, with each line syntax-highlighted and the
 /// match marked. `mark` is the pattern to emphasize; `link` builds the blob href.
-fn result_files(groups: &[(&str, Vec<&GrepMatch>)], mark: &str, link: impl Fn(&str) -> String) -> Markup {
+fn result_files(
+    groups: &[(&str, Vec<&GrepMatch>)],
+    mark: &str,
+    link: impl Fn(&str) -> String,
+) -> Markup {
     html! {
         @for (path, ms) in groups {
             div.srfile data-point {
@@ -1387,7 +1484,14 @@ fn search_modes(base: &str, query: &str, active: &str) -> Markup {
     }
 }
 
-pub fn search(repo: &str, base: &str, side: &SideInfo, query: &str, pattern: &str, matches: &[GrepMatch]) -> Markup {
+pub fn search(
+    repo: &str,
+    base: &str,
+    side: &SideInfo,
+    query: &str,
+    pattern: &str,
+    matches: &[GrepMatch],
+) -> Markup {
     let groups = group_by_file(matches);
     let body = html! {
         (search_modes(base, query, "text"))

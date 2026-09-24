@@ -488,7 +488,10 @@ pub struct CommitRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Deco {
     Local(String),
-    Remote { remote: String, branch: String },
+    Remote {
+        remote: String,
+        branch: String,
+    },
     Tag(String),
     Group {
         branch: String,

@@ -122,7 +122,12 @@ fn delete_branch_merged_into_head_needs_no_force() {
 
     let backend = Git2Backend::discover(&dir).unwrap();
     backend.delete_branch("feat", false).unwrap();
-    assert!(!backend.local_branches().unwrap().contains(&"feat".to_owned()));
+    assert!(
+        !backend
+            .local_branches()
+            .unwrap()
+            .contains(&"feat".to_owned())
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -135,7 +140,10 @@ fn clean_dry_run_lists_without_deleting() {
 
     let backend = Git2Backend::discover(&dir).unwrap();
     let out = backend.clean(true).unwrap();
-    assert!(out.contains("junk.txt"), "dry run should mention the file: {out}");
+    assert!(
+        out.contains("junk.txt"),
+        "dry run should mention the file: {out}"
+    );
     assert!(dir.join("junk.txt").exists(), "dry run must not delete");
 
     backend.clean(false).unwrap();
@@ -155,13 +163,19 @@ fn stash_push_untracked_scoping() {
     std::fs::write(dir.join("tracked"), "v2\n").unwrap();
     std::fs::write(dir.join("untracked.txt"), "u\n").unwrap();
     backend.stash_push(false).unwrap();
-    assert_eq!(std::fs::read_to_string(dir.join("tracked")).unwrap(), "v1\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("tracked")).unwrap(),
+        "v1\n"
+    );
     assert!(
         dir.join("untracked.txt").exists(),
         "untracked file should survive a non-untracked stash"
     );
     backend.stash_pop(0).unwrap();
-    assert_eq!(std::fs::read_to_string(dir.join("tracked")).unwrap(), "v2\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("tracked")).unwrap(),
+        "v2\n"
+    );
 
     // With include_untracked, the untracked file is stashed away too.
     backend.stash_push(true).unwrap();
@@ -225,7 +239,10 @@ fn merge_abort_clears_a_conflicted_merge() {
     let backend = Git2Backend::discover(&dir).unwrap();
     let result = backend.merge("feat", false, false, &|_| {});
     assert!(result.is_err(), "conflicting edits should fail the merge");
-    assert!(dir.join(".git/MERGE_HEAD").exists(), "merge left in progress");
+    assert!(
+        dir.join(".git/MERGE_HEAD").exists(),
+        "merge left in progress"
+    );
 
     backend.merge_abort().unwrap();
     assert!(
@@ -251,7 +268,17 @@ fn remote_branches_lists_the_tracking_refs_after_a_clone() {
     let clone = base.join("clone");
     let url = format!("file://{}", remote.display());
 
-    git(&base, &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    git(
+        &base,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ],
+    );
     git(&base, &["clone", "-q", &url, work.to_str().unwrap()]);
     git(&work, &["config", "user.email", "t@example.com"]);
     git(&work, &["config", "user.name", "test"]);
@@ -275,9 +302,13 @@ fn set_remote_url_and_rename_remote() {
     commit(&dir, "a", "a\n", "seed");
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    backend.add_remote("origin", "https://example.com/one.git").unwrap();
+    backend
+        .add_remote("origin", "https://example.com/one.git")
+        .unwrap();
 
-    backend.set_remote_url("origin", "https://example.com/two.git").unwrap();
+    backend
+        .set_remote_url("origin", "https://example.com/two.git")
+        .unwrap();
     let remotes = backend.remotes().unwrap();
     assert_eq!(remotes.len(), 1);
     assert_eq!(remotes[0].url, "https://example.com/two.git");
@@ -341,7 +372,10 @@ fn revert_no_commit_leaves_head_and_stages_the_inverse() {
 
     assert_eq!(head(&dir), before, "no_commit should not move HEAD");
     let status = backend.status().unwrap();
-    assert!(!status.staged.is_empty(), "the inverse change should be staged");
+    assert!(
+        !status.staged.is_empty(),
+        "the inverse change should be staged"
+    );
     assert_eq!(
         std::fs::read_to_string(dir.join("f.txt")).unwrap(),
         "v1\n",
@@ -412,7 +446,10 @@ fn remove_path_cached_keeps_the_worktree_file() {
     let backend = Git2Backend::discover(&dir).unwrap();
     backend.remove_path("f.txt", true).unwrap();
 
-    assert!(dir.join("f.txt").exists(), "cached removal keeps the file on disk");
+    assert!(
+        dir.join("f.txt").exists(),
+        "cached removal keeps the file on disk"
+    );
     let out = Command::new("git")
         .arg("-C")
         .arg(&dir)
@@ -486,7 +523,10 @@ fn log_filters_by_since_and_until() {
         })
         .unwrap();
     let summaries: Vec<&str> = since.iter().map(|e| e.summary.as_str()).collect();
-    assert!(!summaries.contains(&"old"), "since should exclude the older commit");
+    assert!(
+        !summaries.contains(&"old"),
+        "since should exclude the older commit"
+    );
     assert!(summaries.contains(&"mid") && summaries.contains(&"new"));
 
     let until = backend
@@ -496,7 +536,10 @@ fn log_filters_by_since_and_until() {
         })
         .unwrap();
     let summaries: Vec<&str> = until.iter().map(|e| e.summary.as_str()).collect();
-    assert!(!summaries.contains(&"new"), "until should exclude the newer commit");
+    assert!(
+        !summaries.contains(&"new"),
+        "until should exclude the newer commit"
+    );
     assert!(summaries.contains(&"old") && summaries.contains(&"mid"));
 }
 
@@ -536,7 +579,17 @@ fn push_tags_and_push_delete_over_a_local_remote() {
     let work = base.join("work");
     let url = format!("file://{}", remote.display());
 
-    git(&base, &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    git(
+        &base,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ],
+    );
     git(&base, &["clone", "-q", &url, work.to_str().unwrap()]);
     git(&work, &["config", "user.email", "t@example.com"]);
     git(&work, &["config", "user.name", "test"]);
@@ -593,7 +646,9 @@ fn remove_worktree_drops_it_from_the_list() {
             .filter(|w| !w.is_main)
             .collect::<Vec<_>>()
     };
-    backend.add_worktree("side", wt_path.to_str().unwrap()).unwrap();
+    backend
+        .add_worktree("side", wt_path.to_str().unwrap())
+        .unwrap();
     let after_add = linked(&backend);
     assert_eq!(after_add.len(), 1);
     assert_eq!(after_add[0].name, "side");

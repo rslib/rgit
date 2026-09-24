@@ -90,11 +90,7 @@ fn is_trailer_block(para: &str) -> bool {
         let Some((key, _)) = line.split_once(':') else {
             return false;
         };
-        if key.is_empty()
-            || !key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             return false;
         }
     }

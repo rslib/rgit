@@ -68,8 +68,9 @@ impl Visit for MessageVisitor {
 pub fn init() -> bool {
     // Keep our git-style output (target `git`) at info even at the default
     // level, so the log window and file always show it.
-    let filter = EnvFilter::try_from_env("RGIT_LOG")
-        .unwrap_or_else(|_| EnvFilter::new("warn,git=info,rgit_git=info,rgit_tui=info"));
+    let filter = EnvFilter::try_from_env("RGIT_LOG").unwrap_or_else(|_| {
+        EnvFilter::new("warn,git=info,rgit_git=info,rgit_tui=info,startup=info")
+    });
 
     let (file_layer, ok) = match log_dir() {
         Some(dir) if std::fs::create_dir_all(&dir).is_ok() => {

@@ -18,6 +18,7 @@ use serde::Deserialize;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub theme: ThemeConfig,
+    pub forge: ForgeConfig,
     pub ui: UiConfig,
     pub commit: CommitConfig,
     /// The active keybinding profile: a built-in (`"magit"`/`"emacs"` or
@@ -35,6 +36,35 @@ pub struct Config {
     /// profile on a built-in (or another custom profile), which its own
     /// `[keys.<name>]` then customizes.
     pub profiles: HashMap<String, ProfileDef>,
+}
+
+/// Forge account/profile selection. Credentials remain in the OS keychain.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ForgeConfig {
+    pub default_profile: Option<String>,
+    pub profiles: HashMap<String, ForgeProfile>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ForgeProfile {
+    pub provider: Option<String>,
+    pub account: Option<String>,
+    pub host: Option<String>,
+}
+
+impl ForgeConfig {
+    pub fn context(&self) -> (Option<String>, Option<String>) {
+        let profile = self
+            .default_profile
+            .as_ref()
+            .and_then(|name| self.profiles.get(name));
+        (
+            profile.and_then(|profile| profile.account.clone()),
+            profile.and_then(|profile| profile.host.clone()),
+        )
+    }
 }
 
 /// One custom profile: a base to inherit from, then its own `[keys.<name>]`.

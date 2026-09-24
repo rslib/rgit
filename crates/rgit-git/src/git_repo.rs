@@ -158,9 +158,11 @@ impl GitBackend for Git2Backend {
             .show_untracked_content(true);
         let unstaged = extract_with_renames(repo.diff_index_to_workdir(None, Some(&mut wt_opts))?)?;
         let mut idx_opts = DiffOptions::new();
-        let staged = extract_with_renames(
-            repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut idx_opts))?,
-        )?;
+        let staged = extract_with_renames(repo.diff_tree_to_index(
+            head_tree.as_ref(),
+            None,
+            Some(&mut idx_opts),
+        )?)?;
 
         Ok(RepoStatus {
             head,
@@ -416,7 +418,8 @@ impl GitBackend for Git2Backend {
         let tree = commit.tree()?;
         let parent_tree = commit.parent(0).ok().map(|p| p.tree()).transpose()?;
         let mut opts = DiffOptions::new();
-        let mut diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
+        let mut diff =
+            repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
         // Detect renames so a moved file lists once as "old -> new" with only its
         // real +/- counts, matching the working-tree and detail views.
         let mut fopts = DiffFindOptions::new();
@@ -478,11 +481,7 @@ impl GitBackend for Git2Backend {
         })
     }
 
-    fn commit_file_diff(
-        &self,
-        rev: &str,
-        path: &str,
-    ) -> Result<Option<crate::FileDiff>, GitError> {
+    fn commit_file_diff(&self, rev: &str, path: &str) -> Result<Option<crate::FileDiff>, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let commit = repo.revparse_single(rev)?.peel_to_commit()?;
         let tree = commit.tree()?;
@@ -490,7 +489,9 @@ impl GitBackend for Git2Backend {
         let mut opts = DiffOptions::new();
         opts.pathspec(path);
         let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
-        Ok(extract_with_renames(diff)?.into_iter().find(|f| f.path == path))
+        Ok(extract_with_renames(diff)?
+            .into_iter()
+            .find(|f| f.path == path))
     }
 
     fn diff_refs(&self, from: &str, to: &str) -> Result<Vec<crate::FileDiff>, GitError> {
@@ -518,7 +519,9 @@ impl GitBackend for Git2Backend {
                 .show_untracked_content(true);
             repo.diff_index_to_workdir(None, Some(&mut opts))?
         };
-        Ok(extract_with_renames(diff)?.into_iter().find(|f| f.path == path))
+        Ok(extract_with_renames(diff)?
+            .into_iter()
+            .find(|f| f.path == path))
     }
 
     fn blame(&self, path: &str) -> Result<Vec<crate::BlameLine>, GitError> {
@@ -533,21 +536,23 @@ impl GitBackend for Git2Backend {
         let lines = content
             .lines()
             .enumerate()
-            .map(|(i, text)| match blame.as_ref().and_then(|b| b.get_line(i + 1)) {
-                Some(hunk) => crate::BlameLine {
-                    short_id: hunk.final_commit_id().to_string().chars().take(7).collect(),
-                    author: hunk
-                        .final_signature()
-                        .and_then(|s| s.name().ok().map(str::to_owned))
-                        .unwrap_or_else(|| "?".to_owned()),
-                    line: text.to_owned(),
+            .map(
+                |(i, text)| match blame.as_ref().and_then(|b| b.get_line(i + 1)) {
+                    Some(hunk) => crate::BlameLine {
+                        short_id: hunk.final_commit_id().to_string().chars().take(7).collect(),
+                        author: hunk
+                            .final_signature()
+                            .and_then(|s| s.name().ok().map(str::to_owned))
+                            .unwrap_or_else(|| "?".to_owned()),
+                        line: text.to_owned(),
+                    },
+                    None => crate::BlameLine {
+                        short_id: String::new(),
+                        author: String::new(),
+                        line: text.to_owned(),
+                    },
                 },
-                None => crate::BlameLine {
-                    short_id: String::new(),
-                    author: String::new(),
-                    line: text.to_owned(),
-                },
-            })
+            )
             .collect();
         Ok(lines)
     }
@@ -790,9 +795,8 @@ impl GitBackend for Git2Backend {
             // path in every parent. For a merge that only carried a side's version
             // through unchanged the ids match a parent, so it is simplified away -
             // matching `git log -- path` rather than flagging the merge.
-            let oid_at = |t: &git2::Tree, p: &str| {
-                t.get_path(std::path::Path::new(p)).ok().map(|e| e.id())
-            };
+            let oid_at =
+                |t: &git2::Tree, p: &str| t.get_path(std::path::Path::new(p)).ok().map(|e| e.id());
             let matched: Vec<String> = want
                 .iter()
                 .filter(|p| {
@@ -813,7 +817,12 @@ impl GitBackend for Git2Backend {
                         .ok()
                         .and_then(|b| b.as_str().ok().map(str::to_owned))
                         .unwrap_or_default(),
-                    summary: commit.summary().ok().flatten().unwrap_or_default().to_owned(),
+                    summary: commit
+                        .summary()
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default()
+                        .to_owned(),
                     when: relative_age(commit.time().seconds(), now),
                 };
                 for p in matched {
@@ -1014,7 +1023,11 @@ impl GitBackend for Git2Backend {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let mut out: Vec<(i64, crate::TagInfo)> = Vec::new();
-        for name in repo.tag_names(None)?.iter().filter_map(|t| t.ok().flatten()) {
+        for name in repo
+            .tag_names(None)?
+            .iter()
+            .filter_map(|t| t.ok().flatten())
+        {
             let Ok(obj) = repo.revparse_single(name) else {
                 continue;
             };
@@ -1072,7 +1085,11 @@ impl GitBackend for Git2Backend {
             let content = blob.content();
             let mut header = tar::Header::new_gnu();
             header.set_size(content.len() as u64);
-            header.set_mode(if entry.filemode() == 0o120000 { 0o777 } else { 0o644 });
+            header.set_mode(if entry.filemode() == 0o120000 {
+                0o777
+            } else {
+                0o644
+            });
             header.set_cksum();
             if let Err(e) = builder.append_data(&mut header, &path, content) {
                 failure = Some(e.into());
@@ -1481,7 +1498,10 @@ impl GitBackend for Git2Backend {
         let head_oid = repo.head().ok().and_then(|h| h.target());
         let obj = repo.revparse_single(rev)?;
         let is_head = rev == "HEAD"
-            || obj.peel_to_commit().map(|c| Some(c.id()) == head_oid).unwrap_or(false);
+            || obj
+                .peel_to_commit()
+                .map(|c| Some(c.id()) == head_oid)
+                .unwrap_or(false);
         let describe = if is_head {
             repo.describe(&opts)?
         } else {
@@ -1706,7 +1726,9 @@ impl GitBackend for Git2Backend {
                 .head()
                 .ok()
                 .and_then(|h| h.peel_to_commit().ok())
-                .map(|head| head.id() == tip || repo.graph_descendant_of(head.id(), tip).unwrap_or(false))
+                .map(|head| {
+                    head.id() == tip || repo.graph_descendant_of(head.id(), tip).unwrap_or(false)
+                })
                 .unwrap_or(false);
             if !merged {
                 return Err(GitError::Other(format!(
@@ -1832,7 +1854,8 @@ impl GitBackend for Git2Backend {
             // Only prune entries whose working tree is missing (not valid).
             let mut opts = git2::WorktreePruneOptions::new();
             opts.valid(false).working_tree(true);
-            if wt.is_prunable(Some(&mut opts)).unwrap_or(false) && wt.prune(Some(&mut opts)).is_ok() {
+            if wt.is_prunable(Some(&mut opts)).unwrap_or(false) && wt.prune(Some(&mut opts)).is_ok()
+            {
                 pruned.push(name.to_owned());
             }
         }
@@ -2136,7 +2159,11 @@ impl GitBackend for Git2Backend {
             index.read_tree(&p_tree)?;
             let mut opts = DiffOptions::new();
             let diff = repo.diff_tree_to_tree(Some(&p_tree), Some(&c_tree), Some(&mut opts))?;
-            let selected = |p: &str| paths.iter().any(|s| p == s || p.starts_with(&format!("{s}/")));
+            let selected = |p: &str| {
+                paths
+                    .iter()
+                    .any(|s| p == s || p.starts_with(&format!("{s}/")))
+            };
             let mut moved = 0;
             for i in 0..diff.deltas().len() {
                 let delta = diff.get_delta(i).expect("delta in range");
@@ -2169,9 +2196,23 @@ impl GitBackend for Git2Backend {
             // Part 1 keeps only the subject (a fresh change id); part 2 keeps the
             // full message and the original change id.
             let subject = full_msg.lines().next().unwrap_or("").to_owned();
-            let c1 = repo.commit(None, &target.author(), &sig, &subject, &part1_tree, &[&parent])?;
+            let c1 = repo.commit(
+                None,
+                &target.author(),
+                &sig,
+                &subject,
+                &part1_tree,
+                &[&parent],
+            )?;
             let c1_commit = repo.find_commit(c1)?;
-            let c2 = repo.commit(None, &target.author(), &sig, full_msg, &c_tree, &[&c1_commit])?;
+            let c2 = repo.commit(
+                None,
+                &target.author(),
+                &sig,
+                full_msg,
+                &c_tree,
+                &[&c1_commit],
+            )?;
 
             let chain = first_parent_chain(&repo, target.id())?;
             let descendants: Vec<&git2::Commit> = chain.iter().rev().skip(1).collect();
@@ -2291,7 +2332,9 @@ impl GitBackend for Git2Backend {
             let rev_oid = repo.revparse_single(rev)?.peel_to_commit()?.id();
             let target_oid = repo.revparse_single(target)?.peel_to_commit()?.id();
             if rev_oid == target_oid {
-                return Err(GitError::Other("cannot move a commit onto itself".to_owned()));
+                return Err(GitError::Other(
+                    "cannot move a commit onto itself".to_owned(),
+                ));
             }
             // Walk HEAD down the first-parent chain until both are seen.
             let mut chain: Vec<git2::Commit> = Vec::new();
@@ -2313,15 +2356,17 @@ impl GitBackend for Git2Backend {
                     }
                 };
             }
-            let base = chain
-                .last()
-                .unwrap()
-                .parent(0)
-                .map_err(|_| GitError::Other("cannot reorder across the root commit".to_owned()))?;
+            let base =
+                chain.last().unwrap().parent(0).map_err(|_| {
+                    GitError::Other("cannot reorder across the root commit".to_owned())
+                })?;
 
             // Affected commits, oldest first; move rev relative to target.
             let mut order: Vec<Oid> = chain.iter().rev().map(git2::Commit::id).collect();
-            let rev_pos = order.iter().position(|&o| o == rev_oid).expect("rev in order");
+            let rev_pos = order
+                .iter()
+                .position(|&o| o == rev_oid)
+                .expect("rev in order");
             order.remove(rev_pos);
             let target_pos = order
                 .iter()
@@ -2546,11 +2591,9 @@ impl GitBackend for Git2Backend {
         let (remote_name, branch) = match remote {
             Some(r) => {
                 let head = repo.head()?;
-                let branch = head
-                    .shorthand()
-                    .ok()
-                    .map(str::to_owned)
-                    .ok_or_else(|| GitError::Other("HEAD is detached; not on a branch".to_owned()))?;
+                let branch = head.shorthand().ok().map(str::to_owned).ok_or_else(|| {
+                    GitError::Other("HEAD is detached; not on a branch".to_owned())
+                })?;
                 (r.to_owned(), branch)
             }
             None => upstream_remote(&repo)?,
@@ -2605,11 +2648,7 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
-    fn push_tags(
-        &self,
-        remote: Option<&str>,
-        report: &dyn Fn(OpProgress),
-    ) -> Result<(), GitError> {
+    fn push_tags(&self, remote: Option<&str>, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
         // libgit2 rejects a wildcard push refspec, so enumerate the tags and push
         // an explicit refspec for each.
         let refspecs: Vec<String> = {
@@ -2779,7 +2818,12 @@ fn ssh_key_file(user: &str, name: &str, passphrase: Option<&str>) -> Result<Cred
         return Err(git2::Error::from_str("no such default ssh key"));
     }
     let public = private.with_extension("pub");
-    Cred::ssh_key(user, public.exists().then_some(&public), &private, passphrase)
+    Cred::ssh_key(
+        user,
+        public.exists().then_some(&public),
+        &private,
+        passphrase,
+    )
 }
 
 /// The remote to push a lane branch to: the branch's own remote if configured,
@@ -2857,7 +2901,11 @@ fn remote_callbacks<'a>(
                     }
                     match &ssh_pass {
                         Some(pass) if !pass.is_empty() => {
-                            let key = if ssh_attempts == 4 { "id_ed25519" } else { "id_rsa" };
+                            let key = if ssh_attempts == 4 {
+                                "id_ed25519"
+                            } else {
+                                "id_rsa"
+                            };
                             ssh_key_file(user, key, Some(pass))
                         }
                         _ => Err(git2::Error::from_str("no passphrase given")),
@@ -3051,7 +3099,10 @@ fn stash_saved_line(repo: &Repository) -> String {
                 .ok()
                 .and_then(|b| b.as_str().ok().map(str::to_owned))
                 .unwrap_or_default();
-            (short, commit.summary().ok().flatten().unwrap_or("").to_owned())
+            (
+                short,
+                commit.summary().ok().flatten().unwrap_or("").to_owned(),
+            )
         }
         Err(_) => (String::new(), String::new()),
     };
@@ -3202,7 +3253,14 @@ fn replay_onto(repo: &Repository, commits: &[&git2::Commit], base: Oid) -> Resul
             )));
         }
         let tree = repo.find_tree(index.write_tree_to(repo)?)?;
-        tip = repo.commit(None, &c.author(), &sig, c.message().unwrap_or(""), &tree, &[&our])?;
+        tip = repo.commit(
+            None,
+            &c.author(),
+            &sig,
+            c.message().unwrap_or(""),
+            &tree,
+            &[&our],
+        )?;
     }
     Ok(tip)
 }

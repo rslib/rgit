@@ -1018,7 +1018,12 @@ fn untracked_file_shows_its_all_added_diff() {
     let status = backend.status().unwrap();
 
     // It is listed as untracked...
-    assert!(status.entries.iter().any(|e| e.path == "new.txt" && e.is_untracked()));
+    assert!(
+        status
+            .entries
+            .iter()
+            .any(|e| e.path == "new.txt" && e.is_untracked())
+    );
     // ...and its content is available as an all-added diff in the unstaged list.
     let diff = status
         .unstaged

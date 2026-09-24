@@ -9,10 +9,13 @@ rust-version.workspace = true
 anyhow = "1.0.104"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29.0"
+rgit-forge.workspace = true
 rgit-git.workspace = true
 rgit-index.workspace = true
 rgit-tui.workspace = true
 rgit-web.workspace = true
+serde.workspace = true
+toml.workspace = true
 serde_json.workspace = true
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 tracing.workspace = true

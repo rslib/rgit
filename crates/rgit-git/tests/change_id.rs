@@ -133,7 +133,11 @@ fn rebase_preserves_the_change_id() {
     let backend = Git2Backend::discover(&dir).unwrap();
     backend.rebase_onto("main", &|_| {}).unwrap();
 
-    assert_ne!(head_oid(&dir, "HEAD"), before, "rebase replays T1 as a new oid");
+    assert_ne!(
+        head_oid(&dir, "HEAD"),
+        before,
+        "rebase replays T1 as a new oid"
+    );
     assert_eq!(
         change_id(&dir, "HEAD").as_deref(),
         Some(id.as_str()),

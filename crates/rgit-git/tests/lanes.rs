@@ -205,7 +205,10 @@ fn reconcile_drops_ownership_of_a_reverted_path() {
     std::fs::remove_file(dir.join("a.txt")).unwrap();
     let state = backend.lanes_state().unwrap();
     assert!(
-        state.lanes.iter().all(|l| !l.paths.contains(&"a.txt".to_owned())),
+        state
+            .lanes
+            .iter()
+            .all(|l| !l.paths.contains(&"a.txt".to_owned())),
         "a reverted path is dropped from every lane"
     );
 
@@ -264,7 +267,11 @@ fn a_files_hunks_split_across_lanes() {
     std::fs::write(dir.join("f.txt"), lines.join("\n") + "\n").unwrap();
 
     let st = backend.status().unwrap();
-    let hunks = st.unstaged_diff("f.txt").expect("f.txt is changed").hunks.clone();
+    let hunks = st
+        .unstaged_diff("f.txt")
+        .expect("f.txt is changed")
+        .hunks
+        .clone();
     assert_eq!(hunks.len(), 2, "expected two separate hunks");
     let first = hunks[0].new_start;
 
@@ -275,19 +282,31 @@ fn a_files_hunks_split_across_lanes() {
     let default = state.lanes.iter().find(|l| l.name == "default").unwrap();
     assert_eq!(top.hunks.len(), 1, "top owns one hunk of f.txt");
     assert_eq!(default.hunks.len(), 1, "default owns the other hunk");
-    assert!(default.paths.is_empty(), "f.txt is hunk-managed, not whole-file");
+    assert!(
+        default.paths.is_empty(),
+        "f.txt is hunk-managed, not whole-file"
+    );
 
     // Commit top: its branch gets the line-3 change but NOT the line-17 change.
     backend.lane_commit("top", "line 3").unwrap();
     let top_file = show(&dir, "top:f.txt");
     assert!(top_file.contains("l3-CHANGED"), "top has the line-3 change");
-    assert!(!top_file.contains("l17-CHANGED"), "top must not have line-17");
+    assert!(
+        !top_file.contains("l17-CHANGED"),
+        "top must not have line-17"
+    );
 
     // Commit default (-> main): the line-17 change but NOT line-3.
     backend.lane_commit("default", "line 17").unwrap();
     let main_file = show(&dir, "main:f.txt");
-    assert!(main_file.contains("l17-CHANGED"), "main has the line-17 change");
-    assert!(!main_file.contains("l3-CHANGED"), "main must not have line-3");
+    assert!(
+        main_file.contains("l17-CHANGED"),
+        "main has the line-17 change"
+    );
+    assert!(
+        !main_file.contains("l3-CHANGED"),
+        "main must not have line-3"
+    );
 
     // The worktree still has both edits.
     let wt = std::fs::read_to_string(dir.join("f.txt")).unwrap();
@@ -357,7 +376,10 @@ fn lane_delete_returns_changes_to_default() {
     let state = backend.lanes_state().unwrap();
     assert!(!state.lanes.iter().any(|l| l.name == "feat"));
     let default = state.lanes.iter().find(|l| l.name == "default").unwrap();
-    assert!(default.paths.contains(&"a.txt".to_owned()), "a.txt returns to default");
+    assert!(
+        default.paths.contains(&"a.txt".to_owned()),
+        "a.txt returns to default"
+    );
 
     // The default lane cannot be deleted.
     assert!(backend.lane_delete("default").is_err());
@@ -367,7 +389,11 @@ fn lane_delete_returns_changes_to_default() {
 
 fn rev(dir: &Path, spec: &str) -> String {
     let out = Command::new("git")
-        .arg("-C").arg(dir).args(["rev-parse", spec]).output().unwrap();
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", spec])
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
@@ -390,9 +416,16 @@ fn stacked_lane_builds_on_its_parent_lane() {
 
     // feat-b carries a.txt (from feat-a) AND b.txt, and forks off feat-a's tip.
     let feat_b = tree_files(&dir, "feat-b");
-    assert!(feat_b.contains(&"a.txt".to_owned()), "inherits feat-a's a.txt");
+    assert!(
+        feat_b.contains(&"a.txt".to_owned()),
+        "inherits feat-a's a.txt"
+    );
     assert!(feat_b.contains(&"b.txt".to_owned()));
-    assert_eq!(rev(&dir, "feat-b~1"), rev(&dir, "feat-a"), "feat-b forks off feat-a");
+    assert_eq!(
+        rev(&dir, "feat-b~1"),
+        rev(&dir, "feat-a"),
+        "feat-b forks off feat-a"
+    );
 
     // The git stack config records the relationship (composes with restack).
     let parents = backend.stack_parents().unwrap();
@@ -441,7 +474,11 @@ fn lane_restack_moves_child_onto_parents_new_tip() {
     std::fs::write(dir.join("a2.txt"), "a2\n").unwrap();
     backend.lane_assign("feat-a", "a2.txt").unwrap();
     backend.lane_commit("feat-a", "A2").unwrap();
-    assert_ne!(rev(&dir, "feat-b~1"), rev(&dir, "feat-a"), "feat-b is stale before restack");
+    assert_ne!(
+        rev(&dir, "feat-b~1"),
+        rev(&dir, "feat-a"),
+        "feat-b is stale before restack"
+    );
 
     let head_before = head_oid(&dir);
     let outcome = backend.lane_restack().unwrap();
@@ -449,14 +486,23 @@ fn lane_restack_moves_child_onto_parents_new_tip() {
     assert!(outcome.conflicted.is_empty());
 
     // feat-b now forks off feat-a's new tip and inherits a2.txt.
-    assert_eq!(rev(&dir, "feat-b~1"), rev(&dir, "feat-a"), "feat-b moved onto feat-a");
+    assert_eq!(
+        rev(&dir, "feat-b~1"),
+        rev(&dir, "feat-a"),
+        "feat-b moved onto feat-a"
+    );
     let feat_b = tree_files(&dir, "feat-b");
-    assert!(feat_b.contains(&"a2.txt".to_owned()), "inherits the parent's new file");
+    assert!(
+        feat_b.contains(&"a2.txt".to_owned()),
+        "inherits the parent's new file"
+    );
     assert!(feat_b.contains(&"b.txt".to_owned()));
 
     // HEAD and the dirty worktree are untouched.
     assert_eq!(head_oid(&dir), head_before, "HEAD did not move");
-    assert!(dir.join("a.txt").exists() && dir.join("b.txt").exists() && dir.join("a2.txt").exists());
+    assert!(
+        dir.join("a.txt").exists() && dir.join("b.txt").exists() && dir.join("a2.txt").exists()
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

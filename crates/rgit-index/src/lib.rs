@@ -108,8 +108,9 @@ pub struct Embedder {
 impl Embedder {
     pub fn new() -> Result<Self, IndexError> {
         // normalize=true so cosine similarity is a plain dot product.
-        let model = model2vec_rs::model::StaticModel::from_pretrained(MODEL, None, Some(true), None)
-            .map_err(|e| IndexError::Embed(e.to_string()))?;
+        let model =
+            model2vec_rs::model::StaticModel::from_pretrained(MODEL, None, Some(true), None)
+                .map_err(|e| IndexError::Embed(e.to_string()))?;
         Ok(Self { model })
     }
 
@@ -355,7 +356,9 @@ pub fn build_with(
         if meta.len() == 0 || meta.len() > MAX_FILE_BYTES {
             continue;
         }
-        let Ok(bytes) = std::fs::read(path) else { continue };
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
         if !is_probably_text(&bytes) {
             continue;
         }
@@ -375,7 +378,9 @@ pub fn build_with(
             }
         }
 
-        let Ok(text) = String::from_utf8(bytes) else { continue };
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
         for fc in file_chunks(&rel, &text) {
             let preview = fc.body.lines().take(3).collect::<Vec<_>>().join("\n");
             let chunk = Chunk {
@@ -515,4 +520,3 @@ pub fn load(path: &Path) -> Option<Index> {
     let records: Vec<Record> = bincode::deserialize(&std::fs::read(path).ok()?).ok()?;
     Some(Index::from_records(records))
 }
-

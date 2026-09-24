@@ -111,7 +111,10 @@ fn checkout_dash_b_creates_and_switches() {
     commit(&dir, "f", "x\n", "init");
     let (_, _, ok) = rgit(&dir, &["checkout", "-b", "feature"]);
     assert!(ok);
-    assert_eq!(git_out(&dir, &["branch", "--show-current"]).trim(), "feature");
+    assert_eq!(
+        git_out(&dir, &["branch", "--show-current"]).trim(),
+        "feature"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -230,7 +233,10 @@ fn reset_paths_unstages() {
     let (_, _, ok) = rgit(&dir, &["reset", "--", "a"]);
     assert!(ok);
     let staged = git_out(&dir, &["diff", "--cached", "--name-only"]);
-    assert!(!staged.contains('a') && staged.contains('b'), "only a unstaged");
+    assert!(
+        !staged.contains('a') && staged.contains('b'),
+        "only a unstaged"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -252,8 +258,26 @@ fn branch_all_lists_remotes() {
     std::fs::create_dir_all(&base).unwrap();
     let remote = base.join("remote.git");
     let work = base.join("work");
-    git(&base, &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
-    git(&base, &["clone", "-q", remote.to_str().unwrap(), work.to_str().unwrap()]);
+    git(
+        &base,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ],
+    );
+    git(
+        &base,
+        &[
+            "clone",
+            "-q",
+            remote.to_str().unwrap(),
+            work.to_str().unwrap(),
+        ],
+    );
     git(&work, &["config", "user.email", "t@t"]);
     git(&work, &["config", "user.name", "t"]);
     commit(&work, "f", "x\n", "init");
@@ -282,8 +306,17 @@ fn describe_dirty_is_opt_in() {
 fn remote_set_url_and_rename() {
     let dir = repo("remote");
     commit(&dir, "f", "x\n", "init");
-    rgit(&dir, &["remote", "add", "origin", "https://example.com/a.git"]);
-    assert!(rgit(&dir, &["remote", "set-url", "origin", "https://example.com/b.git"]).2);
+    rgit(
+        &dir,
+        &["remote", "add", "origin", "https://example.com/a.git"],
+    );
+    assert!(
+        rgit(
+            &dir,
+            &["remote", "set-url", "origin", "https://example.com/b.git"]
+        )
+        .2
+    );
     assert!(rgit(&dir, &["remote"]).0.contains("b.git"));
     assert!(rgit(&dir, &["remote", "rename", "origin", "upstream"]).2);
     assert!(rgit(&dir, &["remote"]).0.contains("upstream"));
@@ -304,7 +337,11 @@ fn cherry_pick_no_commit_leaves_staged() {
     assert!(ok);
     let after = git_out(&dir, &["rev-parse", "HEAD"]).trim().to_owned();
     assert_eq!(before, after, "-n does not create a commit");
-    assert!(!git_out(&dir, &["diff", "--cached", "--name-only"]).trim().is_empty());
+    assert!(
+        !git_out(&dir, &["diff", "--cached", "--name-only"])
+            .trim()
+            .is_empty()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -324,7 +361,11 @@ fn rebase_onto_replays_range() {
     assert!(ok, "rebase --onto succeeds");
     // newbase is now an ancestor of the rebased feature tip.
     let merge_base = git_out(&dir, &["merge-base", "HEAD", &newbase]);
-    assert_eq!(merge_base.trim(), newbase, "feature now sits on the new base");
+    assert_eq!(
+        merge_base.trim(),
+        newbase,
+        "feature now sits on the new base"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

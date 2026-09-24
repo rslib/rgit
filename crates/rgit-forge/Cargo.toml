@@ -1,0 +1,21 @@
+[package]
+name = "rgit-forge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+octocrab.workspace = true
+open = "5"
+rand = "0.9"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+base64 = "0.22"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["time"] }
+urlencoding = "2"
+zeroize = "1"

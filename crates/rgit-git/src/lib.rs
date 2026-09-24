@@ -8,9 +8,9 @@ mod backend;
 mod change_id;
 mod creds;
 mod diff;
-mod lanes;
 mod error;
 mod git_repo;
+mod lanes;
 mod model;
 mod oplog;
 #[cfg(feature = "ssh")]
@@ -35,9 +35,9 @@ pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 pub use error::GitError;
 pub use git_repo::{Git2Backend, clone, init};
 pub use model::{
-    activity_weights, BlameLine, Commit, CommitDetails, CommitFile, CommitOverview, CommitRef, Deco, FileActivity, Head, HunkRef, Lane, LanesState, LogEntry,
-    LogOptions, group_decorations,
-    Blob, GrepMatch, GrepQuery, LastCommit, OpLogEntry, OpProgress, RefEntry, RefKind, Remote, RepoState, RepoStatus,
+    BlameLine, Blob, Commit, CommitDetails, CommitFile, CommitOverview, CommitRef, Deco,
+    FileActivity, GrepMatch, GrepQuery, Head, HunkRef, Lane, LanesState, LastCommit, LogEntry,
+    LogOptions, OpLogEntry, OpProgress, RefEntry, RefKind, Remote, RepoState, RepoStatus,
     ResetMode, RestackOutcome, SmartlogEntry, Stash, StatusCode, StatusEntry, TagInfo, TreeEntry,
-    Worktree,
+    Worktree, activity_weights, group_decorations,
 };

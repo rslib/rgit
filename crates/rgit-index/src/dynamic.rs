@@ -19,10 +19,19 @@ fn registry(ext: &str) -> Option<(&'static str, &'static str)> {
     Some(match ext {
         "rb" => ("ruby", "https://github.com/tree-sitter/tree-sitter-ruby"),
         "sh" | "bash" => ("bash", "https://github.com/tree-sitter/tree-sitter-bash"),
-        "cs" => ("c_sharp", "https://github.com/tree-sitter/tree-sitter-c-sharp"),
+        "cs" => (
+            "c_sharp",
+            "https://github.com/tree-sitter/tree-sitter-c-sharp",
+        ),
         "scala" | "sbt" => ("scala", "https://github.com/tree-sitter/tree-sitter-scala"),
-        "ex" | "exs" => ("elixir", "https://github.com/elixir-lang/tree-sitter-elixir"),
-        "lua" => ("lua", "https://github.com/tree-sitter-grammars/tree-sitter-lua"),
+        "ex" | "exs" => (
+            "elixir",
+            "https://github.com/elixir-lang/tree-sitter-elixir",
+        ),
+        "lua" => (
+            "lua",
+            "https://github.com/tree-sitter-grammars/tree-sitter-lua",
+        ),
         "ml" | "mli" => ("ocaml", "https://github.com/tree-sitter/tree-sitter-ocaml"),
         _ => return None,
     })
@@ -38,7 +47,10 @@ fn cache() -> &'static Mutex<Cache> {
 
 fn cache_dir() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".cache").join("rgit").join("grammars");
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("rgit")
+            .join("grammars");
     }
     std::env::temp_dir().join("rgit-grammars")
 }

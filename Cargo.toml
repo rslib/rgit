@@ -10,6 +10,7 @@ repository = "https://github.com/rayandrew/rgit"
 rust-version = "1.85"
 
 [workspace.dependencies]
+rgit-forge = { path = "crates/rgit-forge" }
 rgit-git = { path = "crates/rgit-git" }
 rgit-index = { path = "crates/rgit-index" }
 rgit-model = { path = "crates/rgit-model" }

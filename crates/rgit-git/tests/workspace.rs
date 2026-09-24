@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rgit_git::{workspace, Git2Backend, GitBackend};
+use rgit_git::{Git2Backend, GitBackend, workspace};
 
 fn scratch(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("rgit-workspace-{}-{name}", std::process::id()))
@@ -57,7 +57,11 @@ fn workspace_dest(repo_root: &Path, name: &str) -> PathBuf {
         .parent()
         .unwrap_or(repo_root)
         .join(".rgit-workspaces")
-        .join(repo_root.file_name().unwrap_or(std::ffi::OsStr::new("repo")))
+        .join(
+            repo_root
+                .file_name()
+                .unwrap_or(std::ffi::OsStr::new("repo")),
+        )
         .join(name)
 }
 
@@ -164,7 +168,10 @@ fn create_cleans_up_clone_when_branch_already_exists() {
     let backend = Git2Backend::discover(&dir).unwrap();
     let result = workspace::create(&backend, name);
     assert!(result.is_err(), "branch already exists in the clone");
-    assert!(!dest.exists(), "failed create should not leave an orphan dir");
+    assert!(
+        !dest.exists(),
+        "failed create should not leave an orphan dir"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -119,11 +119,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // get the side preview; detail views (Diff, Commit, Blame) fill the width.
     let previewable_view = matches!(
         app.active_kind(),
-        ViewKind::Status
-            | ViewKind::Log
-            | ViewKind::Smartlog
-            | ViewKind::Stack
-            | ViewKind::Refs
+        ViewKind::Status | ViewKind::Log | ViewKind::Smartlog | ViewKind::Stack | ViewKind::Refs
     );
     let wide = app.preview_enabled && body.width >= 100 && previewable_view;
     let [nav, prev] =
@@ -369,7 +365,9 @@ fn render_hook_console(
     // Dock the console as a full-width pane along the bottom, like an editor's
     // integrated terminal - more intuitive for streaming output than a centered
     // popup, and it leaves the view above visible.
-    let height = (area.height * 2 / 5).clamp(8, 18).min(area.height.saturating_sub(1));
+    let height = (area.height * 2 / 5)
+        .clamp(8, 18)
+        .min(area.height.saturating_sub(1));
     let rect = Rect {
         x: area.x,
         y: area.y + area.height.saturating_sub(height),
@@ -483,10 +481,7 @@ fn render_code_finder(frame: &mut Frame, app: &App, input_area: Rect, list_area:
     } else if f.hits.is_empty() {
         "  type to search, Tab for meaning".to_owned()
     } else {
-        format!(
-            "  {} hits (text)  Tab: meaning  ^o: editor",
-            f.hits.len()
-        )
+        format!("  {} hits (text)  Tab: meaning  ^o: editor", f.hits.len())
     };
     // Split the query at the caret so it renders between the two halves.
     let chars: Vec<char> = f.input.chars().collect();
@@ -1436,19 +1431,18 @@ fn context_hints(app: &App) -> (Option<String>, Vec<(&'static str, &'static str)
                 ..
             }) => (
                 Some("hunk".into()),
-                vec![("s", "stage"), ("v", "lines"), ("⏎", "editor"), ("x", "discard")],
+                vec![
+                    ("s", "stage"),
+                    ("v", "lines"),
+                    ("⏎", "editor"),
+                    ("x", "discard"),
+                ],
             ),
             Some(Target::Hunk {
-                staged: Some(true),
-                ..
-            }) => (
-                Some("hunk".into()),
-                vec![("u", "unstage"), ("⏎", "editor")],
-            ),
+                staged: Some(true), ..
+            }) => (Some("hunk".into()), vec![("u", "unstage"), ("⏎", "editor")]),
             // A read-only diff hunk (commit / diff view): open the file at the line.
-            Some(Target::Hunk { staged: None, .. }) => {
-                (Some("hunk".into()), vec![("⏎", "editor")])
-            }
+            Some(Target::Hunk { staged: None, .. }) => (Some("hunk".into()), vec![("⏎", "editor")]),
             Some(Target::Stash { .. }) => (
                 Some("stash".into()),
                 vec![("p", "pop"), ("z", "menu"), ("x", "drop")],

@@ -10,9 +10,8 @@ mod style;
 
 pub use build::{
     DIFF_GUTTER_COLS, GlyphMode, SyntaxColors, build, build_blame, build_commit, build_diff,
-    build_log, build_refs, diff_line_file_line, highlight_code, highlight_file,
-    build_remotes, build_worktrees, glyph, glyph_mode, set_glyph_mode, set_side_by_side,
-    set_syntax_colors, unicode,
+    build_log, build_refs, build_remotes, build_worktrees, diff_line_file_line, glyph, glyph_mode,
+    highlight_code, highlight_file, set_glyph_mode, set_side_by_side, set_syntax_colors, unicode,
 };
 pub use content::{NodeKind, RefTarget, Section, SectionId, Target};
 pub use style::{Span, Style};

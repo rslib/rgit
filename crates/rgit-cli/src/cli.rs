@@ -41,7 +41,13 @@ pub enum Command {
     /// Recent commits as `sha subject` lines.
     Log {
         /// Maximum number of commits to show (git's -n).
-        #[arg(short = 'n', short_alias = 'l', long = "max-count", visible_alias = "limit", default_value_t = 20)]
+        #[arg(
+            short = 'n',
+            short_alias = 'l',
+            long = "max-count",
+            visible_alias = "limit",
+            default_value_t = 20
+        )]
         limit: usize,
         /// Walk every ref, not just HEAD.
         #[arg(long)]
@@ -419,6 +425,20 @@ pub enum Command {
         #[command(subcommand)]
         cmd: FlowCmd,
     },
+    /// Manage GitHub repositories, branches, and pull requests without gh.
+    Forge {
+        /// Named forge profile from the rgit config file.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Credential account label for forge API operations.
+        #[arg(long)]
+        account: Option<String>,
+        /// Forge host override for GitLab API operations.
+        #[arg(long)]
+        host: Option<String>,
+        #[command(subcommand)]
+        cmd: ForgeCmd,
+    },
     /// Stacked branches: chain branches and restack descendants after edits
     /// (no subcommand lists the current stack).
     Stack {
@@ -639,7 +659,6 @@ pub enum StashCmd {
     List,
 }
 
-
 #[derive(Subcommand)]
 pub enum RemoteCmd {
     /// Add a remote.
@@ -800,10 +819,164 @@ pub enum FlowCmd {
         #[arg(long)]
         finish: bool,
     },
+
     /// Show the active workflow and its policy.
     Status,
 }
 
+/// Authentication commands shared by all forge providers.
+#[derive(clap::Subcommand)]
+pub enum AuthCmd {
+    /// List known forge providers and whether credentials are stored.
+    List,
+    /// Show detailed authentication status.
+    Status,
+}
+
+/// Native forge management commands.
+#[derive(clap::Subcommand)]
+pub enum ForgeCmd {
+    /// Store a forge credential in the OS credential store.
+    Login {
+        provider: String,
+        /// Forge host, such as `https://gitlab.example.com`.
+        #[arg(long)]
+        host: Option<String>,
+        /// Credential account label.
+        #[arg(long, default_value = "default")]
+        account: String,
+        /// Read the token from stdin; it is never accepted as a command argument.
+        #[arg(long, default_value_t = false)]
+        token_stdin: bool,
+    },
+    /// Show authentication status for configured forge providers.
+    Auth {
+        #[command(subcommand)]
+        cmd: AuthCmd,
+    },
+    /// Show the authenticated account for one forge.
+    Whoami {
+        /// Provider name, such as `github`; defaults when unambiguous.
+        provider: Option<String>,
+        /// Forge host override.
+        #[arg(long)]
+        host: Option<String>,
+        /// Credential account label.
+        #[arg(long, default_value = "default")]
+        account: String,
+    },
+    /// Remove the stored forge credential.
+    Logout {
+        provider: String,
+        /// Forge host override.
+        #[arg(long)]
+        host: Option<String>,
+        /// Credential account label.
+        #[arg(long, default_value = "default")]
+        account: String,
+    },
+    /// View, create, or delete a hosted repository.
+    Repo {
+        #[command(subcommand)]
+        cmd: RepoCmd,
+    },
+    /// List or delete branches on the forge.
+    Branch {
+        #[command(subcommand)]
+        cmd: ForgeBranchCmd,
+    },
+    /// List, create, or close pull requests (merge requests on GitLab).
+    Pr {
+        #[command(subcommand)]
+        cmd: PrCmd,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub enum RepoCmd {
+    /// Show repository metadata.
+    View {
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+    },
+    /// Create a repository.
+    Create {
+        #[arg(long, default_value = "github")]
+        provider: String,
+        name: String,
+        #[arg(long)]
+        organization: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        private: bool,
+        #[arg(long)]
+        auto_init: bool,
+    },
+    /// Delete a repository after explicit confirmation.
+    Delete {
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub enum ForgeBranchCmd {
+    /// List remote branches.
+    List {
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+    },
+    /// Delete a remote branch after explicit confirmation.
+    Delete {
+        branch: String,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub enum PrCmd {
+    /// List open pull requests or merge requests.
+    List {
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+    },
+    /// Create a pull request or merge request.
+    Create {
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        base: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        draft: bool,
+    },
+    /// Close a pull request or merge request.
+    Close {
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+}
 /// Subcommands for CoW workspaces.
 #[derive(clap::Subcommand)]
 pub enum WorkspaceCmd {
@@ -834,8 +1007,15 @@ fn index_cmd(backend: &Arc<dyn GitBackend>, action: IndexCmd) -> anyhow::Result<
         IndexCmd::Status => {
             let path = rgit_index::index_path(backend.workdir());
             match rgit_index::load(&path) {
-                Some(index) => Ok(format!("indexed: {} chunks ({})", index.len(), path.display())),
-                None => Ok(format!("no index ({}); run `rgit index build`", path.display())),
+                Some(index) => Ok(format!(
+                    "indexed: {} chunks ({})",
+                    index.len(),
+                    path.display()
+                )),
+                None => Ok(format!(
+                    "no index ({}); run `rgit index build`",
+                    path.display()
+                )),
             }
         }
     }
@@ -972,7 +1152,11 @@ pub(crate) fn code_search(
     for (label, b) in &targets {
         hits.extend(hybrid_hits(b, label, query, pool));
     }
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.truncate(limit);
     if hits.is_empty() {
         return Ok("no matches".to_owned());
@@ -980,9 +1164,15 @@ pub(crate) fn code_search(
     let mut out = String::new();
     for h in hits {
         if multi {
-            out.push_str(&format!("{:.4}  {}/{}:{}  [{}]\n", h.score, h.repo, h.path, h.line, h.tag));
+            out.push_str(&format!(
+                "{:.4}  {}/{}:{}  [{}]\n",
+                h.score, h.repo, h.path, h.line, h.tag
+            ));
         } else {
-            out.push_str(&format!("{:.4}  {}:{}  [{}]\n", h.score, h.path, h.line, h.tag));
+            out.push_str(&format!(
+                "{:.4}  {}:{}  [{}]\n",
+                h.score, h.path, h.line, h.tag
+            ));
         }
     }
     Ok(out.trim_end().to_owned())
@@ -1016,8 +1206,9 @@ pub(crate) fn semantic_search(
     for (label, b) in &targets {
         if let Some(index) = rgit_index::load(&rgit_index::index_path(b.workdir())) {
             let boost = history_boost(b);
-            for h in rgit_index::search_boosted(&index, &embedder, query, limit, &boost, HISTORY_ALPHA)
-                .map_err(|e| anyhow::anyhow!("{e}"))?
+            for h in
+                rgit_index::search_boosted(&index, &embedder, query, limit, &boost, HISTORY_ALPHA)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
             {
                 hits.push((h.score, label.clone(), h));
             }
@@ -1031,9 +1222,15 @@ pub(crate) fn semantic_search(
     let mut out = String::new();
     for (score, repo, h) in hits {
         if multi {
-            out.push_str(&format!("{score:.3}  {}/{}:{}-{}\n", repo, h.path, h.start_line, h.end_line));
+            out.push_str(&format!(
+                "{score:.3}  {}/{}:{}-{}\n",
+                repo, h.path, h.start_line, h.end_line
+            ));
         } else {
-            out.push_str(&format!("{score:.3}  {}:{}-{}\n", h.path, h.start_line, h.end_line));
+            out.push_str(&format!(
+                "{score:.3}  {}:{}-{}\n",
+                h.path, h.start_line, h.end_line
+            ));
         }
     }
     Ok(out.trim_end().to_owned())
@@ -1185,10 +1382,19 @@ pub fn run(
                     let (a, b) = spec
                         .split_once(',')
                         .ok_or_else(|| anyhow::anyhow!("-L wants START,END"))?;
-                    let start: usize = a.trim().parse().map_err(|_| anyhow::anyhow!("bad -L start"))?;
-                    let end: usize = b.trim().parse().map_err(|_| anyhow::anyhow!("bad -L end"))?;
+                    let start: usize = a
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("bad -L start"))?;
+                    let end: usize = b
+                        .trim()
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("bad -L end"))?;
                     let lo = start.saturating_sub(1);
-                    all.into_iter().skip(lo).take(end.saturating_sub(lo)).collect()
+                    all.into_iter()
+                        .skip(lo)
+                        .take(end.saturating_sub(lo))
+                        .collect()
                 }
                 None => all,
             };
@@ -1693,9 +1899,11 @@ pub fn run(
             backend.git(&args)?
         }
         Command::Git { args } => backend.git(&args)?,
-        Command::Init { .. } | Command::Clone { .. } | Command::Mcp | Command::Serve { .. } => {
-            unreachable!("handled before dispatch")
-        }
+        Command::Init { .. }
+        | Command::Clone { .. }
+        | Command::Mcp
+        | Command::Serve { .. }
+        | Command::Forge { .. } => unreachable!("handled before dispatch"),
     })
 }
 

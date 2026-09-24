@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
@@ -12,13 +12,24 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::app::{App, Effect, InfoKind, LaneOp, Leader, Msg, Mutation, TextOp, update};
 use crate::events::{Event, Events};
 use crate::keymap::{
-    self, resolve_commit_key, resolve_confirm_key, resolve_help_key, resolve_key,
-    resolve_finder_key, resolve_palette_key, resolve_prompt_key, resolve_rebase_key,
-    resolve_search_key,
+    self, resolve_commit_key, resolve_confirm_key, resolve_finder_key, resolve_help_key,
+    resolve_key, resolve_palette_key, resolve_prompt_key, resolve_rebase_key, resolve_search_key,
     resolve_transient_key,
 };
 use crate::ui;
 
+fn resolve_forge_key(key: crossterm::event::KeyEvent) -> Option<Msg> {
+    use crossterm::event::KeyCode;
+    match key.code {
+        KeyCode::Char(']') => Some(Msg::ForgeProfileNext),
+        KeyCode::Char('c') => Some(Msg::ForgeCreate),
+        KeyCode::Char('d') | KeyCode::Enter => Some(Msg::ForgeDetails),
+        KeyCode::Char('x') => Some(Msg::ForgeClose),
+        KeyCode::Char('o') | KeyCode::Char('O') => Some(Msg::ForgeOpen),
+        _ if keymap::profile() == keymap::Profile::Vim => keymap::resolve_vim_key(key),
+        _ => resolve_key(key),
+    }
+}
 /// Route a key while the vim-profile leader (which-key) overlay is open. Mutates
 /// the leader level directly and returns the resolved action, if any.
 fn resolve_leader(app: &mut App, key: crossterm::event::KeyEvent) -> Option<Msg> {
@@ -166,16 +177,22 @@ impl rgit_git::CredentialPrompt for TuiCredentialPrompt {
 /// Run one lane operation and describe the result for a toast.
 fn run_lane_op(backend: &dyn GitBackend, op: &LaneOp) -> String {
     let result = match op {
-        LaneOp::New(name) => backend.lane_new(name).map(|()| format!("created lane {name}")),
-        LaneOp::Assign { lane, path } => {
-            backend.lane_assign(lane, path).map(|()| format!("{path} -> {lane}"))
-        }
-        LaneOp::Unassign(path) => backend.lane_unassign(path).map(|()| format!("{path} -> default")),
+        LaneOp::New(name) => backend
+            .lane_new(name)
+            .map(|()| format!("created lane {name}")),
+        LaneOp::Assign { lane, path } => backend
+            .lane_assign(lane, path)
+            .map(|()| format!("{path} -> {lane}")),
+        LaneOp::Unassign(path) => backend
+            .lane_unassign(path)
+            .map(|()| format!("{path} -> default")),
         LaneOp::Commit { lane, message } => backend.lane_commit(lane, message),
-        LaneOp::Rename { old, new } => {
-            backend.lane_rename(old, new).map(|()| format!("{old} -> {new}"))
-        }
-        LaneOp::Delete(name) => backend.lane_delete(name).map(|()| format!("deleted lane {name}")),
+        LaneOp::Rename { old, new } => backend
+            .lane_rename(old, new)
+            .map(|()| format!("{old} -> {new}")),
+        LaneOp::Delete(name) => backend
+            .lane_delete(name)
+            .map(|()| format!("deleted lane {name}")),
         LaneOp::Push(lane) => backend.lane_push(lane),
         LaneOp::Pr(lane) => backend.lane_pr(lane),
         LaneOp::Stack { name, parent } => backend
@@ -271,14 +288,13 @@ async fn event_loop(
 
     // Let network operations prompt for a password/passphrase through the UI.
     app.backend()
-        .set_credential_prompt(Box::new(TuiCredentialPrompt {
-            tx: msg_tx.clone(),
-        }));
+        .set_credential_prompt(Box::new(TuiCredentialPrompt { tx: msg_tx.clone() }));
 
     // Auto-refresh on worktree changes; kept alive for the loop's duration.
     let _watcher = spawn_watcher(app.backend().workdir(), msg_tx.clone());
 
     msg_tx.send(Msg::Refresh).ok();
+    tracing::info!(target: "startup", "tui initial refresh queued");
     // Draw once up front; thereafter only when something actually changes, so an
     // idle TUI does no work between the periodic animation ticks.
     terminal.draw(|frame| ui::render(frame, &mut app))?;
@@ -338,6 +354,17 @@ async fn event_loop(
                     resolve_confirm_key(key)
                 } else if app.leader.is_some() {
                     resolve_leader(&mut app, key)
+                } else if (app.active_kind() == crate::app::ViewKind::Status
+                    && app.buffer().cursor_id().as_deref() == Some("remote/forge")
+                    && key.code == crossterm::event::KeyCode::Enter)
+                    || (key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                        && key.code == crossterm::event::KeyCode::Char('g'))
+                {
+                    Some(Msg::Forge)
+                } else if app.active_kind() == crate::app::ViewKind::Forge {
+                    resolve_forge_key(key)
                 } else if app.active_kind() == crate::app::ViewKind::SessionLog {
                     resolve_session_log_key(key)
                 } else if app.active_kind() == crate::app::ViewKind::Lanes {
@@ -632,15 +659,17 @@ async fn run_msg(
                 events.pause();
                 ratatui::restore();
                 let editor = editor_command();
-                let opened = tokio::task::spawn_blocking(move || {
-                    run_editor_at(&editor, &full, line, col)
-                })
-                .await;
+                let opened =
+                    tokio::task::spawn_blocking(move || run_editor_at(&editor, &full, line, col))
+                        .await;
                 *terminal = ratatui::init();
                 enable_mouse_capture();
                 events.resume();
                 if !matches!(opened, Ok(Ok(true))) {
-                    app.push_toast(crate::app::ToastKind::Error, "editor exited abnormally".into());
+                    app.push_toast(
+                        crate::app::ToastKind::Error,
+                        "editor exited abnormally".into(),
+                    );
                 }
             }
             Effect::BuildSnippetPreview { key, path, line } => {
@@ -749,7 +778,8 @@ async fn run_msg(
                     // works from the TUI without dropping to `rgit lanes init`.
                     if !backend.lanes_active() {
                         if let Err(e) = backend.lanes_init() {
-                            let _ = msg_tx.send(Msg::LaneNotice(format!("could not enable lanes: {e}")));
+                            let _ = msg_tx
+                                .send(Msg::LaneNotice(format!("could not enable lanes: {e}")));
                             return;
                         }
                     }
@@ -846,8 +876,7 @@ async fn run_msg(
                 let msg_tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     let base = std::path::PathBuf::from(&path);
-                    let msg = match rgit_git::Git2Backend::discover(&base)
-                        .and_then(|b| b.status())
+                    let msg = match rgit_git::Git2Backend::discover(&base).and_then(|b| b.status())
                     {
                         Ok(status) => {
                             let changed = status.unstaged.len();
@@ -874,8 +903,11 @@ async fn run_msg(
             Effect::LoadForge => {
                 let backend = app.backend();
                 let workdir = backend.workdir().to_path_buf();
+                let forge_account = app.forge_account.clone();
+                let forge_host = app.forge_host.clone();
                 let msg_tx = msg_tx.clone();
                 tokio::spawn(async move {
+                    let started = Instant::now();
                     let origin = tokio::task::spawn_blocking(move || {
                         backend.remotes().ok().and_then(|rs| {
                             rs.into_iter().find(|r| r.name == "origin").map(|r| r.url)
@@ -884,41 +916,112 @@ async fn run_msg(
                     .await
                     .ok()
                     .flatten();
-                    let result = crate::forge::load(origin, workdir).await;
+                    let handle = tokio::runtime::Handle::current();
+                    let result = tokio::task::spawn_blocking(move || {
+                        handle.block_on(crate::forge::load(
+                            origin,
+                            workdir,
+                            forge_account,
+                            forge_host,
+                        ))
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(format!("forge worker failed: {error}")));
+                    tracing::info!(
+                        target: "startup",
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "forge load completed"
+                    );
                     let _ = msg_tx.send(Msg::ForgeLoaded(result));
                 });
             }
-            Effect::LoadRemoteStatus => {
-                let backend = app.backend();
-                let workdir = backend.workdir().to_path_buf();
-                let branch = app.head().and_then(|h| h.branch.clone());
+            Effect::ForgeClose {
+                provider,
+                host,
+                account,
+                repository,
+                number,
+            } => {
                 let msg_tx = msg_tx.clone();
                 tokio::spawn(async move {
-                    let Some(branch) = branch else {
-                        let _ = msg_tx.send(Msg::RemoteStatusLoaded(None));
-                        return;
-                    };
-                    let origin = tokio::task::spawn_blocking(move || {
-                        backend.remotes().ok().and_then(|rs| {
-                            rs.into_iter().find(|r| r.name == "origin").map(|r| r.url)
-                        })
-                    })
-                    .await
-                    .ok()
-                    .flatten();
-                    // A forge error (no gh/glab/token) means no section, not a
-                    // misleading "no PR"; success with no match means no PR.
-                    let summary = match crate::forge::load(origin, workdir).await {
-                        Ok(prs) => {
-                            let pr = prs.into_iter().find(|p| p.branch == branch);
-                            Some(crate::app::RemoteSummary {
-                                pr: pr.as_ref().map(|p| (p.number, p.state.clone())),
-                                checks: pr.and_then(|p| p.checks),
-                            })
+                    let result = async {
+                        let repo = rgit_forge::RepoRef::parse(&repository)
+                            .map_err(|error| error.to_string())?;
+                        match provider.as_str() {
+                            "github" => {
+                                let client =
+                                    rgit_forge::GithubClient::from_environment_for(&account)
+                                        .await
+                                        .map_err(|error| error.to_string())?;
+                                client
+                                    .close_pull_request(&repo, number)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            "gitlab" => {
+                                let client =
+                                    rgit_forge::GitlabClient::from_environment_for(&host, &account)
+                                        .map_err(|error| error.to_string())?;
+                                client
+                                    .close_merge_request(&repo, number)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            _ => return Err("unsupported forge provider".to_owned()),
                         }
-                        Err(_) => None,
-                    };
-                    let _ = msg_tx.send(Msg::RemoteStatusLoaded(summary));
+                        Ok(format!("closed {provider} request #{number}"))
+                    }
+                    .await;
+                    let _ = msg_tx.send(Msg::ForgeMutationDone(result));
+                });
+            }
+            Effect::ForgeCreate {
+                provider,
+                host,
+                account,
+                repository,
+                title,
+                head,
+                base,
+            } => {
+                let msg_tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let repo = rgit_forge::RepoRef::parse(&repository)
+                            .map_err(|error| error.to_string())?;
+                        let request = rgit_forge::CreatePullRequest {
+                            title,
+                            head,
+                            base,
+                            body: None,
+                            draft: false,
+                        };
+                        match provider.as_str() {
+                            "github" => {
+                                let client =
+                                    rgit_forge::GithubClient::from_environment_for(&account)
+                                        .await
+                                        .map_err(|error| error.to_string())?;
+                                client
+                                    .create_pull_request(&repo, &request)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            "gitlab" => {
+                                let client =
+                                    rgit_forge::GitlabClient::from_environment_for(&host, &account)
+                                        .map_err(|error| error.to_string())?;
+                                client
+                                    .create_merge_request(&repo, &request)
+                                    .await
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            _ => return Err("unsupported forge provider".to_owned()),
+                        }
+                        Ok(format!("created {provider} request"))
+                    }
+                    .await;
+                    let _ = msg_tx.send(Msg::ForgeMutationDone(result));
                 });
             }
             Effect::LoadDiff { from, to } => {
@@ -961,7 +1064,6 @@ fn spawn_watcher(
         .ok()?;
     Some(debouncer)
 }
-
 /// Run a synchronous read/mutation on a blocking task and report the resulting
 /// status back as a [`Msg`], so the render loop never blocks.
 fn spawn_read<F>(app: &App, msg_tx: &UnboundedSender<Msg>, work: F)
@@ -971,7 +1073,14 @@ where
     let backend = app.backend();
     let msg_tx = msg_tx.clone();
     tokio::task::spawn_blocking(move || {
-        let _ = msg_tx.send(Msg::Refreshed(Box::new(work(&*backend))));
+        let started = Instant::now();
+        let result = work(&*backend);
+        tracing::info!(
+            target: "startup",
+            elapsed_ms = started.elapsed().as_millis(),
+            "git refresh completed"
+        );
+        let _ = msg_tx.send(Msg::Refreshed(Box::new(result)));
     });
 }
 
@@ -1185,7 +1294,13 @@ async fn op_console(
             force_with_lease,
             set_upstream,
             remote,
-        } => backend.push(remote.as_deref(), force, force_with_lease, set_upstream, &report),
+        } => backend.push(
+            remote.as_deref(),
+            force,
+            force_with_lease,
+            set_upstream,
+            &report,
+        ),
         ConsoleOp::Merge { rev, no_ff } => backend.merge(&rev, no_ff, false, &report),
         ConsoleOp::RebaseOnto(rev) => backend.rebase_onto(&rev, &report),
         ConsoleOp::Sync => backend.sync(&report).map(drop),
@@ -1486,7 +1601,9 @@ fn code_search(
         }
     }
     for (rank, h) in semantic.iter().enumerate() {
-        let e = acc.entry((h.path.clone(), bucket(h.start_line))).or_default();
+        let e = acc
+            .entry((h.path.clone(), bucket(h.start_line)))
+            .or_default();
         e.score += 1.0 / (K + rank as f64);
         e.semantic = true;
         if e.line == 0 {
@@ -1530,12 +1647,19 @@ fn stack_move(backend: &dyn GitBackend, up: bool) -> Result<(), GitError> {
             .map(|(b, _)| b)
             .collect();
         match children.as_slice() {
-            [] => return Err(GitError::Other(format!("{current} has no branch stacked on it"))),
+            [] => {
+                return Err(GitError::Other(format!(
+                    "{current} has no branch stacked on it"
+                )));
+            }
             [one] => (*one).clone(),
             many => {
                 return Err(GitError::Other(format!(
                     "multiple children: {}",
-                    many.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                    many.iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )));
             }
         }
@@ -1769,12 +1893,18 @@ mod tests {
         let dir = temp_repo("grep");
         std::fs::write(dir.join("f.rs"), "fn alpha() {}\nfn zztokenzz() {}\n").unwrap();
         for a in [vec!["add", "f.rs"], vec!["commit", "-qm", "c"]] {
-            std::process::Command::new("git").arg("-C").arg(&dir).args(&a).status().unwrap();
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(&a)
+                .status()
+                .unwrap();
         }
         let backend = rgit_git::Git2Backend::discover(&dir).unwrap();
         let hits = grep_hits(&backend, "zztokenzz").unwrap();
         assert!(
-            hits.iter().any(|h| h.path == "f.rs" && h.line == 2 && h.tag == "text"),
+            hits.iter()
+                .any(|h| h.path == "f.rs" && h.line == 2 && h.tag == "text"),
             "grep_hits should find the token at f.rs:2"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1798,7 +1928,10 @@ mod tests {
             restacked: vec!["a -> main".into(), "b -> a".into()],
             conflicted: vec![],
         };
-        assert_eq!(restack_note(&moved).as_deref(), Some("auto-restack (restacked 2)"));
+        assert_eq!(
+            restack_note(&moved).as_deref(),
+            Some("auto-restack (restacked 2)")
+        );
         let mixed = RestackOutcome {
             restacked: vec!["a -> main".into()],
             conflicted: vec!["b".into()],

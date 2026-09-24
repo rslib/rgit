@@ -229,8 +229,7 @@ pub trait GitBackend: Send + Sync {
 
     /// The full diff for one file in a commit (against its first parent). None if
     /// the file is not part of the commit's diff.
-    fn commit_file_diff(&self, rev: &str, path: &str)
-    -> Result<Option<crate::FileDiff>, GitError>;
+    fn commit_file_diff(&self, rev: &str, path: &str) -> Result<Option<crate::FileDiff>, GitError>;
 
     /// The diff between two revisions' trees (`from` as the old side).
     fn diff_refs(&self, from: &str, to: &str) -> Result<Vec<crate::FileDiff>, GitError>;

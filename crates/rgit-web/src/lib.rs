@@ -238,10 +238,7 @@ impl Registry {
     /// A repo name must be a single, non-hidden path segment: no separators, no
     /// `.`/`..`, so it can only ever name a directory directly under the root.
     fn valid(name: &str) -> bool {
-        !name.is_empty()
-            && !name.starts_with('.')
-            && !name.contains('/')
-            && !name.contains('\\')
+        !name.is_empty() && !name.starts_with('.') && !name.contains('/') && !name.contains('\\')
     }
 
     fn resolve(&self, name: &str) -> Result<Arc<dyn GitBackend>, AppError> {
@@ -299,11 +296,15 @@ type Shared = Arc<AppState>;
 
 /// Resolve a request to (backend, repo display name, URL base). In single mode
 /// the base is empty; in multi mode it is `/{repo}`.
-fn ctx(state: &Shared, repo: Option<&str>) -> Result<(Arc<dyn GitBackend>, String, String), AppError> {
+fn ctx(
+    state: &Shared,
+    repo: Option<&str>,
+) -> Result<(Arc<dyn GitBackend>, String, String), AppError> {
     match &state.repos {
         Repos::Single { backend, name } => Ok((backend.clone(), name.clone(), String::new())),
         Repos::Multi(reg) => {
-            let name = repo.ok_or_else(|| AppError(StatusCode::NOT_FOUND, "repo required".into()))?;
+            let name =
+                repo.ok_or_else(|| AppError(StatusCode::NOT_FOUND, "repo required".into()))?;
             let backend = reg.resolve(name)?;
             Ok((backend, name.to_owned(), format!("/{name}")))
         }
@@ -328,11 +329,22 @@ fn summary_page(b: &dyn GitBackend, repo: &str, base: &str) -> Result<Markup, Ap
         .ok()
         .flatten()
         .map(|t| (t.name, t.when, t.message));
-    Ok(view::summary(repo, base, &side, &b.status()?, lanes.as_ref()))
+    Ok(view::summary(
+        repo,
+        base,
+        &side,
+        &b.status()?,
+        lanes.as_ref(),
+    ))
 }
 
 fn commit_page(b: &dyn GitBackend, repo: &str, base: &str, rev: &str) -> Result<Markup, AppError> {
-    Ok(view::commit(repo, base, &side_info(b, base, repo), &b.commit_overview(rev)?))
+    Ok(view::commit(
+        repo,
+        base,
+        &side_info(b, base, repo),
+        &b.commit_overview(rev)?,
+    ))
 }
 
 fn commit_diff_fragment(b: &dyn GitBackend, rev: &str, path: &str) -> Result<Markup, AppError> {
@@ -344,7 +356,12 @@ fn commit_diffs_fragment(b: &dyn GitBackend, rev: &str) -> Result<Markup, AppErr
 }
 
 fn refs_page(b: &dyn GitBackend, repo: &str, base: &str) -> Result<Markup, AppError> {
-    Ok(view::refs(repo, base, &side_info(b, base, repo), &b.refs()?))
+    Ok(view::refs(
+        repo,
+        base,
+        &side_info(b, base, repo),
+        &b.refs()?,
+    ))
 }
 
 fn releases_page(b: &dyn GitBackend, repo: &str, base: &str) -> Result<Markup, AppError> {
@@ -357,7 +374,13 @@ fn releases_page(b: &dyn GitBackend, repo: &str, base: &str) -> Result<Markup, A
 }
 
 fn blame_page(b: &dyn GitBackend, repo: &str, base: &str, path: &str) -> Result<Markup, AppError> {
-    Ok(view::blame(repo, base, &side_info(b, base, repo), path, &b.blame(path)?))
+    Ok(view::blame(
+        repo,
+        base,
+        &side_info(b, base, repo),
+        path,
+        &b.blame(path)?,
+    ))
 }
 
 fn diff_page(
@@ -636,8 +659,15 @@ fn semantic_page(
     let hits = match (&index, query.is_empty()) {
         (Some(idx), false) => {
             let boost = history_boost(b);
-            rgit_index::search_boosted(idx, embedder()?, query, SEMANTIC_LIMIT, &boost, HISTORY_ALPHA)
-                .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            rgit_index::search_boosted(
+                idx,
+                embedder()?,
+                query,
+                SEMANTIC_LIMIT,
+                &boost,
+                HISTORY_ALPHA,
+            )
+            .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         }
         _ => Vec::new(),
     };
@@ -679,10 +709,17 @@ fn global_semantic_page(reg: &Registry, q: &HashMap<String, String>) -> Result<M
         }
         // Keep the best across repos by cosine score.
         for (_, hits) in &mut groups {
-            hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
         groups.sort_by(|a, b| {
-            let (sa, sb) = (a.1.first().map(|h| h.score).unwrap_or(0.0), b.1.first().map(|h| h.score).unwrap_or(0.0));
+            let (sa, sb) = (
+                a.1.first().map(|h| h.score).unwrap_or(0.0),
+                b.1.first().map(|h| h.score).unwrap_or(0.0),
+            );
             sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
         });
     }
@@ -795,7 +832,11 @@ fn files_body(b: &dyn GitBackend) -> Result<Response, AppError> {
 }
 
 fn prs_body(b: &dyn GitBackend) -> Result<Response, AppError> {
-    let branch = b.status().ok().and_then(|s| s.head.branch).unwrap_or_default();
+    let branch = b
+        .status()
+        .ok()
+        .and_then(|s| s.head.branch)
+        .unwrap_or_default();
     let html = if branch.is_empty() {
         String::new()
     } else {
@@ -804,7 +845,11 @@ fn prs_body(b: &dyn GitBackend) -> Result<Response, AppError> {
     Ok(([("content-type", "text/html; charset=utf-8")], html).into_response())
 }
 
-fn archive_body(b: &dyn GitBackend, repo: &str, q: &HashMap<String, String>) -> Result<Response, AppError> {
+fn archive_body(
+    b: &dyn GitBackend,
+    repo: &str,
+    q: &HashMap<String, String>,
+) -> Result<Response, AppError> {
     let rev = q.get("rev").map(String::as_str).unwrap_or("HEAD");
     let bytes = b.archive_targz(rev)?;
     let filename = format!("{repo}-{rev}.tar.gz");
@@ -974,9 +1019,7 @@ async fn m_index(State(s): State<Shared>) -> Result<Markup, AppError> {
                 reg.list().into_iter().map(|name| reg.card(&name)).collect();
             Ok(view::index(&cards))
         }
-        Repos::Single { backend, name } => {
-            Ok(view::index(&[repo_card(backend.as_ref(), name)]))
-        }
+        Repos::Single { backend, name } => Ok(view::index(&[repo_card(backend.as_ref(), name)])),
     }
 }
 async fn m_summary(State(s): State<Shared>, Path(repo): Path<String>) -> Result<Markup, AppError> {
@@ -1195,7 +1238,10 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let _ = CLONE_BASE.set(clone_base);
     let state = Arc::new(AppState {
-        repos: Repos::Single { backend, name: repo },
+        repos: Repos::Single {
+            backend,
+            name: repo,
+        },
     });
     run(with_mcp(single_router(state), mcp), addr).await
 }
@@ -1232,11 +1278,20 @@ mod tests {
         use serde_json::json;
         assert_eq!(super::ci_mark(&[]), "");
         let pass = [json!({"state": "SUCCESS"}), json!({"state": "SKIPPED"})];
-        assert!(super::ci_mark(&pass).contains('\u{2713}'), "all-pass is a check");
+        assert!(
+            super::ci_mark(&pass).contains('\u{2713}'),
+            "all-pass is a check"
+        );
         let fail = [json!({"state": "SUCCESS"}), json!({"state": "FAILURE"})];
-        assert!(super::ci_mark(&fail).contains('\u{2717}'), "any fail is a cross");
+        assert!(
+            super::ci_mark(&fail).contains('\u{2717}'),
+            "any fail is a cross"
+        );
         let pending = [json!({"state": "SUCCESS"}), json!({"state": "IN_PROGRESS"})];
-        assert!(super::ci_mark(&pending).contains('\u{25cf}'), "any pending is a dot");
+        assert!(
+            super::ci_mark(&pending).contains('\u{25cf}'),
+            "any pending is a dot"
+        );
     }
 
     #[test]

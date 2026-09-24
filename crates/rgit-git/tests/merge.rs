@@ -85,8 +85,16 @@ fn fast_forward_merge_moves_the_branch_tip() {
     let backend = Git2Backend::discover(&dir).unwrap();
     backend.merge("feature", false, false, &|_| {}).unwrap();
 
-    assert_eq!(head(&dir), feature_tip, "main should fast-forward to feature");
-    assert_eq!(parent_count(&dir, "HEAD"), 1, "ff merge has no merge commit");
+    assert_eq!(
+        head(&dir),
+        feature_tip,
+        "main should fast-forward to feature"
+    );
+    assert_eq!(
+        parent_count(&dir, "HEAD"),
+        1,
+        "ff merge has no merge commit"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -111,7 +119,11 @@ fn no_ff_merge_creates_a_merge_commit() {
 
     let new_head = head(&dir);
     assert_ne!(new_head, feature_tip, "no-ff must not just fast-forward");
-    assert_eq!(parent_count(&dir, &new_head), 2, "no-ff merge commit has 2 parents");
+    assert_eq!(
+        parent_count(&dir, &new_head),
+        2,
+        "no-ff merge commit has 2 parents"
+    );
     assert_ne!(new_head, main_tip, "HEAD moved past the pre-merge tip");
 
     let _ = std::fs::remove_dir_all(&dir);

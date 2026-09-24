@@ -8,6 +8,7 @@ use crate::cli::{Cli, Command};
 
 mod cli;
 mod creds;
+mod forge;
 mod interactive;
 mod lanes;
 mod logging;
@@ -15,7 +16,6 @@ mod mcp;
 mod prompt;
 mod render;
 mod stack;
-
 fn main() -> ! {
     logging::init();
     // The in-process ssh transport falls back to a password prompt when key auth
@@ -35,11 +35,7 @@ fn main() -> ! {
         }) => {
             let path = path.unwrap_or_else(|| ".".to_owned());
             exit(report_result(
-                rgit_git::init(
-                    std::path::Path::new(&path),
-                    initial_branch.as_deref(),
-                    bare,
-                ),
+                rgit_git::init(std::path::Path::new(&path), initial_branch.as_deref(), bare),
                 "ok",
             ));
         }
@@ -82,7 +78,10 @@ fn main() -> ! {
                     exit(1);
                 }
             };
-            let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     eprintln!("rgit: {e}");
@@ -96,12 +95,7 @@ fn main() -> ! {
                     let root_path = std::path::PathBuf::from(&dir);
                     // The HTTP MCP endpoint resolves `repo` by name under the root.
                     let mcp = mcp::http_router_rooted(root_path.clone());
-                    runtime.block_on(rgit_web::serve_root(
-                        root_path,
-                        addr,
-                        clone_base,
-                        Some(mcp),
-                    ))
+                    runtime.block_on(rgit_web::serve_root(root_path, addr, clone_base, Some(mcp)))
                 }
                 None => {
                     let backend = discover_or_exit();
@@ -137,6 +131,29 @@ fn main() -> ! {
             }
         }
         // Every other subcommand runs one operation and prints compact output.
+        Some(Command::Forge {
+            profile,
+            account,
+            host,
+            cmd,
+        }) => match forge::run(
+            cmd,
+            forge::ForgeContext {
+                profile,
+                provider: None,
+                account,
+                host,
+            },
+        ) {
+            Ok(output) => {
+                println!("{output}");
+                exit(0);
+            }
+            Err(error) => {
+                eprintln!("rgit: {error}");
+                exit(1);
+            }
+        },
         Some(command) => {
             // Color and prompts only on a real terminal.
             render::set_color(std::io::IsTerminal::is_terminal(&std::io::stdout()));

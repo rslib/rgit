@@ -6,9 +6,9 @@
 //! for `ssh://` that speaks SSH with the pure-Rust `russh`, honoring ssh config
 //! (parsed here) - including a bastion hop done in-process, either by reusing a
 //! live OpenSSH `ControlMaster` socket or opening a fresh `direct-tcpip` channel
-//! - while libgit2 still performs the whole git protocol over the stream. URL
-//! rewrites (`url.<base>.insteadOf`/`pushInsteadOf`) are applied by libgit2
-//! before the transport is invoked, so they work without anything extra here.
+//! while libgit2 still performs the whole git protocol over the stream. URL
+//!   rewrites (`url.<base>.insteadOf`/`pushInsteadOf`) are applied by libgit2
+//!   before the transport is invoked, so they work without anything extra here.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -53,9 +53,7 @@ fn runtime() -> &'static Runtime {
 pub fn register() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| unsafe {
-        let _ = git2::transport::register("ssh", |remote| {
-            Transport::smart(&remote, false, RgitSsh)
-        });
+        let _ = git2::transport::register("ssh", |remote| Transport::smart(remote, false, RgitSsh));
     });
 }
 
@@ -141,7 +139,7 @@ fn parse_url(url: &str) -> Result<Target, String> {
             Some((a, p)) => (a, format!("/{p}")),
             None => (rest, String::new()),
         };
-        let (user, host_port) = split_user(&authority);
+        let (user, host_port) = split_user(authority);
         let (host, port) = match host_port.rsplit_once(':') {
             Some((h, p)) => (h.to_owned(), p.parse().ok()),
             None => (host_port, None),
@@ -200,7 +198,10 @@ fn resolve_ssh_config(host: &str) -> SshHostConfig {
             continue;
         }
         let (key, value) = match line.split_once(|c: char| c.is_whitespace() || c == '=') {
-            Some((k, v)) => (k.to_ascii_lowercase(), v.trim_start_matches(['=', ' ', '\t']).trim()),
+            Some((k, v)) => (
+                k.to_ascii_lowercase(),
+                v.trim_start_matches(['=', ' ', '\t']).trim(),
+            ),
             None => continue,
         };
         if key == "host" {
@@ -296,7 +297,7 @@ fn jump_host(cfg: &SshHostConfig) -> Option<String> {
     }
     if let Some(pc) = &cfg.proxy_command {
         let toks: Vec<&str> = pc.split_whitespace().collect();
-        if toks.first() == Some(&"ssh") && toks.iter().any(|t| *t == "-W") {
+        if toks.first() == Some(&"ssh") && toks.contains(&"-W") {
             // First non-flag token after `ssh` is the jump host.
             if let Some(h) = toks.iter().skip(1).find(|t| !t.starts_with('-')) {
                 return Some((*h).to_owned());
@@ -312,10 +313,7 @@ async fn connect(url: &str, command: &str) -> Result<SshStream, String> {
     let target = parse_url(url)?;
     let cfg = resolve_ssh_config(&target.host);
 
-    let host_name = cfg
-        .host_name
-        .clone()
-        .unwrap_or_else(|| target.host.clone());
+    let host_name = cfg.host_name.clone().unwrap_or_else(|| target.host.clone());
     let port = target.port.or(cfg.port).unwrap_or(22);
     let user = target
         .user
@@ -511,7 +509,10 @@ fn controlmaster_forward(
     control_path: &Path,
     host: &str,
     port: u16,
-) -> Option<(std::os::unix::net::UnixStream, std::os::unix::net::UnixStream)> {
+) -> Option<(
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+)> {
     use nix::sys::socket::{
         AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, socketpair,
     };
@@ -704,7 +705,7 @@ impl client::Handler for HostKeyVerifier {
             russh::keys::PublicKeyOrCertificate::Certificate(_) => return Ok(false),
         };
         match russh::keys::check_known_hosts(&self.host, self.port, key) {
-            Ok(true) => Ok(true),   // known and matches
+            Ok(true) => Ok(true), // known and matches
             Ok(false) => {
                 // Unknown host: trust on first use, like ssh's accept-new.
                 tracing::warn!(target: "git", "accepting unknown host key for {}", self.host);
@@ -775,7 +776,10 @@ mod tests {
         // Case-insensitive.
         assert!(host_line_matches("BASTION", "bastion"));
         // Negation wins even when another pattern matches.
-        assert!(!host_line_matches("secret.example.com", "*.example.com !secret.example.com"));
+        assert!(!host_line_matches(
+            "secret.example.com",
+            "*.example.com !secret.example.com"
+        ));
         assert!(!host_line_matches("other", "bastion gitserver"));
         assert!(host_line_matches("gitserver", "bastion gitserver"));
     }

@@ -481,7 +481,11 @@ fn uncommit_keeps_changes_staged() {
         .args(["diff", "--cached", "--name-only"])
         .output()
         .unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "f", "B's change is staged");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "f",
+        "B's change is staged"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -645,7 +649,17 @@ fn sync_fast_forwards_a_branch_to_its_upstream() {
     let url = format!("file://{}", remote.display());
 
     // A bare remote, and a working clone with a user identity.
-    git(&base, &["init", "-q", "--bare", "-b", "main", remote.to_str().unwrap()]);
+    git(
+        &base,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ],
+    );
     git(&base, &["clone", "-q", &url, work.to_str().unwrap()]);
     git(&work, &["config", "user.email", "t@example.com"]);
     git(&work, &["config", "user.name", "test"]);

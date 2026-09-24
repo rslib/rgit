@@ -269,10 +269,7 @@ pub(crate) fn open_pull_request(branch: &str, base: &str) -> String {
     // PR already tracks the branch head, so the push updated it: check for an
     // existing PR first and report that, rather than failing on a duplicate
     // `pr create` and misreporting it as "gh not installed".
-    if let Some(url) = run_forge(
-        "gh",
-        &["pr", "view", branch, "--json", "url", "-q", ".url"],
-    ) {
+    if let Some(url) = run_forge("gh", &["pr", "view", branch, "--json", "url", "-q", ".url"]) {
         return format!("pushed {branch} and updated its pull request:\n{url}");
     }
     if let Some(url) = run_forge(

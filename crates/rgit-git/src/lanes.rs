@@ -34,7 +34,9 @@ pub fn init(repo: &Repository) -> Result<(), GitError> {
     if active(repo) {
         return Err(other("lanes already active; use `lanes off` first"));
     }
-    let head = repo.head().map_err(|_| other("cannot init lanes: no HEAD yet"))?;
+    let head = repo
+        .head()
+        .map_err(|_| other("cannot init lanes: no HEAD yet"))?;
     if !head.is_branch() {
         return Err(other("cannot init lanes on a detached HEAD"));
     }
@@ -207,8 +209,7 @@ pub fn restack(repo: &Repository) -> Result<crate::RestackOutcome, GitError> {
     let mut outcome = crate::RestackOutcome::default();
     for name in order {
         let parent_name = &parents[&name];
-        let (Some(lane_branch), Some(parent_branch)) =
-            (branch_of(&name), branch_of(parent_name))
+        let (Some(lane_branch), Some(parent_branch)) = (branch_of(&name), branch_of(parent_name))
         else {
             continue;
         };
@@ -225,7 +226,11 @@ pub fn restack(repo: &Repository) -> Result<crate::RestackOutcome, GitError> {
             record_base(repo);
             continue; // no commits to replay
         };
-        if lane_tip == new_base || repo.graph_descendant_of(lane_tip, new_base).unwrap_or(false) {
+        if lane_tip == new_base
+            || repo
+                .graph_descendant_of(lane_tip, new_base)
+                .unwrap_or(false)
+        {
             record_base(repo); // already on top of the parent
             continue;
         }
@@ -379,8 +384,7 @@ pub fn assign_hunk(
     // move this specific hunk to the target lane.
     for l in &mut state.lanes {
         l.paths.retain(|p| p != path);
-        l.hunks
-            .retain(|h| !(h.path == path && h.anchor == anchor));
+        l.hunks.retain(|h| !(h.path == path && h.anchor == anchor));
     }
     let target = state.lanes.iter_mut().find(|l| l.name == lane).unwrap();
     target.hunks.push(HunkRef {
@@ -583,8 +587,10 @@ fn reconcile(repo: &Repository, state: &mut LanesState) -> Result<(), GitError> 
     let base = Oid::from_str(&state.base)?;
     let changed = changed_paths(repo, base)?;
     let hunks = tracked_hunks(repo, base)?;
-    let current: HashSet<(String, String)> =
-        hunks.iter().map(|(p, _, a)| (p.clone(), a.clone())).collect();
+    let current: HashSet<(String, String)> = hunks
+        .iter()
+        .map(|(p, _, a)| (p.clone(), a.clone()))
+        .collect();
 
     // Prune stale ownership from real lanes; clear the default for recompute.
     for lane in &mut state.lanes {
@@ -649,10 +655,11 @@ fn tracked_hunks(repo: &Repository, base: Oid) -> Result<Vec<(String, u32, Strin
     let diff = repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))?;
     let mut out = Vec::new();
     for idx in 0..diff.deltas().len() {
-        let Some(path) = diff
-            .get_delta(idx)
-            .and_then(|d| d.new_file().path().map(|p| p.to_string_lossy().into_owned()))
-        else {
+        let Some(path) = diff.get_delta(idx).and_then(|d| {
+            d.new_file()
+                .path()
+                .map(|p| p.to_string_lossy().into_owned())
+        }) else {
             continue;
         };
         let Some(patch) = Patch::from_diff(&diff, idx)? else {
@@ -706,8 +713,11 @@ fn apply_owned_hunks(
         let current = RefCell::new(String::new());
         let mut aopts = ApplyOptions::new();
         aopts.delta_callback(|delta| {
-            let path =
-                delta.and_then(|d| d.new_file().path().map(|p| p.to_string_lossy().into_owned()));
+            let path = delta.and_then(|d| {
+                d.new_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().into_owned())
+            });
             *current.borrow_mut() = path.clone().unwrap_or_default();
             path.map(|p| owned_starts.contains_key(&p)).unwrap_or(false)
         });

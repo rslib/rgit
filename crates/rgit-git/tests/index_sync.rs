@@ -19,20 +19,38 @@ fn init_repo(name: &str) -> std::path::PathBuf {
         vec!["config", "user.email", "t@example.com"],
         vec!["config", "user.name", "test"],
     ] {
-        assert!(Command::new("git").arg("-C").arg(&dir).args(&args).status().unwrap().success());
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
     dir
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    assert!(Command::new("git").arg("-C").arg(dir).args(args).status().unwrap().success());
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 fn tree_files(dir: &Path) -> String {
     let out = Command::new("git")
-        .arg("-C").arg(dir)
+        .arg("-C")
+        .arg(dir)
         .args(["ls-tree", "--name-only", "-r", "HEAD"])
-        .output().unwrap();
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -51,7 +69,10 @@ fn backend_commit_includes_a_git_staged_file() {
     backend.commit("add foo").unwrap();
 
     let files = tree_files(&dir);
-    assert!(files.contains("foo.txt"), "commit must include the git-staged file, got: {files:?}");
+    assert!(
+        files.contains("foo.txt"),
+        "commit must include the git-staged file, got: {files:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -70,7 +91,10 @@ fn external_git_add_shows_as_staged() {
     git(&dir, &["add", "foo.txt"]);
 
     let st = backend.status().unwrap();
-    assert!(st.staged_diff("foo.txt").is_some(), "external git add must show as staged");
+    assert!(
+        st.staged_diff("foo.txt").is_some(),
+        "external git add must show as staged"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

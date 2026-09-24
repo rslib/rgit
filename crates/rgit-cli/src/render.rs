@@ -154,9 +154,10 @@ fn ref_decor(refs: &[CommitRef]) -> String {
     for deco in group_decorations(refs) {
         match deco {
             Deco::Local(name) => out.push_str(&format!("{} ", paint(&name, GREEN))),
-            Deco::Remote { remote, branch } => {
-                out.push_str(&format!("{} ", paint(&format!("{remote}/{branch}"), MAGENTA)))
-            }
+            Deco::Remote { remote, branch } => out.push_str(&format!(
+                "{} ",
+                paint(&format!("{remote}/{branch}"), MAGENTA)
+            )),
             Deco::Tag(name) => out.push_str(&format!("{} ", paint(&name, CYAN))),
             Deco::Group {
                 branch,

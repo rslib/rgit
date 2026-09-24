@@ -799,7 +799,8 @@ pub struct Spinner {
 
 /// While set, the spinner animation thread holds its line instead of redrawing,
 /// so an interactive credential prompt can own the terminal cleanly.
-static SPINNER_SUPPRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SPINNER_SUPPRESSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Pause or resume spinner drawing. Cheap; safe to call with no spinner running.
 pub fn suppress_spinner(on: bool) {

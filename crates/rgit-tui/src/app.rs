@@ -14,7 +14,7 @@ use rgit_model::{
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::buffer::Buffer;
-use crate::forge::{self, PullRequest};
+use crate::forge::{self, ForgeSnapshot};
 
 /// Where a streamed hook run stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -429,6 +429,7 @@ pub enum TextOp {
 pub struct RemoteSummary {
     /// The open PR for the current branch: `(number, state)`.
     pub pr: Option<(u64, String)>,
+    pub title: Option<String>,
     /// The PR's CI rollup: `passing` / `failing` / `pending`.
     pub checks: Option<String>,
 }
@@ -604,7 +605,13 @@ pub enum Msg {
         files: Vec<rgit_git::FileDiff>,
     },
     Forge,
-    ForgeLoaded(Result<Vec<PullRequest>, String>),
+    ForgeLoaded(Result<ForgeSnapshot, String>),
+    ForgeProfileNext,
+    ForgeOpen,
+    ForgeClose,
+    ForgeMutationDone(Result<String, String>),
+    ForgeCreate,
+    ForgeDetails,
     DiffPrompt,
     DiffLoaded {
         title: String,
@@ -641,10 +648,6 @@ pub enum Msg {
     Restack,
     /// A note (shown as a toast) that an amend auto-restacked its children.
     AutoRestackNote(String),
-    /// The current branch's forge PR/CI status finished loading.
-    RemoteStatusLoaded(Option<RemoteSummary>),
-    /// A network operation needs a credential; open a (masked) prompt and reply
-    /// with the value the user enters, or `None` if they cancel.
     CredentialRequest {
         label: String,
         masked: bool,
@@ -1326,6 +1329,7 @@ pub enum PromptAction {
     SplitPaths,
     /// Rename `pending_move_from` to the path named by the prompt value.
     MoveFile,
+    ForgeCreate,
 }
 
 /// A minibuffer: a label, an editable input, and optional filterable candidates.
@@ -1702,8 +1706,6 @@ pub enum Effect {
     LoadOplog,
     /// Load the stacked-branch parents, then push the stack view.
     LoadStack,
-    /// Fetch the current branch's forge PR/CI status for the REMOTE section.
-    LoadRemoteStatus,
     /// Load the lanes state, then (re)build the lanes view.
     LoadLanes,
     /// Run a lane operation, toast the result, then reload the lanes view.
@@ -1731,6 +1733,22 @@ pub enum Effect {
     },
     /// Load forge pull requests, then push the forge view.
     LoadForge,
+    ForgeClose {
+        provider: String,
+        host: String,
+        account: String,
+        repository: String,
+        number: u64,
+    },
+    ForgeCreate {
+        provider: String,
+        host: String,
+        account: String,
+        repository: String,
+        title: String,
+        head: String,
+        base: String,
+    },
     /// Open the in-app commit editor (loading the HEAD message when amending).
     OpenCommitEditor {
         amend: bool,
@@ -1778,11 +1796,22 @@ pub enum Leader {
 /// commit and stash diffs are fetched asynchronously and cached.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PreviewKey {
-    File { path: String, staged: bool },
-    Commit { id: String },
-    Stash { index: usize },
+    File {
+        path: String,
+        staged: bool,
+    },
+    Commit {
+        id: String,
+    },
+    Stash {
+        index: usize,
+    },
     /// A window of a file's content around a code-search hit.
-    Snippet { path: String, line: usize },
+    Snippet {
+        path: String,
+        line: usize,
+    },
+    Forge,
 }
 
 /// File diffs with more than this many lines are built off the main thread;
@@ -1799,7 +1828,7 @@ impl PreviewKey {
         match self {
             PreviewKey::Commit { id } => Some(id.clone()),
             PreviewKey::Stash { index } => Some(format!("stash@{{{index}}}")),
-            PreviewKey::File { .. } | PreviewKey::Snippet { .. } => None,
+            PreviewKey::File { .. } | PreviewKey::Snippet { .. } | PreviewKey::Forge => None,
         }
     }
 }
@@ -1891,7 +1920,12 @@ pub struct App {
     /// The current branch's forge PR/CI status, shown as a REMOTE section. None
     /// until loaded or when the forge is unavailable.
     remote_status: Option<RemoteSummary>,
-    /// When the forge status was last fetched, to throttle network calls.
+    forge_snapshot: Option<ForgeSnapshot>,
+    forge_profiles: Vec<(String, Option<String>, Option<String>)>,
+    forge_profile_index: usize,
+    forge_close_armed: Option<(u64, std::time::Instant)>,
+    forge_open_requested: bool,
+    /// When the background forge snapshot was last requested.
     last_remote_fetch: Option<std::time::Instant>,
     /// Last status snapshot, for the adaptive preview pane.
     snapshot: Option<RepoStatus>,
@@ -1927,8 +1961,10 @@ pub struct App {
     /// The last click (in-preview?, row, time), for double-click fold detection.
     last_click: Option<(bool, usize, std::time::Instant)>,
     /// Which regions let the terminal background show through.
-    pub transparency: crate::config::Transparency,
     pub error: Option<String>,
+    pub forge_account: Option<String>,
+    pub forge_host: Option<String>,
+    pub transparency: crate::config::Transparency,
     pub should_quit: bool,
 }
 
@@ -1947,6 +1983,20 @@ impl App {
             Some("true" | "yes" | "on" | "1")
         );
         let gpg_sign = config.commit.gpg_sign || git_wants_sign;
+        let (forge_account, forge_host) = config.forge.context();
+        let mut forge_profiles: Vec<_> = config
+            .forge
+            .profiles
+            .iter()
+            .map(|(name, profile)| (name.clone(), profile.account.clone(), profile.host.clone()))
+            .collect();
+        forge_profiles.sort_by(|left, right| left.0.cmp(&right.0));
+        let forge_profile_index = config
+            .forge
+            .default_profile
+            .as_ref()
+            .and_then(|name| forge_profiles.iter().position(|profile| &profile.0 == name))
+            .unwrap_or(0);
         Self {
             backend,
             views: vec![View {
@@ -1996,8 +2046,13 @@ impl App {
             pending_lane: None,
             pending_lane_path: None,
             pending_cred_reply: None,
+            forge_profiles,
+            forge_profile_index,
             remote_status: None,
+            forge_snapshot: None,
+            forge_close_armed: None,
             last_remote_fetch: None,
+            forge_open_requested: false,
             snapshot: None,
             preview_key: None,
             preview_buf: Buffer::default(),
@@ -2012,6 +2067,8 @@ impl App {
             body_top: 1,
             preview_top: 1,
             last_click: None,
+            forge_account,
+            forge_host,
             transparency: config.ui.transparent,
             error: None,
             should_quit: false,
@@ -2025,11 +2082,6 @@ impl App {
     /// Whether an amend/reword/extend should restack the stacked children after.
     pub fn auto_restack(&self) -> bool {
         self.auto_restack
-    }
-
-    /// The current HEAD summary (branch, upstream, ahead/behind), if loaded.
-    pub fn head(&self) -> Option<&Head> {
-        self.head.as_ref()
     }
 
     /// The short id of the commit under the cursor, if any.
@@ -2053,6 +2105,11 @@ impl App {
     /// hunks), a commit, or a stash. `None` when the row has no previewable
     /// target.
     fn cursor_preview_key(&self) -> Option<PreviewKey> {
+        if self.active_kind() == ViewKind::Status
+            && self.buffer().cursor_id().as_deref() == Some("remote/forge")
+        {
+            return Some(PreviewKey::Forge);
+        }
         // The finder drives the preview from its own selection, not a buffer row.
         if let Some(f) = &self.code_finder {
             let h = f.hits.get(f.selected)?;
@@ -2089,6 +2146,21 @@ impl App {
     /// preview is available. Commit and stash diffs are loaded asynchronously;
     /// see [`sync_preview`](Self::sync_preview).
     pub fn refresh_preview(&mut self, height: usize) -> bool {
+        if matches!(self.cursor_preview_key(), Some(PreviewKey::Forge)) {
+            if self.preview_key != Some(PreviewKey::Forge) {
+                self.preview_buf = Buffer::default();
+                let sections = self
+                    .forge_snapshot
+                    .as_ref()
+                    .map(forge::build_view)
+                    .unwrap_or_else(forge::build_placeholder);
+                self.preview_buf.set_content(sections);
+                self.preview_key = Some(PreviewKey::Forge);
+                self.preview_loading = false;
+            }
+            self.preview_buf.set_height(height);
+            return !self.preview_buf.is_empty();
+        }
         match self.cursor_preview_key() {
             Some(PreviewKey::File { path, staged }) => {
                 self.refresh_file_preview(&path, staged, height)
@@ -2210,6 +2282,7 @@ impl App {
                 self.preview_key = Some(key.clone());
                 vec![Effect::BuildSnippetPreview { key, path, line }]
             }
+            PreviewKey::Forge => Vec::new(),
             _ => {
                 let rev = key.rev().expect("commit/stash keys resolve to a rev");
                 self.set_preview_placeholder();
@@ -2319,11 +2392,9 @@ impl App {
     /// Whether `path` is an untracked file in the last snapshot. Untracked files
     /// have no history, so blame is not meaningful for them.
     fn is_untracked(&self, path: &str) -> bool {
-        self.snapshot.as_ref().is_some_and(|s| {
-            s.entries
-                .iter()
-                .any(|e| e.path == path && e.is_untracked())
-        })
+        self.snapshot
+            .as_ref()
+            .is_some_and(|s| s.entries.iter().any(|e| e.path == path && e.is_untracked()))
     }
 
     fn set_preview_placeholder(&mut self) {
@@ -2382,6 +2453,7 @@ impl App {
             Some(PreviewKey::Snippet { path, line }) => format!("{path}:{line}"),
             Some(PreviewKey::Commit { id }) => id.clone(),
             Some(PreviewKey::Stash { index }) => format!("stash@{{{index}}}"),
+            Some(PreviewKey::Forge) => "FORGE".to_owned(),
             None => String::new(),
         }
     }
@@ -2755,28 +2827,32 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 return vec![effect];
             }
             match app.buffer().target_at_cursor() {
-            Some(Target::Commit { id }) => return vec![Effect::LoadCommit(id)],
-            Some(Target::CodeHit { path, .. }) => return vec![Effect::LoadBlame(path)],
-            // An untracked file has no history to blame; visit it in the editor
-            // (its all-added diff already shows in the preview pane).
-            Some(Target::File { path, .. }) if app.is_untracked(&path) => {
-                return vec![Effect::OpenInEditor { path, line: 1, col: 1 }];
-            }
-            Some(Target::File { path, .. }) => return vec![Effect::LoadBlame(path)],
-            Some(Target::Ref { name, kind }) => {
-                app.pop_view();
-                app.loading = true;
-                let mutation = match kind {
-                    RefTarget::Local => Mutation::CheckoutBranch(name),
-                    RefTarget::Remote | RefTarget::Tag => Mutation::CheckoutDetached(name),
-                };
-                return vec![Effect::Mutate(mutation)];
-            }
-            Some(Target::Worktree { name, path }) => {
-                app.loading = true;
-                return vec![Effect::InspectWorktree { name, path }];
-            }
-            _ => {}
+                Some(Target::Commit { id }) => return vec![Effect::LoadCommit(id)],
+                Some(Target::CodeHit { path, .. }) => return vec![Effect::LoadBlame(path)],
+                // An untracked file has no history to blame; visit it in the editor
+                // (its all-added diff already shows in the preview pane).
+                Some(Target::File { path, .. }) if app.is_untracked(&path) => {
+                    return vec![Effect::OpenInEditor {
+                        path,
+                        line: 1,
+                        col: 1,
+                    }];
+                }
+                Some(Target::File { path, .. }) => return vec![Effect::LoadBlame(path)],
+                Some(Target::Ref { name, kind }) => {
+                    app.pop_view();
+                    app.loading = true;
+                    let mutation = match kind {
+                        RefTarget::Local => Mutation::CheckoutBranch(name),
+                        RefTarget::Remote | RefTarget::Tag => Mutation::CheckoutDetached(name),
+                    };
+                    return vec![Effect::Mutate(mutation)];
+                }
+                Some(Target::Worktree { name, path }) => {
+                    app.loading = true;
+                    return vec![Effect::InspectWorktree { name, path }];
+                }
+                _ => {}
             }
         }
         Msg::Refs => return vec![Effect::LoadRefs],
@@ -2835,10 +2911,6 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }];
         }
         Msg::AutoRestackNote(text) => app.push_toast(ToastKind::Success, text),
-        Msg::RemoteStatusLoaded(summary) => {
-            app.remote_status = summary;
-            rebuild_status(app);
-        }
         Msg::CredentialRequest {
             label,
             masked,
@@ -2903,7 +2975,11 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::LaneStackPrompt => match lane_at_cursor(app) {
             Some(parent) => {
                 app.pending_lane = Some(parent.clone());
-                revision_prompt(app, &format!("New lane stacked on {parent}"), PromptAction::LaneStack)
+                revision_prompt(
+                    app,
+                    &format!("New lane stacked on {parent}"),
+                    PromptAction::LaneStack,
+                )
             }
             None => app.push_toast(ToastKind::Error, "move onto a lane first".into()),
         },
@@ -2962,7 +3038,81 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 });
             }
         }
+        Msg::ForgeProfileNext => {
+            if app.forge_profiles.is_empty() {
+                app.push_toast(
+                    ToastKind::Error,
+                    "no forge profiles are configured".to_owned(),
+                );
+                return vec![];
+            }
+            app.forge_profile_index = (app.forge_profile_index + 1) % app.forge_profiles.len();
+            let (name, account, host) = app.forge_profiles[app.forge_profile_index].clone();
+            app.forge_account = account;
+            app.forge_host = host;
+            app.push_toast(ToastKind::Success, format!("forge profile: {name}"));
+            return vec![Effect::LoadForge];
+        }
+        Msg::ForgeCreate => {
+            if app.forge_snapshot.is_none() {
+                app.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
+                return vec![];
+            }
+            app.prompt = Some(Prompt {
+                label: "Create request (title head base)".to_owned(),
+                input: String::new(),
+                cursor: 0,
+                candidates: Vec::new(),
+                selected: 0,
+                action: PromptAction::ForgeCreate,
+                masked: false,
+            });
+            return vec![];
+        }
         Msg::WorktreeMenu => app.transient = Some(Transient::worktree()),
+        Msg::ForgeClose => {
+            let Some(snapshot) = app.forge_snapshot.as_ref() else {
+                app.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
+                return vec![];
+            };
+            let index = app.buffer().cursor().saturating_sub(1);
+            let Some(request) = snapshot.requests.get(index) else {
+                app.push_toast(
+                    ToastKind::Error,
+                    "move onto a pull request first".to_owned(),
+                );
+                return vec![];
+            };
+            let confirmed = app.forge_close_armed.take().is_some_and(|(number, armed)| {
+                number == request.number && armed.elapsed() <= std::time::Duration::from_secs(10)
+            });
+            if !confirmed {
+                app.forge_close_armed = Some((request.number, std::time::Instant::now()));
+                app.push_toast(
+                    ToastKind::Error,
+                    format!(
+                        "press x again within 10s to close request #{}",
+                        request.number
+                    ),
+                );
+                return vec![];
+            }
+            return vec![Effect::ForgeClose {
+                provider: snapshot.provider.clone(),
+                host: snapshot.host.clone(),
+                account: snapshot.account.clone(),
+                repository: snapshot.repository.clone(),
+                number: request.number,
+            }];
+        }
+        Msg::ForgeMutationDone(Ok(message)) => {
+            app.push_toast(ToastKind::Success, message);
+            return vec![Effect::LoadForge];
+        }
+        Msg::ForgeMutationDone(Err(error)) => {
+            app.push_toast(ToastKind::Error, error);
+            return vec![];
+        }
         Msg::WorktreesLoaded(worktrees) => {
             let mut buffer = Buffer::default();
             buffer.set_content(build_worktrees(&worktrees));
@@ -2973,17 +3123,81 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             let mut buffer = Buffer::default();
             buffer.set_content(rgit_model::build_diff(&title, &files));
             app.push_view(ViewKind::Diff, buffer);
-            // Record the worktree's own root so "open in editor" opens the file
-            // inside that worktree, not the main checkout.
             if let Some(top) = app.views.last_mut() {
                 top.base = Some(base);
             }
         }
-        Msg::Forge => return vec![Effect::LoadForge],
-        Msg::ForgeLoaded(Ok(prs)) => {
+        Msg::Forge => {
+            app.forge_open_requested = true;
+            return vec![Effect::LoadForge];
+        }
+        Msg::ForgeLoaded(Ok(snapshot)) => {
             let mut buffer = Buffer::default();
-            buffer.set_content(forge::build_view(&prs));
-            app.push_view(ViewKind::Forge, buffer);
+            buffer.set_content(forge::build_view(&snapshot));
+            let open_view = app.forge_open_requested;
+            app.forge_open_requested = false;
+            let branch = app.head.as_ref().and_then(|head| head.branch.as_deref());
+            let request = branch.and_then(|branch| {
+                snapshot
+                    .requests
+                    .iter()
+                    .find(|request| request.branch == branch)
+            });
+            app.remote_status = Some(RemoteSummary {
+                pr: request.map(|request| (request.number, request.state.clone())),
+                title: request.map(|request| request.title.clone()),
+                checks: request.and_then(|request| request.checks.clone()),
+            });
+            app.forge_snapshot = Some(snapshot);
+            rebuild_status(app);
+            if open_view {
+                app.push_view(ViewKind::Forge, buffer);
+            } else if app.active_kind() == ViewKind::Forge {
+                let sections =
+                    forge::build_view(app.forge_snapshot.as_ref().expect("forge snapshot"));
+                app.buffer_mut().set_content(sections);
+            }
+        }
+        Msg::ForgeDetails => {
+            let Some(snapshot) = app.forge_snapshot.as_ref() else {
+                app.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
+                return Vec::new();
+            };
+            let index = app.buffer().cursor().saturating_sub(1);
+            let Some(request) = snapshot.requests.get(index) else {
+                app.push_toast(
+                    ToastKind::Error,
+                    "move onto a pull request first".to_owned(),
+                );
+                return Vec::new();
+            };
+            let mut buffer = Buffer::default();
+            buffer.set_content(forge::build_detail(snapshot, request));
+            app.push_view(ViewKind::Review, buffer);
+            return Vec::new();
+        }
+        Msg::ForgeOpen => {
+            let Some(snapshot) = app.forge_snapshot.as_ref() else {
+                app.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
+                return Vec::new();
+            };
+            let index = app.buffer().cursor().saturating_sub(1);
+            let Some(request) = snapshot.requests.get(index) else {
+                app.push_toast(
+                    ToastKind::Error,
+                    "move onto a pull request first".to_owned(),
+                );
+                return Vec::new();
+            };
+            if request.url.is_empty() {
+                app.push_toast(
+                    ToastKind::Error,
+                    "this forge did not provide a request URL".to_owned(),
+                );
+            } else if let Err(error) = open::that_detached(&request.url) {
+                app.push_toast(ToastKind::Error, format!("could not open request: {error}"));
+            }
+            return Vec::new();
         }
         Msg::ForgeLoaded(Err(e)) => app.push_toast(ToastKind::Error, e),
         Msg::Error(e) => {
@@ -3710,6 +3924,27 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
     if value.is_empty() {
         return Vec::new();
     }
+    if let PromptAction::ForgeCreate = prompt.action {
+        let mut parts = value.splitn(3, '|').map(str::trim);
+        let (Some(title), Some(head), Some(base)) = (parts.next(), parts.next(), parts.next())
+        else {
+            app.error = Some("expected: title | head | base".into());
+            return Vec::new();
+        };
+        let Some(snapshot) = app.forge_snapshot.as_ref() else {
+            app.error = Some("forge data is not loaded".into());
+            return Vec::new();
+        };
+        return vec![Effect::ForgeCreate {
+            provider: snapshot.provider.clone(),
+            host: snapshot.host.clone(),
+            account: snapshot.account.clone(),
+            repository: snapshot.repository.clone(),
+            title: title.to_owned(),
+            head: head.to_owned(),
+            base: base.to_owned(),
+        }];
+    }
     // "name url" is split into two arguments for a remote add.
     if let PromptAction::AddRemote = prompt.action {
         let mut parts = value.split_whitespace();
@@ -3837,7 +4072,10 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         }
         PromptAction::LaneCommit => {
             if let Some(lane) = app.pending_lane.take() {
-                return vec![Effect::LaneOp(LaneOp::Commit { lane, message: value })];
+                return vec![Effect::LaneOp(LaneOp::Commit {
+                    lane,
+                    message: value,
+                })];
             }
             return Vec::new();
         }
@@ -3849,12 +4087,16 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         }
         PromptAction::LaneStack => {
             if let Some(parent) = app.pending_lane.take() {
-                return vec![Effect::LaneOp(LaneOp::Stack { name: value, parent })];
+                return vec![Effect::LaneOp(LaneOp::Stack {
+                    name: value,
+                    parent,
+                })];
             }
             return Vec::new();
         }
         PromptAction::PushRemote => {
-            let (force, force_with_lease, set_upstream) = app.pending_push.take().unwrap_or_default();
+            let (force, force_with_lease, set_upstream) =
+                app.pending_push.take().unwrap_or_default();
             return open_op(
                 app,
                 ConsoleOp::Push {
@@ -3871,7 +4113,11 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
                 return Vec::new();
             }
             app.pending_reorder_rev = Some(value);
-            revision_prompt(app, "Move it before which commit", PromptAction::ReorderTarget);
+            revision_prompt(
+                app,
+                "Move it before which commit",
+                PromptAction::ReorderTarget,
+            );
             return Vec::new();
         }
         // Split is two steps: pick the commit, then the paths for the first part.
@@ -3882,7 +4128,11 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
                 value
             };
             app.pending_split_rev = Some(rev);
-            revision_prompt(app, "Paths for the first commit (comma-separated)", PromptAction::SplitPaths);
+            revision_prompt(
+                app,
+                "Paths for the first commit (comma-separated)",
+                PromptAction::SplitPaths,
+            );
             return Vec::new();
         }
         // Reword is a two-step prompt: pick the commit, then its new message.
@@ -3984,7 +4234,8 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         | PromptAction::PushRemote
         | PromptAction::ReorderRev
         | PromptAction::SplitRev
-        | PromptAction::Credential => {
+        | PromptAction::Credential
+        | PromptAction::ForgeCreate => {
             return Vec::new();
         }
         PromptAction::DeleteBranch => Mutation::DeleteBranch(value),
@@ -4147,7 +4398,11 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
             Vec::new()
         }
         ActionKind::Split => {
-            revision_prompt(app, "Split which commit (empty = HEAD)", PromptAction::SplitRev);
+            revision_prompt(
+                app,
+                "Split which commit (empty = HEAD)",
+                PromptAction::SplitRev,
+            );
             Vec::new()
         }
         ActionKind::OpSync => open_op(app, ConsoleOp::Sync),
@@ -4594,14 +4849,12 @@ fn refreshed(app: &mut App, result: RefreshResult) -> Vec<Effect> {
                 app.push_toast(ToastKind::Success, format!("{label} done"));
             }
             let mut effects = app.sync_preview();
-            // Refresh the forge PR/CI status, throttled so frequent worktree
-            // refreshes do not spam the network.
             let stale = app
                 .last_remote_fetch
-                .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(20));
+                .is_none_or(|time| time.elapsed() >= std::time::Duration::from_secs(20));
             if stale {
                 app.last_remote_fetch = Some(std::time::Instant::now());
-                effects.push(Effect::LoadRemoteStatus);
+                effects.push(Effect::LoadForge);
             }
             return effects;
         }
@@ -4617,16 +4870,23 @@ fn rebuild_status(app: &mut App) {
         return;
     };
     let mut sections = build(&status);
-    if let Some(section) = build_remote_section(app.remote_status.as_ref(), app.head.as_ref()) {
+    if let Some(section) = build_remote_section(
+        app.remote_status.as_ref(),
+        app.head.as_ref(),
+        app.forge_snapshot.as_ref(),
+    ) {
         sections.push(section);
     }
     app.status_buffer_mut().set_content(sections);
 }
-
 /// The REMOTE section: per-remote ahead/behind for the current branch, plus its
 /// open PR and CI rollup once loaded. `None` when there is nothing to show (no
 /// remotes and no loaded forge status).
-fn build_remote_section(remote: Option<&RemoteSummary>, head: Option<&Head>) -> Option<Section> {
+fn build_remote_section(
+    remote: Option<&RemoteSummary>,
+    head: Option<&Head>,
+    forge: Option<&ForgeSnapshot>,
+) -> Option<Section> {
     use rgit_model::{NodeKind, Section, Span, Style};
     let mut children: Vec<Section> = Vec::new();
 
@@ -4651,13 +4911,12 @@ fn build_remote_section(remote: Option<&RemoteSummary>, head: Option<&Head>) -> 
         match &remote.pr {
             Some((num, state)) => {
                 spans.push(Span::new(format!("PR #{num} "), Style::Hash));
-                let style = if state.eq_ignore_ascii_case("open")
-                    || state.eq_ignore_ascii_case("opened")
-                {
-                    Style::Added
-                } else {
-                    Style::Dim
-                };
+                let style =
+                    if state.eq_ignore_ascii_case("open") || state.eq_ignore_ascii_case("opened") {
+                        Style::Added
+                    } else {
+                        Style::Dim
+                    };
                 spans.push(Span::new(state.clone(), style));
             }
             None => spans.push(Span::new("no open pull request".to_owned(), Style::Dim)),
@@ -4670,9 +4929,31 @@ fn build_remote_section(remote: Option<&RemoteSummary>, head: Option<&Head>) -> 
             };
             spans.push(Span::new(format!("   {sym} {checks}"), style));
         }
+        if let Some(title) = &remote.title {
+            spans.push(Span::plain(format!("  {title}")));
+        }
         children.push(Section::leaf("remote/pr", NodeKind::Info, spans));
     }
 
+    let forge_spans = if let Some(forge) = forge {
+        vec![Span::new(
+            format!(
+                "{} · {} · account {} (Ctrl-G for details)",
+                forge.provider, forge.host, forge.account
+            ),
+            Style::Dim,
+        )]
+    } else if head.is_some_and(|head| !head.remotes.is_empty()) {
+        vec![Span::new(
+            "forge not loaded · Ctrl-G to load".to_owned(),
+            Style::Dim,
+        )]
+    } else {
+        Vec::new()
+    };
+    if !forge_spans.is_empty() {
+        children.push(Section::leaf("remote/forge", NodeKind::Info, forge_spans));
+    }
     if children.is_empty() {
         return None;
     }
@@ -4744,18 +5025,25 @@ mod tests {
         let total = keys.len();
         keys.sort_unstable();
         keys.dedup();
-        assert_eq!(keys.len(), total, "duplicate action keys in the operations menu");
+        assert_eq!(
+            keys.len(),
+            total,
+            "duplicate action keys in the operations menu"
+        );
     }
 
     #[test]
     fn remote_section_appears_only_when_loaded() {
-        assert!(build_remote_section(None, None).is_none());
+        assert!(build_remote_section(None, None, None).is_none());
         let summary = RemoteSummary {
             pr: Some((7, "open".into())),
+            title: Some("Improve forge".into()),
             checks: Some("passing".into()),
         };
         let mut buffer = Buffer::default();
-        buffer.set_content(vec![build_remote_section(Some(&summary), None).unwrap()]);
+        buffer.set_content(vec![
+            build_remote_section(Some(&summary), None, None).unwrap(),
+        ]);
         let ids: Vec<String> = buffer.rows().map(|r| r.id.clone()).collect();
         assert!(ids.contains(&"remote".to_owned()));
         assert!(ids.contains(&"remote/pr".to_owned()));
@@ -4931,13 +5219,19 @@ mod tests {
             },
         );
         assert_eq!(app.active_kind(), ViewKind::Blame);
-        assert_eq!(app.views.last().unwrap().path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(
+            app.views.last().unwrap().path.as_deref(),
+            Some("src/lib.rs")
+        );
         assert!(app.finder_resume.is_none());
 
         // `q` pops blame and reopens the finder with its query intact.
         update(&mut app, Msg::Quit);
         assert_eq!(app.active_kind(), ViewKind::Status);
-        assert_eq!(app.code_finder.as_ref().map(|f| f.input.as_str()), Some("needle"));
+        assert_eq!(
+            app.code_finder.as_ref().map(|f| f.input.as_str()),
+            Some("needle")
+        );
     }
 
     #[test]
@@ -4947,7 +5241,7 @@ mod tests {
             crate::config::Config::default(),
         );
 
-        // Submitting the editor opens the hook console and asks to run the commit.
+        app.gpg_sign = false;
         app.commit_editor = Some(CommitEditor::new(false, "my message"));
         let fx = update(&mut app, Msg::CommitEditorSubmit);
         assert!(app.commit_editor.is_none());

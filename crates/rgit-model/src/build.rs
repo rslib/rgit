@@ -1,8 +1,9 @@
 use std::sync::OnceLock;
 
 use rgit_git::{
-    BlameLine, CommitDetails, CommitRef, Deco, DiffLine, FileDiff, Head, Hunk, LineOrigin, LogEntry,
-    RefEntry, RefKind, Remote, RepoStatus, StatusCode, StatusEntry, Worktree, group_decorations,
+    BlameLine, CommitDetails, CommitRef, Deco, DiffLine, FileDiff, Head, Hunk, LineOrigin,
+    LogEntry, RefEntry, RefKind, Remote, RepoStatus, StatusCode, StatusEntry, Worktree,
+    group_decorations,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{
@@ -731,7 +732,16 @@ pub fn build_commit(details: &CommitDetails) -> Vec<Section> {
             .hunks
             .iter()
             .enumerate()
-            .map(|(hi, hunk)| hunk_node(&file_id, &file.path, hi, hunk, ext_of(&file.path), HunkCtx::Historical))
+            .map(|(hi, hunk)| {
+                hunk_node(
+                    &file_id,
+                    &file.path,
+                    hi,
+                    hunk,
+                    ext_of(&file.path),
+                    HunkCtx::Historical,
+                )
+            })
             .collect();
         sections.push(Section::branch(
             file_id,
@@ -776,7 +786,16 @@ pub fn build_diff(title: &str, files: &[FileDiff]) -> Vec<Section> {
             .hunks
             .iter()
             .enumerate()
-            .map(|(hi, hunk)| hunk_node(&file_id, &file.path, hi, hunk, ext_of(&file.path), HunkCtx::Historical))
+            .map(|(hi, hunk)| {
+                hunk_node(
+                    &file_id,
+                    &file.path,
+                    hi,
+                    hunk,
+                    ext_of(&file.path),
+                    HunkCtx::Historical,
+                )
+            })
             .collect();
         sections.push(Section::branch(
             file_id,
@@ -852,8 +871,13 @@ fn hunk_node(
             .collect()
     };
 
-    Section::branch(hunk_id, NodeKind::Hunk, hunk_header_spans(&hunk.header), lines)
-        .with_target(target(hunk.new_start))
+    Section::branch(
+        hunk_id,
+        NodeKind::Hunk,
+        hunk_header_spans(&hunk.header),
+        lines,
+    )
+    .with_target(target(hunk.new_start))
 }
 
 fn diff_line_spans(line: &DiffLine) -> Vec<Span> {
@@ -1069,7 +1093,9 @@ pub fn highlight_code(path: &str, line: &str) -> Vec<Span> {
 /// caller only shows a window.
 pub fn highlight_file(path: &str, text: &str) -> Vec<Vec<Span>> {
     let mut h = HighlightLines::new(syntax_for_path(path), syn_theme());
-    text.lines().map(|line| highlighted_spans(&mut h, line)).collect()
+    text.lines()
+        .map(|line| highlighted_spans(&mut h, line))
+        .collect()
 }
 
 /// The old-side start line parsed from a `@@ -old,c +new,c @@` header.
@@ -1458,7 +1484,7 @@ fn hunk_nodes(file_id: &str, path: &str, staged: bool, diff: &FileDiff) -> Vec<S
 
 #[cfg(test)]
 mod hunk_component_tests {
-    use super::{build, build_commit, Target};
+    use super::{Target, build, build_commit};
     use rgit_git::{
         CommitDetails, DiffLine, FileDiff, Head, Hunk, LineOrigin, RepoStatus, StatusCode,
         StatusEntry,
@@ -1567,7 +1593,11 @@ mod diff_line_tests {
         assert_eq!(diff_line_file_line(&hunk, 0), 20, "context = new_start");
         // A removed line has no new-side number, so it resolves to the next
         // new-side line (where the deletion lands in the working file).
-        assert_eq!(diff_line_file_line(&hunk, 1), 21, "removed -> next new line");
+        assert_eq!(
+            diff_line_file_line(&hunk, 1),
+            21,
+            "removed -> next new line"
+        );
         assert_eq!(diff_line_file_line(&hunk, 2), 21, "the added line");
         assert_eq!(diff_line_file_line(&hunk, 3), 22, "context after");
     }
@@ -1647,10 +1677,7 @@ mod graph_tests {
                 head: false,
             },
         ];
-        let joined: String = ref_labels(&refs)
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect();
+        let joined: String = ref_labels(&refs).iter().map(|s| s.text.as_str()).collect();
         assert_eq!(joined, "  feature  origin/main");
     }
 
