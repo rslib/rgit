@@ -5,9 +5,10 @@
 //! missing value is prompted for (our own widgets); with `--no-input` or a non-TTY
 //! (an agent, a pipe, CI) it errors instead, so scripted use stays predictable.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rgit_git::{GitBackend, GitError, LogOptions, OpProgress, ResetMode};
 
 use crate::render;
@@ -28,16 +29,82 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_input: bool,
 
+    /// Print a JSON result envelope.
+    #[arg(long, global = true, conflicts_with_all = ["toon", "human"])]
+    pub json: bool,
+
+    /// Print TOON for agents: no color, spinners, or prompts. The default when
+    /// stdout is not a terminal.
+    #[arg(long, visible_alias = "axi", global = true, conflicts_with = "human")]
+    pub toon: bool,
+
+    /// Force human text output, even when stdout is not a terminal.
+    #[arg(long, alias = "text", global = true)]
+    pub human: bool,
+
+    /// Disable ANSI color even on a terminal.
+    #[arg(long, global = true)]
+    pub no_color: bool,
+
+    /// Extra table columns to print in agent output (comma-separated).
+    #[arg(long, global = true, value_delimiter = ',', value_name = "FIELD,...")]
+    pub fields: Vec<String>,
+
+    /// Print long text (patches, commit bodies) without truncation.
+    #[arg(long, global = true)]
+    pub full: bool,
+
     /// Open the TUI without the side preview pane (single column). Handy when
     /// embedding rgit in a narrow editor split. Overrides `ui.preview`.
     #[arg(long)]
     pub no_preview: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    Text,
+    Porcelain,
+    Json,
+}
+
+impl Cli {
+    pub fn output_mode(&self, stdout_is_terminal: bool) -> OutputMode {
+        if self.json {
+            OutputMode::Json
+        } else if self.toon || !stdout_is_terminal && !self.human {
+            OutputMode::Porcelain
+        } else {
+            OutputMode::Text
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Command {
-    /// Compact working-tree status.
-    Status,
+    /// Compact working-tree status. Agents: add `--toon` for a structured table.
+    /// `--porcelain`, `--short`, `--branch`, and `-z` print git's raw formats,
+    /// exactly as `git status` does, for scripts.
+    Status {
+        /// git's raw script format (`git status --porcelain`), v1 by default.
+        /// Agents should prefer `--toon`.
+        #[arg(
+            long,
+            value_name = "VERSION",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "v1"
+        )]
+        porcelain: Option<String>,
+        /// git's short format (`git status --short`).
+        #[arg(short, long)]
+        short: bool,
+        /// Add branch and tracking info (`git status --branch`).
+        #[arg(short, long)]
+        branch: bool,
+        /// Terminate entries with NUL (`git status -z`).
+        #[arg(short = 'z')]
+        z: bool,
+    },
     /// Recent commits as `sha subject` lines.
     Log {
         /// Maximum number of commits to show (git's -n).
@@ -72,7 +139,7 @@ pub enum Command {
         #[arg(last = true, value_name = "PATH")]
         path: Option<String>,
     },
-    /// Diffstat of the staged changes, or between two revisions.
+    /// Diffstat of unstaged changes (`--cached` for staged), or between two revisions.
     Diff {
         /// Diff FROM..TO; omit both to diff the working tree.
         from: Option<String>,
@@ -223,7 +290,6 @@ pub enum Command {
         #[arg(required = true)]
         paths: Vec<String>,
     },
-    /// Delete local branches already merged into a base (default HEAD).
     /// Prune unreachable objects (git's `prune`). For deleting merged branches,
     /// use `branch prune`.
     Prune {
@@ -533,6 +599,16 @@ pub enum Command {
     },
     /// Run the Model Context Protocol server over stdio.
     Mcp,
+    /// Install session hooks so Claude Code, Codex, and OpenCode start with rgit context.
+    Hooks {
+        #[command(subcommand)]
+        cmd: HooksCmd,
+    },
+    /// Install the rgit Agent Skill for Claude Code, Codex, and other agents.
+    Skills {
+        #[command(subcommand)]
+        cmd: SkillsCmd,
+    },
     /// Semantic code search: build the on-disk vector index or query it.
     Index {
         #[command(subcommand)]
@@ -555,6 +631,66 @@ pub enum Command {
         #[arg(long)]
         clone_base: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum HooksCmd {
+    /// Install or repair the session-start hook (project scope by default).
+    Install {
+        /// Install into the user's home config instead of this project.
+        #[arg(long)]
+        user: bool,
+        /// Which agent app to configure.
+        #[arg(long, value_enum, default_value_t = crate::setup::HookApp::All)]
+        app: crate::setup::HookApp,
+    },
+    /// Show which agent apps have the rgit hook and whether it is current.
+    Status,
+}
+
+#[derive(Subcommand)]
+pub enum SkillsCmd {
+    /// List embedded skills and install targets.
+    List,
+    /// Print the rgit SKILL.md, or its command reference.
+    Show {
+        /// Print references/commands.md instead of SKILL.md.
+        #[arg(long)]
+        reference: bool,
+    },
+    /// Install embedded skills into user or project skill directories.
+    Install {
+        /// Install into this project.
+        #[arg(long)]
+        project: bool,
+        /// Install into the current user's home directory.
+        #[arg(long)]
+        user: bool,
+        /// Which client layout to write.
+        #[arg(long, value_enum, default_value_t = SkillTarget::All)]
+        target: SkillTarget,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum SkillTarget {
+    /// Portable Agent Skills path used by Pi, Codex, and other clients.
+    #[value(alias = "pi", alias = "codex")]
+    Agents,
+    /// Claude Code native skill path.
+    Claude,
+    /// Both portable and Claude Code paths.
+    All,
+}
+
+impl std::fmt::Display for SkillTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SkillTarget::Agents => "agents",
+            SkillTarget::Claude => "claude",
+            SkillTarget::All => "all",
+        })
+    }
 }
 
 #[derive(Subcommand)]
@@ -1057,12 +1193,12 @@ pub(crate) fn repo_targets(
 }
 
 /// A fused search result across (possibly) many repos.
-struct Hit {
-    score: f64,
-    repo: String,
-    path: String,
-    line: usize,
-    tag: &'static str,
+pub(crate) struct Hit {
+    pub score: f64,
+    pub repo: String,
+    pub path: String,
+    pub line: usize,
+    pub tag: &'static str,
 }
 
 /// Hybrid hits for one repo: fuse literal `grep` and semantic ranking with
@@ -1139,12 +1275,13 @@ fn hybrid_hits(backend: &Arc<dyn GitBackend>, repo: &str, query: &str, pool: usi
 /// Hybrid code search over a scope (one repo, or every repo under `root`),
 /// fusing lexical and semantic ranking. Results are rendered `score path:line
 /// [tag]`, prefixed with the repo when the scope spans more than one.
-pub(crate) fn code_search(
+/// Ranked hybrid code-search hits, and whether they span several repos.
+pub(crate) fn code_hits(
     backend: &Arc<dyn GitBackend>,
     root: Option<&str>,
     query: &str,
     limit: usize,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(Vec<Hit>, bool)> {
     let targets = repo_targets(root, backend)?;
     let multi = targets.len() > 1;
     let pool = (limit * 3).max(20);
@@ -1158,6 +1295,16 @@ pub(crate) fn code_search(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     hits.truncate(limit);
+    Ok((hits, multi))
+}
+
+pub(crate) fn code_search(
+    backend: &Arc<dyn GitBackend>,
+    root: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<String> {
+    let (hits, multi) = code_hits(backend, root, query, limit)?;
     if hits.is_empty() {
         return Ok("no matches".to_owned());
     }
@@ -1193,16 +1340,21 @@ fn history_boost(backend: &Arc<dyn GitBackend>) -> std::collections::HashMap<Str
 }
 
 /// Semantic-only search over a scope (one repo, or every repo under `root`).
-pub(crate) fn semantic_search(
+/// A semantic hit as `(score, repo label, hit)`.
+pub(crate) type RepoHit = (f32, String, rgit_index::SearchHit);
+
+/// Semantic hits as `(score, repo, hit)`, best first, and whether they span
+/// several repos. Empty when no target repo has an index.
+pub(crate) fn semantic_hits(
     backend: &Arc<dyn GitBackend>,
     root: Option<&str>,
     query: &str,
     limit: usize,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(Vec<RepoHit>, bool)> {
     let targets = repo_targets(root, backend)?;
     let multi = targets.len() > 1;
     let embedder = rgit_index::Embedder::new().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut hits: Vec<(f32, String, rgit_index::SearchHit)> = Vec::new();
+    let mut hits: Vec<RepoHit> = Vec::new();
     for (label, b) in &targets {
         if let Some(index) = rgit_index::load(&rgit_index::index_path(b.workdir())) {
             let boost = history_boost(b);
@@ -1214,11 +1366,21 @@ pub(crate) fn semantic_search(
             }
         }
     }
+    hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(limit);
+    Ok((hits, multi))
+}
+
+pub(crate) fn semantic_search(
+    backend: &Arc<dyn GitBackend>,
+    root: Option<&str>,
+    query: &str,
+    limit: usize,
+) -> anyhow::Result<String> {
+    let (hits, multi) = semantic_hits(backend, root, query, limit)?;
     if hits.is_empty() {
         return Ok("no index; run `rgit index build` first".to_owned());
     }
-    hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    hits.truncate(limit);
     let mut out = String::new();
     for (score, repo, h) in hits {
         if multi {
@@ -1261,7 +1423,7 @@ pub(crate) fn index_build(
 /// Parse an ISO date (`YYYY-MM-DD`, optionally with `THH:MM:SS` or a space and a
 /// time) into a unix timestamp in UTC. A bare date is midnight UTC. Uses the
 /// days-from-civil algorithm rather than pulling in a date crate.
-fn parse_date(s: &str) -> anyhow::Result<i64> {
+pub(crate) fn parse_date(s: &str) -> anyhow::Result<i64> {
     let err = || anyhow::anyhow!("bad date {s:?}; use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS");
     let (date, time) = match s.split_once(['T', ' ']) {
         Some((d, t)) => (d, Some(t)),
@@ -1288,6 +1450,363 @@ fn parse_date(s: &str) -> anyhow::Result<i64> {
     Ok(secs)
 }
 
+/// One-line identity shared by the home view and the installed skill.
+pub const DESCRIPTION: &str = "Inspect and change the git repository in the current directory";
+
+/// Next-step commands shared by the home view and the installed skill.
+pub const HOME_HELP: [&str; 5] = [
+    "Run `rgit diff --patch` to see unstaged changes",
+    "Run `rgit stage <path>` to stage a file",
+    "Run `rgit commit -m \"<message>\"` to commit staged changes",
+    "Run `rgit log --limit 20` for recent commits",
+    "Run `rgit smartlog` for local branches and stacks",
+];
+
+/// An error with a fix to suggest and its own exit code (2 = usage).
+#[derive(Debug)]
+pub struct CliError {
+    pub message: String,
+    pub help: Option<String>,
+    pub code: i32,
+}
+
+impl CliError {
+    pub fn usage(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(CliError {
+            message: message.into(),
+            help: None,
+            code: 2,
+        })
+    }
+
+    pub fn not_a_repo() -> anyhow::Error {
+        anyhow::Error::new(CliError {
+            message: "no git repository found".to_owned(),
+            help: Some("Run `rgit init` to create one here".to_owned()),
+            code: 1,
+        })
+    }
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliError {}
+
+/// Git spellings rgit names differently: (rgit command path, git tokens, fix).
+pub const GIT_SPELLINGS: &[(&str, &[&str], &str)] = &[
+    (
+        "rgit",
+        &["add"],
+        "use `rgit stage <path>` (or `rgit stage-all`)",
+    ),
+    (
+        "rgit",
+        &["switch"],
+        "use `rgit checkout <branch>` (`-b <new>` to create)",
+    ),
+    (
+        "rgit",
+        &["restore"],
+        "use `rgit discard <path>` (worktree) or `rgit unstage <path>` (index)",
+    ),
+    (
+        "rgit",
+        &["rev-parse", "cat-file", "ls-files", "for-each-ref"],
+        "plumbing is not wrapped; run `rgit git <args>`",
+    ),
+    (
+        "rgit branch",
+        &["-d", "--delete"],
+        "use `rgit branch delete <name>`",
+    ),
+    (
+        "rgit branch",
+        &["-D"],
+        "use `rgit branch delete <name> --force`",
+    ),
+    (
+        "rgit branch",
+        &["-m", "--move"],
+        "use `rgit branch rename <old> <new>`",
+    ),
+    ("rgit stash", &["save"], "use `rgit stash push [<message>]`"),
+    (
+        "rgit stash",
+        &["show"],
+        "use `rgit stash list`, then `rgit git stash show -p <stash>`",
+    ),
+    (
+        "rgit log",
+        &["--graph"],
+        "use `rgit smartlog` for the branch graph",
+    ),
+    (
+        "rgit log",
+        &["-p", "--patch"],
+        "use `rgit show <id> --patch` for one commit's patch",
+    ),
+    (
+        "rgit push",
+        &["-f"],
+        "use `--force-with-lease` (or `--force`)",
+    ),
+];
+
+/// Top-level commands grouped by task, in the order the skill lists them.
+const SKILL_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Inspect",
+        &[
+            "status", "log", "diff", "show", "blame", "refs", "smartlog", "describe",
+        ],
+    ),
+    (
+        "Stage and discard",
+        &[
+            "stage",
+            "unstage",
+            "stage-all",
+            "unstage-all",
+            "discard",
+            "resolve",
+            "rm",
+            "mv",
+            "clean",
+        ],
+    ),
+    (
+        "Commit and rewrite history",
+        &[
+            "commit",
+            "extend",
+            "reword",
+            "uncommit",
+            "squash",
+            "move",
+            "split",
+            "absorb",
+            "cherry-pick",
+            "revert",
+            "reset",
+        ],
+    ),
+    ("Undo", &["undo", "redo", "oplog"]),
+    (
+        "Branches, tags, stashes",
+        &[
+            "branch", "checkout", "merge", "rebase", "tag", "stash", "bisect", "prune",
+        ],
+    ),
+    (
+        "Stacks, lanes, workspaces, worktrees",
+        &[
+            "stack",
+            "next",
+            "prev",
+            "sync",
+            "submit",
+            "lanes",
+            "workspace",
+            "worktree",
+            "flow",
+        ],
+    ),
+    (
+        "Remotes and forge (GitHub/GitLab)",
+        &["fetch", "pull", "push", "remote", "forge"],
+    ),
+    ("Code search", &["index"]),
+    (
+        "Repositories and escape hatch",
+        &["init", "clone", "submodule", "git"],
+    ),
+    (
+        "Agent integration and servers",
+        &["hooks", "skills", "mcp", "serve"],
+    ),
+];
+
+const SKILL_INTRO: &str = r#"---
+name: rgit
+description: Use for any git work in this repository - inspecting changes, committing, rewriting or undoing history, branches and stacks, and GitHub/GitLab PRs.
+---
+
+# rgit
+
+{DESCRIPTION}. Prefer `rgit` over raw `git`. Run `rgit` with no arguments first: it prints the repo's current state and the next useful commands.
+
+If `rgit` is not on PATH, install it with `cargo install --locked --git https://github.com/rslib/rgit rgit-cli`.
+
+## Start here
+
+"#;
+
+const SKILL_RULES: &str = r#"
+## Output
+
+- rgit prints TOON when stdout is not a terminal. If your shell runs commands in a terminal (a PTY), add `--toon` (alias `--axi`) so you still get TOON with no color, spinners, or prompts. `--json` gives the same data as JSON.
+- Use `--toon` or `--axi`, not `--porcelain`. In rgit, as in git, `--porcelain` exists only on `status` and prints git's raw script format, with no counts, hints, or schema.
+- Output ends with `help` lines naming useful next commands; follow them. Lists include counts (`count: 20 of 65 total`) and say explicitly when they are empty.
+- `--fields a,b` adds table columns; an unknown field lists the valid ones. `--full` disables truncation of patches, commit bodies, and long output.
+- Exit codes: 0 success (including no-ops), 1 error, 2 usage error. Errors print `error:` and `help:` on stdout.
+- rgit never prompts in agent mode. Pass every value as a flag or argument.
+
+## Safety
+
+- Almost every change is recorded in the op-log. `rgit undo` restores HEAD and the working tree (including uncommitted work) from before the last operation; `rgit redo` reverses it; `rgit oplog` lists it.
+- Repeating a change whose result already holds is a no-op (exit 0), for example creating an existing branch or deleting a missing tag.
+- Destructive forge operations require `--yes`.
+- For git plumbing rgit does not wrap, use `rgit git <args>`.
+
+## Git spellings
+
+"#;
+
+const SKILL_FOOTER: &str = r#"
+## More commands
+
+rgit also covers history rewriting (reword, squash, split, move, absorb), stacked branches, lanes, copy-on-write workspaces, branching workflows, remotes, GitHub/GitLab repos and PRs, and code search. When a task needs a command not shown above, read [references/commands.md](references/commands.md) for every command with examples, or run `rgit <command> --help`.
+"#;
+
+/// The rgit Agent Skill: the home view's next steps plus the rules an agent
+/// needs up front. The full command list lives in [`skill_reference`] and is
+/// read only on demand.
+pub(crate) fn skill_markdown() -> String {
+    let mut out = SKILL_INTRO.replace("{DESCRIPTION}", DESCRIPTION);
+    for line in HOME_HELP {
+        out.push_str(&format!("- {line}\n"));
+    }
+    out.push_str(SKILL_RULES);
+    for (path, args, hint) in GIT_SPELLINGS {
+        let prefix = format!("git{}", path.trim_start_matches("rgit"));
+        let spelled: Vec<String> = args.iter().map(|a| format!("`{prefix} {a}`")).collect();
+        out.push_str(&format!("- {}: {hint}\n", spelled.join(", ")));
+    }
+    out.push_str(SKILL_FOOTER);
+    out
+}
+
+/// The skill's command reference, generated from the command tree and its
+/// `--help` examples so it lists every command and never drifts from the CLI.
+pub(crate) fn skill_reference() -> String {
+    use clap::CommandFactory;
+    let mut out = String::from(
+        "# rgit command reference\n\nEvery command with what it does and example invocations. Run `rgit <command> --help` for every flag.\n",
+    );
+    let root = Cli::command();
+    for (group, names) in SKILL_GROUPS {
+        out.push_str(&format!("\n## {group}\n\n"));
+        for name in *names {
+            if let Some(cmd) = root.find_subcommand(name) {
+                skill_entry(&mut out, cmd, name, 0);
+            }
+        }
+    }
+    out
+}
+
+fn skill_entry(out: &mut String, cmd: &clap::Command, path: &str, depth: usize) {
+    let about = cmd.get_about().map(|a| a.to_string()).unwrap_or_default();
+    let mut line = format!("{}- `{path}`", "  ".repeat(depth));
+    let about = about.trim_end_matches('.');
+    if !about.is_empty() {
+        line.push_str(&format!(": {about}."));
+    }
+    if let Some(examples) = crate::examples::lookup(path) {
+        let shown: Vec<String> = examples.iter().map(|e| format!("`{e}`")).collect();
+        line.push_str(&format!(" e.g. {}", shown.join(", ")));
+    }
+    out.push_str(&line);
+    out.push('\n');
+    for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
+        skill_entry(out, sub, &format!("{path} {}", sub.get_name()), depth + 1);
+    }
+}
+
+pub fn run_skills(cmd: SkillsCmd) -> anyhow::Result<String> {
+    match cmd {
+        SkillsCmd::List => Ok("rgit\ntargets: agents, claude, all".to_owned()),
+        SkillsCmd::Show { reference } => Ok(if reference {
+            skill_reference()
+        } else {
+            skill_markdown()
+        }
+        .trim_end()
+        .to_owned()),
+        SkillsCmd::Install {
+            project,
+            user,
+            target,
+        } => install_skills(project || !user, user, target),
+    }
+}
+
+fn install_skills(project: bool, user: bool, target: SkillTarget) -> anyhow::Result<String> {
+    let mut installed = Vec::new();
+    if project {
+        install_target(&std::env::current_dir()?, target, &mut installed)?;
+    }
+    if user {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+        install_target(&home, target, &mut installed)?;
+    }
+    Ok(installed.join("\n"))
+}
+
+fn install_target(
+    root: &std::path::Path,
+    target: SkillTarget,
+    out: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    match target {
+        SkillTarget::Agents => write_skill(&root.join(".agents/skills/rgit"), out),
+        SkillTarget::Claude => write_skill(&root.join(".claude/skills/rgit"), out),
+        SkillTarget::All => {
+            write_skill(&root.join(".agents/skills/rgit"), out)?;
+            write_skill(&root.join(".claude/skills/rgit"), out)
+        }
+    }
+}
+
+/// The skill's files, relative to its directory.
+fn skill_files() -> [(&'static str, String); 2] {
+    [
+        ("SKILL.md", skill_markdown()),
+        ("references/commands.md", skill_reference()),
+    ]
+}
+
+fn write_skill(dir: &std::path::Path, out: &mut Vec<String>) -> anyhow::Result<()> {
+    for (name, contents) in skill_files() {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::fs::read_to_string(&path).is_ok_and(|cur| cur == contents) {
+            out.push(format!("unchanged {}", path.display()));
+            continue;
+        }
+        std::fs::write(&path, contents)?;
+        out.push(format!("installed {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Parse a 1-based `START,END` line range (git's -L).
+pub(crate) fn parse_line_range(spec: &str) -> anyhow::Result<(usize, usize)> {
+    let bad = || CliError::usage(format!("-L wants START,END line numbers, got {spec:?}"));
+    let (a, b) = spec.split_once(',').ok_or_else(bad)?;
+    let start: usize = a.trim().parse().map_err(|_| bad())?;
+    let end: usize = b.trim().parse().map_err(|_| bad())?;
+    Ok((start, end))
+}
+
 /// Run a subcommand and return its compact output. When `interactive`, a
 /// missing required argument is prompted for; otherwise it errors. `Mcp` is
 /// handled by the caller (it takes over the process), so it is unreachable here.
@@ -1309,12 +1828,13 @@ pub fn run(
         match value {
             Some(v) => Ok(v),
             None if interactive => pick(),
-            None => anyhow::bail!("{what} required"),
+            None => Err(CliError::usage(format!("{what} required"))),
         }
     };
     Ok(match command {
         Command::Index { action } => index_cmd(backend, action)?,
-        Command::Status => render::status(&backend.status()?),
+        Command::Skills { .. } | Command::Hooks { .. } => unreachable!("handled before dispatch"),
+        Command::Status { .. } => render::status(&backend.status()?),
         Command::Log {
             limit,
             all,
@@ -1379,17 +1899,7 @@ pub fn run(
             let all = backend.blame(&path)?;
             let selected = match lines {
                 Some(spec) => {
-                    let (a, b) = spec
-                        .split_once(',')
-                        .ok_or_else(|| anyhow::anyhow!("-L wants START,END"))?;
-                    let start: usize = a
-                        .trim()
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("bad -L start"))?;
-                    let end: usize = b
-                        .trim()
-                        .parse()
-                        .map_err(|_| anyhow::anyhow!("bad -L end"))?;
+                    let (start, end) = parse_line_range(&spec)?;
                     let lo = start.saturating_sub(1);
                     all.into_iter()
                         .skip(lo)
@@ -1738,7 +2248,7 @@ pub fn run(
                         format!("deleted {}", names.join(", "))
                     }
                 }
-                None => anyhow::bail!("a branch name required"),
+                None => return Err(CliError::usage("a branch name required")),
             },
             Some(BranchCmd::Rename { old, new }) => ok(backend.rename_branch(&old, &new))?,
             Some(BranchCmd::Prune { base }) => {
@@ -1986,4 +2496,44 @@ fn net(
     } else {
         lines.join("\n")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        super::Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn every_command_is_in_a_skill_group() {
+        let grouped: Vec<&str> = super::SKILL_GROUPS
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
+        for cmd in super::Cli::command().get_subcommands() {
+            let name = cmd.get_name();
+            assert!(
+                grouped.iter().filter(|g| **g == name).count() == 1,
+                "{name} must appear in exactly one SKILL_GROUPS entry"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_skill_matches_generated() {
+        assert_eq!(
+            include_str!("../../../skills/rgit/SKILL.md"),
+            super::skill_markdown(),
+            "skills/rgit/SKILL.md is stale; run `rgit --human skills show > skills/rgit/SKILL.md`"
+        );
+        assert_eq!(
+            include_str!("../../../skills/rgit/references/commands.md"),
+            super::skill_reference(),
+            "skills/rgit/references/commands.md is stale; run \
+             `rgit --human skills show --reference > skills/rgit/references/commands.md`"
+        );
+    }
 }

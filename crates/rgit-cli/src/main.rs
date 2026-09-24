@@ -1,31 +1,85 @@
+use std::io::IsTerminal;
 use std::process::exit;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use rgit_git::{Git2Backend, GitBackend};
+use serde_json::Value;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, CliError, Command, HooksCmd, OutputMode};
+use crate::output::Output;
+use crate::toon::{Node, Obj};
 
+mod axi;
 mod cli;
 mod creds;
+mod examples;
 mod forge;
 mod interactive;
 mod lanes;
 mod logging;
 mod mcp;
+mod output;
 mod prompt;
 mod render;
+mod setup;
 mod stack;
+mod toon;
+
+/// How results are printed for this invocation.
+struct Emit {
+    mode: OutputMode,
+    fields: Vec<String>,
+    full: bool,
+    rerun: String,
+}
+
 fn main() -> ! {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag] = args.as_slice()
+        && matches!(flag.as_str(), "-v" | "-V" | "--version")
+    {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        exit(0);
+    }
     logging::init();
-    // The in-process ssh transport falls back to a password prompt when key auth
-    // fails and no ControlMaster socket exists to reuse.
-    rgit_git::set_password_provider(creds::ssh_password);
-    let cli = Cli::parse();
+    let stdout_is_terminal = std::io::stdout().is_terminal();
+    let parsed = examples::apply(Cli::command())
+        .try_get_matches()
+        .and_then(|m| Cli::from_arg_matches(&m));
+    let cli = match parsed {
+        Ok(cli) => cli,
+        Err(e) => usage_exit(e, &args, stdout_is_terminal),
+    };
+    let output_mode = cli.output_mode(stdout_is_terminal);
+    let structured_output = output_mode != OutputMode::Text;
+    let can_prompt = interactive::enabled(cli.no_input || structured_output);
+    if can_prompt {
+        // The in-process ssh transport falls back to a password prompt when key
+        // auth fails and no ControlMaster socket exists to reuse.
+        rgit_git::set_password_provider(creds::ssh_password);
+    } else {
+        // SAFETY: still single-threaded; keeps spawned git from prompting.
+        unsafe { std::env::set_var("GIT_TERMINAL_PROMPT", "0") };
+    }
+    let emit = Emit {
+        mode: output_mode,
+        fields: cli.fields.clone(),
+        full: cli.full,
+        rerun: rerun(&args),
+    };
 
     match cli.command {
         // The MCP server takes over stdio for the process lifetime.
         Some(Command::Mcp) => exit(mcp::serve(discover_or_exit())),
+        Some(Command::Skills { cmd }) => finish(cli::run_skills(cmd), &emit),
+        Some(Command::Hooks { cmd }) => finish(
+            match cmd {
+                HooksCmd::Install { user, app } => setup::install(app, user),
+                HooksCmd::Status => setup::status(),
+            },
+            &emit,
+        ),
         // Repo creation runs before discovery (there is no repo yet); both use
         // libgit2 directly rather than shelling out.
         Some(Command::Init {
@@ -34,10 +88,12 @@ fn main() -> ! {
             bare,
         }) => {
             let path = path.unwrap_or_else(|| ".".to_owned());
-            exit(report_result(
-                rgit_git::init(std::path::Path::new(&path), initial_branch.as_deref(), bare),
-                "ok",
-            ));
+            finish(
+                rgit_git::init(std::path::Path::new(&path), initial_branch.as_deref(), bare)
+                    .map(|()| "ok".to_owned())
+                    .map_err(anyhow::Error::from),
+                &emit,
+            );
         }
         Some(Command::Clone {
             url,
@@ -61,7 +117,12 @@ fn main() -> ! {
                 depth,
                 &|_| {},
             );
-            exit(report_result(result, &format!("cloned into {dir}")));
+            finish(
+                result
+                    .map(|()| format!("cloned into {dir}"))
+                    .map_err(anyhow::Error::from),
+                &emit,
+            );
         }
         // The web viewer takes over the process, like the TUI, so it runs on
         // its own runtime rather than through the one-shot dispatch below.
@@ -73,10 +134,7 @@ fn main() -> ! {
         }) => {
             let addr = match format!("{host}:{port}").parse::<std::net::SocketAddr>() {
                 Ok(a) => a,
-                Err(e) => {
-                    eprintln!("rgit: bad --host/--port ({e})");
-                    exit(1);
-                }
+                Err(e) => die(CliError::usage(format!("bad --host/--port ({e})")), &emit),
             };
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -106,10 +164,7 @@ fn main() -> ! {
             };
             match served {
                 Ok(()) => exit(0),
-                Err(e) => {
-                    eprintln!("rgit: {e}");
-                    exit(1);
-                }
+                Err(e) => die(anyhow::anyhow!("{e}"), &emit),
             }
         }
         // The `git` escape hatch is a transparent passthrough: inherit stdin,
@@ -117,17 +172,54 @@ fn main() -> ! {
         // hash-object --stdin, apply) and interactive ones behave exactly like
         // git, and exit with git's own status.
         Some(Command::Git { args }) => {
-            let backend = discover_or_exit();
-            let status = std::process::Command::new("git")
+            let backend = match discover_or_init(false) {
+                Ok(backend) => backend,
+                Err(error) => die(error, &emit),
+            };
+            let mut git = std::process::Command::new("git");
+            git.args(&args).current_dir(backend.workdir());
+            if emit.mode == OutputMode::Text {
+                match git.status() {
+                    Ok(s) => exit(s.code().unwrap_or(if s.success() { 0 } else { 1 })),
+                    Err(e) => die(anyhow::anyhow!("could not run git: {e}"), &emit),
+                }
+            }
+            match git.output() {
+                Ok(out) if out.status.success() => finish(
+                    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_owned()),
+                    &emit,
+                ),
+                Ok(out) => die(
+                    rgit_git::GitError::Cli(String::from_utf8_lossy(&out.stderr).into_owned())
+                        .into(),
+                    &emit,
+                ),
+                Err(e) => die(anyhow::anyhow!("could not run git: {e}"), &emit),
+            }
+        }
+        // git's own status formats are for scripts: print them raw in every mode.
+        Some(Command::Status {
+            porcelain,
+            short,
+            branch,
+            z,
+        }) if porcelain.is_some() || short || branch || z => {
+            let backend = match discover_or_init(false) {
+                Ok(backend) => backend,
+                Err(error) => die(error, &emit),
+            };
+            let mut args = vec!["status".to_owned()];
+            args.extend(porcelain.map(|v| format!("--porcelain={v}")));
+            args.extend(short.then(|| "--short".to_owned()));
+            args.extend(branch.then(|| "--branch".to_owned()));
+            args.extend(z.then(|| "-z".to_owned()));
+            match std::process::Command::new("git")
                 .args(&args)
                 .current_dir(backend.workdir())
-                .status();
-            match status {
-                Ok(s) => exit(s.code().unwrap_or(if s.success() { 0 } else { 1 })),
-                Err(e) => {
-                    eprintln!("rgit: could not run git: {e}");
-                    exit(1);
-                }
+                .status()
+            {
+                Ok(s) => exit(s.code().unwrap_or(1)),
+                Err(e) => die(anyhow::anyhow!("could not run git: {e}"), &emit),
             }
         }
         // Every other subcommand runs one operation and prints compact output.
@@ -136,40 +228,53 @@ fn main() -> ! {
             account,
             host,
             cmd,
-        }) => match forge::run(
-            cmd,
-            forge::ForgeContext {
-                profile,
-                provider: None,
-                account,
-                host,
-            },
-        ) {
-            Ok(output) => {
-                println!("{output}");
-                exit(0);
+        }) => {
+            let mut base = String::from("rgit forge");
+            for (flag, value) in [
+                ("--profile", &profile),
+                ("--account", &account),
+                ("--host", &host),
+            ] {
+                if let Some(v) = value {
+                    base.push_str(&format!(" {flag} {v}"));
+                }
             }
-            Err(error) => {
-                eprintln!("rgit: {error}");
-                exit(1);
-            }
-        },
+            let hints = forge_hints(&cmd, &base);
+            finish(
+                forge::run(
+                    cmd,
+                    forge::ForgeContext {
+                        profile,
+                        provider: None,
+                        account,
+                        host,
+                    },
+                )
+                .map(|text| {
+                    let mut out = forge_output(text);
+                    out.help.extend(hints);
+                    out
+                }),
+                &emit,
+            )
+        }
         Some(command) => {
             // Color and prompts only on a real terminal.
-            render::set_color(std::io::IsTerminal::is_terminal(&std::io::stdout()));
-            let backend = discover_or_exit();
-            let interactive = interactive::enabled(cli.no_input);
-            match cli::run(&backend, command, interactive) {
-                Ok(out) => {
-                    println!("{out}");
-                    exit(0);
-                }
-                Err(e) => {
-                    eprintln!("rgit: {e}");
-                    exit(1);
-                }
-            }
+            render::set_color(
+                output_mode == OutputMode::Text && !cli.no_color && stdout_is_terminal,
+            );
+            let backend = match discover_or_init(can_prompt) {
+                Ok(backend) => backend,
+                Err(error) => die(error, &emit),
+            };
+            let result = if structured_output {
+                axi::run(&backend, command, can_prompt)
+            } else {
+                cli::run(&backend, command, can_prompt).map(Output::from)
+            };
+            finish(result, &emit)
         }
+        None if structured_output => finish(Ok(home()), &emit),
         // No subcommand: launch the TUI.
         None => {
             tracing::info!(version = env!("CARGO_PKG_VERSION"), "rgit starting");
@@ -185,13 +290,13 @@ fn main() -> ! {
             };
             // Exit rather than drop the runtime: crossterm's EventStream parks a
             // blocking stdin read that a graceful shutdown would wait on forever.
-            exit(runtime.block_on(run_tui(cli.no_preview)));
+            exit(runtime.block_on(run_tui(cli.no_preview, can_prompt)));
         }
     }
 }
 
-async fn run_tui(no_preview: bool) -> i32 {
-    match rgit_tui::run(discover_or_exit(), no_preview).await {
+async fn run_tui(no_preview: bool, can_prompt: bool) -> i32 {
+    match rgit_tui::run(discover_or_init_or_exit(can_prompt), no_preview).await {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("rgit: {e}");
@@ -200,18 +305,378 @@ async fn run_tui(no_preview: bool) -> i32 {
     }
 }
 
-/// Print `ok_msg` and exit 0 on success, or the error to stderr and exit 1.
-fn report_result(result: Result<(), rgit_git::GitError>, ok_msg: &str) -> i32 {
-    match result {
-        Ok(()) => {
-            println!("{ok_msg}");
-            0
+fn finish(result: anyhow::Result<impl Into<Output>>, emit: &Emit) -> ! {
+    let output = match result {
+        Ok(output) => output.into(),
+        Err(error) => die(error, emit),
+    };
+    if emit.mode == OutputMode::Text {
+        println!("{}", output.text);
+        exit(0);
+    }
+    let mut value = match output.finalize(&emit.fields, emit.full, &emit.rerun) {
+        Ok(value) => value,
+        Err(error) => die(error, emit),
+    };
+    if emit.mode == OutputMode::Json {
+        value.push(("ok".to_owned(), Node::Bool(true)));
+        println!("{}", json(value));
+    } else {
+        println!("{}", toon::encode(&value));
+    }
+    exit(0);
+}
+
+fn die(error: anyhow::Error, emit: &Emit) -> ! {
+    let (message, help, code) = translate(&error);
+    fail(message, help, code, emit.mode)
+}
+
+/// An error's message, fix-it hints, and exit code, with library noise removed.
+fn translate(error: &anyhow::Error) -> (String, Vec<String>, i32) {
+    use rgit_git::GitError;
+    if let Some(e) = error.downcast_ref::<CliError>() {
+        return (e.message.clone(), e.help.iter().cloned().collect(), e.code);
+    }
+    let Some(e) = error.downcast_ref::<GitError>() else {
+        return (error.to_string(), Vec::new(), 1);
+    };
+    let help = match e {
+        GitError::NotARepository(_) => "Run `rgit init` to create one here",
+        GitError::NothingToCommit => "Run `rgit stage <path>` to stage changes first",
+        GitError::NotFastForward => "Run `rgit pull --rebase` to integrate upstream commits",
+        GitError::PushRejected => "Run `rgit pull --rebase`, then `rgit push`",
+        GitError::DetachedHead => "Run `rgit checkout <branch>` to get on a branch",
+        GitError::HunkNotFound { .. } => "Run `rgit diff --patch` to see the current hunks",
+        GitError::Conflict(_) => "Run `rgit status` to see the conflicted files",
+        _ => "",
+    };
+    let message = match e {
+        GitError::Git(g) => g.message().to_owned(),
+        GitError::Cli(text) => text
+            .lines()
+            .map(|l| {
+                l.trim_start_matches("fatal: ")
+                    .trim_start_matches("error: ")
+            })
+            .filter(|l| !l.trim().is_empty() && !l.starts_with("hint: "))
+            .collect::<Vec<_>>()
+            .join("; "),
+        other => other.to_string(),
+    };
+    let help = if help.is_empty() {
+        Vec::new()
+    } else {
+        vec![help.to_owned()]
+    };
+    (message, help, 1)
+}
+
+/// Report an error on stdout in the output format, or on stderr for humans.
+fn fail(message: String, help: Vec<String>, code: i32, mode: OutputMode) -> ! {
+    match mode {
+        OutputMode::Text => {
+            eprintln!("rgit: {message}");
+            for h in &help {
+                eprintln!("hint: {h}");
+            }
         }
-        Err(e) => {
-            eprintln!("rgit: {e}");
-            1
+        OutputMode::Json => {
+            println!(
+                "{}",
+                json(obj! { "ok" => false, "error" => message, "help" => help })
+            );
+        }
+        OutputMode::Porcelain => {
+            let mut value = obj! { "error" => sanitize(message) };
+            if !help.is_empty() {
+                value.push(("help".to_owned(), help.into()));
+            }
+            println!("{}", toon::encode(&value));
         }
     }
+    exit(code);
+}
+
+/// The current invocation as a copy-pasteable command, for `--full` hints.
+fn rerun(args: &[String]) -> String {
+    let mut out = String::from("rgit");
+    for a in args {
+        out.push(' ');
+        if a.is_empty() || a.contains(|c: char| c.is_whitespace() || "\"'`$".contains(c)) {
+            out.push_str(&format!("'{}'", a.replace('\'', "'\\''")));
+        } else {
+            out.push_str(a);
+        }
+    }
+    out
+}
+
+/// Forge list calls request one page of this size.
+const FORGE_PAGE: usize = 100;
+
+fn objects(items: Vec<Value>) -> Vec<Obj> {
+    items
+        .into_iter()
+        .filter_map(|v| match Node::from(v) {
+            Node::Obj(fields) => Some(fields),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Next steps after a forge command, keeping the profile/account/host flags.
+fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> Vec<String> {
+    use cli::{ForgeBranchCmd, ForgeCmd, PrCmd};
+    match cmd {
+        ForgeCmd::Pr {
+            cmd: PrCmd::List { .. },
+        } => vec![
+            format!(
+                "Run `{base} pr create --title \"<title>\" --head <branch> --base <branch>` to open one"
+            ),
+            format!("Run `{base} pr close <number> --yes` to close one"),
+        ],
+        ForgeCmd::Pr {
+            cmd: PrCmd::Create { .. },
+        } => {
+            vec![format!("Run `{base} pr list` to see open pull requests")]
+        }
+        ForgeCmd::Branch {
+            cmd: ForgeBranchCmd::List { .. },
+        } => vec![format!(
+            "Run `{base} branch delete <branch> --yes` to delete one"
+        )],
+        ForgeCmd::Auth { .. } => vec![format!("Run `{base} login <provider>` to add an account")],
+        _ => Vec::new(),
+    }
+}
+
+/// Forge results arrive as JSON; tables get a small default schema.
+fn forge_output(text: String) -> Output {
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(mut map)) => {
+            map.retain(|_, v| !v.is_null());
+            match map.remove("accounts") {
+                Some(Value::Array(items)) => {
+                    let rows = objects(items);
+                    Output::from_json(text, map).list(
+                        "accounts",
+                        rows,
+                        &["provider", "account", "authenticated", "source"],
+                        "0 forge accounts",
+                    )
+                }
+                Some(other) => {
+                    map.insert("accounts".to_owned(), other);
+                    Output::from_json(text, map)
+                }
+                None => Output::from_json(text, map),
+            }
+        }
+        Ok(Value::Array(items)) => {
+            let rows = objects(items);
+            let is_pr = rows
+                .first()
+                .is_some_and(|r| r.iter().any(|(k, _)| k == "number"));
+            let (key, defaults, empty): (&str, &'static [&'static str], &str) = if is_pr {
+                (
+                    "pull_requests",
+                    &["number", "title", "state", "head_branch"],
+                    "0 open pull requests",
+                )
+            } else {
+                (
+                    "branches",
+                    &["name", "sha", "protected"],
+                    "0 remote branches",
+                )
+            };
+            let mut out = Output::new(text);
+            if rows.len() >= FORGE_PAGE {
+                out = out.with(
+                    "count",
+                    format!(
+                        "{} shown; the forge returns at most {FORGE_PAGE} per call",
+                        rows.len()
+                    ),
+                );
+            }
+            out.list(key, rows, defaults, empty)
+        }
+        _ => Output::message(text),
+    }
+}
+
+/// Report a clap parse error. Humans get clap's own message; agents get the
+/// error, clap's tips, and the valid flags or subcommands at the failing level.
+fn usage_exit(e: clap::Error, args: &[String], stdout_is_terminal: bool) -> ! {
+    use clap::error::ErrorKind;
+    let has = |flags: &[&str]| args.iter().any(|a| flags.contains(&a.as_str()));
+    let mode = if has(&["--json"]) {
+        OutputMode::Json
+    } else if has(&["--toon", "--axi"]) || !stdout_is_terminal && !has(&["--human", "--text"]) {
+        OutputMode::Porcelain
+    } else {
+        OutputMode::Text
+    };
+    if mode == OutputMode::Text
+        || matches!(
+            e.kind(),
+            ErrorKind::DisplayHelp
+                | ErrorKind::DisplayVersion
+                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        )
+    {
+        e.exit();
+    }
+
+    let rendered = e.render().to_string();
+    let mut rendered_lines = rendered.lines();
+    let message = rendered_lines
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches("error: ")
+        .to_owned();
+    let mut help: Vec<String> = rendered_lines
+        .filter_map(|l| l.trim().strip_prefix("tip: "))
+        .filter(|tip| !tip.starts_with("to pass "))
+        .map(str::to_owned)
+        .collect();
+
+    let offending = e.context().find_map(|(kind, value)| match (kind, value) {
+        (
+            clap::error::ContextKind::InvalidArg | clap::error::ContextKind::InvalidSubcommand,
+            clap::error::ContextValue::String(s),
+        ) => Some(s.split_whitespace().next().unwrap_or(s).to_owned()),
+        _ => None,
+    });
+
+    let mut cmd = Cli::command();
+    let mut path = String::from("rgit");
+    for arg in args.iter().filter(|a| !a.starts_with('-')) {
+        match cmd.find_subcommand(arg) {
+            Some(sub) => {
+                path.push(' ');
+                path.push_str(sub.get_name());
+                cmd = sub.clone();
+            }
+            None => break,
+        }
+    }
+    if let Some(arg) = &offending
+        && let Some(hint) = renamed(&path, arg)
+    {
+        help.insert(0, hint.to_owned());
+    }
+    let wants_subcommand = matches!(
+        e.kind(),
+        ErrorKind::InvalidSubcommand | ErrorKind::MissingSubcommand
+    );
+    if wants_subcommand && cmd.has_subcommands() {
+        let subs: Vec<&str> = cmd
+            .get_subcommands()
+            .filter(|c| !c.is_hide_set())
+            .map(|c| c.get_name())
+            .collect();
+        help.push(format!(
+            "valid subcommands for `{path}`: {}",
+            subs.join(", ")
+        ));
+    } else {
+        let flags: Vec<String> = cmd
+            .get_arguments()
+            .filter(|a| !a.is_hide_set() && !a.is_global_set())
+            .filter_map(|a| a.get_long())
+            .filter(|l| !matches!(*l, "help" | "version"))
+            .map(|l| format!("--{l}"))
+            .collect();
+        if !flags.is_empty() {
+            help.push(format!("valid flags for `{path}`: {}", flags.join(", ")));
+        }
+    }
+    fail(message, help, 2, mode)
+}
+
+/// A targeted hint for git spellings that rgit names differently.
+fn renamed(path: &str, arg: &str) -> Option<&'static str> {
+    cli::GIT_SPELLINGS
+        .iter()
+        .find(|(p, args, _)| *p == path && args.contains(&arg))
+        .map(|(_, _, hint)| *hint)
+}
+
+/// The home view loads into every agent session, so its file list stays short.
+const HOME_FILES: usize = 10;
+/// How many op-log entries the home view shows, newest first.
+const HOME_OPS: usize = 3;
+
+/// The no-argument view for agents: who rgit is, then the repo's live state.
+fn home() -> Output {
+    let bin = std::env::current_exe()
+        .map(|p| tilde(&p))
+        .unwrap_or_default();
+    let mut data = obj! { "bin" => bin, "description" => cli::DESCRIPTION };
+    match discover_or_init(false).and_then(|b| Ok(b.status()?)) {
+        Ok(status) => {
+            let mut out = axi::run_status(&status);
+            let mut help = if out.help.is_empty() {
+                cli::HOME_HELP.iter().map(|h| h.to_string()).collect()
+            } else {
+                out.help.clone()
+            };
+            if let Some(Node::List(files)) = out.get_mut("files")
+                && files.len() > HOME_FILES
+            {
+                let total = files.len();
+                files.truncate(HOME_FILES);
+                out.set("count", format!("{HOME_FILES} of {total} changed files"));
+                help.insert(0, format!("Run `rgit status` to see all {total} files"));
+            }
+            data.append(&mut out.data);
+            if let Ok(ops) = discover_or_init(false).and_then(|b| Ok(b.oplog()?))
+                && !ops.is_empty()
+            {
+                let recent: Vec<Node> = ops
+                    .iter()
+                    .take(HOME_OPS)
+                    .map(|o| {
+                        Node::Obj(obj! { "id" => o.short_id, "label" => o.label, "when" => o.when })
+                    })
+                    .collect();
+                data.push(("recent".to_owned(), Node::List(recent)));
+            }
+            out.data = data;
+            out.help = help;
+            out
+        }
+        Err(error) => {
+            let (message, help, _) = translate(&error);
+            data.push(("status".to_owned(), sanitize(message).into()));
+            let mut out = Output::new(String::new());
+            out.data = data;
+            out.help = help;
+            out
+        }
+    }
+}
+
+fn tilde(path: &std::path::Path) -> String {
+    let shown = path.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && shown.starts_with(&home) => {
+            format!("~{}", &shown[home.len()..])
+        }
+        _ => shown,
+    }
+}
+
+fn json(value: Obj) -> String {
+    serde_json::to_string(&Node::Obj(value)).unwrap_or_default()
+}
+
+fn sanitize(s: impl AsRef<str>) -> String {
+    s.as_ref().replace('\u{2191}', "^")
 }
 
 fn discover_or_exit() -> Arc<dyn GitBackend> {
@@ -224,5 +689,34 @@ fn discover_or_exit() -> Arc<dyn GitBackend> {
             eprintln!("rgit: {e}");
             exit(1);
         }
+    }
+}
+
+fn discover_or_init_or_exit(can_prompt: bool) -> Arc<dyn GitBackend> {
+    match discover_or_init(can_prompt) {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("rgit: {e}");
+            exit(1);
+        }
+    }
+}
+
+fn discover_or_init(can_prompt: bool) -> anyhow::Result<Arc<dyn GitBackend>> {
+    let cwd = std::env::current_dir()?;
+    match Git2Backend::discover(&cwd) {
+        Ok(backend) => Ok(Arc::new(backend)),
+        Err(rgit_git::GitError::NotARepository(_)) if can_prompt => {
+            if !crate::interactive::confirm(&format!(
+                "No git repository found. Initialize one in {}?",
+                cwd.display()
+            ))? {
+                anyhow::bail!("cancelled");
+            }
+            rgit_git::init(&cwd, None, false)?;
+            Ok(Arc::new(Git2Backend::discover(&cwd)?))
+        }
+        Err(rgit_git::GitError::NotARepository(_)) => Err(CliError::not_a_repo()),
+        Err(e) => Err(e.into()),
     }
 }

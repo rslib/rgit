@@ -158,32 +158,39 @@ pub fn init(backend: &dyn GitBackend, preset: &str) -> Result<String, GitError> 
 }
 
 /// Show the active workflow and its policy.
-pub fn status(backend: &dyn GitBackend) -> Result<String, GitError> {
+/// The active workflow as ordered `(field, value)` pairs.
+pub fn describe(backend: &dyn GitBackend) -> Result<Vec<(&'static str, String)>, GitError> {
     let p = active(backend)?;
-    let mut out = vec![
-        format!("workflow: {}", p.preset),
-        format!("main: {}", p.main),
-    ];
+    let mut out = vec![("workflow", p.preset.to_owned()), ("main", p.main.clone())];
     if let Some(dev) = &p.integration {
-        out.push(format!("integration: {dev}"));
+        out.push(("integration", dev.clone()));
     }
-    out.push(format!(
-        "feature: {}<name> from {}",
-        p.feature_prefix, p.feature_base
+    out.push((
+        "feature",
+        format!("{}<name> from {}", p.feature_prefix, p.feature_base),
     ));
-    out.push(format!(
-        "release: {}<version> from {}",
-        p.release_prefix, p.release_base
+    out.push((
+        "release",
+        format!("{}<version> from {}", p.release_prefix, p.release_base),
     ));
-    out.push(format!(
-        "finish: {}",
+    out.push((
+        "finish",
         if p.pull_request {
             "push + pull request"
         } else {
             "local merge"
         }
+        .to_owned(),
     ));
-    Ok(out.join("\n"))
+    Ok(out)
+}
+
+pub fn status(backend: &dyn GitBackend) -> Result<String, GitError> {
+    Ok(describe(backend)?
+        .into_iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// Start a feature branch per the active workflow.

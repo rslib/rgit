@@ -79,31 +79,49 @@ pub fn create(backend: &dyn GitBackend, name: &str) -> Result<String, GitError> 
 }
 
 /// List the repo's workspaces with their current branch.
-pub fn list(backend: &dyn GitBackend) -> Result<String, GitError> {
-    let base = workspaces_dir(backend.workdir());
-    let Ok(entries) = std::fs::read_dir(&base) else {
-        return Ok("no workspaces".to_owned());
+/// One workspace: its name, checked-out branch (`?` if unreadable), and path.
+pub struct WorkspaceInfo {
+    pub name: String,
+    pub branch: String,
+    pub path: PathBuf,
+}
+
+/// This repo's workspaces, sorted by name.
+pub fn entries(backend: &dyn GitBackend) -> Vec<WorkspaceInfo> {
+    let Ok(dir) = std::fs::read_dir(workspaces_dir(backend.workdir())) else {
+        return Vec::new();
     };
-    let mut lines = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let branch = Git2Backend::discover(&path)
-            .ok()
-            .and_then(|b| b.status().ok())
-            .and_then(|s| s.head.branch)
-            .unwrap_or_else(|| "?".to_owned());
-        lines.push(format!("{name}  [{branch}]  {}", path.display()));
+    let mut out: Vec<WorkspaceInfo> = dir
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .map(|path| WorkspaceInfo {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            branch: Git2Backend::discover(&path)
+                .ok()
+                .and_then(|b| b.status().ok())
+                .and_then(|s| s.head.branch)
+                .unwrap_or_else(|| "?".to_owned()),
+            path,
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+pub fn list(backend: &dyn GitBackend) -> Result<String, GitError> {
+    let list = entries(backend);
+    if list.is_empty() {
+        return Ok("no workspaces".to_owned());
     }
-    if lines.is_empty() {
-        Ok("no workspaces".to_owned())
-    } else {
-        lines.sort();
-        Ok(lines.join("\n"))
-    }
+    Ok(list
+        .iter()
+        .map(|w| format!("{}  [{}]  {}", w.name, w.branch, w.path.display()))
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// Remove a workspace directory.

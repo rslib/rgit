@@ -34,7 +34,14 @@ fn git_out(dir: &Path, args: &[&str]) -> String {
 
 /// Run `rgit <args>` in `dir`. Returns (stdout, stderr, success).
 fn rgit(dir: &Path, args: &[&str]) -> (String, String, bool) {
-    let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rgit"));
+    if !args
+        .iter()
+        .any(|a| matches!(*a, "--json" | "--toon" | "--axi"))
+    {
+        command.arg("--human");
+    }
+    let out = command
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
@@ -384,6 +391,106 @@ fn prune_is_object_prune_branch_prune_is_separate() {
 }
 
 #[test]
+fn skills_install_project_writes_portable_and_claude() {
+    let dir = std::env::temp_dir().join(format!("rgit-skills-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (out, err, ok) = rgit(&dir, &["skills", "install", "--project"]);
+    assert!(ok, "skills install failed: {err}");
+    assert!(out.contains(".agents/skills/rgit/SKILL.md"));
+    assert!(out.contains(".claude/skills/rgit/SKILL.md"));
+
+    let agents = std::fs::read_to_string(dir.join(".agents/skills/rgit/SKILL.md")).unwrap();
+    let claude = std::fs::read_to_string(dir.join(".claude/skills/rgit/SKILL.md")).unwrap();
+    assert!(agents.contains("name: rgit"));
+    assert_eq!(agents, claude);
+
+    let (out, err, ok) = rgit(&dir, &["skills", "install", "--project"]);
+    assert!(ok, "skills reinstall failed: {err}");
+    assert!(
+        !out.contains("installed"),
+        "reinstall must be a no-op: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn json_wraps_cli_output() {
+    let dir = repo("json");
+    commit(&dir, "f", "x\n", "init");
+
+    let (out, err, ok) = rgit(&dir, &["--json", "status"]);
+    assert!(ok, "json status failed: {err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["ok"], true);
+    assert!(value["files"].to_string().contains("clean"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn porcelain_status_refuses_auto_init_without_prompt() {
+    let dir = std::env::temp_dir().join(format!("rgit-auto-init-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (out, err, ok) = rgit(&dir, &["--toon", "status"]);
+    assert!(!ok, "porcelain status should fail outside a repo: {err}");
+    assert!(out.starts_with("error: no git repository found\n"));
+    assert!(out.contains("Run `rgit init`"));
+    assert!(!dir.join(".git").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn axi_alias_prints_toon() {
+    let dir = repo("axi");
+    commit(&dir, "f", "x\n", "init");
+
+    let (out, err, ok) = rgit(&dir, &["--axi", "status"]);
+    assert!(ok, "axi status failed: {err}");
+    assert!(out.starts_with("branch: "));
+    assert!(out.contains("clean"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn default_non_tty_prints_toon_envelope() {
+    let dir = repo("default-axi");
+    commit(&dir, "f", "x\n", "init");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .arg("status")
+        .current_dir(&dir)
+        .env("RGIT_OPLOG", "0")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("branch: "));
+    assert!(stdout.contains("clean"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn toon_flag_prints_toon() {
+    let dir = repo("toon");
+    commit(&dir, "f", "x\n", "init");
+
+    let (out, err, ok) = rgit(&dir, &["--toon", "status"]);
+    assert!(ok, "toon status failed: {err}");
+    assert!(out.starts_with("branch: "));
+    assert!(out.contains("clean"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn init_uses_default_branch_config() {
     let dir = std::env::temp_dir().join(format!("rgit-default-branch-{}", std::process::id()));
     let cfg = dir.with_extension("gitconfig");
@@ -407,4 +514,295 @@ fn init_uses_default_branch_config() {
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_file(&cfg);
+}
+
+#[test]
+fn porcelain_unknown_flag_is_usage_error_on_stdout() {
+    let dir = repo("unknown-flag");
+    commit(&dir, "f", "x\n", "init");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(["diff", "--stat2"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("error: "), "{stdout}");
+    assert!(stdout.contains("valid flags for `rgit diff`"), "{stdout}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn porcelain_missing_arg_exits_2() {
+    let dir = repo("missing-arg");
+    commit(&dir, "f", "x\n", "init");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "branch", "delete"]);
+    assert!(!ok);
+    assert!(out.starts_with("error: a branch name required"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn no_args_non_tty_prints_home_view() {
+    let dir = repo("home");
+    commit(&dir, "f", "x\n", "init");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .current_dir(&dir)
+        .env("RGIT_OPLOG", "0")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("bin: "), "{stdout}");
+    assert!(stdout.contains("description: "));
+    assert!(stdout.contains("clean"));
+    assert!(stdout.contains("help["));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn short_version_prints_bare_version() {
+    let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .arg("-v")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+#[test]
+fn porcelain_list_has_schema_count_and_fields() {
+    let dir = repo("schema");
+    commit(&dir, "f", "x\n", "one");
+    commit(&dir, "f", "y\n", "two");
+    commit(&dir, "f", "z\n", "three");
+
+    let (out, err, ok) = rgit(&dir, &["--toon", "log", "--limit", "2"]);
+    assert!(ok, "log failed: {err}");
+    assert!(out.contains("count: 2 of 3 total"), "{out}");
+    assert!(out.contains("commits[2]{id,summary,author,when}:"), "{out}");
+    assert!(out.contains("rgit log --limit 3"), "{out}");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "log", "--fields", "oid"]);
+    assert!(ok);
+    assert!(out.contains("{id,summary,author,when,oid}"), "{out}");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "log", "--fields", "nope"]);
+    assert!(!ok);
+    assert!(out.starts_with("error: unknown field nope"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn porcelain_empty_list_is_explicit() {
+    let dir = repo("empty-list");
+    commit(&dir, "f", "x\n", "init");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "tag"]);
+    assert!(ok);
+    assert!(out.starts_with("tags: 0 tags"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn porcelain_mutations_are_idempotent() {
+    let dir = repo("idempotent");
+    commit(&dir, "f", "x\n", "init");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "branch", "create", "topic"]);
+    assert!(ok, "{out}");
+    let (out, _, ok) = rgit(&dir, &["--toon", "branch", "create", "topic"]);
+    assert!(ok && out.contains("already exists (no-op)"), "{out}");
+    let (out, _, ok) = rgit(&dir, &["--toon", "branch", "delete", "gone"]);
+    assert!(ok && out.contains("does not exist (no-op)"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn porcelain_truncates_long_body_with_full_hint() {
+    let dir = repo("truncate");
+    let body = "b".repeat(3000);
+    commit(&dir, "f", "x\n", &format!("subject\n\n{body}"));
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "show", "HEAD"]);
+    assert!(ok);
+    assert!(out.contains("(truncated, 3000 chars total)"), "{out}");
+    assert!(out.contains("rgit --full --toon show HEAD"), "{out}");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "show", "HEAD", "--full"]);
+    assert!(ok);
+    assert!(!out.contains("truncated"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn porcelain_renamed_git_spellings_get_targeted_hints() {
+    let dir = repo("renamed");
+    commit(&dir, "f", "x\n", "init");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "add", "f"]);
+    assert!(!ok);
+    assert!(out.contains("`rgit stage <path>`"), "{out}");
+    let (out, _, ok) = rgit(&dir, &["--toon", "branch", "-D", "x"]);
+    assert!(!ok);
+    assert!(out.contains("`rgit branch delete <name> --force`"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn porcelain_mutations_say_what_they_did() {
+    let dir = repo("say-done");
+    commit(&dir, "f", "x\n", "init");
+    write(&dir, "f", "y\n");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "stage", "f"]);
+    assert!(ok);
+    assert!(out.starts_with("result: staged f"), "{out}");
+    let branch = git_out(&dir, &["symbolic-ref", "--short", "HEAD"]);
+    let (out, _, ok) = rgit(&dir, &["--toon", "checkout", branch.trim()]);
+    assert!(ok);
+    assert!(out.contains("(no-op)"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn porcelain_long_plain_output_is_capped() {
+    let dir = repo("cap");
+    for i in 0..250 {
+        write(&dir, &format!("f{i}"), "x\n");
+    }
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-qm", "many"]);
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "git", "ls-files"]);
+    assert!(ok);
+    assert!(out.contains("count: 200 of 250 lines"), "{out}");
+    assert!(
+        out.contains("rgit --full --toon git ls-files` to see all 250 lines"),
+        "{out}"
+    );
+    let (out, _, ok) = rgit(&dir, &["--toon", "--full", "git", "ls-files"]);
+    assert!(ok);
+    assert!(out.starts_with("lines[250]"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn porcelain_columns_keep_schema_order() {
+    let dir = repo("order");
+    commit(&dir, "f", "x\n", "init");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "log", "--fields", "unpushed,oid"]);
+    assert!(ok);
+    assert!(
+        out.contains("commits[1]{id,summary,author,when,oid,unpushed}:"),
+        "{out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn porcelain_lanes_off_is_an_explicit_empty_state() {
+    let dir = repo("lanes-off");
+    commit(&dir, "f", "x\n", "init");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "lanes"]);
+    assert!(ok, "{out}");
+    assert!(out.starts_with("lanes: 0 lanes"), "{out}");
+    assert!(out.contains("rgit lanes init"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn version_fast_path_is_near_process_floor() {
+    let best = |cmd: &mut dyn FnMut() -> std::process::Output| {
+        (0..5)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                assert!(cmd().status.success());
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    let floor = best(&mut || Command::new("true").output().unwrap());
+    let version = best(&mut || {
+        Command::new(env!("CARGO_BIN_EXE_rgit"))
+            .arg("--version")
+            .output()
+            .unwrap()
+    });
+    assert!(
+        version < floor + std::time::Duration::from_millis(50),
+        "--version took {version:?}, process floor {floor:?}"
+    );
+}
+
+#[test]
+fn status_porcelain_matches_git_in_every_mode() {
+    let dir = repo("status-porcelain");
+    commit(&dir, "f", "x\n", "init");
+    write(&dir, "f", "y\n");
+    write(&dir, "new", "n\n");
+
+    let want = git_out(&dir, &["status", "--porcelain"]);
+    for mode in ["--human", "--toon", "--json"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+            .args([mode, "status", "--porcelain"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "mode {mode}");
+    }
+    let short = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(["status", "-sb"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&short.stdout),
+        git_out(&dir, &["status", "-sb"])
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn status_shows_rename_source_and_staged_untrack() {
+    let dir = repo("status-rename");
+    commit(&dir, "a", "x\n", "init");
+    write(&dir, "d", "d\n");
+    git(&dir, &["add", "d"]);
+    git(&dir, &["commit", "-qm", "add d"]);
+    git(&dir, &["mv", "a", "a2"]);
+    git(&dir, &["rm", "-q", "--cached", "d"]);
+
+    let (out, err, ok) = rgit(&dir, &["status"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("a -> a2"), "{out}");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "status"]);
+    assert!(ok);
+    assert!(out.contains("\n  d,D,?"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -592,7 +592,13 @@ fn destructive<F>(yes: bool, object: &str, operation: F) -> Result<String>
 where
     F: FnOnce() -> Result<String>,
 {
-    ensure!(yes, "refusing to delete {object} without --yes");
+    if !yes {
+        return Err(anyhow::Error::new(crate::cli::CliError {
+            message: format!("refusing to delete {object} without --yes"),
+            help: Some("Re-run the same command with --yes to confirm".to_owned()),
+            code: 2,
+        }));
+    }
     operation()
 }
 fn print_json<T: Serialize>(value: T) -> Result<String, ForgeError> {
