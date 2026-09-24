@@ -212,10 +212,10 @@ impl Registry {
     /// tree walk, too heavy to recompute on every index load).
     fn card(&self, name: &str) -> view::RepoCard {
         const TTL: Duration = Duration::from_secs(60);
-        if let Some((at, card)) = self.cards.lock().expect("cards").get(name) {
-            if at.elapsed() < TTL {
-                return card.clone();
-            }
+        if let Some((at, card)) = self.cards.lock().expect("cards").get(name)
+            && at.elapsed() < TTL
+        {
+            return card.clone();
         }
         let card = match self.resolve(name) {
             Ok(b) => repo_card(b.as_ref(), name),
@@ -605,15 +605,15 @@ fn global_search_page(reg: &Registry, q: &HashMap<String, String>) -> Result<Mar
             if total >= MAX_TOTAL {
                 break;
             }
-            if let Ok(b) = reg.resolve(&name) {
-                if let Ok(mut ms) = b.grep_query(&gq) {
-                    if ms.is_empty() {
-                        continue;
-                    }
-                    ms.truncate(MAX_TOTAL - total);
-                    total += ms.len();
-                    groups.push((name, ms));
+            if let Ok(b) = reg.resolve(&name)
+                && let Ok(mut ms) = b.grep_query(&gq)
+            {
+                if ms.is_empty() {
+                    continue;
                 }
+                ms.truncate(MAX_TOTAL - total);
+                total += ms.len();
+                groups.push((name, ms));
             }
         }
     }
@@ -689,21 +689,20 @@ fn global_semantic_page(reg: &Registry, q: &HashMap<String, String>) -> Result<M
     if !query.is_empty() {
         let embedder = embedder()?;
         for name in reg.list() {
-            if let Ok(b) = reg.resolve(&name) {
-                if let Some(index) = rgit_index::load(&rgit_index::index_path(b.workdir())) {
-                    let boost = history_boost(b.as_ref());
-                    if let Ok(hits) = rgit_index::search_boosted(
-                        &index,
-                        embedder,
-                        query,
-                        SEMANTIC_LIMIT,
-                        &boost,
-                        HISTORY_ALPHA,
-                    ) {
-                        if !hits.is_empty() {
-                            groups.push((name, hits));
-                        }
-                    }
+            if let Ok(b) = reg.resolve(&name)
+                && let Some(index) = rgit_index::load(&rgit_index::index_path(b.workdir()))
+            {
+                let boost = history_boost(b.as_ref());
+                if let Ok(hits) = rgit_index::search_boosted(
+                    &index,
+                    embedder,
+                    query,
+                    SEMANTIC_LIMIT,
+                    &boost,
+                    HISTORY_ALPHA,
+                ) && !hits.is_empty()
+                {
+                    groups.push((name, hits));
                 }
             }
         }

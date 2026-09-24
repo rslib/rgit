@@ -7,7 +7,7 @@ version = "0.0.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/rayandrew/rgit"
-rust-version = "1.85"
+rust-version = "1.96"
 
 [workspace.dependencies]
 rgit-forge = { path = "crates/rgit-forge" }

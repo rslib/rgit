@@ -370,12 +370,12 @@ pub fn build_with(
             .into_owned();
 
         // Unchanged file: reuse its records verbatim.
-        if let Some((prev_oid, recs)) = prev_by_path.get(rel.as_str()) {
-            if *prev_oid == oid {
-                reused += recs.len();
-                records.extend(recs.iter().map(|r| (*r).clone()));
-                continue;
-            }
+        if let Some((prev_oid, recs)) = prev_by_path.get(rel.as_str())
+            && *prev_oid == oid
+        {
+            reused += recs.len();
+            records.extend(recs.iter().map(|r| (*r).clone()));
+            continue;
         }
 
         let Ok(text) = String::from_utf8(bytes) else {

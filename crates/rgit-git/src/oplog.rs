@@ -162,10 +162,10 @@ fn restore(repo: &Repository, commit: &Commit, meta: &Meta) -> Result<(), GitErr
         let recorded: std::collections::HashSet<&str> =
             meta.branches.iter().map(|(n, _)| n.as_str()).collect();
         for (name, _) in branch_refs(repo) {
-            if !recorded.contains(name.as_str()) {
-                if let Ok(mut r) = repo.find_reference(&name) {
-                    let _ = r.delete();
-                }
+            if !recorded.contains(name.as_str())
+                && let Ok(mut r) = repo.find_reference(&name)
+            {
+                let _ = r.delete();
             }
         }
     }
@@ -340,10 +340,10 @@ impl Meta {
                 head_oid = Oid::from_str(v.trim()).unwrap_or(Oid::ZERO_SHA1);
             } else if let Some(v) = line.strip_prefix("branch: ") {
                 let mut parts = v.trim().splitn(2, ' ');
-                if let (Some(name), Some(oid)) = (parts.next(), parts.next()) {
-                    if let Ok(oid) = Oid::from_str(oid) {
-                        branches.push((name.to_owned(), oid));
-                    }
+                if let (Some(name), Some(oid)) = (parts.next(), parts.next())
+                    && let Ok(oid) = Oid::from_str(oid)
+                {
+                    branches.push((name.to_owned(), oid));
                 }
             }
         }

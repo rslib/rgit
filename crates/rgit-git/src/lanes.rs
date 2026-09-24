@@ -835,26 +835,26 @@ fn parse(message: &str) -> LanesState {
                 });
             }
         } else if let Some(v) = line.strip_prefix("parent: ") {
-            if let Some((lane, parent)) = v.trim().split_once(' ') {
-                if let Some(l) = lanes.iter_mut().find(|l| l.name == lane) {
-                    l.parent = Some(parent.to_owned());
-                }
+            if let Some((lane, parent)) = v.trim().split_once(' ')
+                && let Some(l) = lanes.iter_mut().find(|l| l.name == lane)
+            {
+                l.parent = Some(parent.to_owned());
             }
         } else if let Some(v) = line.strip_prefix("path: ") {
-            if let Some((lane, path)) = v.split_once(' ') {
-                if let Some(l) = lanes.iter_mut().find(|l| l.name == lane) {
-                    l.paths.push(path.to_owned());
-                }
+            if let Some((lane, path)) = v.split_once(' ')
+                && let Some(l) = lanes.iter_mut().find(|l| l.name == lane)
+            {
+                l.paths.push(path.to_owned());
             }
         } else if let Some(v) = line.strip_prefix("hunk: ") {
             let mut it = v.splitn(3, ' ');
-            if let (Some(lane), Some(anchor), Some(path)) = (it.next(), it.next(), it.next()) {
-                if let Some(l) = lanes.iter_mut().find(|l| l.name == lane) {
-                    l.hunks.push(HunkRef {
-                        path: path.to_owned(),
-                        anchor: anchor.to_owned(),
-                    });
-                }
+            if let (Some(lane), Some(anchor), Some(path)) = (it.next(), it.next(), it.next())
+                && let Some(l) = lanes.iter_mut().find(|l| l.name == lane)
+            {
+                l.hunks.push(HunkRef {
+                    path: path.to_owned(),
+                    anchor: anchor.to_owned(),
+                });
             }
         }
     }

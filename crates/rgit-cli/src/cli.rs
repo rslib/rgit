@@ -1041,10 +1041,10 @@ pub(crate) fn repo_targets(
             let mut out: Vec<(String, Arc<dyn GitBackend>)> = Vec::new();
             for entry in std::fs::read_dir(dir)?.flatten() {
                 let p = entry.path();
-                if p.is_dir() {
-                    if let Ok(b) = rgit_git::Git2Backend::discover(&p) {
-                        out.push((repo_label(&p), Arc::new(b)));
-                    }
+                if p.is_dir()
+                    && let Ok(b) = rgit_git::Git2Backend::discover(&p)
+                {
+                    out.push((repo_label(&p), Arc::new(b)));
                 }
             }
             out.sort_by(|a, b| a.0.cmp(&b.0));

@@ -275,10 +275,10 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 fn expand_home(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = home::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = home::home_dir()
+    {
+        return home.join(rest);
     }
     PathBuf::from(path)
 }
@@ -617,22 +617,21 @@ async fn authenticate(
     identities: &[PathBuf],
 ) -> Result<(), String> {
     // 1. ssh-agent: offer every identity it holds.
-    if let Ok(mut agent) = russh::keys::agent::client::AgentClient::connect_env().await {
-        if let Ok(ids) = agent.request_identities().await {
-            for id in ids {
-                let russh::keys::agent::AgentIdentity::PublicKey { key, .. } = &id else {
-                    continue; // certificate identities: skip
-                };
-                let pubkey = key.clone();
-                let hash_alg = pubkey.algorithm().is_rsa().then_some(HashAlg::Sha256);
-                if let Ok(r) = session
-                    .authenticate_publickey_with(user, pubkey, hash_alg, &mut agent)
-                    .await
-                {
-                    if r.success() {
-                        return Ok(());
-                    }
-                }
+    if let Ok(mut agent) = russh::keys::agent::client::AgentClient::connect_env().await
+        && let Ok(ids) = agent.request_identities().await
+    {
+        for id in ids {
+            let russh::keys::agent::AgentIdentity::PublicKey { key, .. } = &id else {
+                continue; // certificate identities: skip
+            };
+            let pubkey = key.clone();
+            let hash_alg = pubkey.algorithm().is_rsa().then_some(HashAlg::Sha256);
+            if let Ok(r) = session
+                .authenticate_publickey_with(user, pubkey, hash_alg, &mut agent)
+                .await
+                && r.success()
+            {
+                return Ok(());
             }
         }
     }
@@ -651,10 +650,10 @@ async fn authenticate(
         };
         // Sha256 is kept only for RSA keys; ignored otherwise.
         let keyh = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
-        if let Ok(r) = session.authenticate_publickey(user, keyh).await {
-            if r.success() {
-                return Ok(());
-            }
+        if let Ok(r) = session.authenticate_publickey(user, keyh).await
+            && r.success()
+        {
+            return Ok(());
         }
     }
 
@@ -664,10 +663,10 @@ async fn authenticate(
             let Some(password) = ask(&format!("{user}'s password: ")) else {
                 break;
             };
-            if let Ok(r) = session.authenticate_password(user, &password).await {
-                if r.success() {
-                    return Ok(());
-                }
+            if let Ok(r) = session.authenticate_password(user, &password).await
+                && r.success()
+            {
+                return Ok(());
             }
         }
     }

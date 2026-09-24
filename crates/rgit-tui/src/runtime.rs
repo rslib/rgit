@@ -478,10 +478,8 @@ async fn run_msg(
                 tokio::task::spawn_blocking(move || {
                     let status = (|| -> Result<RepoStatus, GitError> {
                         apply_mutation(&*backend, &mutation)?;
-                        if restack_after {
-                            if let Some(note) = auto_restack_note(&*backend)? {
-                                let _ = tx.send(Msg::AutoRestackNote(note));
-                            }
+                        if restack_after && let Some(note) = auto_restack_note(&*backend)? {
+                            let _ = tx.send(Msg::AutoRestackNote(note));
                         }
                         backend.status()
                     })();
@@ -776,12 +774,12 @@ async fn run_msg(
                 tokio::task::spawn_blocking(move || {
                     // Opening the lanes view enables lanes on first use, so it
                     // works from the TUI without dropping to `rgit lanes init`.
-                    if !backend.lanes_active() {
-                        if let Err(e) = backend.lanes_init() {
-                            let _ = msg_tx
-                                .send(Msg::LaneNotice(format!("could not enable lanes: {e}")));
-                            return;
-                        }
+                    if !backend.lanes_active()
+                        && let Err(e) = backend.lanes_init()
+                    {
+                        let _ =
+                            msg_tx.send(Msg::LaneNotice(format!("could not enable lanes: {e}")));
+                        return;
                     }
                     match backend.lanes_state() {
                         Ok(state) => {
@@ -802,10 +800,11 @@ async fn run_msg(
                     // After committing a lane, move any child lanes onto its new
                     // tip. lane_restack works in the odb, so it is safe with the
                     // dirty worktree lanes keep (unlike the checkout-based restack).
-                    if auto_restack && matches!(op, LaneOp::Commit { .. }) {
-                        if let Ok(Some(note)) = backend.lane_restack().map(|o| restack_note(&o)) {
-                            let _ = msg_tx.send(Msg::LaneNotice(note));
-                        }
+                    if auto_restack
+                        && matches!(op, LaneOp::Commit { .. })
+                        && let Ok(Some(note)) = backend.lane_restack().map(|o| restack_note(&o))
+                    {
+                        let _ = msg_tx.send(Msg::LaneNotice(note));
                     }
                     if let Ok(state) = backend.lanes_state() {
                         let _ = msg_tx.send(Msg::LanesLoaded(state));
@@ -1389,10 +1388,8 @@ async fn commit_flow(
         let status = (|| -> Result<RepoStatus, GitError> {
             if amend {
                 backend.amend(&message)?;
-                if auto_restack {
-                    if let Some(note) = auto_restack_note(&*backend)? {
-                        let _ = tx.send(Msg::AutoRestackNote(note));
-                    }
+                if auto_restack && let Some(note) = auto_restack_note(&*backend)? {
+                    let _ = tx.send(Msg::AutoRestackNote(note));
                 }
             } else {
                 backend.commit(&message)?;

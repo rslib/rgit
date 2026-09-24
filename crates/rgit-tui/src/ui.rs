@@ -1221,10 +1221,10 @@ fn render_row_cells<'a>(row: &Row<'a>, hl: Hl, width: u16) -> Line<'a> {
         }
     }
     let caret_past_end = matches!(hl.caret, Some(c) if c >= len);
-    if let Some(c) = hl.caret {
-        if c < len {
-            cells[c].1 = cells[c].1.add_modifier(Modifier::REVERSED);
-        }
+    if let Some(c) = hl.caret
+        && c < len
+    {
+        cells[c].1 = cells[c].1.add_modifier(Modifier::REVERSED);
     }
 
     // Coalesce equal-styled runs back into spans to keep the line compact.

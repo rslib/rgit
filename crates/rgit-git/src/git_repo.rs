@@ -256,10 +256,10 @@ impl GitBackend for Git2Backend {
             {
                 continue;
             }
-            if let Some(path) = &opts.path {
-                if !commit_touched_path(&repo, &commit, path) {
-                    continue;
-                }
+            if let Some(path) = &opts.path
+                && !commit_touched_path(&repo, &commit, path)
+            {
+                continue;
             }
             let author = commit.author();
             let author_name = author.name().unwrap_or("?").to_owned();
@@ -839,11 +839,11 @@ impl GitBackend for Git2Backend {
         let tree = repo.revparse_single(rev)?.peel_to_commit()?.tree()?;
         let mut out = Vec::new();
         tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-            if entry.kind() == Some(git2::ObjectType::Blob) {
-                if let Ok(name) = entry.name() {
-                    // `root` is the containing dir with a trailing slash, or empty.
-                    out.push(format!("{root}{name}"));
-                }
+            if entry.kind() == Some(git2::ObjectType::Blob)
+                && let Ok(name) = entry.name()
+            {
+                // `root` is the containing dir with a trailing slash, or empty.
+                out.push(format!("{root}{name}"));
             }
             git2::TreeWalkResult::Ok
         })?;
@@ -899,10 +899,10 @@ impl GitBackend for Git2Backend {
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .into_owned();
-                if let Some(needle) = &path_filter {
-                    if !rel.to_lowercase().contains(needle.as_str()) {
-                        return None;
-                    }
+                if let Some(needle) = &path_filter
+                    && !rel.to_lowercase().contains(needle.as_str())
+                {
+                    return None;
                 }
                 if !q.exts.is_empty() {
                     let ext = rel
@@ -2459,14 +2459,14 @@ impl GitBackend for Git2Backend {
         let repo = self.repo.lock().expect("repo mutex");
         // core.hooksPath wins (relative to the working directory); otherwise the
         // repository's own hooks directory.
-        if let Ok(cfg) = repo.config() {
-            if let Ok(p) = cfg.get_path("core.hooksPath") {
-                return if p.is_absolute() {
-                    p
-                } else {
-                    self.workdir.join(p)
-                };
-            }
+        if let Ok(cfg) = repo.config()
+            && let Ok(p) = cfg.get_path("core.hooksPath")
+        {
+            return if p.is_absolute() {
+                p
+            } else {
+                self.workdir.join(p)
+            };
         }
         repo.path().join("hooks")
     }
@@ -2618,14 +2618,13 @@ impl GitBackend for Git2Backend {
             let target = branch_ref.clone();
             callbacks.push_negotiation(move |updates| {
                 for update in updates {
-                    if update.dst_refname().ok() == Some(target.as_str()) {
-                        if let Some(lease) = lease {
-                            if update.src() != lease {
-                                return Err(git2::Error::from_str(
-                                    "stale info: the remote branch moved; force-with-lease aborted",
-                                ));
-                            }
-                        }
+                    if update.dst_refname().ok() == Some(target.as_str())
+                        && let Some(lease) = lease
+                        && update.src() != lease
+                    {
+                        return Err(git2::Error::from_str(
+                            "stale info: the remote branch moved; force-with-lease aborted",
+                        ));
                     }
                 }
                 Ok(())
@@ -2921,10 +2920,10 @@ fn remote_callbacks<'a>(
             // First the git credential helper (keychain, cache, ...).
             if !helper_tried {
                 helper_tried = true;
-                if let Ok(config) = git2::Config::open_default() {
-                    if let Ok(c) = Cred::credential_helper(&config, url, username) {
-                        return Ok(c);
-                    }
+                if let Ok(config) = git2::Config::open_default()
+                    && let Ok(c) = Cred::credential_helper(&config, url, username)
+                {
+                    return Ok(c);
                 }
             }
             // Then prompt the user, if a prompt is installed.
@@ -3064,21 +3063,19 @@ fn commit_report(repo: &Repository) -> Vec<String> {
     let mut out = vec![head_line];
 
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-    if let Ok(tree) = commit.tree() {
-        if let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) {
-            if let Ok(stats) = diff.stats() {
-                let plural =
-                    |n: usize, s: &str| format!("{n} {s}{}", if n == 1 { "" } else { "s" });
-                let mut line = format!(" {} changed", plural(stats.files_changed(), "file"));
-                if stats.insertions() > 0 {
-                    line += &format!(", {}(+)", plural(stats.insertions(), "insertion"));
-                }
-                if stats.deletions() > 0 {
-                    line += &format!(", {}(-)", plural(stats.deletions(), "deletion"));
-                }
-                out.push(line);
-            }
+    if let Ok(tree) = commit.tree()
+        && let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+        && let Ok(stats) = diff.stats()
+    {
+        let plural = |n: usize, s: &str| format!("{n} {s}{}", if n == 1 { "" } else { "s" });
+        let mut line = format!(" {} changed", plural(stats.files_changed(), "file"));
+        if stats.insertions() > 0 {
+            line += &format!(", {}(+)", plural(stats.insertions(), "insertion"));
         }
+        if stats.deletions() > 0 {
+            line += &format!(", {}(-)", plural(stats.deletions(), "deletion"));
+        }
+        out.push(line);
     }
     out
 }
@@ -3356,22 +3353,19 @@ fn run_rebase(
 /// The commit the smartlog treats as the trunk: HEAD's upstream if it has one,
 /// else the first existing local `main`/`master`/`develop`/`trunk`.
 fn detect_trunk(repo: &Repository) -> Option<git2::Oid> {
-    if let Ok(head) = repo.head() {
-        if let Ok(name) = head.shorthand() {
-            if let Ok(local) = repo.find_branch(name, BranchType::Local) {
-                if let Ok(up) = local.upstream() {
-                    if let Some(oid) = up.get().target() {
-                        return Some(oid);
-                    }
-                }
-            }
-        }
+    if let Ok(head) = repo.head()
+        && let Ok(name) = head.shorthand()
+        && let Ok(local) = repo.find_branch(name, BranchType::Local)
+        && let Ok(up) = local.upstream()
+        && let Some(oid) = up.get().target()
+    {
+        return Some(oid);
     }
     for name in ["main", "master", "develop", "trunk"] {
-        if let Ok(branch) = repo.find_branch(name, BranchType::Local) {
-            if let Some(oid) = branch.get().target() {
-                return Some(oid);
-            }
+        if let Ok(branch) = repo.find_branch(name, BranchType::Local)
+            && let Some(oid) = branch.get().target()
+        {
+            return Some(oid);
         }
     }
     None
@@ -3569,28 +3563,27 @@ fn fill_upstream(repo: &Repository, branch: &str, head: &mut Head) {
             head.upstream = Some(name.to_owned());
             configured = true;
         }
-        if let (Some(local_oid), Some(up_oid)) = (local.get().target(), upstream.get().target()) {
-            if let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, up_oid) {
-                head.ahead = ahead;
-                head.behind = behind;
-            }
+        if let (Some(local_oid), Some(up_oid)) = (local.get().target(), upstream.get().target())
+            && let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, up_oid)
+        {
+            head.ahead = ahead;
+            head.behind = behind;
         }
     }
     fill_remotes(repo, &local, branch, head);
     // No tracking configured, but the branch exists on a remote by name: treat
     // that as the effective upstream so "published" state and the REMOTE overview
     // agree. Prefer origin (the usual push target), else the first such remote.
-    if !configured {
-        if let Some((name, ahead, behind)) = head
+    if !configured
+        && let Some((name, ahead, behind)) = head
             .remotes
             .iter()
             .find(|(n, _, _)| n.starts_with("origin/"))
             .or_else(|| head.remotes.first())
-        {
-            head.upstream = Some(name.clone());
-            head.ahead = *ahead;
-            head.behind = *behind;
-        }
+    {
+        head.upstream = Some(name.clone());
+        head.ahead = *ahead;
+        head.behind = *behind;
     }
 }
 
@@ -3608,12 +3601,11 @@ fn fill_remotes(repo: &Repository, local: &git2::Branch, branch: &str, head: &mu
             continue;
         };
         let tracking = format!("{remote}/{branch}");
-        if let Ok(rb) = repo.find_branch(&tracking, BranchType::Remote) {
-            if let Some(roid) = rb.get().target() {
-                if let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, roid) {
-                    head.remotes.push((tracking, ahead, behind));
-                }
-            }
+        if let Ok(rb) = repo.find_branch(&tracking, BranchType::Remote)
+            && let Some(roid) = rb.get().target()
+            && let Ok((ahead, behind)) = repo.graph_ahead_behind(local_oid, roid)
+        {
+            head.remotes.push((tracking, ahead, behind));
         }
     }
 }
@@ -3845,10 +3837,10 @@ fn unpushed_oids(repo: &Repository) -> std::collections::HashSet<git2::Oid> {
     let mut remote_tips = Vec::new();
     if let Ok(refs) = repo.references() {
         for r in refs.flatten() {
-            if r.is_remote() {
-                if let Some(oid) = r.target() {
-                    remote_tips.push(oid);
-                }
+            if r.is_remote()
+                && let Some(oid) = r.target()
+            {
+                remote_tips.push(oid);
             }
         }
     }

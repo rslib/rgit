@@ -2224,10 +2224,10 @@ impl App {
         if self.preview_focus {
             self.preview_followed_hunk = None; // re-follow when focus returns
         } else if hunk_start != self.preview_followed_hunk {
-            if let Some(header) = hunk_start.and_then(|ns| self.hunk_header(path, staged, ns)) {
-                if let Some(idx) = self.preview_buf.search(&header, 0, true) {
-                    self.preview_buf.set_cursor(idx);
-                }
+            if let Some(header) = hunk_start.and_then(|ns| self.hunk_header(path, staged, ns))
+                && let Some(idx) = self.preview_buf.search(&header, 0, true)
+            {
+                self.preview_buf.set_cursor(idx);
             }
             self.preview_followed_hunk = hunk_start;
         }
@@ -2726,34 +2726,34 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::CodeFinderSubmit => {
-            if let Some(f) = app.code_finder.take() {
-                if let Some(h) = f.hits.get(f.selected) {
-                    let path = h.path.clone();
-                    // Keep the finder aside so `q` from the blame view resumes it.
-                    app.finder_resume = Some(f);
-                    return vec![Effect::LoadBlame(path)];
-                }
+            if let Some(f) = app.code_finder.take()
+                && let Some(h) = f.hits.get(f.selected)
+            {
+                let path = h.path.clone();
+                // Keep the finder aside so `q` from the blame view resumes it.
+                app.finder_resume = Some(f);
+                return vec![Effect::LoadBlame(path)];
             }
         }
         Msg::CodeFinderEditor => {
-            if let Some(f) = app.code_finder.take() {
-                if let Some(h) = f.hits.get(f.selected) {
-                    return vec![Effect::OpenInEditor {
-                        path: h.path.clone(),
-                        line: h.line,
-                        col: 1,
-                    }];
-                }
+            if let Some(f) = app.code_finder.take()
+                && let Some(h) = f.hits.get(f.selected)
+            {
+                return vec![Effect::OpenInEditor {
+                    path: h.path.clone(),
+                    line: h.line,
+                    col: 1,
+                }];
             }
         }
         Msg::OpenEditor => {
-            if let Some(view) = app.views.last() {
-                if let Some(path) = view.path.clone() {
-                    // Blame renders one file line per row, so the row index is the
-                    // zero-based line; editors want it one-based.
-                    let line = app.buffer().cursor() + 1;
-                    return vec![Effect::OpenInEditor { path, line, col: 1 }];
-                }
+            if let Some(view) = app.views.last()
+                && let Some(path) = view.path.clone()
+            {
+                // Blame renders one file line per row, so the row index is the
+                // zero-based line; editors want it one-based.
+                let line = app.buffer().cursor() + 1;
+                return vec![Effect::OpenInEditor { path, line, col: 1 }];
             }
             app.push_toast(ToastKind::Error, "nothing to open in editor here".into());
         }
@@ -3330,38 +3330,38 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::RebaseTodoMoveUp => {
-            if let Some(t) = &mut app.rebase_todo {
-                if t.cursor > 0 {
-                    t.entries.swap(t.cursor, t.cursor - 1);
-                    t.cursor -= 1;
-                }
+            if let Some(t) = &mut app.rebase_todo
+                && t.cursor > 0
+            {
+                t.entries.swap(t.cursor, t.cursor - 1);
+                t.cursor -= 1;
             }
         }
         Msg::RebaseTodoMoveDown => {
-            if let Some(t) = &mut app.rebase_todo {
-                if t.cursor + 1 < t.entries.len() {
-                    t.entries.swap(t.cursor, t.cursor + 1);
-                    t.cursor += 1;
-                }
+            if let Some(t) = &mut app.rebase_todo
+                && t.cursor + 1 < t.entries.len()
+            {
+                t.entries.swap(t.cursor, t.cursor + 1);
+                t.cursor += 1;
             }
         }
         Msg::RebaseTodoSetAction(c) => {
-            if let Some(t) = &mut app.rebase_todo {
-                if let Some(entry) = t.entries.get_mut(t.cursor) {
-                    entry.action = c;
-                }
+            if let Some(t) = &mut app.rebase_todo
+                && let Some(entry) = t.entries.get_mut(t.cursor)
+            {
+                entry.action = c;
             }
         }
         Msg::RebaseTodoCancel => app.rebase_todo = None,
         Msg::RebaseTodoRun => {
-            if let Some(t) = &app.rebase_todo {
-                if matches!(t.entries.first().map(|e| e.action), Some('s') | Some('f')) {
-                    app.push_toast(
-                        ToastKind::Error,
-                        "first commit cannot be squash/fixup".into(),
-                    );
-                    return Vec::new();
-                }
+            if let Some(t) = &app.rebase_todo
+                && matches!(t.entries.first().map(|e| e.action), Some('s') | Some('f'))
+            {
+                app.push_toast(
+                    ToastKind::Error,
+                    "first commit cannot be squash/fixup".into(),
+                );
+                return Vec::new();
             }
             if let Some(t) = app.rebase_todo.take() {
                 app.busy = Some("rebasing".into());
@@ -3399,10 +3399,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             })
         }
         Msg::PaletteInput(key) => {
-            if let Some(p) = &mut app.palette {
-                if edit_line(&mut p.input, &mut p.cursor, key) {
-                    p.selected = 0;
-                }
+            if let Some(p) = &mut app.palette
+                && edit_line(&mut p.input, &mut p.cursor, key)
+            {
+                p.selected = 0;
             }
         }
         Msg::PaletteUp => {
@@ -3430,10 +3430,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             search_jump(app, app.buffer().cursor(), true);
         }
         Msg::SearchSubmit => {
-            if let Some(s) = app.search.take() {
-                if !s.is_empty() {
-                    app.last_search = Some(s);
-                }
+            if let Some(s) = app.search.take()
+                && !s.is_empty()
+            {
+                app.last_search = Some(s);
             }
         }
         Msg::SearchCancel => app.search = None,
@@ -3594,11 +3594,11 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::PaletteCancel => app.palette = None,
         Msg::PaletteSubmit => {
-            if let Some(p) = app.palette.take() {
-                if let Some(entry) = Palette::matches(&p.input).get(p.selected) {
-                    let msg = (entry.make)();
-                    return update(app, msg);
-                }
+            if let Some(p) = app.palette.take()
+                && let Some(entry) = Palette::matches(&p.input).get(p.selected)
+            {
+                let msg = (entry.make)();
+                return update(app, msg);
             }
         }
         Msg::Refresh => {
@@ -3655,16 +3655,16 @@ fn editor_at_hunk(app: &App) -> Option<Effect> {
 }
 
 fn stage_at_cursor(app: &mut App) -> Vec<Effect> {
-    if let Some(sel) = app.buffer().line_selection() {
-        if !sel.staged {
-            app.buffer_mut().toggle_selection();
-            app.loading = true;
-            return vec![Effect::Mutate(Mutation::StageLines {
-                path: sel.path,
-                new_start: sel.new_start,
-                lines: sel.lines,
-            })];
-        }
+    if let Some(sel) = app.buffer().line_selection()
+        && !sel.staged
+    {
+        app.buffer_mut().toggle_selection();
+        app.loading = true;
+        return vec![Effect::Mutate(Mutation::StageLines {
+            path: sel.path,
+            new_start: sel.new_start,
+            lines: sel.lines,
+        })];
     }
     let mutation = match app.buffer().target_at_cursor() {
         Some(Target::File {
@@ -3692,16 +3692,16 @@ fn stage_at_cursor(app: &mut App) -> Vec<Effect> {
 
 /// `u` unstages the staged region, file, or hunk under the cursor.
 fn unstage_at_cursor(app: &mut App) -> Vec<Effect> {
-    if let Some(sel) = app.buffer().line_selection() {
-        if sel.staged {
-            app.buffer_mut().toggle_selection();
-            app.loading = true;
-            return vec![Effect::Mutate(Mutation::UnstageLines {
-                path: sel.path,
-                new_start: sel.new_start,
-                lines: sel.lines,
-            })];
-        }
+    if let Some(sel) = app.buffer().line_selection()
+        && sel.staged
+    {
+        app.buffer_mut().toggle_selection();
+        app.loading = true;
+        return vec![Effect::Mutate(Mutation::UnstageLines {
+            path: sel.path,
+            new_start: sel.new_start,
+            lines: sel.lines,
+        })];
     }
     let mutation = match app.buffer().target_at_cursor() {
         Some(Target::File { path, staged: true }) => Mutation::UnstageFile(path),
@@ -4255,11 +4255,11 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
 /// A key in an open transient: toggle a matching argument, or fire a matching
 /// action with the accumulated arguments.
 fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
-    if let Some(t) = app.transient.as_mut() {
-        if let Some(arg) = t.args.iter_mut().find(|a| a.key == c) {
-            arg.on = !arg.on;
-            return Vec::new();
-        }
+    if let Some(t) = app.transient.as_mut()
+        && let Some(arg) = t.args.iter_mut().find(|a| a.key == c)
+    {
+        arg.on = !arg.on;
+        return Vec::new();
     }
     let Some(t) = app.transient.as_ref() else {
         return Vec::new();

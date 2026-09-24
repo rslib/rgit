@@ -147,12 +147,12 @@ pub fn init(backend: &dyn GitBackend, preset: &str) -> Result<String, GitError> 
     backend.config_set("rgit.workflow", p.preset)?;
 
     let mut notes = vec![format!("workflow set to {}", p.preset)];
-    if let Some(dev) = &p.integration {
-        if !backend.branch_exists(dev) {
-            backend.checkout_branch(&p.main)?;
-            backend.create_branch(dev)?;
-            notes.push(format!("created integration branch {dev} from {}", p.main));
-        }
+    if let Some(dev) = &p.integration
+        && !backend.branch_exists(dev)
+    {
+        backend.checkout_branch(&p.main)?;
+        backend.create_branch(dev)?;
+        notes.push(format!("created integration branch {dev} from {}", p.main));
     }
     Ok(notes.join("\n"))
 }
