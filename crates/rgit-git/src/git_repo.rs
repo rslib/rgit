@@ -2761,13 +2761,24 @@ fn fast_forward(
 /// Create a repository at `path`. `initial_branch` names the first branch
 /// (git's `-b`); `bare` makes a bare repository (git's `--bare`).
 pub fn init(path: &Path, initial_branch: Option<&str>, bare: bool) -> Result<(), GitError> {
+    let branch = initial_branch
+        .map(str::to_owned)
+        .or_else(default_initial_branch);
     let mut opts = git2::RepositoryInitOptions::new();
     opts.bare(bare);
-    if let Some(b) = initial_branch {
+    if let Some(b) = branch.as_deref() {
         opts.initial_head(b);
     }
     Repository::init_opts(path, &opts)?;
     Ok(())
+}
+
+fn default_initial_branch() -> Option<String> {
+    git2::Config::open_default()
+        .ok()?
+        .get_string("init.defaultBranch")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 /// Clone `url` into `path` (`git clone`), via libgit2, using the same
@@ -3611,6 +3622,8 @@ fn fill_remotes(repo: &Repository, local: &git2::Branch, branch: &str, head: &mu
 }
 
 fn collect_entries(repo: &Repository) -> Result<Vec<StatusEntry>, GitError> {
+    // Worktree renames stay off, as in `git status`: pairing a deletion with an
+    // untracked file would make one entry stand for two paths that stage apart.
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)

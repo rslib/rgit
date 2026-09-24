@@ -382,3 +382,29 @@ fn prune_is_object_prune_branch_prune_is_separate() {
     assert!(ok, "branch prune runs: {out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn init_uses_default_branch_config() {
+    let dir = std::env::temp_dir().join(format!("rgit-default-branch-{}", std::process::id()));
+    let cfg = dir.with_extension("gitconfig");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&cfg);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&cfg, "[init]\n\tdefaultBranch = trunk\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .arg("init")
+        .current_dir(&dir)
+        .env("GIT_CONFIG_GLOBAL", &cfg)
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        git_out(&dir, &["symbolic-ref", "--short", "HEAD"]).trim(),
+        "trunk"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&cfg);
+}
