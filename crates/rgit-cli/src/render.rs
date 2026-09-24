@@ -78,7 +78,11 @@ fn group(
     out.push('\n');
     out.push_str(&paint(&format!("{label} ({})", entries.len()), DIM));
     for e in entries {
-        out.push_str(&format!("\n  {} {}", paint(code(e), color), e.path));
+        let path = match &e.orig_path {
+            Some(from) if *from != e.path => format!("{from} -> {}", e.path),
+            _ => e.path.clone(),
+        };
+        out.push_str(&format!("\n  {} {path}", paint(code(e), color)));
     }
 }
 

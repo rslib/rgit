@@ -3627,8 +3627,7 @@ fn collect_entries(repo: &Repository) -> Result<Vec<StatusEntry>, GitError> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
-        .renames_head_to_index(true)
-        .renames_index_to_workdir(true);
+        .renames_head_to_index(true);
 
     let statuses = repo.statuses(Some(&mut opts))?;
     let mut entries = Vec::with_capacity(statuses.len());
@@ -3638,18 +3637,25 @@ fn collect_entries(repo: &Repository) -> Result<Vec<StatusEntry>, GitError> {
         if status.contains(Status::IGNORED) {
             continue;
         }
-        let Ok(path) = entry.path() else {
+        // `StatusEntry::path` is the pre-rename path; a rename lives at its new one.
+        let rename = entry
+            .head_to_index()
+            .filter(|d| d.status() == Delta::Renamed);
+        let Some(path) = rename
+            .as_ref()
+            .and_then(|d| d.new_file().path())
+            .map(|p| p.to_string_lossy().into_owned())
+            .or_else(|| entry.path().ok().map(str::to_owned))
+        else {
             continue;
         };
-        let orig_path = entry
-            .head_to_index()
-            .or_else(|| entry.index_to_workdir())
+        let orig_path = rename
             .and_then(|d| d.old_file().path())
             .map(|p| p.to_string_lossy().into_owned())
-            .filter(|old| old != path);
+            .filter(|old| *old != path);
 
         entries.push(StatusEntry {
-            path: path.to_owned(),
+            path,
             orig_path,
             index: index_code(status),
             worktree: worktree_code(status),

@@ -1040,3 +1040,72 @@ fn untracked_file_shows_its_all_added_diff() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn renames_list_the_new_path_and_deletions_show_as_deleted() {
+    let dir = init_repo("rename-delete-codes");
+    for f in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        std::fs::write(dir.join(f), format!("{f}\none\ntwo\nthree\n")).unwrap();
+    }
+    std::fs::write(dir.join("e.txt"), "").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "init"]);
+
+    git(&dir, &["mv", "a.txt", "a2.txt"]);
+    git(&dir, &["mv", "d.txt", "d2.txt"]);
+    std::fs::write(dir.join("d2.txt"), "d.txt\none\ntwo\nthree\nfour\n").unwrap();
+    std::fs::remove_file(dir.join("b.txt")).unwrap();
+    git(&dir, &["rm", "-q", "c.txt"]);
+    std::fs::remove_file(dir.join("e.txt")).unwrap();
+    std::fs::write(dir.join("new.txt"), "").unwrap();
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let status = backend.status().unwrap();
+    let find = |p: &str| {
+        status
+            .entries
+            .iter()
+            .find(|e| e.path == p)
+            .unwrap_or_else(|| panic!("no entry for {p}: {:?}", status.entries))
+    };
+
+    let a = find("a2.txt");
+    assert_eq!(a.orig_path.as_deref(), Some("a.txt"));
+    assert_eq!(
+        (a.index, a.worktree),
+        (StatusCode::Renamed, StatusCode::Unmodified)
+    );
+    let d = find("d2.txt");
+    assert_eq!(d.orig_path.as_deref(), Some("d.txt"));
+    assert_eq!(
+        (d.index, d.worktree),
+        (StatusCode::Renamed, StatusCode::Modified)
+    );
+    assert!(
+        status
+            .entries
+            .iter()
+            .all(|e| e.path != "a.txt" && e.path != "d.txt")
+    );
+
+    let b = find("b.txt");
+    assert_eq!(
+        (b.index, b.worktree),
+        (StatusCode::Unmodified, StatusCode::Deleted)
+    );
+    let c = find("c.txt");
+    assert_eq!(
+        (c.index, c.worktree),
+        (StatusCode::Deleted, StatusCode::Unmodified)
+    );
+
+    // As in `git status`, a worktree delete plus a new file stay two entries.
+    let e = find("e.txt");
+    assert_eq!(
+        (e.orig_path.as_deref(), e.worktree),
+        (None, StatusCode::Deleted)
+    );
+    assert!(find("new.txt").is_untracked());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
