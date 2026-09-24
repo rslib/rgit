@@ -383,6 +383,7 @@ fn reply(value: Obj, is_error: bool) -> CallToolResult {
 /// An error as `error` plus `help`, the shape `rgit --toon` prints on failure.
 fn failure(error: &anyhow::Error) -> Obj {
     let (message, help, _) = crate::output::translate(error);
+    let help: Vec<String> = help.iter().map(|h| as_tool_call(h)).collect();
     let mut value = crate::obj! { "error" => message };
     if !help.is_empty() {
         value.push(("help".to_owned(), help.into()));
@@ -1221,11 +1222,148 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> anyhow::
         let mcp = format!("Call {name} with full=true");
         for line in help {
             if let Node::Str(text) = line {
-                *text = text.replace(&cli, &mcp);
+                *text = as_tool_call(&text.replace(&cli, &mcp));
             }
         }
     }
     Ok(value)
+}
+
+/// CLI command words, the MCP tool they map to, and that tool's positional
+/// parameters in CLI order. Longer word sequences come first so they win.
+const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
+    ("rebase --continue", "git_rebase_continue", &[]),
+    ("rebase --abort", "git_rebase_abort", &[]),
+    ("rebase --skip", "git_rebase_skip", &[]),
+    ("stash pop", "git_stash_pop", &["index"]),
+    ("stash list", "git_stashes", &[]),
+    ("stash push", "git_stash_push", &["message"]),
+    ("branch create", "git_branch_create", &["name"]),
+    ("branch delete", "git_branch_delete", &["name"]),
+    ("branch rename", "git_branch_rename", &["old", "new"]),
+    ("remote add", "git_remote_add", &["name", "url"]),
+    ("remote set-url", "git_remote_set_url", &["name", "url"]),
+    ("workspace new", "git_workspace_new", &["name"]),
+    ("stack new", "git_stack_new", &["name"]),
+    ("lanes init", "git_lanes_init", &[]),
+    ("lanes assign", "git_lanes_assign", &["lane", "path"]),
+    ("lanes commit", "git_lanes_commit", &["lane"]),
+    ("lanes push", "git_lanes_push", &["lane"]),
+    ("flow init", "git_flow_init", &["preset"]),
+    ("flow start", "git_flow_start", &["name"]),
+    ("flow finish", "git_flow_finish", &[]),
+    ("git ls-files", "git_files", &[]),
+    ("status", "git_status", &[]),
+    ("log", "git_log", &["rev"]),
+    ("diff", "git_diff", &["from", "to"]),
+    ("show", "git_show", &["rev"]),
+    ("blame", "git_blame", &["path"]),
+    ("stage", "git_stage", &["path"]),
+    ("unstage", "git_unstage", &["path"]),
+    ("discard", "git_discard", &["path"]),
+    ("resolve", "git_resolve", &["path"]),
+    ("commit", "git_commit", &[]),
+    ("push", "git_push", &[]),
+    ("pull", "git_pull", &[]),
+    ("fetch", "git_fetch", &[]),
+    ("sync", "git_sync", &[]),
+    ("submit", "git_submit", &[]),
+    ("undo", "git_undo", &[]),
+    ("redo", "git_redo", &[]),
+    ("smartlog", "git_smartlog", &[]),
+    ("checkout", "git_checkout", &["rev"]),
+    ("merge", "git_merge", &["rev"]),
+    ("rebase", "git_rebase", &["onto"]),
+    ("stash", "git_stash_push", &[]),
+    ("branch", "git_branches", &[]),
+    ("tag", "git_tag_create", &["name"]),
+    ("remote", "git_remotes", &[]),
+    ("worktree", "git_worktrees", &[]),
+    ("workspace", "git_workspace_list", &[]),
+    ("stack", "git_stack_list", &[]),
+];
+
+/// CLI flags that take a value, and the tool parameter they set.
+const VALUE_FLAGS: &[(&str, &str)] = &[
+    ("-m", "message"),
+    ("--message", "message"),
+    ("-n", "limit"),
+    ("--limit", "limit"),
+    ("-L", "lines"),
+    ("--remote", "remote"),
+    ("--hunk", "hunk"),
+    ("--on", "on"),
+];
+
+/// Split a hint's command on spaces, keeping `"..."` groups whole.
+fn words(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for c in cmd.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                cur.push(c);
+            }
+            ' ' if !quoted => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Rewrite a CLI hint (`Run `rgit stage <path>` to ...`) as the matching tool
+/// call (`Call git_stage with path=<path> to ...`). Hints without a tool
+/// equivalent (init, forge, index) stay as they are.
+fn as_tool_call(hint: &str) -> String {
+    let Some(rest) = hint.strip_prefix("Run `rgit ") else {
+        return hint.to_owned();
+    };
+    let Some((cmd, tail)) = rest.split_once('`') else {
+        return hint.to_owned();
+    };
+    let args = words(cmd);
+    let Some((matched, tool, positional)) = CLI_TOOLS.iter().find_map(|(words_, tool, pos)| {
+        let want: Vec<&str> = words_.split(' ').collect();
+        (args.len() >= want.len() && args.iter().zip(&want).all(|(a, w)| a == w)).then_some((
+            want.len(),
+            *tool,
+            *pos,
+        ))
+    }) else {
+        return hint.to_owned();
+    };
+    let mut params = Vec::new();
+    let mut positional = positional.iter();
+    let mut it = args[matched..].iter();
+    while let Some(arg) = it.next() {
+        if let Some((_, param)) = VALUE_FLAGS.iter().find(|(f, _)| f == arg) {
+            if let Some(value) = it.next() {
+                params.push(format!("{param}={value}"));
+            }
+        } else if arg == "--ours|--theirs" {
+            params.push("ours=true|false".to_owned());
+        } else if let Some(flag) = arg.strip_prefix("--") {
+            params.push(format!("{}=true", flag.replace('-', "_")));
+        } else if let Some(param) = positional.next() {
+            params.push(format!("{param}={arg}"));
+        } else {
+            return hint.to_owned();
+        }
+    }
+    if params.is_empty() {
+        format!("Call {tool}{tail}")
+    } else {
+        format!("Call {tool} with {}{tail}", params.join(", "))
+    }
 }
 
 /// Typed access to a tool call's JSON arguments; bad input is a usage error.
@@ -1925,19 +2063,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A tool with a CLI twin prints exactly what `axi::run` + `finalize` does.
+    /// A tool with a CLI twin prints exactly what `axi::run` + `finalize` does,
+    /// with its CLI hints rewritten as tool calls.
     #[test]
     fn tools_match_the_cli_agent_output() {
         let dir = init_repo("parity");
         let backend = open(&dir);
         std::fs::write(dir.join("new.txt"), "n\n").unwrap();
         let cli = |command: crate::cli::Command| {
-            crate::toon::encode(
-                &crate::axi::run(&backend, command, false)
-                    .unwrap()
-                    .finalize(&[], false, "rgit")
-                    .unwrap(),
-            )
+            let mut out = crate::axi::run(&backend, command, false).unwrap();
+            out.help = out.help.iter().map(|h| as_tool_call(h)).collect();
+            crate::toon::encode(&out.finalize(&[], false, "rgit").unwrap())
         };
         assert_eq!(
             call(&backend, "git_status", json!({})).unwrap(),
@@ -1998,6 +2134,51 @@ mod tests {
     }
 
     #[test]
+    fn cli_hints_become_tool_calls() {
+        let cases = [
+            (
+                "Run `rgit stage <path>` to stage a file",
+                "Call git_stage with path=<path> to stage a file",
+            ),
+            (
+                "Run `rgit diff` to see unstaged changes",
+                "Call git_diff to see unstaged changes",
+            ),
+            (
+                "Run `rgit commit -m \"<message>\"` to commit staged changes",
+                "Call git_commit with message=\"<message>\" to commit staged changes",
+            ),
+            (
+                "Run `rgit push --set-upstream` to publish topic",
+                "Call git_push with set_upstream=true to publish topic",
+            ),
+            (
+                "Run `rgit log --limit 65` to see all 65 commits",
+                "Call git_log with limit=65 to see all 65 commits",
+            ),
+            (
+                "Run `rgit rebase --continue` after resolving conflicts",
+                "Call git_rebase_continue after resolving conflicts",
+            ),
+            (
+                "Run `rgit stash pop` to restore the newest one",
+                "Call git_stash_pop to restore the newest one",
+            ),
+            (
+                "Run `rgit init` to create one here",
+                "Run `rgit init` to create one here",
+            ),
+            (
+                "Call git_diff with full=true",
+                "Call git_diff with full=true",
+            ),
+        ];
+        for (cli, mcp) in cases {
+            assert_eq!(as_tool_call(cli), mcp);
+        }
+    }
+
+    #[test]
     fn errors_carry_help() {
         let dir = init_repo("errors");
         let backend = open(&dir);
@@ -2010,7 +2191,10 @@ mod tests {
 
         let nothing = call(&backend, "git_commit", json!({ "message": "m" })).unwrap_err();
         assert!(nothing.starts_with("error: "), "{nothing}");
-        assert!(nothing.contains("rgit stage <path>"), "{nothing}");
+        assert!(
+            nothing.contains("Call git_stage with path=<path>"),
+            "{nothing}"
+        );
 
         let unknown = call(&backend, "git_nope", json!({})).unwrap_err();
         assert!(unknown.contains("tools/list"), "{unknown}");
