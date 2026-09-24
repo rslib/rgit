@@ -25,6 +25,7 @@ pub fn run(
     interactive: bool,
 ) -> anyhow::Result<Output> {
     let done = done_message(&command);
+    let next = next_steps(&command);
     let finish = |text: String| {
         Output::from(if text == "ok" {
             done.clone().unwrap_or(text)
@@ -521,15 +522,11 @@ pub fn run(
         Command::Stack {
             cmd: None | Some(StackCmd::List),
         } => stack(backend)?,
-        Command::Stage { .. } | Command::StageAll => {
-            finish(crate::cli::run(backend, command, interactive)?)
-                .help("Run `rgit commit -m \"<message>\"` to commit staged changes")
+        other => {
+            let mut out = finish(crate::cli::run(backend, other, interactive)?);
+            out.help.extend(next);
+            out
         }
-        Command::Commit { .. } | Command::Extend => {
-            finish(crate::cli::run(backend, command, interactive)?)
-                .help("Run `rgit push` to publish the branch")
-        }
-        other => finish(crate::cli::run(backend, other, interactive)?),
     })
 }
 
@@ -966,7 +963,7 @@ fn done_message(c: &Command) -> Option<String> {
         Command::CherryPick { rev: Some(rev), .. } => format!("cherry-picked {rev}"),
         Command::Revert { rev: Some(rev), .. } => format!("reverted {rev}"),
         Command::Branch { cmd: Some(cmd), .. } => match cmd {
-            BranchCmd::Create { name } => format!("created branch {name}"),
+            BranchCmd::Create { name } => format!("created and checked out branch {name}"),
             BranchCmd::Checkout { name } => format!("checked out {name}"),
             BranchCmd::Delete {
                 name: Some(name), ..
@@ -1007,4 +1004,75 @@ fn done_message(c: &Command) -> Option<String> {
         Command::Mv { from, to, .. } => format!("moved {from} to {to}"),
         _ => return None,
     })
+}
+
+/// Next steps after a change, where the follow-up is not obvious from the
+/// result. Concrete names are used when the command supplied them.
+fn next_steps(c: &Command) -> Vec<String> {
+    match c {
+        Command::Stage { .. } | Command::StageAll => {
+            vec!["Run `rgit commit -m \"<message>\"` to commit staged changes".into()]
+        }
+        Command::Commit { .. } | Command::Extend | Command::Reword { .. } => {
+            vec!["Run `rgit push` to publish the branch".into()]
+        }
+        Command::Uncommit { .. } => {
+            vec!["Run `rgit commit -m \"<message>\"` to commit the staged changes again".into()]
+        }
+        Command::Undo => vec!["Run `rgit redo` to reverse the undo".into()],
+        Command::Fetch { .. } => vec![
+            "Run `rgit pull` to integrate the current branch's upstream".into(),
+            "Run `rgit sync` to update and restack the whole stack".into(),
+        ],
+        Command::Push { delete: None, tags: false, .. } => vec![
+            "Run `rgit forge pr create --title \"<title>\" --head <branch> --base <branch>` to open a pull request".into(),
+        ],
+        Command::Branch {
+            cmd: Some(BranchCmd::Create { name }),
+            ..
+        } => vec![format!(
+            "Run `rgit push --set-upstream` to publish {name}"
+        )],
+        Command::Tag {
+            name: Some(_),
+            delete: None,
+            ..
+        } => vec!["Run `rgit push --tags` to publish tags".into()],
+        Command::Stash {
+            cmd: None | Some(StashCmd::Push { .. }),
+        } => vec![
+            "Run `rgit stash list` to see stashes".into(),
+            "Run `rgit stash pop` to restore the newest one".into(),
+        ],
+        Command::Remote {
+            cmd: Some(RemoteCmd::Add { name, .. }),
+        } => vec![format!("Run `rgit fetch --remote {name}` to download its refs")],
+        Command::Worktree {
+            cmd: Some(WorktreeCmd::Add { .. }),
+        } => vec!["Run `rgit worktree` to list worktrees".into()],
+        Command::Stack {
+            cmd: Some(StackCmd::New { .. }),
+        } => vec![
+            "Run `rgit commit -m \"<message>\"` to add work to the new branch".into(),
+            "Run `rgit submit` to push the stack and open pull requests".into(),
+        ],
+        Command::Lanes {
+            cmd: Some(LanesCmd::New { name } | LanesCmd::Stack { name, .. }),
+        } => vec![format!(
+            "Run `rgit lanes assign {name} <path>` to move a file into it"
+        )],
+        Command::Lanes {
+            cmd: Some(LanesCmd::Commit { lane, .. }),
+        } => vec![format!("Run `rgit lanes push {lane}` to publish the lane")],
+        Command::Flow {
+            cmd: FlowCmd::Start { .. },
+        } => vec!["Run `rgit flow finish` when the feature is done".into()],
+        Command::Flow {
+            cmd: FlowCmd::Init { .. },
+        } => vec!["Run `rgit flow start <name>` to begin a feature".into()],
+        Command::Workspace {
+            cmd: Some(WorkspaceCmd::New { .. }),
+        } => vec!["Run `rgit workspace` to list workspaces and their paths".into()],
+        _ => Vec::new(),
+    }
 }

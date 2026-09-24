@@ -806,3 +806,24 @@ fn status_shows_rename_source_and_staged_untrack() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn toon_mutations_suggest_the_next_step() {
+    let dir = repo("next-steps");
+    commit(&dir, "f", "x\n", "init");
+
+    let (out, _, ok) = rgit(&dir, &["--toon", "branch", "create", "topic"]);
+    assert!(
+        ok && out.contains("created and checked out branch topic"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Run `rgit push --set-upstream` to publish topic"),
+        "{out}"
+    );
+    write(&dir, "f", "y\n");
+    let (out, _, ok) = rgit(&dir, &["--toon", "stash"]);
+    assert!(ok && out.contains("Run `rgit stash pop`"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
