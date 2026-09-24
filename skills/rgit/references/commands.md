@@ -127,10 +127,10 @@ Every command with what it does and example invocations. Run `rgit <command> --h
     - `forge repo create`: Create a repository. e.g. `rgit forge repo create <name>`, `rgit forge repo create <name> --organization <org> --private`
     - `forge repo delete`: Delete a repository after explicit confirmation. e.g. `rgit forge repo delete owner/repo --yes`
   - `forge branch`: List or delete branches on the forge. e.g. `rgit forge branch list`
-    - `forge branch list`: List remote branches. e.g. `rgit forge branch list`, `rgit forge branch list owner/repo`
+    - `forge branch list`: List remote branches, 100 per page. e.g. `rgit forge branch list`, `rgit forge branch list owner/repo`
     - `forge branch delete`: Delete a remote branch after explicit confirmation. e.g. `rgit forge branch delete <branch> --yes`, `rgit forge branch delete <branch> owner/repo --yes`
   - `forge pr`: List, create, or close pull requests (merge requests on GitLab). e.g. `rgit forge pr list`
-    - `forge pr list`: List open pull requests or merge requests. e.g. `rgit forge pr list`, `rgit forge pr list owner/repo`
+    - `forge pr list`: List open pull requests or merge requests, 100 per page. e.g. `rgit forge pr list`, `rgit forge pr list owner/repo`, `rgit forge pr list --page 2`
     - `forge pr create`: Create a pull request or merge request. e.g. `rgit forge pr create --title "<title>" --head <branch> --base main`
     - `forge pr close`: Close a pull request or merge request. e.g. `rgit forge pr close 42 --yes`, `rgit forge pr close 42 owner/repo --yes`
 

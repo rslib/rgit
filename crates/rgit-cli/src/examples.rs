@@ -323,7 +323,11 @@ const EXAMPLES: &[Entry] = &[
     ("forge pr", &["rgit forge pr list"]),
     (
         "forge pr list",
-        &["rgit forge pr list", "rgit forge pr list owner/repo"],
+        &[
+            "rgit forge pr list",
+            "rgit forge pr list owner/repo",
+            "rgit forge pr list --page 2",
+        ],
     ),
     (
         "forge pr create",

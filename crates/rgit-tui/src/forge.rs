@@ -54,9 +54,10 @@ pub async fn load(
                 .await
                 .map_err(|error| forge_error(&provider, &host, &account, error))?;
             client
-                .pull_requests(&repo)
+                .pull_requests(&repo, 1)
                 .await
                 .map_err(|error| forge_error(&provider, &host, &account, error))?
+                .items
                 .into_iter()
                 .map(|pr| PullRequest {
                     number: pr.number,
@@ -72,9 +73,10 @@ pub async fn load(
             let client = rgit_forge::GitlabClient::from_environment_for(&host, &account)
                 .map_err(|error| forge_error(&provider, &host, &account, error))?;
             client
-                .merge_requests(&repo)
+                .merge_requests(&repo, 1)
                 .await
                 .map_err(|error| forge_error(&provider, &host, &account, error))?
+                .items
                 .into_iter()
                 .map(|mr| PullRequest {
                     number: mr.number,

@@ -239,7 +239,7 @@ fn main() -> ! {
                     base.push_str(&format!(" {flag} {v}"));
                 }
             }
-            let hints = forge_hints(&cmd, &base);
+            let (hints, list_cmd) = forge_hints(&cmd, &base);
             finish(
                 forge::run(
                     cmd,
@@ -251,7 +251,7 @@ fn main() -> ! {
                     },
                 )
                 .map(|text| {
-                    let mut out = forge_output(text);
+                    let mut out = forge_output(text, list_cmd.as_deref());
                     out.help.extend(hints);
                     out
                 }),
@@ -412,9 +412,6 @@ fn rerun(args: &[String]) -> String {
     out
 }
 
-/// Forge list calls request one page of this size.
-const FORGE_PAGE: usize = 100;
-
 fn objects(items: Vec<Value>) -> Vec<Obj> {
     items
         .into_iter()
@@ -425,36 +422,157 @@ fn objects(items: Vec<Value>) -> Vec<Obj> {
         .collect()
 }
 
-/// Next steps after a forge command, keeping the profile/account/host flags.
-fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> Vec<String> {
-    use cli::{ForgeBranchCmd, ForgeCmd, PrCmd};
+/// ` <target> <repo>` as given, so hints address the same repository.
+fn repo_args(target: &Option<String>, repo: &Option<String>) -> String {
+    [target, repo]
+        .into_iter()
+        .flatten()
+        .map(|v| format!(" {v}"))
+        .collect()
+}
+
+/// Next steps after a forge command, keeping the profile/account/host flags
+/// and the repository arguments. Also returns the list command a `--page`
+/// hint should extend.
+fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> (Vec<String>, Option<String>) {
+    use cli::{ForgeBranchCmd, ForgeCmd, PrCmd, RepoCmd};
     match cmd {
-        ForgeCmd::Pr {
-            cmd: PrCmd::List { .. },
-        } => vec![
-            format!(
-                "Run `{base} pr create --title \"<title>\" --head <branch> --base <branch>` to open one"
+        ForgeCmd::Login { provider, .. } => (
+            vec![format!(
+                "Run `{base} whoami {provider}` to check the account"
+            )],
+            None,
+        ),
+        ForgeCmd::Logout { .. } => (
+            vec![format!("Run `{base} auth list` to see remaining accounts")],
+            None,
+        ),
+        ForgeCmd::Auth { .. } => (
+            vec![format!("Run `{base} login <provider>` to add an account")],
+            None,
+        ),
+        ForgeCmd::Whoami { .. } => (Vec::new(), None),
+        ForgeCmd::Repo { cmd } => match cmd {
+            RepoCmd::View { target, repo } => {
+                let at = repo_args(target, repo);
+                (
+                    vec![
+                        format!("Run `{base} pr list{at}` for open pull requests"),
+                        format!("Run `{base} branch list{at}` for its branches"),
+                    ],
+                    None,
+                )
+            }
+            RepoCmd::Create { .. } => (
+                vec![
+                    "Run `rgit remote add origin <clone_url>` to point this repo at it".to_owned(),
+                    "Run `rgit push --set-upstream` to publish the current branch".to_owned(),
+                ],
+                None,
             ),
-            format!("Run `{base} pr close <number> --yes` to close one"),
-        ],
-        ForgeCmd::Pr {
-            cmd: PrCmd::Create { .. },
-        } => {
-            vec![format!("Run `{base} pr list` to see open pull requests")]
-        }
-        ForgeCmd::Branch {
-            cmd: ForgeBranchCmd::List { .. },
-        } => vec![format!(
-            "Run `{base} branch delete <branch> --yes` to delete one"
-        )],
-        ForgeCmd::Auth { .. } => vec![format!("Run `{base} login <provider>` to add an account")],
-        _ => Vec::new(),
+            RepoCmd::Delete { .. } => (Vec::new(), None),
+        },
+        ForgeCmd::Branch { cmd } => match cmd {
+            ForgeBranchCmd::List { target, repo, .. } => {
+                let at = repo_args(target, repo);
+                (
+                    vec![format!(
+                        "Run `{base} branch delete <branch>{at} --yes` to delete one"
+                    )],
+                    Some(format!("{base} branch list{at}")),
+                )
+            }
+            ForgeBranchCmd::Delete { target, repo, .. } => (
+                vec![format!(
+                    "Run `{base} branch list{}` to see the remaining branches",
+                    repo_args(target, repo)
+                )],
+                None,
+            ),
+        },
+        ForgeCmd::Pr { cmd } => match cmd {
+            PrCmd::List { target, repo, .. } => {
+                let at = repo_args(target, repo);
+                (
+                    vec![
+                        format!(
+                            "Run `{base} pr create{at} --title \"<title>\" --head <branch> --base <branch>` to open one"
+                        ),
+                        format!("Run `{base} pr close <number>{at} --yes` to close one"),
+                    ],
+                    Some(format!("{base} pr list{at}")),
+                )
+            }
+            PrCmd::Create { target, repo, .. } => {
+                let at = repo_args(target, repo);
+                (
+                    vec![
+                        format!("Run `{base} pr list{at}` to see open pull requests"),
+                        format!("Run `{base} pr close <number>{at} --yes` to close it"),
+                    ],
+                    None,
+                )
+            }
+            PrCmd::Close { target, repo, .. } => (
+                vec![format!(
+                    "Run `{base} pr list{}` to see the remaining pull requests",
+                    repo_args(target, repo)
+                )],
+                None,
+            ),
+        },
     }
 }
 
-/// Forge results arrive as JSON; tables get a small default schema.
-fn forge_output(text: String) -> Output {
+/// Forge results arrive as JSON; tables get a small default schema. A paged
+/// listing (`items`, `page`, `more`, `total`) gets a count and, when more
+/// pages follow, a hint that re-runs `list_cmd` with the next `--page`.
+fn forge_output(text: String, list_cmd: Option<&str>) -> Output {
     match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(mut map)) if map.get("items").is_some_and(Value::is_array) => {
+            let Some(Value::Array(items)) = map.remove("items") else {
+                unreachable!("checked above")
+            };
+            let page = map.get("page").and_then(Value::as_u64).unwrap_or(1);
+            let more = map.get("more").and_then(Value::as_bool).unwrap_or(false);
+            let total = map.get("total").and_then(Value::as_u64);
+            let rows = objects(items);
+            let is_pr = list_cmd.is_some_and(|c| c.contains(" pr list"));
+            let (key, defaults, noun): (&str, &'static [&'static str], &str) = if is_pr {
+                (
+                    "pull_requests",
+                    &["number", "title", "state", "head_branch"],
+                    "open pull requests",
+                )
+            } else {
+                ("branches", &["name", "sha", "protected"], "remote branches")
+            };
+            let shown = rows.len() as u64;
+            let first = (page - 1) * u64::from(rgit_forge::PAGE_SIZE) + 1;
+            let mut out = Output::new(text);
+            match total {
+                Some(total) if total > shown && shown > 0 => {
+                    out = out.with(
+                        "count",
+                        format!("{first}-{} of {total} total", first + shown - 1),
+                    );
+                }
+                None if more => {
+                    out = out.with("count", format!("{shown} shown on page {page}; more exist"));
+                }
+                _ => {}
+            }
+            let empty = if page > 1 {
+                format!("0 {noun} on page {page}")
+            } else {
+                format!("0 {noun}")
+            };
+            out = out.list(key, rows, defaults, empty);
+            if more && let Some(cmd) = list_cmd {
+                out = out.help(format!("Run `{cmd} --page {}` for the next page", page + 1));
+            }
+            out
+        }
         Ok(Value::Object(mut map)) => {
             map.retain(|_, v| !v.is_null());
             match map.remove("accounts") {
@@ -473,36 +591,6 @@ fn forge_output(text: String) -> Output {
                 }
                 None => Output::from_json(text, map),
             }
-        }
-        Ok(Value::Array(items)) => {
-            let rows = objects(items);
-            let is_pr = rows
-                .first()
-                .is_some_and(|r| r.iter().any(|(k, _)| k == "number"));
-            let (key, defaults, empty): (&str, &'static [&'static str], &str) = if is_pr {
-                (
-                    "pull_requests",
-                    &["number", "title", "state", "head_branch"],
-                    "0 open pull requests",
-                )
-            } else {
-                (
-                    "branches",
-                    &["name", "sha", "protected"],
-                    "0 remote branches",
-                )
-            };
-            let mut out = Output::new(text);
-            if rows.len() >= FORGE_PAGE {
-                out = out.with(
-                    "count",
-                    format!(
-                        "{} shown; the forge returns at most {FORGE_PAGE} per call",
-                        rows.len()
-                    ),
-                );
-            }
-            out.list(key, rows, defaults, empty)
         }
         _ => Output::message(text),
     }
@@ -718,5 +806,57 @@ fn discover_or_init(can_prompt: bool) -> anyhow::Result<Arc<dyn GitBackend>> {
         }
         Err(rgit_git::GitError::NotARepository(_)) => Err(CliError::not_a_repo()),
         Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(out: Output) -> String {
+        toon::encode(&out.finalize(&[], false, "rgit").unwrap())
+    }
+
+    #[test]
+    fn forge_listing_reports_range_and_next_page() {
+        let text = r#"{"items":[{"number":7,"title":"t","state":"open","html_url":"u","head_branch":"h","base_branch":"main","draft":false}],"page":2,"more":true,"total":150}"#;
+        let out = render(forge_output(
+            text.to_owned(),
+            Some("rgit forge pr list o/r"),
+        ));
+        assert!(out.contains("count: 101-101 of 150 total"), "{out}");
+        assert!(
+            out.contains("pull_requests[1]{number,title,state,head_branch}:"),
+            "{out}"
+        );
+        assert!(out.contains("rgit forge pr list o/r --page 3"), "{out}");
+    }
+
+    #[test]
+    fn forge_listing_empty_page_is_explicit() {
+        let text = r#"{"items":[],"page":3,"more":false,"total":null}"#;
+        let out = render(forge_output(
+            text.to_owned(),
+            Some("rgit forge branch list"),
+        ));
+        assert_eq!(out, "branches: 0 remote branches on page 3");
+    }
+
+    #[test]
+    fn forge_hints_keep_flags_and_repo() {
+        let cmd = cli::ForgeCmd::Pr {
+            cmd: cli::PrCmd::Close {
+                number: 1,
+                target: Some("o/r".to_owned()),
+                repo: None,
+                yes: true,
+            },
+        };
+        let (hints, list) = forge_hints(&cmd, "rgit forge --profile work");
+        assert_eq!(list, None);
+        assert_eq!(
+            hints,
+            ["Run `rgit forge --profile work pr list o/r` to see the remaining pull requests"]
+        );
     }
 }

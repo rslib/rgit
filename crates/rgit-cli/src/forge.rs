@@ -267,50 +267,48 @@ pub fn run(command: ForgeCmd, mut context: ForgeContext) -> Result<String> {
                 }),
             }
         }
-        ForgeCmd::Branch { cmd } => {
-            match cmd {
-                ForgeBranchCmd::List { target, repo } => {
-                    let (provider, repo) = resolve_target(target.as_deref(), repo.as_deref())?;
-                    match provider.as_str() {
-                        "github" => with_client(|client| async move {
-                            print_json(client.branches(&repo).await?)
-                        }),
-                        "gitlab" => with_gitlab_client(|client| async move {
-                            print_json(client.branches(&repo).await?)
-                        }),
-                        provider => anyhow::bail!("unsupported forge provider {provider:?}"),
-                    }
-                }
-                ForgeBranchCmd::Delete {
-                    target,
-                    repo,
-                    branch,
-                    yes,
-                } => destructive(yes, "remote branch", || {
-                    let (provider, repo) = resolve_target(target.as_deref(), repo.as_deref())?;
-                    match provider.as_str() {
-                        "github" => with_client(|client| async move {
-                            client.delete_branch(&repo, &branch).await?;
-                            Ok(format!("deleted {}/{}", repo.full_name(), branch))
-                        }),
-                        "gitlab" => with_gitlab_client(|client| async move {
-                            client.delete_branch(&repo, &branch).await?;
-                            Ok(format!("deleted {}/{}", repo.full_name(), branch))
-                        }),
-                        provider => anyhow::bail!("unsupported forge provider {provider:?}"),
-                    }
-                }),
-            }
-        }
-        ForgeCmd::Pr { cmd } => match cmd {
-            PrCmd::List { target, repo } => {
+        ForgeCmd::Branch { cmd } => match cmd {
+            ForgeBranchCmd::List { target, repo, page } => {
                 let (provider, repo) = resolve_target(target.as_deref(), repo.as_deref())?;
                 match provider.as_str() {
                     "github" => with_client(|client| async move {
-                        print_json(client.pull_requests(&repo).await?)
+                        print_json(client.branches(&repo, page).await?)
                     }),
                     "gitlab" => with_gitlab_client(|client| async move {
-                        print_json(client.merge_requests(&repo).await?)
+                        print_json(client.branches(&repo, page).await?)
+                    }),
+                    provider => anyhow::bail!("unsupported forge provider {provider:?}"),
+                }
+            }
+            ForgeBranchCmd::Delete {
+                target,
+                repo,
+                branch,
+                yes,
+            } => destructive(yes, "remote branch", || {
+                let (provider, repo) = resolve_target(target.as_deref(), repo.as_deref())?;
+                match provider.as_str() {
+                    "github" => with_client(|client| async move {
+                        client.delete_branch(&repo, &branch).await?;
+                        Ok(format!("deleted {}/{}", repo.full_name(), branch))
+                    }),
+                    "gitlab" => with_gitlab_client(|client| async move {
+                        client.delete_branch(&repo, &branch).await?;
+                        Ok(format!("deleted {}/{}", repo.full_name(), branch))
+                    }),
+                    provider => anyhow::bail!("unsupported forge provider {provider:?}"),
+                }
+            }),
+        },
+        ForgeCmd::Pr { cmd } => match cmd {
+            PrCmd::List { target, repo, page } => {
+                let (provider, repo) = resolve_target(target.as_deref(), repo.as_deref())?;
+                match provider.as_str() {
+                    "github" => with_client(|client| async move {
+                        print_json(client.pull_requests(&repo, page).await?)
+                    }),
+                    "gitlab" => with_gitlab_client(|client| async move {
+                        print_json(client.merge_requests(&repo, page).await?)
                     }),
                     provider => anyhow::bail!("unsupported forge provider {provider:?}"),
                 }

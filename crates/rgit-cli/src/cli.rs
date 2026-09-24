@@ -1062,11 +1062,14 @@ pub enum RepoCmd {
 
 #[derive(clap::Subcommand)]
 pub enum ForgeBranchCmd {
-    /// List remote branches.
+    /// List remote branches, 100 per page.
     List {
         /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
         target: Option<String>,
         repo: Option<String>,
+        /// Which page of 100 to show.
+        #[arg(long, default_value_t = 1)]
+        page: u32,
     },
     /// Delete a remote branch after explicit confirmation.
     Delete {
@@ -1081,11 +1084,14 @@ pub enum ForgeBranchCmd {
 
 #[derive(clap::Subcommand)]
 pub enum PrCmd {
-    /// List open pull requests or merge requests.
+    /// List open pull requests or merge requests, 100 per page.
     List {
         /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
         target: Option<String>,
         repo: Option<String>,
+        /// Which page of 100 to show.
+        #[arg(long, default_value_t = 1)]
+        page: u32,
     },
     /// Create a pull request or merge request.
     Create {

@@ -41,6 +41,41 @@ pub struct Repository {
     pub description: Option<String>,
 }
 
+/// Items per page for forge list calls, the largest both forges allow.
+pub const PAGE_SIZE: u32 = 100;
+
+/// One page of a forge list. `more` says whether later pages exist; `total` is
+/// the item count across all pages when the forge reports or implies it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Listing<T> {
+    pub items: Vec<T>,
+    pub page: u32,
+    pub more: bool,
+    pub total: Option<u64>,
+}
+
+impl<T> Listing<T> {
+    fn map<U>(self, f: impl FnMut(T) -> U) -> Listing<U> {
+        Listing {
+            items: self.items.into_iter().map(f).collect(),
+            page: self.page,
+            more: self.more,
+            total: self.total,
+        }
+    }
+}
+
+/// The item count implied by the last page: every earlier page is full.
+fn total_from_last_page(page: u32, items_on_page: usize) -> Option<u64> {
+    (page == 1 || items_on_page > 0)
+        .then(|| u64::from(page - 1) * u64::from(PAGE_SIZE) + items_on_page as u64)
+}
+
+fn page_query(route: &str, page: u32) -> String {
+    let sep = if route.contains('?') { '&' } else { '?' };
+    format!("{route}{sep}per_page={PAGE_SIZE}&page={}", page.max(1))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Branch {
     pub name: String,
@@ -126,11 +161,15 @@ impl RepoRef {
 pub trait ForgeProvider {
     async fn repository(&self, repo: &RepoRef) -> Result<Repository, ForgeError>;
 
-    async fn branches(&self, repo: &RepoRef) -> Result<Vec<Branch>, ForgeError>;
+    async fn branches(&self, repo: &RepoRef, page: u32) -> Result<Listing<Branch>, ForgeError>;
 
     async fn delete_branch(&self, repo: &RepoRef, branch: &str) -> Result<(), ForgeError>;
 
-    async fn pull_requests(&self, repo: &RepoRef) -> Result<Vec<PullRequest>, ForgeError>;
+    async fn pull_requests(
+        &self,
+        repo: &RepoRef,
+        page: u32,
+    ) -> Result<Listing<PullRequest>, ForgeError>;
 
     async fn create_pull_request(
         &self,
@@ -204,7 +243,44 @@ impl GithubClient {
             .map_err(api_error)
     }
 
-    pub async fn branches(&self, repo: &RepoRef) -> Result<Vec<Branch>, ForgeError> {
+    /// One page of a list endpoint. When a `last` link is present, that page
+    /// is fetched too so the exact total can be reported.
+    async fn list_page<T: serde::de::DeserializeOwned>(
+        &self,
+        route: &str,
+        page: u32,
+    ) -> Result<Listing<T>, ForgeError> {
+        let page = page.max(1);
+        let first: octocrab::Page<T> = self
+            .api
+            .get(page_query(route, page), None::<&()>)
+            .await
+            .map_err(api_error)?;
+        let more = first.next.is_some();
+        let last_page = first.last.as_ref().and_then(|uri| {
+            uri.query()?
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("page="))
+                .and_then(|n| n.parse::<u32>().ok())
+        });
+        let total = match last_page {
+            Some(last) if last != page => {
+                let tail: Option<octocrab::Page<serde_json::Value>> =
+                    self.api.get_page(&first.last).await.map_err(api_error)?;
+                tail.and_then(|t| total_from_last_page(last, t.items.len()))
+            }
+            _ if !more => total_from_last_page(page, first.items.len()),
+            _ => None,
+        };
+        Ok(Listing {
+            items: first.items,
+            page,
+            more,
+            total,
+        })
+    }
+
+    pub async fn branches(&self, repo: &RepoRef, page: u32) -> Result<Listing<Branch>, ForgeError> {
         #[derive(Deserialize)]
         struct ApiBranch {
             name: String,
@@ -215,22 +291,17 @@ impl GithubClient {
         struct ApiCommit {
             sha: String,
         }
-        let page: Vec<ApiBranch> = self
-            .api
-            .get(
-                format!("/repos/{}/{}/branches?per_page=100", repo.owner, repo.name),
-                None::<&()>,
+        let listing: Listing<ApiBranch> = self
+            .list_page(
+                &format!("/repos/{}/{}/branches", repo.owner, repo.name),
+                page,
             )
-            .await
-            .map_err(api_error)?;
-        Ok(page
-            .into_iter()
-            .map(|branch| Branch {
-                name: branch.name,
-                sha: branch.commit.sha,
-                protected: branch.protected,
-            })
-            .collect())
+            .await?;
+        Ok(listing.map(|branch| Branch {
+            name: branch.name,
+            sha: branch.commit.sha,
+            protected: branch.protected,
+        }))
     }
 
     pub async fn delete_branch(&self, repo: &RepoRef, branch: &str) -> Result<(), ForgeError> {
@@ -248,7 +319,11 @@ impl GithubClient {
             .map_err(api_error)
     }
 
-    pub async fn pull_requests(&self, repo: &RepoRef) -> Result<Vec<PullRequest>, ForgeError> {
+    pub async fn pull_requests(
+        &self,
+        repo: &RepoRef,
+        page: u32,
+    ) -> Result<Listing<PullRequest>, ForgeError> {
         #[derive(Deserialize)]
         struct ApiRequest {
             number: u64,
@@ -264,29 +339,21 @@ impl GithubClient {
             #[serde(rename = "ref")]
             branch: String,
         }
-        let requests: Vec<ApiRequest> = self
-            .api
-            .get(
-                format!(
-                    "/repos/{}/{}/pulls?state=open&per_page=100",
-                    repo.owner, repo.name
-                ),
-                None::<&()>,
+        let listing: Listing<ApiRequest> = self
+            .list_page(
+                &format!("/repos/{}/{}/pulls?state=open", repo.owner, repo.name),
+                page,
             )
-            .await
-            .map_err(api_error)?;
-        Ok(requests
-            .into_iter()
-            .map(|request| PullRequest {
-                number: request.number,
-                title: request.title,
-                state: request.state,
-                html_url: request.html_url,
-                head_branch: request.head.branch,
-                base_branch: request.base.branch,
-                draft: request.draft,
-            })
-            .collect())
+            .await?;
+        Ok(listing.map(|request| PullRequest {
+            number: request.number,
+            title: request.title,
+            state: request.state,
+            html_url: request.html_url,
+            head_branch: request.head.branch,
+            base_branch: request.base.branch,
+            draft: request.draft,
+        }))
     }
 
     pub async fn create_pull_request(
@@ -342,16 +409,20 @@ impl ForgeProvider for GithubClient {
         GithubClient::repository(self, repo).await
     }
 
-    async fn branches(&self, repo: &RepoRef) -> Result<Vec<Branch>, ForgeError> {
-        GithubClient::branches(self, repo).await
+    async fn branches(&self, repo: &RepoRef, page: u32) -> Result<Listing<Branch>, ForgeError> {
+        GithubClient::branches(self, repo, page).await
     }
 
     async fn delete_branch(&self, repo: &RepoRef, branch: &str) -> Result<(), ForgeError> {
         GithubClient::delete_branch(self, repo, branch).await
     }
 
-    async fn pull_requests(&self, repo: &RepoRef) -> Result<Vec<PullRequest>, ForgeError> {
-        GithubClient::pull_requests(self, repo).await
+    async fn pull_requests(
+        &self,
+        repo: &RepoRef,
+        page: u32,
+    ) -> Result<Listing<PullRequest>, ForgeError> {
+        GithubClient::pull_requests(self, repo, page).await
     }
 
     async fn create_pull_request(
@@ -578,7 +649,54 @@ impl GitlabClient {
         })
     }
 
-    pub async fn branches(&self, repo: &RepoRef) -> Result<Vec<Branch>, ForgeError> {
+    /// One page of a list endpoint, with GitLab's `x-total` and
+    /// `x-next-page` headers (`x-total` is omitted above 10k items).
+    async fn list_page<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        page: u32,
+    ) -> Result<Listing<T>, ForgeError> {
+        let page = page.max(1);
+        let response = self
+            .http
+            .get(page_query(url, page))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|error| ForgeError::Api(error.to_string()))?
+            .error_for_status()
+            .map_err(|error| ForgeError::Api(error.to_string()))?;
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        let more = header("x-next-page").is_some();
+        let reported: Option<u64> = header("x-total").and_then(|v| v.parse().ok());
+        let items: Vec<T> = response
+            .json()
+            .await
+            .map_err(|error| ForgeError::Response(error.to_string()))?;
+        let total = reported.or_else(|| {
+            if more {
+                None
+            } else {
+                total_from_last_page(page, items.len())
+            }
+        });
+        Ok(Listing {
+            items,
+            page,
+            more,
+            total,
+        })
+    }
+
+    pub async fn branches(&self, repo: &RepoRef, page: u32) -> Result<Listing<Branch>, ForgeError> {
         #[derive(Deserialize)]
         struct ApiBranch {
             name: String,
@@ -589,30 +707,17 @@ impl GitlabClient {
         struct ApiCommit {
             id: String,
         }
-        let branches: Vec<ApiBranch> = self
-            .http
-            .get(format!(
-                "{}/projects/{}/repository/branches?per_page=100",
-                self.base_url,
-                self.project_path(repo)
-            ))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|error| ForgeError::Api(error.to_string()))?
-            .error_for_status()
-            .map_err(|error| ForgeError::Api(error.to_string()))?
-            .json()
-            .await
-            .map_err(|error| ForgeError::Response(error.to_string()))?;
-        Ok(branches
-            .into_iter()
-            .map(|branch| Branch {
-                name: branch.name,
-                sha: branch.commit.id,
-                protected: branch.protected,
-            })
-            .collect())
+        let url = format!(
+            "{}/projects/{}/repository/branches",
+            self.base_url,
+            self.project_path(repo)
+        );
+        let listing: Listing<ApiBranch> = self.list_page(&url, page).await?;
+        Ok(listing.map(|branch| Branch {
+            name: branch.name,
+            sha: branch.commit.id,
+            protected: branch.protected,
+        }))
     }
 
     pub async fn delete_branch(&self, repo: &RepoRef, branch: &str) -> Result<(), ForgeError> {
@@ -632,7 +737,11 @@ impl GitlabClient {
             .map_err(|error| ForgeError::Api(error.to_string()))
     }
 
-    pub async fn merge_requests(&self, repo: &RepoRef) -> Result<Vec<PullRequest>, ForgeError> {
+    pub async fn merge_requests(
+        &self,
+        repo: &RepoRef,
+        page: u32,
+    ) -> Result<Listing<PullRequest>, ForgeError> {
         #[derive(Deserialize)]
         struct ApiMergeRequest {
             iid: u64,
@@ -643,34 +752,21 @@ impl GitlabClient {
             source_branch: String,
             target_branch: String,
         }
-        let requests: Vec<ApiMergeRequest> = self
-            .http
-            .get(format!(
-                "{}/projects/{}/merge_requests?state=opened&per_page=100",
-                self.base_url,
-                self.project_path(repo)
-            ))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|error| ForgeError::Api(error.to_string()))?
-            .error_for_status()
-            .map_err(|error| ForgeError::Api(error.to_string()))?
-            .json()
-            .await
-            .map_err(|error| ForgeError::Response(error.to_string()))?;
-        Ok(requests
-            .into_iter()
-            .map(|request| PullRequest {
-                number: request.iid,
-                title: request.title,
-                state: request.state,
-                html_url: request.web_url,
-                head_branch: request.source_branch,
-                base_branch: request.target_branch,
-                draft: request.draft,
-            })
-            .collect())
+        let url = format!(
+            "{}/projects/{}/merge_requests?state=opened",
+            self.base_url,
+            self.project_path(repo)
+        );
+        let listing: Listing<ApiMergeRequest> = self.list_page(&url, page).await?;
+        Ok(listing.map(|request| PullRequest {
+            number: request.iid,
+            title: request.title,
+            state: request.state,
+            html_url: request.web_url,
+            head_branch: request.source_branch,
+            base_branch: request.target_branch,
+            draft: request.draft,
+        }))
     }
 
     pub async fn create_merge_request(
@@ -764,16 +860,20 @@ impl ForgeProvider for GitlabClient {
         GitlabClient::repository(self, repo).await
     }
 
-    async fn branches(&self, repo: &RepoRef) -> Result<Vec<Branch>, ForgeError> {
-        GitlabClient::branches(self, repo).await
+    async fn branches(&self, repo: &RepoRef, page: u32) -> Result<Listing<Branch>, ForgeError> {
+        GitlabClient::branches(self, repo, page).await
     }
 
     async fn delete_branch(&self, repo: &RepoRef, branch: &str) -> Result<(), ForgeError> {
         GitlabClient::delete_branch(self, repo, branch).await
     }
 
-    async fn pull_requests(&self, repo: &RepoRef) -> Result<Vec<PullRequest>, ForgeError> {
-        GitlabClient::merge_requests(self, repo).await
+    async fn pull_requests(
+        &self,
+        repo: &RepoRef,
+        page: u32,
+    ) -> Result<Listing<PullRequest>, ForgeError> {
+        GitlabClient::merge_requests(self, repo, page).await
     }
 
     async fn create_pull_request(
@@ -1331,11 +1431,12 @@ mod tests {
             let bytes = stream.read(&mut request).expect("read request");
             let request = String::from_utf8_lossy(&request[..bytes]);
             assert!(request.starts_with("GET /api/v4/projects/group%2Fproject/merge_requests"));
+            assert!(request.contains("per_page=100&page=2"));
             assert!(request.contains("authorization: Bearer token"));
             let body = r#"[{"iid":7,"title":"Improve forge","state":"opened","web_url":"https://gitlab.example/merge_requests/7","draft":true,"source_branch":"feature","target_branch":"main"}]"#;
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Total: 150\r\nX-Next-Page: \r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             )
@@ -1354,12 +1455,39 @@ mod tests {
                     owner: "group".to_owned(),
                     name: "project".to_owned(),
                 },
+                2,
             ))
             .expect("merge requests");
         server.join().expect("server thread");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].number, 7);
-        assert_eq!(requests[0].head_branch, "feature");
-        assert!(requests[0].draft);
+        assert_eq!(requests.page, 2);
+        assert!(!requests.more);
+        assert_eq!(requests.total, Some(150));
+        let items = &requests.items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].number, 7);
+        assert_eq!(items[0].head_branch, "feature");
+        assert!(items[0].draft);
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::*;
+
+    #[test]
+    fn last_page_implies_the_total() {
+        assert_eq!(total_from_last_page(1, 0), Some(0));
+        assert_eq!(total_from_last_page(1, 42), Some(42));
+        assert_eq!(total_from_last_page(4, 7), Some(307));
+        assert_eq!(total_from_last_page(5, 0), None);
+    }
+
+    #[test]
+    fn page_query_appends_to_existing_query() {
+        assert_eq!(page_query("/r/b", 2), "/r/b?per_page=100&page=2");
+        assert_eq!(
+            page_query("/r/p?state=open", 0),
+            "/r/p?state=open&per_page=100&page=1"
+        );
     }
 }
