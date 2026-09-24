@@ -34,23 +34,89 @@ fn enabled() -> bool {
     })
 }
 
+/// A snapshot pushed by [`snapshot`], with what [`discard`] needs to take it
+/// back if the operation it guarded fails.
+#[derive(Debug)]
+pub struct Pushed {
+    pub undo: Oid,
+    pub prev_redo: Option<Oid>,
+    state: State,
+}
+
+/// Everything an operation could change that undo restores.
+#[derive(Debug, PartialEq, Eq)]
+struct State {
+    head_ref: String,
+    head_oid: Oid,
+    tree: Oid,
+    staged: Oid,
+    branches: Vec<(String, Oid)>,
+    stash: Option<Oid>,
+    repo_state: git2::RepositoryState,
+}
+
+fn state(repo: &Repository) -> Result<State, GitError> {
+    let (head_ref, head_oid) = head_state(repo)?;
+    let (tree, staged) = capture_tree(repo)?;
+    Ok(State {
+        head_ref,
+        head_oid,
+        tree,
+        staged,
+        branches: branch_refs(repo),
+        stash: repo.refname_to_id("refs/stash").ok(),
+        repo_state: repo.state(),
+    })
+}
+
 /// Snapshot the current state under the undo stack and clear the redo stack
-/// (a new operation invalidates any redo future). Best-effort: a failure to
-/// snapshot never blocks the operation the caller is about to perform.
-pub fn snapshot(repo: &Repository, label: &str) -> Result<(), GitError> {
+/// (a new operation invalidates any redo future). Returns `None` when nothing
+/// was pushed (op-log disabled, or a conflicted index).
+pub fn snapshot(repo: &Repository, label: &str) -> Result<Option<Pushed>, GitError> {
     // Opt-out: with the op-log off, rgit writes no extra refs/commits and stays
     // a plain git tool. Undo/redo simply have nothing to restore.
     if !enabled() {
-        return Ok(());
+        return Ok(None);
     }
-    let (head_ref, head_oid) = head_state(repo)?;
     // A conflicted index cannot be written to a tree; a mid-conflict state is
     // not snapshotted (undo still restores the previous snapshot, wiping it).
-    let Ok(tree) = capture_tree(repo) else {
-        return Ok(());
+    let Ok(state) = state(repo) else {
+        return Ok(None);
     };
-    push(repo, UNDO, tree, label, &head_ref, head_oid)?;
+    let prev_redo = tip(repo, REDO)?;
+    push(
+        repo,
+        UNDO,
+        state.tree,
+        label,
+        &state.head_ref,
+        state.head_oid,
+    )?;
+    let Some(undo) = tip(repo, UNDO)? else {
+        return Ok(None);
+    };
     clear(repo, REDO)?;
+    Ok(Some(Pushed {
+        undo,
+        prev_redo,
+        state,
+    }))
+}
+
+/// Take back a snapshot whose operation failed: pop it and restore the redo
+/// stack. Only when the snapshot is still the undo tip and the repository is
+/// unchanged since; a partially applied failure keeps its snapshot for undo.
+pub fn discard(repo: &Repository, pushed: &Pushed) -> Result<(), GitError> {
+    if tip(repo, UNDO)? != Some(pushed.undo) {
+        return Ok(());
+    }
+    if state(repo).ok().as_ref() != Some(&pushed.state) {
+        return Ok(());
+    }
+    pop(repo, UNDO)?;
+    if let Some(redo) = pushed.prev_redo {
+        repo.reference(REDO, redo, true, "rgit oplog discard")?;
+    }
     Ok(())
 }
 
@@ -98,7 +164,7 @@ fn step(repo: &Repository, from: &str, to: &str, what: &str) -> Result<String, G
     // Best-effort: save where we are now so the reverse direction can return
     // here (labeled with the op being reversed). A conflicted index cannot be
     // captured, so the reverse direction is simply unavailable in that case.
-    if let Ok(current) = capture_tree(repo) {
+    if let Ok((current, _)) = capture_tree(repo) {
         let (head_ref, head_oid) = head_state(repo)?;
         push(repo, to, current, &meta.label, &head_ref, head_oid)?;
     }
@@ -109,8 +175,8 @@ fn step(repo: &Repository, from: &str, to: &str, what: &str) -> Result<String, G
 }
 
 /// Write the working tree (staged + unstaged, honoring .gitignore) to a tree
-/// object without disturbing the real index.
-fn capture_tree(repo: &Repository) -> Result<Oid, GitError> {
+/// object without disturbing the real index. Returns it and the staged tree.
+fn capture_tree(repo: &Repository) -> Result<(Oid, Oid), GitError> {
     let mut index = repo.index()?;
     // Reload from disk first: `saved` is written back to the index below, so a
     // stale in-memory snapshot would clobber staging done by plain `git add`
@@ -124,7 +190,7 @@ fn capture_tree(repo: &Repository) -> Result<Oid, GitError> {
     let saved_tree = repo.find_tree(saved)?;
     index.read_tree(&saved_tree)?;
     index.write()?;
-    Ok(tree)
+    Ok((tree, saved))
 }
 
 /// Restore HEAD, its branch, and the working tree to a snapshot.

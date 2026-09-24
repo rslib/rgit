@@ -49,16 +49,33 @@ impl Git2Backend {
         })
     }
 
-    /// Snapshot the current state into the operation log before a destructive
-    /// operation, so it can be undone. Best-effort: a snapshot failure is logged
-    /// but never blocks the operation. Takes and releases the repo lock, so call
-    /// it before the operation acquires its own lock (the mutex is not
+    /// Run a destructive operation under an op-log snapshot so it can be undone.
+    /// On failure the snapshot is discarded if the repository is unchanged.
+    /// Snapshot trouble is logged but never blocks the operation. Takes and
+    /// releases the repo lock around `op`, so `op` may lock it (the mutex is not
     /// reentrant).
-    fn snap(&self, label: &str) {
-        let repo = self.repo.lock().expect("repo mutex");
-        if let Err(e) = crate::oplog::snapshot(&repo, label) {
-            tracing::warn!(target: "rgit_git", "oplog snapshot failed: {e}");
+    fn logged<T>(
+        &self,
+        label: &str,
+        op: impl FnOnce() -> Result<T, GitError>,
+    ) -> Result<T, GitError> {
+        let pushed = {
+            let repo = self.repo.lock().expect("repo mutex");
+            crate::oplog::snapshot(&repo, label).unwrap_or_else(|e| {
+                tracing::warn!(target: "rgit_git", "oplog snapshot failed: {e}");
+                None
+            })
+        };
+        let result = op();
+        if result.is_err()
+            && let Some(pushed) = pushed
+        {
+            let repo = self.repo.lock().expect("repo mutex");
+            if let Err(e) = crate::oplog::discard(&repo, &pushed) {
+                tracing::warn!(target: "rgit_git", "oplog discard failed: {e}");
+            }
         }
+        result
     }
 
     /// Push arbitrary refspecs to `remote` (or the current branch's upstream
@@ -176,11 +193,12 @@ impl GitBackend for Git2Backend {
     }
 
     fn stash_push(&self, include_untracked: bool) -> Result<String, GitError> {
-        self.snap("stash");
-        let mut repo = self.repo.lock().expect("repo mutex");
-        let sig = repo.signature()?;
-        repo.stash_save2(&sig, None, stash_flags(include_untracked))?;
-        Ok(stash_saved_line(&repo))
+        self.logged("stash", || {
+            let mut repo = self.repo.lock().expect("repo mutex");
+            let sig = repo.signature()?;
+            repo.stash_save2(&sig, None, stash_flags(include_untracked))?;
+            Ok(stash_saved_line(&repo))
+        })
     }
 
     fn stash_push_message(
@@ -188,32 +206,36 @@ impl GitBackend for Git2Backend {
         message: &str,
         include_untracked: bool,
     ) -> Result<String, GitError> {
-        self.snap("stash");
-        let mut repo = self.repo.lock().expect("repo mutex");
-        let sig = repo.signature()?;
-        repo.stash_save2(&sig, Some(message), stash_flags(include_untracked))?;
-        Ok(stash_saved_line(&repo))
+        self.logged("stash", || {
+            let mut repo = self.repo.lock().expect("repo mutex");
+            let sig = repo.signature()?;
+            repo.stash_save2(&sig, Some(message), stash_flags(include_untracked))?;
+            Ok(stash_saved_line(&repo))
+        })
     }
 
     fn stash_pop(&self, index: usize) -> Result<(), GitError> {
-        self.snap("stash pop");
-        let mut repo = self.repo.lock().expect("repo mutex");
-        repo.stash_pop(index, None)?;
-        Ok(())
+        self.logged("stash pop", || {
+            let mut repo = self.repo.lock().expect("repo mutex");
+            repo.stash_pop(index, None)?;
+            Ok(())
+        })
     }
 
     fn stash_apply(&self, index: usize) -> Result<(), GitError> {
-        self.snap("stash apply");
-        let mut repo = self.repo.lock().expect("repo mutex");
-        repo.stash_apply(index, None)?;
-        Ok(())
+        self.logged("stash apply", || {
+            let mut repo = self.repo.lock().expect("repo mutex");
+            repo.stash_apply(index, None)?;
+            Ok(())
+        })
     }
 
     fn stash_drop(&self, index: usize) -> Result<(), GitError> {
-        self.snap("stash drop");
-        let mut repo = self.repo.lock().expect("repo mutex");
-        repo.stash_drop(index)?;
-        Ok(())
+        self.logged("stash drop", || {
+            let mut repo = self.repo.lock().expect("repo mutex");
+            repo.stash_drop(index)?;
+            Ok(())
+        })
     }
 
     fn log(&self, opts: &crate::LogOptions) -> Result<Vec<crate::LogEntry>, GitError> {
@@ -1105,12 +1127,13 @@ impl GitBackend for Git2Backend {
     }
 
     fn checkout_detached(&self, rev: &str) -> Result<(), GitError> {
-        self.snap("checkout");
-        let repo = self.repo.lock().expect("repo mutex");
-        let commit = repo.revparse_single(rev)?.peel_to_commit()?;
-        repo.checkout_tree(commit.as_object(), Some(CheckoutBuilder::new().safe()))?;
-        repo.set_head_detached(commit.id())?;
-        Ok(())
+        self.logged("checkout", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let commit = repo.revparse_single(rev)?.peel_to_commit()?;
+            repo.checkout_tree(commit.as_object(), Some(CheckoutBuilder::new().safe()))?;
+            repo.set_head_detached(commit.id())?;
+            Ok(())
+        })
     }
 
     fn commits_between(&self, base: &str) -> Result<Vec<(String, String)>, GitError> {
@@ -1194,11 +1217,12 @@ impl GitBackend for Git2Backend {
     }
 
     fn rebase_onto(&self, rev: &str, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
-        self.snap("rebase");
-        let repo = self.repo.lock().expect("repo mutex");
-        let target = repo.revparse_single(rev)?.peel_to_commit()?;
-        let upstream = repo.find_annotated_commit(target.id())?;
-        run_rebase(&repo, &upstream, None, report)
+        self.logged("rebase", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let target = repo.revparse_single(rev)?.peel_to_commit()?;
+            let upstream = repo.find_annotated_commit(target.id())?;
+            run_rebase(&repo, &upstream, None, report)
+        })
     }
 
     fn rebase_range(
@@ -1207,13 +1231,14 @@ impl GitBackend for Git2Backend {
         onto: &str,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
-        self.snap("restack");
-        let repo = self.repo.lock().expect("repo mutex");
-        let upstream_oid = repo.revparse_single(upstream)?.peel_to_commit()?.id();
-        let onto_oid = repo.revparse_single(onto)?.peel_to_commit()?.id();
-        let upstream = repo.find_annotated_commit(upstream_oid)?;
-        let onto = repo.find_annotated_commit(onto_oid)?;
-        run_rebase(&repo, &upstream, Some(&onto), report)
+        self.logged("restack", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let upstream_oid = repo.revparse_single(upstream)?.peel_to_commit()?.id();
+            let onto_oid = repo.revparse_single(onto)?.peel_to_commit()?.id();
+            let upstream = repo.find_annotated_commit(upstream_oid)?;
+            let onto = repo.find_annotated_commit(onto_oid)?;
+            run_rebase(&repo, &upstream, Some(&onto), report)
+        })
     }
 
     fn branch_tip(&self, name: &str) -> Result<Option<String>, GitError> {
@@ -1280,155 +1305,155 @@ impl GitBackend for Git2Backend {
     fn absorb(&self) -> Result<String, GitError> {
         use std::collections::{HashMap, HashSet};
 
-        self.snap("absorb");
-        // Phase 1 (read): for each changed hunk, blame its lines to find the
-        // local commit that last touched them; group hunks by that commit.
-        let (base, order, groups, hunk_count) = {
-            let repo = self.repo.lock().expect("repo mutex");
-            let head = repo.head()?.peel_to_commit()?;
+        self.logged("absorb", || {
+            // Phase 1 (read): for each changed hunk, blame its lines to find the
+            // local commit that last touched them; group hunks by that commit.
+            let (base, order, groups, hunk_count) = {
+                let repo = self.repo.lock().expect("repo mutex");
+                let head = repo.head()?.peel_to_commit()?;
 
-            // Refuse if there are staged changes: a fixup would capture them too.
-            let head_tree = head.tree()?;
-            if repo
-                .diff_tree_to_index(Some(&head_tree), None, None)?
-                .deltas()
-                .len()
-                > 0
-            {
-                return Err(GitError::Conflict(
-                    "you have staged changes; commit or unstage them before absorbing".into(),
-                ));
-            }
-
-            let trunk = detect_trunk(&repo).ok_or_else(|| {
-                GitError::Conflict("no trunk (main/master) to absorb against".into())
-            })?;
-            let base = repo.merge_base(head.id(), trunk).unwrap_or(trunk);
-
-            // Local commits (base..HEAD) - the mutable absorb targets.
-            let mut walk = repo.revwalk()?;
-            walk.push(head.id())?;
-            let _ = walk.hide(base);
-            let mutable: HashSet<git2::Oid> = walk.flatten().collect();
-            if mutable.is_empty() {
-                return Err(GitError::Conflict(
-                    "no local commits since the trunk to absorb into".into(),
-                ));
-            }
-
-            // Map each modified hunk to the commit its lines were last touched
-            // in, grouping hunks per target and keeping first-seen order. Zero
-            // context keeps distinct changes as separate hunks (so nearby edits
-            // owned by different commits do not merge into one).
-            let mut dopts = DiffOptions::new();
-            dopts.context_lines(0);
-            let diff = repo.diff_index_to_workdir(None, Some(&mut dopts))?;
-            let ndeltas = diff.deltas().count();
-            let mut order: Vec<git2::Oid> = Vec::new();
-            let mut groups: HashMap<git2::Oid, Vec<(String, u32)>> = HashMap::new();
-            let mut hunk_count = 0usize;
-            for i in 0..ndeltas {
-                let Some(patch) = git2::Patch::from_diff(&diff, i)? else {
-                    continue;
-                };
-                if patch.delta().status() != git2::Delta::Modified {
-                    continue;
+                // Refuse if there are staged changes: a fixup would capture them too.
+                let head_tree = head.tree()?;
+                if repo
+                    .diff_tree_to_index(Some(&head_tree), None, None)?
+                    .deltas()
+                    .len()
+                    > 0
+                {
+                    return Err(GitError::Conflict(
+                        "you have staged changes; commit or unstage them before absorbing".into(),
+                    ));
                 }
-                let Some(path) = patch.delta().new_file().path() else {
-                    continue;
-                };
-                let path = path.to_string_lossy().into_owned();
-                let Ok(blame) = repo.blame_file(Path::new(&path), None) else {
-                    continue;
-                };
-                for h in 0..patch.num_hunks() {
-                    let (hunk, num_lines) = patch.hunk(h)?;
-                    // Blame the first line the hunk deletes (the changed old
-                    // line), not the hunk's leading context, which the base
-                    // commit usually owns. Pure additions fall back to the
-                    // hunk anchor.
-                    let mut line = hunk.old_start().max(1) as usize;
-                    for l in 0..num_lines {
-                        if let Ok(dl) = patch.line_in_hunk(h, l) {
-                            if dl.origin() == '-' {
-                                if let Some(no) = dl.old_lineno() {
-                                    line = no as usize;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    let Some(bhunk) = blame.get_line(line) else {
+
+                let trunk = detect_trunk(&repo).ok_or_else(|| {
+                    GitError::Conflict("no trunk (main/master) to absorb against".into())
+                })?;
+                let base = repo.merge_base(head.id(), trunk).unwrap_or(trunk);
+
+                // Local commits (base..HEAD) - the mutable absorb targets.
+                let mut walk = repo.revwalk()?;
+                walk.push(head.id())?;
+                let _ = walk.hide(base);
+                let mutable: HashSet<git2::Oid> = walk.flatten().collect();
+                if mutable.is_empty() {
+                    return Err(GitError::Conflict(
+                        "no local commits since the trunk to absorb into".into(),
+                    ));
+                }
+
+                // Map each modified hunk to the commit its lines were last touched
+                // in, grouping hunks per target and keeping first-seen order. Zero
+                // context keeps distinct changes as separate hunks (so nearby edits
+                // owned by different commits do not merge into one).
+                let mut dopts = DiffOptions::new();
+                dopts.context_lines(0);
+                let diff = repo.diff_index_to_workdir(None, Some(&mut dopts))?;
+                let ndeltas = diff.deltas().count();
+                let mut order: Vec<git2::Oid> = Vec::new();
+                let mut groups: HashMap<git2::Oid, Vec<(String, u32)>> = HashMap::new();
+                let mut hunk_count = 0usize;
+                for i in 0..ndeltas {
+                    let Some(patch) = git2::Patch::from_diff(&diff, i)? else {
                         continue;
                     };
-                    let target = bhunk.final_commit_id();
-                    if !mutable.contains(&target) {
+                    if patch.delta().status() != git2::Delta::Modified {
                         continue;
                     }
-                    if !groups.contains_key(&target) {
-                        order.push(target);
+                    let Some(path) = patch.delta().new_file().path() else {
+                        continue;
+                    };
+                    let path = path.to_string_lossy().into_owned();
+                    let Ok(blame) = repo.blame_file(Path::new(&path), None) else {
+                        continue;
+                    };
+                    for h in 0..patch.num_hunks() {
+                        let (hunk, num_lines) = patch.hunk(h)?;
+                        // Blame the first line the hunk deletes (the changed old
+                        // line), not the hunk's leading context, which the base
+                        // commit usually owns. Pure additions fall back to the
+                        // hunk anchor.
+                        let mut line = hunk.old_start().max(1) as usize;
+                        for l in 0..num_lines {
+                            if let Ok(dl) = patch.line_in_hunk(h, l)
+                                && dl.origin() == '-'
+                                && let Some(no) = dl.old_lineno()
+                            {
+                                line = no as usize;
+                                break;
+                            }
+                        }
+                        let Some(bhunk) = blame.get_line(line) else {
+                            continue;
+                        };
+                        let target = bhunk.final_commit_id();
+                        if !mutable.contains(&target) {
+                            continue;
+                        }
+                        if !groups.contains_key(&target) {
+                            order.push(target);
+                        }
+                        groups
+                            .entry(target)
+                            .or_default()
+                            .push((path.clone(), hunk.new_start()));
+                        hunk_count += 1;
                     }
-                    groups
-                        .entry(target)
-                        .or_default()
-                        .push((path.clone(), hunk.new_start()));
-                    hunk_count += 1;
+                }
+                (base, order, groups, hunk_count)
+            };
+
+            if order.is_empty() {
+                return Ok("nothing to absorb (changes do not map to local commits)".to_owned());
+            }
+
+            // Phase 2 (write): one fixup commit per target, containing only that
+            // target's hunks (staged one at a time from a freshly recomputed diff).
+            {
+                let repo = self.repo.lock().expect("repo mutex");
+                let sig = repo
+                    .signature()
+                    .or_else(|_| git2::Signature::now("rgit", "rgit@localhost"))?;
+                for target in &order {
+                    for (path, new_start) in &groups[target] {
+                        let mut dopts = DiffOptions::new();
+                        dopts.pathspec(path);
+                        dopts.context_lines(0);
+                        let diff = repo.diff_index_to_workdir(None, Some(&mut dopts))?;
+                        apply_one_hunk(&repo, &diff, path, *new_start)?;
+                    }
+                    let subject = repo
+                        .find_commit(*target)?
+                        .summary()
+                        .ok()
+                        .flatten()
+                        .unwrap_or("")
+                        .to_owned();
+                    let tree = repo.find_tree(repo.index()?.write_tree()?)?;
+                    let head = repo.head()?.peel_to_commit()?;
+                    repo.commit(
+                        Some("HEAD"),
+                        &sig,
+                        &sig,
+                        &format!("fixup! {subject}"),
+                        &tree,
+                        &[&head],
+                    )?;
                 }
             }
-            (base, order, groups, hunk_count)
-        };
-
-        if order.is_empty() {
-            return Ok("nothing to absorb (changes do not map to local commits)".to_owned());
-        }
-
-        // Phase 2 (write): one fixup commit per target, containing only that
-        // target's hunks (staged one at a time from a freshly recomputed diff).
-        {
-            let repo = self.repo.lock().expect("repo mutex");
-            let sig = repo
-                .signature()
-                .or_else(|_| git2::Signature::now("rgit", "rgit@localhost"))?;
-            for target in &order {
-                for (path, new_start) in &groups[target] {
-                    let mut dopts = DiffOptions::new();
-                    dopts.pathspec(path);
-                    dopts.context_lines(0);
-                    let diff = repo.diff_index_to_workdir(None, Some(&mut dopts))?;
-                    apply_one_hunk(&repo, &diff, path, *new_start)?;
-                }
-                let subject = repo
-                    .find_commit(*target)?
-                    .summary()
-                    .ok()
-                    .flatten()
-                    .unwrap_or("")
-                    .to_owned();
-                let tree = repo.find_tree(repo.index()?.write_tree()?)?;
-                let head = repo.head()?.peel_to_commit()?;
-                repo.commit(
-                    Some("HEAD"),
-                    &sig,
-                    &sig,
-                    &format!("fixup! {subject}"),
-                    &tree,
-                    &[&head],
-                )?;
+            // If autosquash conflicts, abort so the repo is not left mid-rebase with
+            // the synthetic fixup commits; the op-log snapshot then fully restores.
+            if let Err(e) = self.run_git(
+                &["rebase", "-i", "--autosquash", &base.to_string()],
+                &[("GIT_SEQUENCE_EDITOR", "true"), ("GIT_EDITOR", "true")],
+            ) {
+                let _ = self.run_git(&["rebase", "--abort"], &[]);
+                return Err(e);
             }
-        }
-        // If autosquash conflicts, abort so the repo is not left mid-rebase with
-        // the synthetic fixup commits; the op-log snapshot then fully restores.
-        if let Err(e) = self.run_git(
-            &["rebase", "-i", "--autosquash", &base.to_string()],
-            &[("GIT_SEQUENCE_EDITOR", "true"), ("GIT_EDITOR", "true")],
-        ) {
-            let _ = self.run_git(&["rebase", "--abort"], &[]);
-            return Err(e);
-        }
-        Ok(format!(
-            "absorbed {hunk_count} hunk(s) into {} commit(s)",
-            order.len()
-        ))
+            Ok(format!(
+                "absorbed {hunk_count} hunk(s) into {} commit(s)",
+                order.len()
+            ))
+        })
     }
 
     fn bisect(&self, args: &[String]) -> Result<String, GitError> {
@@ -1438,44 +1463,46 @@ impl GitBackend for Git2Backend {
     }
 
     fn clean(&self, dry_run: bool) -> Result<String, GitError> {
-        if !dry_run {
-            self.snap("clean");
-        }
         // libgit2 has no clean; -nd lists, -fd removes (files and directories).
-        self.run_git(&["clean", if dry_run { "-nd" } else { "-fd" }], &[])
+        if dry_run {
+            return self.run_git(&["clean", "-nd"], &[]);
+        }
+        self.logged("clean", || self.run_git(&["clean", "-fd"], &[]))
     }
 
     fn remove_path(&self, path: &str, cached: bool) -> Result<(), GitError> {
-        self.snap("rm");
-        let repo = self.repo.lock().expect("repo mutex");
-        sync_index(&repo)?;
-        let mut index = repo.index()?;
-        index.remove_path(Path::new(path))?;
-        index.write()?;
-        if !cached {
-            let full = self.workdir.join(path);
-            if full.exists() {
-                std::fs::remove_file(full)?;
+        self.logged("rm", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            let mut index = repo.index()?;
+            index.remove_path(Path::new(path))?;
+            index.write()?;
+            if !cached {
+                let full = self.workdir.join(path);
+                if full.exists() {
+                    std::fs::remove_file(full)?;
+                }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn move_path(&self, from: &str, to: &str, force: bool) -> Result<(), GitError> {
-        self.snap("mv");
-        let repo = self.repo.lock().expect("repo mutex");
-        sync_index(&repo)?;
-        if !force && self.workdir.join(to).exists() {
-            return Err(GitError::Other(format!(
-                "destination {to} already exists; use --force to overwrite"
-            )));
-        }
-        std::fs::rename(self.workdir.join(from), self.workdir.join(to))?;
-        let mut index = repo.index()?;
-        index.remove_path(Path::new(from))?;
-        index.add_path(Path::new(to))?;
-        index.write()?;
-        Ok(())
+        self.logged("mv", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            if !force && self.workdir.join(to).exists() {
+                return Err(GitError::Other(format!(
+                    "destination {to} already exists; use --force to overwrite"
+                )));
+            }
+            std::fs::rename(self.workdir.join(from), self.workdir.join(to))?;
+            let mut index = repo.index()?;
+            index.remove_path(Path::new(from))?;
+            index.add_path(Path::new(to))?;
+            index.write()?;
+            Ok(())
+        })
     }
 
     fn describe(
@@ -1526,44 +1553,47 @@ impl GitBackend for Git2Backend {
     }
 
     fn reset(&self, rev: &str, mode: ResetMode) -> Result<(), GitError> {
-        self.snap("reset");
-        let repo = self.repo.lock().expect("repo mutex");
-        let target = repo.revparse_single(rev)?;
-        let kind = match mode {
-            ResetMode::Soft => ResetType::Soft,
-            ResetMode::Mixed => ResetType::Mixed,
-            ResetMode::Hard => ResetType::Hard,
-        };
-        repo.reset(&target, kind, None)?;
-        Ok(())
+        self.logged("reset", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let target = repo.revparse_single(rev)?;
+            let kind = match mode {
+                ResetMode::Soft => ResetType::Soft,
+                ResetMode::Mixed => ResetType::Mixed,
+                ResetMode::Hard => ResetType::Hard,
+            };
+            repo.reset(&target, kind, None)?;
+            Ok(())
+        })
     }
 
     fn cherry_pick(&self, rev: &str, no_commit: bool) -> Result<(), GitError> {
-        self.snap("cherry-pick");
-        let repo = self.repo.lock().expect("repo mutex");
-        let source = repo.revparse_single(rev)?.peel_to_commit()?;
-        repo.cherrypick(&source, None)?;
-        if no_commit {
-            // Leave the change staged; the caller commits when ready.
-            return Ok(());
-        }
-        finalize_sequenced(&repo, &source.author(), source.message().unwrap_or(""))
+        self.logged("cherry-pick", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let source = repo.revparse_single(rev)?.peel_to_commit()?;
+            repo.cherrypick(&source, None)?;
+            if no_commit {
+                // Leave the change staged; the caller commits when ready.
+                return Ok(());
+            }
+            finalize_sequenced(&repo, &source.author(), source.message().unwrap_or(""))
+        })
     }
 
     fn revert(&self, rev: &str, no_commit: bool) -> Result<(), GitError> {
-        self.snap("revert");
-        let repo = self.repo.lock().expect("repo mutex");
-        let source = repo.revparse_single(rev)?.peel_to_commit()?;
-        repo.revert(&source, None)?;
-        if no_commit {
-            return Ok(());
-        }
-        let summary = source.summary().ok().flatten().unwrap_or("commit");
-        let message = format!(
-            "Revert \"{summary}\"\n\nThis reverts commit {}.",
-            source.id()
-        );
-        finalize_sequenced(&repo, &repo.signature()?, &message)
+        self.logged("revert", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let source = repo.revparse_single(rev)?.peel_to_commit()?;
+            repo.revert(&source, None)?;
+            if no_commit {
+                return Ok(());
+            }
+            let summary = source.summary().ok().flatten().unwrap_or("commit");
+            let message = format!(
+                "Revert \"{summary}\"\n\nThis reverts commit {}.",
+                source.id()
+            );
+            finalize_sequenced(&repo, &repo.signature()?, &message)
+        })
     }
 
     fn merge(
@@ -1573,129 +1603,132 @@ impl GitBackend for Git2Backend {
         ff_only: bool,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
-        self.snap("merge");
-        let repo = self.repo.lock().expect("repo mutex");
-        let source = repo.revparse_single(rev)?.peel_to_commit()?;
-        let annotated = repo.find_annotated_commit(source.id())?;
-        let (analysis, _) = repo.merge_analysis(&[&annotated])?;
+        self.logged("merge", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let source = repo.revparse_single(rev)?.peel_to_commit()?;
+            let annotated = repo.find_annotated_commit(source.id())?;
+            let (analysis, _) = repo.merge_analysis(&[&annotated])?;
 
-        if analysis.is_up_to_date() {
-            report(OpProgress::Line("Already up to date.".to_owned()));
-            return Ok(());
-        }
-        if ff_only && !analysis.is_fast_forward() {
-            return Err(GitError::Other(
-                "not possible to fast-forward; use a merge commit instead".to_owned(),
-            ));
-        }
-        if analysis.is_fast_forward() && !no_ff {
-            if let Some(old) = repo.head().ok().and_then(|h| h.target()) {
-                report(OpProgress::Line(format!(
-                    "Updating {}..{}",
-                    short7(old),
-                    short7(source.id())
-                )));
+            if analysis.is_up_to_date() {
+                report(OpProgress::Line("Already up to date.".to_owned()));
+                return Ok(());
             }
-            // Safe checkout first: refuse (rather than clobber) if the update
-            // would overwrite local uncommitted changes, like real git. Only
-            // move the branch ref once the working tree updated cleanly.
-            repo.checkout_tree(source.as_object(), Some(CheckoutBuilder::new().safe()))
-                .map_err(|_| {
-                    GitError::Conflict(
-                        "your local changes would be overwritten by the fast-forward; \
-                         commit or stash them first"
-                            .into(),
-                    )
-                })?;
-            let name = repo.head()?.name().unwrap_or("HEAD").to_owned();
-            repo.reference(&name, source.id(), true, "merge: fast-forward")?;
-            repo.set_head(&name)?;
-            report(OpProgress::Line("Fast-forward".to_owned()));
-            return Ok(());
-        }
-
-        repo.merge(&[&annotated], None, None)?;
-        let index = repo.index()?;
-        if index.has_conflicts() {
-            for entry in index.conflicts()?.flatten() {
-                if let Some(path) = entry
-                    .our
-                    .as_ref()
-                    .or(entry.their.as_ref())
-                    .and_then(|e| std::str::from_utf8(&e.path).ok())
-                {
+            if ff_only && !analysis.is_fast_forward() {
+                return Err(GitError::Other(
+                    "not possible to fast-forward; use a merge commit instead".to_owned(),
+                ));
+            }
+            if analysis.is_fast_forward() && !no_ff {
+                if let Some(old) = repo.head().ok().and_then(|h| h.target()) {
                     report(OpProgress::Line(format!(
-                        "CONFLICT (content): Merge conflict in {path}"
+                        "Updating {}..{}",
+                        short7(old),
+                        short7(source.id())
                     )));
                 }
+                // Safe checkout first: refuse (rather than clobber) if the update
+                // would overwrite local uncommitted changes, like real git. Only
+                // move the branch ref once the working tree updated cleanly.
+                repo.checkout_tree(source.as_object(), Some(CheckoutBuilder::new().safe()))
+                    .map_err(|_| {
+                        GitError::Conflict(
+                            "your local changes would be overwritten by the fast-forward; \
+                             commit or stash them first"
+                                .into(),
+                        )
+                    })?;
+                let name = repo.head()?.name().unwrap_or("HEAD").to_owned();
+                repo.reference(&name, source.id(), true, "merge: fast-forward")?;
+                repo.set_head(&name)?;
+                report(OpProgress::Line("Fast-forward".to_owned()));
+                return Ok(());
             }
+
+            repo.merge(&[&annotated], None, None)?;
+            let index = repo.index()?;
+            if index.has_conflicts() {
+                for entry in index.conflicts()?.flatten() {
+                    if let Some(path) = entry
+                        .our
+                        .as_ref()
+                        .or(entry.their.as_ref())
+                        .and_then(|e| std::str::from_utf8(&e.path).ok())
+                    {
+                        report(OpProgress::Line(format!(
+                            "CONFLICT (content): Merge conflict in {path}"
+                        )));
+                    }
+                }
+                report(OpProgress::Line(
+                    "Automatic merge failed; fix conflicts and then commit the result.".to_owned(),
+                ));
+                return Err(GitError::Conflict(
+                    "merge conflicts; resolve and commit, or reset --hard to abort".into(),
+                ));
+            }
+            let sig = repo.signature()?;
+            let tree = repo.find_tree(repo.index()?.write_tree()?)?;
+            let head = repo.head()?.peel_to_commit()?;
+            repo.commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                &format!("Merge {rev}"),
+                &tree,
+                &[&head, &source],
+            )?;
+            repo.cleanup_state()?;
             report(OpProgress::Line(
-                "Automatic merge failed; fix conflicts and then commit the result.".to_owned(),
+                "Merge made by the 'ort' strategy.".to_owned(),
             ));
-            return Err(GitError::Conflict(
-                "merge conflicts; resolve and commit, or reset --hard to abort".into(),
-            ));
-        }
-        let sig = repo.signature()?;
-        let tree = repo.find_tree(repo.index()?.write_tree()?)?;
-        let head = repo.head()?.peel_to_commit()?;
-        repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            &format!("Merge {rev}"),
-            &tree,
-            &[&head, &source],
-        )?;
-        repo.cleanup_state()?;
-        report(OpProgress::Line(
-            "Merge made by the 'ort' strategy.".to_owned(),
-        ));
-        Ok(())
+            Ok(())
+        })
     }
 
     fn merge_abort(&self) -> Result<(), GitError> {
-        self.snap("merge abort");
-        let repo = self.repo.lock().expect("repo mutex");
-        // A conflicted merge has not moved HEAD, so hard-resetting to it drops the
-        // half-merged index and worktree; cleanup_state clears MERGE_HEAD et al.
-        let head = repo.head()?.peel_to_commit()?;
-        repo.reset(head.as_object(), git2::ResetType::Hard, None)?;
-        repo.cleanup_state()?;
-        Ok(())
+        self.logged("merge abort", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            // A conflicted merge has not moved HEAD, so hard-resetting to it drops the
+            // half-merged index and worktree; cleanup_state clears MERGE_HEAD et al.
+            let head = repo.head()?.peel_to_commit()?;
+            repo.reset(head.as_object(), git2::ResetType::Hard, None)?;
+            repo.cleanup_state()?;
+            Ok(())
+        })
     }
 
     fn resolve_conflict(&self, path: &str, ours: bool) -> Result<(), GitError> {
-        self.snap("resolve");
-        let repo = self.repo.lock().expect("repo mutex");
-        let mut index = repo.index()?;
-        // Find the chosen side's blob before mutating the index.
-        let chosen = {
-            let conflicts = index.conflicts()?;
-            let mut found = None;
-            for entry in conflicts {
-                let entry = entry?;
-                let side = if ours { entry.our } else { entry.their };
-                if let Some(e) = side {
-                    if e.path == path.as_bytes() {
+        self.logged("resolve", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let mut index = repo.index()?;
+            // Find the chosen side's blob before mutating the index.
+            let chosen = {
+                let conflicts = index.conflicts()?;
+                let mut found = None;
+                for entry in conflicts {
+                    let entry = entry?;
+                    let side = if ours { entry.our } else { entry.their };
+                    if let Some(e) = side
+                        && e.path == path.as_bytes()
+                    {
                         found = Some(e.id);
                         break;
                     }
                 }
-            }
-            found
-        };
-        let Some(oid) = chosen else {
-            return Err(GitError::Conflict(format!(
-                "no conflict recorded for {path}"
-            )));
-        };
-        let blob = repo.find_blob(oid)?;
-        std::fs::write(self.workdir.join(path), blob.content())?;
-        index.conflict_remove(Path::new(path))?;
-        index.add_path(Path::new(path))?;
-        index.write()?;
-        Ok(())
+                found
+            };
+            let Some(oid) = chosen else {
+                return Err(GitError::Conflict(format!(
+                    "no conflict recorded for {path}"
+                )));
+            };
+            let blob = repo.find_blob(oid)?;
+            std::fs::write(self.workdir.join(path), blob.content())?;
+            index.conflict_remove(Path::new(path))?;
+            index.add_path(Path::new(path))?;
+            index.write()?;
+            Ok(())
+        })
     }
 
     fn create_tag(&self, name: &str, message: &str) -> Result<(), GitError> {
@@ -1717,27 +1750,29 @@ impl GitBackend for Git2Backend {
     }
 
     fn delete_branch(&self, name: &str, force: bool) -> Result<(), GitError> {
-        self.snap("delete branch");
-        let repo = self.repo.lock().expect("repo mutex");
-        let mut branch = repo.find_branch(name, BranchType::Local)?;
-        if !force {
-            let tip = branch.get().peel_to_commit()?.id();
-            let merged = repo
-                .head()
-                .ok()
-                .and_then(|h| h.peel_to_commit().ok())
-                .map(|head| {
-                    head.id() == tip || repo.graph_descendant_of(head.id(), tip).unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if !merged {
-                return Err(GitError::Other(format!(
-                    "branch {name} is not fully merged into HEAD; use --force to delete"
-                )));
+        self.logged("delete branch", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let mut branch = repo.find_branch(name, BranchType::Local)?;
+            if !force {
+                let tip = branch.get().peel_to_commit()?.id();
+                let merged = repo
+                    .head()
+                    .ok()
+                    .and_then(|h| h.peel_to_commit().ok())
+                    .map(|head| {
+                        head.id() == tip
+                            || repo.graph_descendant_of(head.id(), tip).unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if !merged {
+                    return Err(GitError::Other(format!(
+                        "branch {name} is not fully merged into HEAD; use --force to delete"
+                    )));
+                }
             }
-        }
-        branch.delete()?;
-        Ok(())
+            branch.delete()?;
+            Ok(())
+        })
     }
 
     fn remotes(&self) -> Result<Vec<crate::Remote>, GitError> {
@@ -1927,9 +1962,10 @@ impl GitBackend for Git2Backend {
     }
 
     fn lane_restack(&self) -> Result<crate::RestackOutcome, GitError> {
-        self.snap("lane restack");
-        let repo = self.repo.lock().expect("repo mutex");
-        crate::lanes::restack(&repo)
+        self.logged("lane restack", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            crate::lanes::restack(&repo)
+        })
     }
 
     fn lane_assign(&self, lane: &str, path: &str) -> Result<(), GitError> {
@@ -1951,10 +1987,11 @@ impl GitBackend for Git2Backend {
     }
 
     fn lane_commit(&self, lane: &str, message: &str) -> Result<String, GitError> {
-        self.snap("lane commit");
-        let repo = self.repo.lock().expect("repo mutex");
-        sync_index(&repo)?;
-        crate::lanes::commit(&repo, lane, message)
+        self.logged("lane commit", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            crate::lanes::commit(&repo, lane, message)
+        })
     }
 
     fn lane_rename(&self, old: &str, new: &str) -> Result<(), GitError> {
@@ -2003,11 +2040,12 @@ impl GitBackend for Git2Backend {
     }
 
     fn rename_branch(&self, old: &str, new: &str) -> Result<(), GitError> {
-        self.snap("rename branch");
-        let repo = self.repo.lock().expect("repo mutex");
-        repo.find_branch(old, BranchType::Local)?
-            .rename(new, false)?;
-        Ok(())
+        self.logged("rename branch", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            repo.find_branch(old, BranchType::Local)?
+                .rename(new, false)?;
+            Ok(())
+        })
     }
 
     fn local_branches(&self) -> Result<Vec<String>, GitError> {
@@ -2040,61 +2078,66 @@ impl GitBackend for Git2Backend {
     }
 
     fn checkout_branch(&self, name: &str) -> Result<(), GitError> {
-        self.snap("checkout");
-        let repo = self.repo.lock().expect("repo mutex");
-        checkout(&repo, name)
+        self.logged("checkout", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            checkout(&repo, name)
+        })
     }
 
     fn create_branch(&self, name: &str) -> Result<(), GitError> {
-        self.snap("create branch");
-        let repo = self.repo.lock().expect("repo mutex");
-        let head = repo.head()?.peel_to_commit()?;
-        repo.branch(name, &head, false)?;
-        checkout(&repo, name)
+        self.logged("create branch", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let head = repo.head()?.peel_to_commit()?;
+            repo.branch(name, &head, false)?;
+            checkout(&repo, name)
+        })
     }
 
     fn discard_file(&self, path: &str) -> Result<(), GitError> {
-        self.snap("discard");
-        let repo = self.repo.lock().expect("repo mutex");
-        sync_index(&repo)?;
-        let status = repo.status_file(Path::new(path))?;
-        if status.contains(Status::WT_NEW) {
-            std::fs::remove_file(self.workdir.join(path))?;
-        } else {
-            // Restore the worktree file to its index (staged) content.
-            let mut checkout = CheckoutBuilder::new();
-            checkout.path(path).force();
-            repo.checkout_index(None, Some(&mut checkout))?;
-        }
-        Ok(())
+        self.logged("discard", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            let status = repo.status_file(Path::new(path))?;
+            if status.contains(Status::WT_NEW) {
+                std::fs::remove_file(self.workdir.join(path))?;
+            } else {
+                // Restore the worktree file to its index (staged) content.
+                let mut checkout = CheckoutBuilder::new();
+                checkout.path(path).force();
+                repo.checkout_index(None, Some(&mut checkout))?;
+            }
+            Ok(())
+        })
     }
 
     fn discard_hunk(&self, path: &str, new_start: u32) -> Result<(), GitError> {
-        self.snap("discard");
-        let repo = self.repo.lock().expect("repo mutex");
-        sync_index(&repo)?;
-        let diff = worktree_diff(&repo, path)?;
-        let patch = reverse_hunk_patch(&diff, path, new_start)?;
-        repo.apply(
-            &Diff::from_buffer(patch.as_bytes())?,
-            ApplyLocation::WorkDir,
-            None,
-        )?;
-        Ok(())
+        self.logged("discard", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            let diff = worktree_diff(&repo, path)?;
+            let patch = reverse_hunk_patch(&diff, path, new_start)?;
+            repo.apply(
+                &Diff::from_buffer(patch.as_bytes())?,
+                ApplyLocation::WorkDir,
+                None,
+            )?;
+            Ok(())
+        })
     }
 
     fn discard_lines(&self, path: &str, new_start: u32, lines: &[usize]) -> Result<(), GitError> {
-        self.snap("discard");
-        let repo = self.repo.lock().expect("repo mutex");
-        sync_index(&repo)?;
-        let diff = worktree_diff(&repo, path)?;
-        let patch = partial_hunk_patch(&diff, path, new_start, lines, true)?;
-        repo.apply(
-            &Diff::from_buffer(patch.as_bytes())?,
-            ApplyLocation::WorkDir,
-            None,
-        )?;
-        Ok(())
+        self.logged("discard", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            let diff = worktree_diff(&repo, path)?;
+            let patch = partial_hunk_patch(&diff, path, new_start, lines, true)?;
+            repo.apply(
+                &Diff::from_buffer(patch.as_bytes())?,
+                ApplyLocation::WorkDir,
+                None,
+            )?;
+            Ok(())
+        })
     }
 
     fn commit_msg_path(&self) -> PathBuf {
@@ -2106,152 +2149,159 @@ impl GitBackend for Git2Backend {
     }
 
     fn commit(&self, message: &str) -> Result<(), GitError> {
-        self.snap("commit");
-        let repo = self.repo.lock().expect("repo mutex");
-        let parents = match repo.head() {
-            Ok(head_ref) => vec![head_ref.peel_to_commit()?],
-            Err(_) => Vec::new(),
-        };
-        make_commit(&repo, message, &parents, true, true)
+        self.logged("commit", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let parents = match repo.head() {
+                Ok(head_ref) => vec![head_ref.peel_to_commit()?],
+                Err(_) => Vec::new(),
+            };
+            make_commit(&repo, message, &parents, true, true)
+        })
     }
 
     fn amend(&self, message: &str) -> Result<(), GitError> {
-        self.snap("amend");
-        let repo = self.repo.lock().expect("repo mutex");
-        make_amend(&repo, message, true)
+        self.logged("amend", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            make_amend(&repo, message, true)
+        })
     }
 
     fn reword(&self, rev: &str, message: &str) -> Result<(), GitError> {
-        self.snap("reword");
-        {
-            let repo = self.repo.lock().expect("repo mutex");
-            let target = repo.revparse_single(rev)?.peel_to_commit()?.id();
-            reword_commit(&repo, target, message)?;
-        }
-        // Descendant stacked branches point at the old oids; move them forward.
-        let _ = self.restack();
-        Ok(())
+        self.logged("reword", || {
+            {
+                let repo = self.repo.lock().expect("repo mutex");
+                let target = repo.revparse_single(rev)?.peel_to_commit()?.id();
+                reword_commit(&repo, target, message)?;
+            }
+            // Descendant stacked branches point at the old oids; move them forward.
+            let _ = self.restack();
+            Ok(())
+        })
     }
 
     fn uncommit(&self, n: usize) -> Result<(), GitError> {
-        self.snap("uncommit");
-        let repo = self.repo.lock().expect("repo mutex");
-        let target = repo.revparse_single(&format!("HEAD~{}", n.max(1)))?;
-        repo.reset(&target, ResetType::Soft, None)?;
-        Ok(())
+        self.logged("uncommit", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let target = repo.revparse_single(&format!("HEAD~{}", n.max(1)))?;
+            repo.reset(&target, ResetType::Soft, None)?;
+            Ok(())
+        })
     }
 
     fn split(&self, rev: &str, paths: &[String]) -> Result<(), GitError> {
-        self.snap("split");
-        {
-            let repo = self.repo.lock().expect("repo mutex");
-            let branch_ref = head_branch_ref(&repo)?;
-            let target = repo.revparse_single(rev)?.peel_to_commit()?;
-            let parent = target
-                .parent(0)
-                .map_err(|_| GitError::Other("cannot split the root commit".to_owned()))?;
-            let p_tree = parent.tree()?;
-            let c_tree = target.tree()?;
+        self.logged("split", || {
+            {
+                let repo = self.repo.lock().expect("repo mutex");
+                let branch_ref = head_branch_ref(&repo)?;
+                let target = repo.revparse_single(rev)?.peel_to_commit()?;
+                let parent = target
+                    .parent(0)
+                    .map_err(|_| GitError::Other("cannot split the root commit".to_owned()))?;
+                let p_tree = parent.tree()?;
+                let c_tree = target.tree()?;
 
-            // First part: the parent's tree with the selected paths taken from the
-            // target (nested paths handled via a full-path index).
-            let mut index = git2::Index::new()?;
-            index.read_tree(&p_tree)?;
-            let mut opts = DiffOptions::new();
-            let diff = repo.diff_tree_to_tree(Some(&p_tree), Some(&c_tree), Some(&mut opts))?;
-            let selected = |p: &str| {
-                paths
-                    .iter()
-                    .any(|s| p == s || p.starts_with(&format!("{s}/")))
-            };
-            let mut moved = 0;
-            for i in 0..diff.deltas().len() {
-                let delta = diff.get_delta(i).expect("delta in range");
-                let path = delta
-                    .new_file()
-                    .path()
-                    .or_else(|| delta.old_file().path())
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                if !selected(&path) {
-                    continue;
-                }
-                match c_tree.get_path(std::path::Path::new(&path)) {
-                    Ok(entry) => index_set(&mut index, &path, entry.id(), entry.filemode())?,
-                    Err(_) => {
-                        index.remove_path(std::path::Path::new(&path))?;
+                // First part: the parent's tree with the selected paths taken from the
+                // target (nested paths handled via a full-path index).
+                let mut index = git2::Index::new()?;
+                index.read_tree(&p_tree)?;
+                let mut opts = DiffOptions::new();
+                let diff = repo.diff_tree_to_tree(Some(&p_tree), Some(&c_tree), Some(&mut opts))?;
+                let selected = |p: &str| {
+                    paths
+                        .iter()
+                        .any(|s| p == s || p.starts_with(&format!("{s}/")))
+                };
+                let mut moved = 0;
+                for i in 0..diff.deltas().len() {
+                    let delta = diff.get_delta(i).expect("delta in range");
+                    let path = delta
+                        .new_file()
+                        .path()
+                        .or_else(|| delta.old_file().path())
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if !selected(&path) {
+                        continue;
                     }
+                    match c_tree.get_path(std::path::Path::new(&path)) {
+                        Ok(entry) => index_set(&mut index, &path, entry.id(), entry.filemode())?,
+                        Err(_) => {
+                            index.remove_path(std::path::Path::new(&path))?;
+                        }
+                    }
+                    moved += 1;
                 }
-                moved += 1;
-            }
-            if moved == 0 {
-                return Err(GitError::Other(
-                    "no changes in the given paths for this commit".to_owned(),
-                ));
-            }
-            let part1_tree = repo.find_tree(index.write_tree_to(&repo)?)?;
+                if moved == 0 {
+                    return Err(GitError::Other(
+                        "no changes in the given paths for this commit".to_owned(),
+                    ));
+                }
+                let part1_tree = repo.find_tree(index.write_tree_to(&repo)?)?;
 
-            let sig = repo.signature()?;
-            let full_msg = target.message().unwrap_or("");
-            // Part 1 keeps only the subject (a fresh change id); part 2 keeps the
-            // full message and the original change id.
-            let subject = full_msg.lines().next().unwrap_or("").to_owned();
-            let c1 = repo.commit(
-                None,
-                &target.author(),
-                &sig,
-                &subject,
-                &part1_tree,
-                &[&parent],
-            )?;
-            let c1_commit = repo.find_commit(c1)?;
-            let c2 = repo.commit(
-                None,
-                &target.author(),
-                &sig,
-                full_msg,
-                &c_tree,
-                &[&c1_commit],
-            )?;
+                let sig = repo.signature()?;
+                let full_msg = target.message().unwrap_or("");
+                // Part 1 keeps only the subject (a fresh change id); part 2 keeps the
+                // full message and the original change id.
+                let subject = full_msg.lines().next().unwrap_or("").to_owned();
+                let c1 = repo.commit(
+                    None,
+                    &target.author(),
+                    &sig,
+                    &subject,
+                    &part1_tree,
+                    &[&parent],
+                )?;
+                let c1_commit = repo.find_commit(c1)?;
+                let c2 = repo.commit(
+                    None,
+                    &target.author(),
+                    &sig,
+                    full_msg,
+                    &c_tree,
+                    &[&c1_commit],
+                )?;
 
-            let chain = first_parent_chain(&repo, target.id())?;
-            let descendants: Vec<&git2::Commit> = chain.iter().rev().skip(1).collect();
-            let new_tip = replay_onto(&repo, &descendants, c2)?;
-            repo.reference(&branch_ref, new_tip, true, "rgit split")?;
-        }
-        let _ = self.restack();
-        Ok(())
+                let chain = first_parent_chain(&repo, target.id())?;
+                let descendants: Vec<&git2::Commit> = chain.iter().rev().skip(1).collect();
+                let new_tip = replay_onto(&repo, &descendants, c2)?;
+                repo.reference(&branch_ref, new_tip, true, "rgit split")?;
+            }
+            let _ = self.restack();
+            Ok(())
+        })
     }
 
     fn sync(&self, report: &dyn Fn(OpProgress)) -> Result<crate::RestackOutcome, GitError> {
-        self.snap("sync");
-        self.fetch(None, false, false, report)?;
-        {
-            let repo = self.repo.lock().expect("repo mutex");
-            let current_ref: Option<String> = repo
-                .head()
-                .ok()
-                .and_then(|h| h.name().ok().map(str::to_owned));
-            for entry in repo.branches(Some(BranchType::Local))? {
-                let (branch, _) = entry?;
-                let full = branch.get().name().ok().map(str::to_owned);
-                if full.is_none() || full == current_ref {
-                    continue;
-                }
-                let tip = branch.get().peel_to_commit()?.id();
-                if let Ok(upstream) = branch.upstream() {
-                    let up = upstream.get().peel_to_commit()?.id();
-                    // Only a strict fast-forward is safe to apply to a ref we are
-                    // not on (no working tree to update).
-                    if up != tip && repo.graph_descendant_of(up, tip).unwrap_or(false) {
-                        if let Some(name) = &full {
+        self.logged("sync", || {
+            self.fetch(None, false, false, report)?;
+            {
+                let repo = self.repo.lock().expect("repo mutex");
+                let current_ref: Option<String> = repo
+                    .head()
+                    .ok()
+                    .and_then(|h| h.name().ok().map(str::to_owned));
+                for entry in repo.branches(Some(BranchType::Local))? {
+                    let (branch, _) = entry?;
+                    let full = branch.get().name().ok().map(str::to_owned);
+                    if full.is_none() || full == current_ref {
+                        continue;
+                    }
+                    let tip = branch.get().peel_to_commit()?.id();
+                    if let Ok(upstream) = branch.upstream() {
+                        let up = upstream.get().peel_to_commit()?.id();
+                        // Only a strict fast-forward is safe to apply to a ref we are
+                        // not on (no working tree to update).
+                        if up != tip
+                            && repo.graph_descendant_of(up, tip).unwrap_or(false)
+                            && let Some(name) = &full
+                        {
                             repo.reference(name, up, true, "rgit sync fast-forward")?;
                         }
                     }
                 }
             }
-        }
-        self.restack()
+            self.restack()
+        })
     }
 
     fn submit_stack(&self, report: &dyn Fn(OpProgress)) -> Result<Vec<String>, GitError> {
@@ -2289,170 +2339,175 @@ impl GitBackend for Git2Backend {
     }
 
     fn prune_merged(&self, base: &str) -> Result<Vec<String>, GitError> {
-        self.snap("prune");
-        let repo = self.repo.lock().expect("repo mutex");
-        let base_oid = repo.revparse_single(base)?.peel_to_commit()?.id();
-        let current_ref: Option<String> = repo
-            .head()
-            .ok()
-            .and_then(|h| h.name().ok().map(str::to_owned));
-        let mut deleted = Vec::new();
-        for entry in repo.branches(Some(BranchType::Local))? {
-            let (mut branch, _) = entry?;
-            let full = branch.get().name().ok().map(str::to_owned);
-            if full.is_some() && full == current_ref {
-                continue;
+        self.logged("prune", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let base_oid = repo.revparse_single(base)?.peel_to_commit()?.id();
+            let current_ref: Option<String> = repo
+                .head()
+                .ok()
+                .and_then(|h| h.name().ok().map(str::to_owned));
+            let mut deleted = Vec::new();
+            for entry in repo.branches(Some(BranchType::Local))? {
+                let (mut branch, _) = entry?;
+                let full = branch.get().name().ok().map(str::to_owned);
+                if full.is_some() && full == current_ref {
+                    continue;
+                }
+                let name = full
+                    .as_deref()
+                    .map(|f| f.trim_start_matches("refs/heads/").to_owned())
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                let tip = branch.get().peel_to_commit()?.id();
+                if tip == base_oid {
+                    continue;
+                }
+                // Merged when base descends from the branch tip (tip is an ancestor).
+                if repo.graph_descendant_of(base_oid, tip).unwrap_or(false) {
+                    branch.delete()?;
+                    deleted.push(name);
+                }
             }
-            let name = full
-                .as_deref()
-                .map(|f| f.trim_start_matches("refs/heads/").to_owned())
-                .unwrap_or_default();
-            if name.is_empty() {
-                continue;
-            }
-            let tip = branch.get().peel_to_commit()?.id();
-            if tip == base_oid {
-                continue;
-            }
-            // Merged when base descends from the branch tip (tip is an ancestor).
-            if repo.graph_descendant_of(base_oid, tip).unwrap_or(false) {
-                branch.delete()?;
-                deleted.push(name);
-            }
-        }
-        deleted.sort();
-        Ok(deleted)
+            deleted.sort();
+            Ok(deleted)
+        })
     }
 
     fn reorder(&self, rev: &str, target: &str, before: bool) -> Result<(), GitError> {
-        self.snap("reorder");
-        {
-            let repo = self.repo.lock().expect("repo mutex");
-            let branch_ref = head_branch_ref(&repo)?;
-            let rev_oid = repo.revparse_single(rev)?.peel_to_commit()?.id();
-            let target_oid = repo.revparse_single(target)?.peel_to_commit()?.id();
-            if rev_oid == target_oid {
-                return Err(GitError::Other(
-                    "cannot move a commit onto itself".to_owned(),
-                ));
-            }
-            // Walk HEAD down the first-parent chain until both are seen.
-            let mut chain: Vec<git2::Commit> = Vec::new();
-            let mut c = repo.head()?.peel_to_commit()?;
-            let (mut seen_rev, mut seen_target) = (false, false);
-            loop {
-                seen_rev |= c.id() == rev_oid;
-                seen_target |= c.id() == target_oid;
-                chain.push(c);
-                if seen_rev && seen_target {
-                    break;
+        self.logged("reorder", || {
+            {
+                let repo = self.repo.lock().expect("repo mutex");
+                let branch_ref = head_branch_ref(&repo)?;
+                let rev_oid = repo.revparse_single(rev)?.peel_to_commit()?.id();
+                let target_oid = repo.revparse_single(target)?.peel_to_commit()?.id();
+                if rev_oid == target_oid {
+                    return Err(GitError::Other(
+                        "cannot move a commit onto itself".to_owned(),
+                    ));
                 }
-                c = match chain.last().unwrap().parent(0) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        return Err(GitError::Other(
-                            "both commits must be ancestors of HEAD".to_owned(),
-                        ));
+                // Walk HEAD down the first-parent chain until both are seen.
+                let mut chain: Vec<git2::Commit> = Vec::new();
+                let mut c = repo.head()?.peel_to_commit()?;
+                let (mut seen_rev, mut seen_target) = (false, false);
+                loop {
+                    seen_rev |= c.id() == rev_oid;
+                    seen_target |= c.id() == target_oid;
+                    chain.push(c);
+                    if seen_rev && seen_target {
+                        break;
                     }
-                };
-            }
-            let base =
-                chain.last().unwrap().parent(0).map_err(|_| {
+                    c = match chain.last().unwrap().parent(0) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            return Err(GitError::Other(
+                                "both commits must be ancestors of HEAD".to_owned(),
+                            ));
+                        }
+                    };
+                }
+                let base = chain.last().unwrap().parent(0).map_err(|_| {
                     GitError::Other("cannot reorder across the root commit".to_owned())
                 })?;
 
-            // Affected commits, oldest first; move rev relative to target.
-            let mut order: Vec<Oid> = chain.iter().rev().map(git2::Commit::id).collect();
-            let rev_pos = order
-                .iter()
-                .position(|&o| o == rev_oid)
-                .expect("rev in order");
-            order.remove(rev_pos);
-            let target_pos = order
-                .iter()
-                .position(|&o| o == target_oid)
-                .expect("target in order");
-            order.insert(if before { target_pos } else { target_pos + 1 }, rev_oid);
+                // Affected commits, oldest first; move rev relative to target.
+                let mut order: Vec<Oid> = chain.iter().rev().map(git2::Commit::id).collect();
+                let rev_pos = order
+                    .iter()
+                    .position(|&o| o == rev_oid)
+                    .expect("rev in order");
+                order.remove(rev_pos);
+                let target_pos = order
+                    .iter()
+                    .position(|&o| o == target_oid)
+                    .expect("target in order");
+                order.insert(if before { target_pos } else { target_pos + 1 }, rev_oid);
 
-            let commits: Vec<git2::Commit> = order
-                .iter()
-                .map(|o| repo.find_commit(*o))
-                .collect::<Result<_, _>>()?;
-            let refs: Vec<&git2::Commit> = commits.iter().collect();
-            let new_tip = replay_onto(&repo, &refs, base.id())?;
-            repo.reference(&branch_ref, new_tip, true, "rgit move")?;
-        }
-        let _ = self.restack();
-        Ok(())
+                let commits: Vec<git2::Commit> = order
+                    .iter()
+                    .map(|o| repo.find_commit(*o))
+                    .collect::<Result<_, _>>()?;
+                let refs: Vec<&git2::Commit> = commits.iter().collect();
+                let new_tip = replay_onto(&repo, &refs, base.id())?;
+                repo.reference(&branch_ref, new_tip, true, "rgit move")?;
+            }
+            let _ = self.restack();
+            Ok(())
+        })
     }
 
     fn squash_range(&self, from: &str) -> Result<(), GitError> {
-        self.snap("squash");
-        {
-            let repo = self.repo.lock().expect("repo mutex");
-            let branch_ref = head_branch_ref(&repo)?;
-            let base = repo.revparse_single(from)?.peel_to_commit()?;
-            let head = repo.head()?.peel_to_commit()?;
-            if base.id() == head.id() {
-                return Err(GitError::Other("nothing to squash".to_owned()));
+        self.logged("squash", || {
+            {
+                let repo = self.repo.lock().expect("repo mutex");
+                let branch_ref = head_branch_ref(&repo)?;
+                let base = repo.revparse_single(from)?.peel_to_commit()?;
+                let head = repo.head()?.peel_to_commit()?;
+                if base.id() == head.id() {
+                    return Err(GitError::Other("nothing to squash".to_owned()));
+                }
+                let chain = first_parent_chain(&repo, base.id())?; // [HEAD.., base]
+                // Folded commits, oldest first (base's child up to HEAD).
+                let folded: Vec<&git2::Commit> = chain.iter().rev().skip(1).collect();
+                let mut msg = String::new();
+                for c in &folded {
+                    msg.push_str(c.message().unwrap_or("").trim_end());
+                    msg.push_str("\n\n");
+                }
+                let msg =
+                    crate::change_id::preserve(head.message().unwrap_or(""), msg.trim_end());
+                let sig = repo.signature()?;
+                let new = repo.commit(None, &head.author(), &sig, &msg, &head.tree()?, &[&base])?;
+                repo.reference(&branch_ref, new, true, "rgit squash range")?;
             }
-            let chain = first_parent_chain(&repo, base.id())?; // [HEAD.., base]
-            // Folded commits, oldest first (base's child up to HEAD).
-            let folded: Vec<&git2::Commit> = chain.iter().rev().skip(1).collect();
-            let mut msg = String::new();
-            for c in &folded {
-                msg.push_str(c.message().unwrap_or("").trim_end());
-                msg.push_str("\n\n");
-            }
-            let msg = crate::change_id::preserve(head.message().unwrap_or(""), msg.trim_end());
-            let sig = repo.signature()?;
-            let new = repo.commit(None, &head.author(), &sig, &msg, &head.tree()?, &[&base])?;
-            repo.reference(&branch_ref, new, true, "rgit squash range")?;
-        }
-        let _ = self.restack();
-        Ok(())
+            let _ = self.restack();
+            Ok(())
+        })
     }
 
     fn squash(&self, rev: &str) -> Result<(), GitError> {
-        self.snap("squash");
-        {
-            let repo = self.repo.lock().expect("repo mutex");
-            let branch_ref = head_branch_ref(&repo)?;
-            let target = repo.revparse_single(rev)?.peel_to_commit()?;
-            let parent = target
-                .parent(0)
-                .map_err(|_| GitError::Other("cannot squash the root commit".to_owned()))?;
-            let chain = first_parent_chain(&repo, target.id())?; // [HEAD.., target]
+        self.logged("squash", || {
+            {
+                let repo = self.repo.lock().expect("repo mutex");
+                let branch_ref = head_branch_ref(&repo)?;
+                let target = repo.revparse_single(rev)?.peel_to_commit()?;
+                let parent = target
+                    .parent(0)
+                    .map_err(|_| GitError::Other("cannot squash the root commit".to_owned()))?;
+                let chain = first_parent_chain(&repo, target.id())?; // [HEAD.., target]
 
-            // Fold target into its parent: parent's parents, target's tree, and
-            // both messages joined.
-            let combined = format!(
-                "{}\n\n{}",
-                parent.message().unwrap_or("").trim_end(),
-                target.message().unwrap_or("").trim_end()
-            );
-            let combined = crate::change_id::preserve(parent.message().unwrap_or(""), &combined);
-            let sig = repo.signature()?;
-            let grandparents: Vec<git2::Commit> = (0..parent.parent_count())
-                .filter_map(|k| parent.parent(k).ok())
-                .collect();
-            let gp_refs: Vec<&git2::Commit> = grandparents.iter().collect();
-            let squashed = repo.commit(
-                None,
-                &parent.author(),
-                &sig,
-                &combined,
-                &target.tree()?,
-                &gp_refs,
-            )?;
+                // Fold target into its parent: parent's parents, target's tree, and
+                // both messages joined.
+                let combined = format!(
+                    "{}\n\n{}",
+                    parent.message().unwrap_or("").trim_end(),
+                    target.message().unwrap_or("").trim_end()
+                );
+                let combined =
+                    crate::change_id::preserve(parent.message().unwrap_or(""), &combined);
+                let sig = repo.signature()?;
+                let grandparents: Vec<git2::Commit> = (0..parent.parent_count())
+                    .filter_map(|k| parent.parent(k).ok())
+                    .collect();
+                let gp_refs: Vec<&git2::Commit> = grandparents.iter().collect();
+                let squashed = repo.commit(
+                    None,
+                    &parent.author(),
+                    &sig,
+                    &combined,
+                    &target.tree()?,
+                    &gp_refs,
+                )?;
 
-            // Replay the commits above target onto the squashed commit.
-            let descendants: Vec<&git2::Commit> = chain.iter().rev().skip(1).collect();
-            let new_tip = replay_onto(&repo, &descendants, squashed)?;
-            repo.reference(&branch_ref, new_tip, true, "rgit squash")?;
-        }
-        let _ = self.restack();
-        Ok(())
+                // Replay the commits above target onto the squashed commit.
+                let descendants: Vec<&git2::Commit> = chain.iter().rev().skip(1).collect();
+                let new_tip = replay_onto(&repo, &descendants, squashed)?;
+                repo.reference(&branch_ref, new_tip, true, "rgit squash")?;
+            }
+            let _ = self.restack();
+            Ok(())
+        })
     }
 
     fn hooks_dir(&self) -> PathBuf {
@@ -2472,19 +2527,21 @@ impl GitBackend for Git2Backend {
     }
 
     fn commit_no_verify(&self, message: &str) -> Result<(), GitError> {
-        self.snap("commit");
-        let repo = self.repo.lock().expect("repo mutex");
-        let parents = match repo.head() {
-            Ok(head_ref) => vec![head_ref.peel_to_commit()?],
-            Err(_) => Vec::new(),
-        };
-        make_commit(&repo, message, &parents, true, false)
+        self.logged("commit", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let parents = match repo.head() {
+                Ok(head_ref) => vec![head_ref.peel_to_commit()?],
+                Err(_) => Vec::new(),
+            };
+            make_commit(&repo, message, &parents, true, false)
+        })
     }
 
     fn amend_no_verify(&self, message: &str) -> Result<(), GitError> {
-        self.snap("amend");
-        let repo = self.repo.lock().expect("repo mutex");
-        make_amend(&repo, message, false)
+        self.logged("amend", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            make_amend(&repo, message, false)
+        })
     }
 
     fn commit_report(&self) -> Vec<String> {
@@ -2557,22 +2614,24 @@ impl GitBackend for Git2Backend {
     }
 
     fn pull(&self, rebase: bool, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
-        // Snapshot before locking (snap takes the repo lock itself) so a rebase
-        // pull is undoable.
+        let run = || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+            let cred = cred_guard.as_deref();
+            let (remote, branch) = upstream_remote(&repo)?;
+            do_fetch(&repo, &remote, false, report, cred)?;
+            if rebase {
+                let target = repo.refname_to_id(&format!("refs/remotes/{remote}/{branch}"))?;
+                let upstream = repo.find_annotated_commit(target)?;
+                run_rebase(&repo, &upstream, None, report)
+            } else {
+                fast_forward(&repo, &remote, &branch, report)
+            }
+        };
         if rebase {
-            self.snap("pull --rebase");
-        }
-        let repo = self.repo.lock().expect("repo mutex");
-        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
-        let cred = cred_guard.as_deref();
-        let (remote, branch) = upstream_remote(&repo)?;
-        do_fetch(&repo, &remote, false, report, cred)?;
-        if rebase {
-            let target = repo.refname_to_id(&format!("refs/remotes/{remote}/{branch}"))?;
-            let upstream = repo.find_annotated_commit(target)?;
-            run_rebase(&repo, &upstream, None, report)
+            self.logged("pull --rebase", run)
         } else {
-            fast_forward(&repo, &remote, &branch, report)
+            run()
         }
     }
 
@@ -2671,9 +2730,10 @@ impl GitBackend for Git2Backend {
         branch: &str,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
-        self.snap("push delete");
-        // An empty source ref deletes the destination on the remote.
-        self.push_refspecs(remote, &[format!(":refs/heads/{branch}")], report)
+        self.logged("push delete", || {
+            // An empty source ref deletes the destination on the remote.
+            self.push_refspecs(remote, &[format!(":refs/heads/{branch}")], report)
+        })
     }
 }
 
