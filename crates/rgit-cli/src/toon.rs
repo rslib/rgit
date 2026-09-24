@@ -1,7 +1,7 @@
 //! An ordered value tree and its TOON encoding (https://toonformat.dev), for
 //! the agent output modes. Keys keep insertion order, so a schema prints in the
-//! order it is declared without turning on `serde_json/preserve_order` for the
-//! whole build.
+//! order it is declared. A `help` list is laid out one hint per line, the AXI
+//! convention, since hints are prose rather than data.
 
 use serde::ser::{SerializeMap, SerializeSeq};
 
@@ -277,6 +277,19 @@ fn write_fields(out: &mut Vec<String>, fields: &[(String, Node)], depth: usize) 
 /// indentation plus `- ` for the first field of a list-item object.
 fn write_field(out: &mut Vec<String>, key: &str, v: &Node, depth: usize, lead: &str) {
     match v {
+        Node::List(hints) if key == "help" && hints.iter().all(|h| h.as_str().is_some()) => {
+            let hints: Vec<&str> = hints.iter().filter_map(Node::as_str).collect();
+            match hints.as_slice() {
+                [] => out.push(format!("{lead}{key}: []")),
+                [one] => out.push(format!("{lead}{key}[1]: {one}")),
+                many => {
+                    out.push(format!("{lead}{key}[{}]:", many.len()));
+                    for hint in many {
+                        out.push(format!("{}{hint}", pad(depth + 1)));
+                    }
+                }
+            }
+        }
         Node::List(items) => write_array(out, key, items, depth, lead),
         Node::Obj(fields) => {
             out.push(format!("{lead}{key}:"));
@@ -491,6 +504,14 @@ mod tests {
         let text = r#"{"zeta":1,"alpha":{"b":true,"a":null},"list":[2.5,"x"]}"#;
         let node: Node = serde_json::from_str(text).unwrap();
         assert_eq!(serde_json::to_string(&node).unwrap(), text);
+    }
+
+    #[test]
+    fn help_is_one_hint_per_line() {
+        let one = obj! { "help" => vec!["Run `x --full` to see it"] };
+        assert_eq!(encode(&one), "help[1]: Run `x --full` to see it");
+        let two = obj! { "help" => vec!["Run `a`, then `b`", "Run `c`"] };
+        assert_eq!(encode(&two), "help[2]:\n  Run `a`, then `b`\n  Run `c`");
     }
 
     #[test]
