@@ -414,7 +414,69 @@ impl GitBackend for Git2Backend {
         let mut opts = DiffOptions::new();
         let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
 
+        let mut refs = Vec::new();
+        let mut merged = Vec::new();
+        let mut contained = Vec::new();
+        for r in repo.references()?.flatten() {
+            let (Ok(name), Ok(tip)) = (r.shorthand(), r.peel_to_commit()) else {
+                continue;
+            };
+            if r.is_remote() && name.ends_with("/HEAD") {
+                continue;
+            }
+            let tip = tip.id();
+            if tip == commit.id() && (r.is_branch() || r.is_remote() || r.is_tag()) {
+                refs.push(name.to_owned());
+            }
+            if !r.is_branch() {
+                continue;
+            }
+            if tip == commit.id() || repo.graph_descendant_of(commit.id(), tip)? {
+                merged.push(name.to_owned());
+            }
+            if tip == commit.id() || repo.graph_descendant_of(tip, commit.id())? {
+                contained.push(name.to_owned());
+            }
+        }
+        let parents = commit
+            .parents()
+            .map(|p| {
+                let short = p
+                    .as_object()
+                    .short_id()
+                    .ok()
+                    .and_then(|b| b.as_str().ok().map(str::to_owned))
+                    .unwrap_or_default();
+                (short, p.summary().ok().flatten().unwrap_or("").to_owned())
+            })
+            .collect();
+        let follows = commit
+            .as_object()
+            .describe(git2::DescribeOptions::new().describe_tags())
+            .and_then(|d| {
+                d.format(Some(
+                    git2::DescribeFormatOptions::new().always_use_long_format(true),
+                ))
+            })
+            .ok()
+            .and_then(|s| {
+                // `<tag>-<distance>-g<hash>`; the tag itself may contain dashes.
+                let mut it = s.rsplitn(3, '-');
+                let _hash = it.next()?;
+                let n = it.next()?.parse().ok()?;
+                Some((it.next()?.to_owned(), n))
+            });
+
         Ok(crate::CommitDetails {
+            author_date: git_date(commit.author().when()),
+            committer: commit.committer().name().unwrap_or("?").to_owned(),
+            committer_email: commit.committer().email().unwrap_or("").to_owned(),
+            commit_date: git_date(commit.committer().when()),
+            parents,
+            refs,
+            merged,
+            contained,
+            follows,
             id: commit
                 .as_object()
                 .short_id()
@@ -3828,6 +3890,41 @@ fn stash_flags(include_untracked: bool) -> Option<git2::StashFlags> {
     }
 }
 
+/// A signature time in `git log`'s default form: `Thu Sep 24 23:24:06 2026 -0500`.
+fn git_date(t: git2::Time) -> String {
+    let off = i64::from(t.offset_minutes());
+    let local = t.seconds() + off * 60;
+    let days = local.div_euclid(86400);
+    let secs = local.rem_euclid(86400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    const WD: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MO: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{} {} {} {:02}:{:02}:{:02} {} {}{:02}{:02}",
+        WD[days.rem_euclid(7) as usize],
+        MO[(month - 1) as usize],
+        day,
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60,
+        year,
+        if off < 0 { '-' } else { '+' },
+        off.abs() / 60,
+        off.abs() % 60,
+    )
+}
+
 fn relative_age(then: i64, now: i64) -> String {
     let delta = (now - then).max(0);
     match delta {
@@ -4077,12 +4174,25 @@ fn extract(diff: &Diff) -> Result<Vec<FileDiff>, GitError> {
         files.push(FileDiff {
             path,
             old_path,
+            status: delta_status(delta.status()),
             hunks,
             binary,
         });
     }
 
     Ok(files)
+}
+
+fn delta_status(d: Delta) -> StatusCode {
+    match d {
+        Delta::Added | Delta::Untracked => StatusCode::Added,
+        Delta::Deleted => StatusCode::Deleted,
+        Delta::Renamed => StatusCode::Renamed,
+        Delta::Copied => StatusCode::Copied,
+        Delta::Typechange => StatusCode::TypeChanged,
+        Delta::Conflicted => StatusCode::Unmerged,
+        _ => StatusCode::Modified,
+    }
 }
 
 fn line_origin(origin: char) -> LineOrigin {

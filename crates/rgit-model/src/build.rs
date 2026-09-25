@@ -688,44 +688,131 @@ fn lane_style(col: usize) -> Style {
     }
 }
 
-/// Build the commit-detail view: header fields, message, and the diff.
-/// `" <email>"` for the author line, or empty when the commit has no email.
-fn author_email(details: &CommitDetails) -> String {
-    if details.email.is_empty() {
-        String::new()
-    } else {
-        format!("  <{}>", details.email)
-    }
+/// A `Label:     value` header row; the label is padded so values line up.
+fn field_row(id: String, label: &str, value: Vec<Span>) -> Section {
+    let mut spans = vec![Span::new(format!("{label:<12}"), Style::FieldLabel)];
+    spans.extend(value);
+    Section::leaf(id, NodeKind::HeadField, spans)
 }
 
+/// `Name <email>`, or just the name when there is no email.
+fn person(name: &str, email: &str) -> Vec<Span> {
+    let mut spans = vec![Span::plain(name.to_owned())];
+    if !email.is_empty() {
+        spans.push(Span::new(format!(" <{email}>"), Style::Dim));
+    }
+    spans
+}
+
+/// Build the commit-detail view, laid out like magit/neogit: refs and id,
+/// author and committer, related refs, the message, a diffstat, then the diff.
 pub fn build_commit(details: &CommitDetails) -> Vec<Section> {
-    let mut sections = vec![
-        Section::leaf(
-            "commit/id",
-            NodeKind::HeadField,
+    let mut head = Vec::new();
+    for r in &details.refs {
+        head.push(Span::new(r.clone(), Style::Branch));
+        head.push(Span::plain(" "));
+    }
+    head.push(Span::new(details.full_id.clone(), Style::Hash));
+    let mut fields = vec![
+        field_row(
+            "commit/author".into(),
+            "Author:",
+            person(&details.author, &details.email),
+        ),
+        field_row(
+            "commit/author-date".into(),
+            "AuthorDate:",
             vec![
-                Span::new("Commit:  ", Style::FieldLabel),
-                Span::new(details.full_id.clone(), Style::Hash),
+                Span::plain(details.author_date.clone()),
+                Span::new(format!("  ({})", details.when), Style::Dim),
             ],
         ),
-        Section::leaf(
-            "commit/author",
-            NodeKind::HeadField,
-            vec![
-                Span::new("Author:  ", Style::FieldLabel),
-                Span::plain(details.author.clone()),
-                Span::new(author_email(details), Style::Dim),
-                Span::new(format!("  · {}", details.when), Style::Dim),
-            ],
+        field_row(
+            "commit/committer".into(),
+            "Commit:",
+            person(&details.committer, &details.committer_email),
         ),
+        field_row(
+            "commit/commit-date".into(),
+            "CommitDate:",
+            vec![Span::plain(details.commit_date.clone())],
+        ),
+        Section::leaf("commit/gap", NodeKind::Info, Vec::new()),
     ];
-    for (i, line) in details.message.lines().enumerate() {
-        sections.push(Section::leaf(
-            format!("commit/msg/{i}"),
-            NodeKind::Info,
-            vec![Span::plain(line.to_owned())],
+    for (i, (id, subject)) in details.parents.iter().enumerate() {
+        fields.push(
+            field_row(
+                format!("commit/parent/{i}"),
+                "Parent:",
+                vec![
+                    Span::new(id.clone(), Style::Hash),
+                    Span::plain(format!(" {subject}")),
+                ],
+            )
+            .with_target(Target::Commit { id: id.clone() }),
+        );
+    }
+    for (label, names) in [
+        ("Merged:", &details.merged),
+        ("Contained:", &details.contained),
+    ] {
+        // A few names per row so a long list wraps instead of running off-screen.
+        for (i, chunk) in names.chunks(3).enumerate() {
+            let spans = chunk
+                .iter()
+                .flat_map(|n| [Span::new(n.clone(), Style::Branch), Span::plain(" ")])
+                .collect();
+            fields.push(field_row(
+                format!("commit/{label}{i}"),
+                if i == 0 { label } else { "" },
+                spans,
+            ));
+        }
+    }
+    if let Some((tag, n)) = &details.follows {
+        fields.push(field_row(
+            "commit/follows".into(),
+            "Follows:",
+            vec![
+                Span::new(tag.clone(), Style::Modified),
+                Span::new(format!(" ({n})"), Style::Dim),
+            ],
         ));
     }
+    let mut sections = vec![Section::branch(
+        "commit/id",
+        NodeKind::Section,
+        head,
+        fields,
+    )];
+
+    let mut lines = details.message.lines();
+    let subject = lines.next().unwrap_or("").to_owned();
+    let body: Vec<Section> = lines
+        .enumerate()
+        .map(|(i, line)| {
+            Section::leaf(
+                format!("commit/msg/{i}"),
+                NodeKind::Info,
+                vec![Span::plain(line.to_owned())],
+            )
+        })
+        .collect();
+    let gap = |id: &str| Section::leaf(id.to_owned(), NodeKind::Info, Vec::new());
+    sections.push(gap("commit/gap-msg"));
+    sections.push(Section::branch(
+        "commit/msg",
+        NodeKind::Section,
+        vec![Span::new(subject, Style::SectionHeader)],
+        body,
+    ));
+    sections.push(gap("commit/gap-stat"));
+
+    if !details.files.is_empty() {
+        sections.push(stat_section(&details.files));
+        sections.push(gap("commit/gap-files"));
+    }
+
     for (fi, file) in details.files.iter().enumerate() {
         let file_id = format!("commit/file/{fi}");
         let hunks = file
@@ -753,15 +840,109 @@ pub fn build_commit(details: &CommitDetails) -> Vec<Section> {
     sections
 }
 
-/// A diff file header: `old -> new` when renamed or copied, else just the path.
-fn diff_file_header(file: &FileDiff) -> Vec<Span> {
-    match &file.old_path {
-        Some(old) => vec![
-            Span::new(format!("{old} -> "), Style::Dim),
-            Span::new(file.path.clone(), Style::Modified),
-        ],
-        None => vec![Span::new(file.path.clone(), Style::Modified)],
+/// `(added, removed)` line counts for a file, from its hunks.
+fn line_counts(file: &FileDiff) -> (usize, usize) {
+    let mut added = 0;
+    let mut removed = 0;
+    for line in file.hunks.iter().flat_map(|h| &h.lines) {
+        match line.origin {
+            LineOrigin::Added => added += 1,
+            LineOrigin::Removed => removed += 1,
+            _ => {}
+        }
     }
+    (added, removed)
+}
+
+/// `git show --stat`: a summary header over one `path | n +++--` row per file.
+fn stat_section(files: &[FileDiff]) -> Section {
+    const PATH_COLS: usize = 50;
+    const BAR_COLS: usize = 30;
+    let counts: Vec<_> = files.iter().map(line_counts).collect();
+    let (ins, del) = counts.iter().fold((0, 0), |(a, d), (x, y)| (a + x, d + y));
+    let path_w = files
+        .iter()
+        .map(|f| f.path.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(PATH_COLS);
+    let max_total = counts.iter().map(|(a, d)| a + d).max().unwrap_or(0);
+    let num_w = max_total.to_string().len();
+    let rows = files
+        .iter()
+        .zip(&counts)
+        .enumerate()
+        .map(|(i, (file, &(a, d)))| {
+            // Keep the tail of a long path, as git does: `.../dir/file.rs`.
+            let n = file.path.chars().count();
+            let path = if n > path_w {
+                let tail: String = file.path.chars().skip(n - path_w + 4).collect();
+                format!(".../{tail}")
+            } else {
+                file.path.clone()
+            };
+            let (mut pa, mut pd) = (a, d);
+            if max_total > BAR_COLS {
+                pa = (a * BAR_COLS).div_ceil(max_total);
+                pd = (d * BAR_COLS).div_ceil(max_total);
+            }
+            let count = if file.binary {
+                "Bin".to_owned()
+            } else {
+                (a + d).to_string()
+            };
+            Section::leaf(
+                format!("commit/stat/{i}"),
+                NodeKind::Info,
+                vec![
+                    Span::new(format!("{path:<path_w$}"), code_style(file.status)),
+                    Span::new(format!(" | {count:>num_w$} "), Style::Dim),
+                    Span::new("+".repeat(pa), Style::Added),
+                    Span::new("-".repeat(pd), Style::Deleted),
+                ],
+            )
+            .with_target(Target::Jump {
+                id: format!("commit/file/{i}"),
+            })
+        })
+        .collect();
+    let plural = |n: usize, one: &str, many: &str| if n == 1 { one } else { many }.to_owned();
+    Section::branch(
+        "commit/stat",
+        NodeKind::Section,
+        vec![Span::new(
+            format!(
+                "{} {}, {ins} {}(+), {del} {}(-)",
+                files.len(),
+                plural(files.len(), "file changed", "files changed"),
+                plural(ins, "insertion", "insertions"),
+                plural(del, "deletion", "deletions"),
+            ),
+            Style::SectionHeader,
+        )],
+        rows,
+    )
+}
+
+/// A diff file header, neogit-style: a padded change label, then the path
+/// (`old -> new` when renamed or copied), colored by the kind of change.
+fn diff_file_header(file: &FileDiff) -> Vec<Span> {
+    let label = match file.status {
+        StatusCode::Added => "new file",
+        StatusCode::Deleted => "deleted",
+        StatusCode::Renamed => "renamed",
+        StatusCode::Copied => "copied",
+        StatusCode::TypeChanged => "typechange",
+        StatusCode::Unmerged => "unmerged",
+        _ => "modified",
+    };
+    let style = code_style(file.status);
+    let mut spans = vec![Span::new(format!("{label:<11}"), style)];
+    if let Some(old) = &file.old_path {
+        spans.push(Span::new(format!("{old} -> "), Style::Dim));
+    }
+    spans.push(Span::new(file.path.clone(), style));
+    spans
 }
 
 /// Build a read-only diff view between two revisions: a header plus one
@@ -1494,6 +1675,7 @@ mod hunk_component_tests {
         FileDiff {
             path: path.into(),
             old_path: None,
+            status: StatusCode::Modified,
             binary: false,
             hunks: vec![Hunk {
                 header: "@@ -1,1 +1,2 @@".into(),
@@ -1534,6 +1716,15 @@ mod hunk_component_tests {
             author: "t".into(),
             email: "t".into(),
             when: "now".into(),
+            author_date: String::new(),
+            committer: "t".into(),
+            committer_email: "t".into(),
+            commit_date: String::new(),
+            parents: Vec::new(),
+            refs: Vec::new(),
+            merged: Vec::new(),
+            contained: Vec::new(),
+            follows: None,
             message: "m".into(),
             files: vec![one_hunk_file("a.rs")],
         };

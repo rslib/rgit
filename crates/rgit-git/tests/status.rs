@@ -336,7 +336,30 @@ fn commit_details_carry_metadata_and_diff() {
     let details = backend.commit_details(&head_id).unwrap();
 
     assert_eq!(details.message.trim(), "add two");
+    let ad = Command::new("git")
+        .args([
+            "-C",
+            dir.to_str().unwrap(),
+            "log",
+            "-1",
+            "--format=%ad%n%cd",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(ad.stdout).unwrap().trim(),
+        format!("{}\n{}", details.author_date, details.commit_date)
+    );
+    assert_eq!(details.parents.len(), 1);
+    assert_eq!(details.parents[0].1, "first");
+    assert!(
+        details
+            .contained
+            .iter()
+            .any(|b| b == "main" || b == "master")
+    );
     let file = details.files.iter().find(|f| f.path == "f.txt").unwrap();
+    assert_eq!(file.status, rgit_git::StatusCode::Modified);
     assert!(
         file.hunks[0]
             .lines

@@ -2137,7 +2137,7 @@ impl App {
             // A worktree opens its changes on Return; no inline preview.
             Target::Worktree { .. } => None,
             // A staging heading acts on the whole section; nothing to preview.
-            Target::Section { .. } => None,
+            Target::Section { .. } | Target::Jump { .. } => None,
         }
     }
 
@@ -2828,6 +2828,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
             match app.buffer().target_at_cursor() {
                 Some(Target::Commit { id }) => return vec![Effect::LoadCommit(id)],
+                Some(Target::Jump { id }) => {
+                    app.buffer_mut().jump_to(&id);
+                    return app.after_cursor_move();
+                }
                 Some(Target::CodeHit { path, .. }) => return vec![Effect::LoadBlame(path)],
                 // An untracked file has no history to blame; visit it in the editor
                 // (its all-added diff already shows in the preview pane).

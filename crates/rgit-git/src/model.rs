@@ -599,6 +599,21 @@ pub struct CommitDetails {
     pub author: String,
     pub email: String,
     pub when: String,
+    /// Absolute dates in `git log` default form, e.g. `Thu Sep 24 23:24:06 2026 -0500`.
+    pub author_date: String,
+    pub committer: String,
+    pub committer_email: String,
+    pub commit_date: String,
+    /// `(short id, subject)` per parent, first parent first.
+    pub parents: Vec<(String, String)>,
+    /// Branches and tags pointing at this commit.
+    pub refs: Vec<String>,
+    /// Local branches whose tip this commit contains.
+    pub merged: Vec<String>,
+    /// Local branches that contain this commit.
+    pub contained: Vec<String>,
+    /// The nearest tag reachable from this commit and the distance to it.
+    pub follows: Option<(String, usize)>,
     pub message: String,
     pub files: Vec<FileDiff>,
 }

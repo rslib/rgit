@@ -5,6 +5,8 @@ pub struct FileDiff {
     /// The source path when this file was renamed or copied (rename detection
     /// on); `None` for a plain add/modify/delete. `path` is always the new side.
     pub old_path: Option<String>,
+    /// How the file changed: added, deleted, modified, renamed, ...
+    pub status: crate::StatusCode,
     pub hunks: Vec<Hunk>,
     pub binary: bool,
 }

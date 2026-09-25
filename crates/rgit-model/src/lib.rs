@@ -83,6 +83,7 @@ mod tests {
             unstaged: vec![FileDiff {
                 path: "a.rs".into(),
                 old_path: None,
+                status: StatusCode::Modified,
                 binary: false,
                 hunks: vec![Hunk {
                     header: "@@ -1,2 +1,2 @@".into(),
@@ -136,6 +137,7 @@ mod tests {
             unstaged: vec![FileDiff {
                 path: "new.rs".into(),
                 old_path: None,
+                status: StatusCode::Modified,
                 binary: false,
                 hunks: vec![Hunk {
                     header: "@@ -0,0 +1,2 @@".into(),

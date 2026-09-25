@@ -320,6 +320,14 @@ impl Buffer {
         self.scroll_into_view();
     }
 
+    /// Put the cursor on the section `id` and scroll it to the top of the view.
+    pub fn jump_to(&mut self, id: &str) {
+        if let Some(idx) = self.rows().position(|r| r.id == id) {
+            self.set_cursor(idx);
+            self.scroll = idx.min(self.visible_len.saturating_sub(self.height.max(1)));
+        }
+    }
+
     pub fn cursor_top(&mut self) {
         self.set_cursor(0);
     }

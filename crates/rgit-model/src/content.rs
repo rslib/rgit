@@ -73,6 +73,11 @@ pub enum Target {
         staged: bool,
         paths: Vec<String>,
     },
+    /// A link to another section of the same buffer, e.g. a diffstat row that
+    /// jumps to its file's diff.
+    Jump {
+        id: SectionId,
+    },
 }
 
 /// Which kind of reference a [`Target::Ref`] points at.
