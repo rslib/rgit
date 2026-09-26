@@ -626,6 +626,20 @@ async fn run_msg(
                     }
                 });
             }
+            Effect::LoadFilePreview { key, path } => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let files: Vec<_> = backend
+                        .file_diff(&path, false)
+                        .ok()
+                        .flatten()
+                        .into_iter()
+                        .collect();
+                    let sections = rgit_model::build_diff(&path, &files);
+                    let _ = msg_tx.send(Msg::PreviewBuilt { key, sections });
+                });
+            }
             Effect::BuildFilePreview { key, diff } => {
                 let msg_tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {

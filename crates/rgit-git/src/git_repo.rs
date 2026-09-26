@@ -166,13 +166,18 @@ impl GitBackend for Git2Backend {
         let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
         // Include untracked files (recursing into new directories) so a brand-new
         // file shows its all-added diff in the preview, like `git diff` with
-        // --no-index would; without this untracked files have no diff to show.
+        // --no-index would. Their contents are read and hashed in full, so past
+        // EAGER_UNTRACKED files (an unignored build dir, say) they are left out
+        // and `file_diff` loads one on demand.
+        const EAGER_UNTRACKED: usize = 200;
         let mut wt_opts = DiffOptions::new();
-        wt_opts
-            .include_untracked(true)
-            .recurse_untracked_dirs(true)
-            // Emit the file's lines as additions, not just a bare "new file" delta.
-            .show_untracked_content(true);
+        if entries.iter().filter(|e| e.is_untracked()).count() <= EAGER_UNTRACKED {
+            wt_opts
+                .include_untracked(true)
+                .recurse_untracked_dirs(true)
+                // Emit the file's lines as additions, not just a bare "new file" delta.
+                .show_untracked_content(true);
+        }
         let unstaged = extract_with_renames(repo.diff_index_to_workdir(None, Some(&mut wt_opts))?)?;
         let mut idx_opts = DiffOptions::new();
         let staged = extract_with_renames(repo.diff_tree_to_index(

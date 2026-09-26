@@ -1675,6 +1675,12 @@ pub enum Effect {
         key: PreviewKey,
         rev: String,
     },
+    /// Load one file's working-tree diff and build its preview off-thread, for
+    /// an untracked file the status snapshot carries no diff for.
+    LoadFilePreview {
+        key: PreviewKey,
+        path: String,
+    },
     /// Build a large file diff for the preview pane off-thread.
     BuildFilePreview {
         key: PreviewKey,
@@ -2256,6 +2262,15 @@ impl App {
             return Vec::new();
         }
         match &key {
+            PreviewKey::File { path, staged }
+                if !*staged && self.file_diff(path, false).is_none() && self.is_untracked(path) =>
+            {
+                let path = path.clone();
+                self.set_preview_placeholder();
+                self.preview_key = Some(key.clone());
+                self.preview_followed_hunk = None;
+                vec![Effect::LoadFilePreview { key, path }]
+            }
             PreviewKey::File { path, staged } => {
                 // Build small diffs synchronously (no flash); defer the ones
                 // whose build - chiefly syntax highlighting - can be felt.

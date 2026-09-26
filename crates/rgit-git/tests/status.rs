@@ -1132,3 +1132,18 @@ fn renames_list_the_new_path_and_deletions_show_as_deleted() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn many_untracked_files_load_their_diff_on_demand() {
+    let dir = init_repo("many-untracked");
+    std::fs::create_dir(dir.join("build")).unwrap();
+    for i in 0..300 {
+        std::fs::write(dir.join(format!("build/{i}.txt")), "x\n").unwrap();
+    }
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let status = backend.status().unwrap();
+    assert_eq!(status.entries.len(), 300);
+    assert!(status.unstaged.is_empty(), "contents are not read up front");
+    let diff = backend.file_diff("build/7.txt", false).unwrap().unwrap();
+    assert_eq!(diff.hunks[0].lines[0].text, "x");
+}
