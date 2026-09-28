@@ -28,6 +28,24 @@ pub trait GitBackend: Send + Sync {
     /// Unstage a whole path, folder or glob (reset its index entries to HEAD).
     fn unstage_file(&self, path: &str) -> Result<(), GitError>;
 
+    /// git's `add`: stage new, changed and deleted files under `paths` (every
+    /// path when empty), or with `update` only tracked ones. `force` adds
+    /// ignored files too.
+    fn add(&self, paths: &[String], update: bool, force: bool) -> Result<(), GitError>;
+
+    /// Restore `paths` from `source` (a revision, or the index when `None`) into
+    /// the index (`staged`) and/or the working tree (`worktree`). `overlay`
+    /// leaves paths the source lacks alone (checkout's rule); otherwise they are
+    /// removed (restore's rule).
+    fn restore(
+        &self,
+        paths: &[String],
+        source: Option<&str>,
+        staged: bool,
+        worktree: bool,
+        overlay: bool,
+    ) -> Result<(), GitError>;
+
     /// Stage one hunk of a path, identified by its new-side start line.
     fn stage_hunk(&self, path: &str, new_start: u32) -> Result<(), GitError>;
 
@@ -59,6 +77,9 @@ pub trait GitBackend: Send + Sync {
 
     /// Replace HEAD with a new commit from the index, keeping HEAD's parents.
     fn amend(&self, message: &str) -> Result<(), GitError>;
+
+    /// Commit (or amend) with the given options; see [`crate::CommitOptions`].
+    fn commit_with(&self, message: &str, opts: &crate::CommitOptions) -> Result<(), GitError>;
 
     /// Change any commit's message (keeping its tree and parents) and replay its
     /// descendants on the current branch, then restack stacked children. The rev
@@ -208,6 +229,34 @@ pub trait GitBackend: Send + Sync {
     /// Create a branch at HEAD and check it out.
     fn create_branch(&self, name: &str) -> Result<(), GitError>;
 
+    /// Create a branch at `start` and check it out; `force` resets an existing
+    /// one. The upstream is set to `start` when it is a remote-tracking branch
+    /// or `track` is set.
+    fn branch_from(
+        &self,
+        name: &str,
+        start: &str,
+        force: bool,
+        track: bool,
+    ) -> Result<(), GitError>;
+
+    /// The branch (or, if detached, the commit) checked out before the current
+    /// one: git's `@{-1}`.
+    fn previous_checkout(&self) -> Result<String, GitError>;
+
+    /// Create branch `name` at `start` without checking it out (git's `branch
+    /// <name> <start>`), tracking `start` when it is a remote-tracking branch.
+    /// `force` moves an existing branch.
+    fn create_branch_at(&self, name: &str, start: &str, force: bool) -> Result<(), GitError>;
+
+    /// Set local branch `name`'s upstream (a remote-tracking or local branch),
+    /// or unset it with `None` (git's `branch -u` / `--unset-upstream`).
+    fn set_upstream(&self, name: &str, upstream: Option<&str>) -> Result<(), GitError>;
+
+    /// Local branch `name`'s upstream and how far the branch is ahead of and
+    /// behind it, or `None` when it tracks nothing.
+    fn branch_upstream(&self, name: &str) -> Result<Option<(String, usize, usize)>, GitError>;
+
     /// Stash the working tree and index (including untracked files). Returns the
     /// git-style `Saved working directory and index state WIP on ...` line.
     /// Stash the working tree and index. With `include_untracked` (git's `-u`),
@@ -222,11 +271,32 @@ pub trait GitBackend: Send + Sync {
         include_untracked: bool,
     ) -> Result<String, GitError>;
 
+    /// Stash like `git stash push`: under `message` when given, untracked files
+    /// too with `include_untracked`, the index kept in place with `keep_index`,
+    /// and only `paths` when any are given. Returns git's `Saved ...` line.
+    fn stash_push_opts(
+        &self,
+        message: Option<&str>,
+        include_untracked: bool,
+        keep_index: bool,
+        paths: &[String],
+    ) -> Result<String, GitError>;
+
     /// Pop the stash at `index` (apply it and drop it).
     fn stash_pop(&self, index: usize) -> Result<(), GitError>;
 
     /// Apply the stash at `index` without dropping it.
     fn stash_apply(&self, index: usize) -> Result<(), GitError>;
+
+    /// Apply the stash at `index`, restoring its staged changes to the index
+    /// too with `restore_index` (git's `--index`), and drop it after with
+    /// `drop` (git's `stash pop`).
+    fn stash_apply_opts(
+        &self,
+        index: usize,
+        restore_index: bool,
+        drop: bool,
+    ) -> Result<(), GitError>;
 
     /// Drop the stash at `index` without applying it.
     fn stash_drop(&self, index: usize) -> Result<(), GitError>;
@@ -545,6 +615,10 @@ pub trait GitBackend: Send + Sync {
     /// Reset HEAD (and, per mode, the index and worktree) to `rev`.
     fn reset(&self, rev: &str, mode: crate::ResetMode) -> Result<(), GitError>;
 
+    /// Reset the index entries of `paths` (files, folders or globs) to `rev`,
+    /// leaving HEAD and the working tree alone (git's `reset <rev> -- <paths>`).
+    fn reset_paths(&self, rev: &str, paths: &[String]) -> Result<(), GitError>;
+
     /// Cherry-pick `rev` onto HEAD. With `no_commit` (git's `-n`), apply it to
     /// the index and working tree without committing.
     fn cherry_pick(&self, rev: &str, no_commit: bool) -> Result<(), GitError> {
@@ -625,6 +699,20 @@ pub trait GitBackend: Send + Sync {
     /// Create a tag at HEAD (annotated when `message` is non-empty).
     fn create_tag(&self, name: &str, message: &str) -> Result<(), GitError>;
 
+    /// Create a tag at `rev` (annotated when `message` is non-empty), replacing
+    /// a tag of the same name when `force`.
+    fn create_tag_at(
+        &self,
+        name: &str,
+        rev: &str,
+        message: &str,
+        force: bool,
+    ) -> Result<(), GitError>;
+
+    /// Whether `ancestor` is `rev` or an ancestor of it (git's `merge-base
+    /// --is-ancestor`).
+    fn is_ancestor(&self, ancestor: &str, rev: &str) -> Result<bool, GitError>;
+
     /// Delete a tag.
     fn delete_tag(&self, name: &str) -> Result<(), GitError>;
 
@@ -640,6 +728,17 @@ pub trait GitBackend: Send + Sync {
     /// Change a remote's fetch URL (git's `remote set-url`).
     fn set_remote_url(&self, name: &str, url: &str) -> Result<(), GitError>;
 
+    /// Every URL of remote `name`, or its push URLs with `push` (its URLs
+    /// when it has none), as `git remote get-url --all [--push]` lists them.
+    fn remote_urls(&self, name: &str, push: bool) -> Result<Vec<String>, GitError>;
+
+    /// Set remote `name`'s push URL (git's `remote set-url --push`).
+    fn set_remote_push_url(&self, name: &str, url: &str) -> Result<(), GitError>;
+
+    /// Delete the remote-tracking branches of `name` that no longer exist on
+    /// it (git's `remote prune`). Returns the branches deleted.
+    fn prune_remote(&self, name: &str) -> Result<Vec<String>, GitError>;
+
     /// Rename a remote and its tracking refs (git's `remote rename`).
     fn rename_remote(&self, old: &str, new: &str) -> Result<(), GitError>;
 
@@ -649,8 +748,32 @@ pub trait GitBackend: Send + Sync {
     /// Create a linked worktree named `name` at `path` (on a new branch `name`).
     fn add_worktree(&self, name: &str, path: &str) -> Result<(), GitError>;
 
-    /// Remove the linked worktree named `name`.
-    /// Remove a linked worktree. `force` prunes it even when locked (git's `-f`).
+    /// Add a linked worktree at `path` as `git worktree add` does: on
+    /// `new_branch` created at `commitish` (default HEAD); else on branch
+    /// `commitish`, or on a new branch tracking the one remote branch of that
+    /// name; else detached at `commitish` (also with `detach`); else on a
+    /// branch named after `path`'s last folder, created at HEAD if missing.
+    fn worktree_add(
+        &self,
+        path: &str,
+        commitish: Option<&str>,
+        new_branch: Option<&str>,
+        detach: bool,
+    ) -> Result<(), GitError>;
+
+    /// Lock a linked worktree (by name or path) against pruning, with an
+    /// optional reason.
+    fn worktree_lock(&self, worktree: &str, reason: Option<&str>) -> Result<(), GitError>;
+
+    /// Unlock a linked worktree (by name or path).
+    fn worktree_unlock(&self, worktree: &str) -> Result<(), GitError>;
+
+    /// Move a linked worktree (by name or path) to `new_path`.
+    fn worktree_move(&self, worktree: &str, new_path: &str) -> Result<(), GitError>;
+
+    /// Remove a linked worktree (by name or path) and its folder. It refuses
+    /// one with modified or untracked files unless `force`, which also removes
+    /// a locked one (git's `-f`).
     fn remove_worktree(&self, name: &str, force: bool) -> Result<(), GitError>;
 
     /// Prune worktree admin entries whose working tree is gone (git's `worktree
@@ -816,6 +939,67 @@ pub trait GitBackend: Send + Sync {
         result?;
         Ok(outcome)
     }
+
+    /// The id of the object a revision names, not peeled (`git rev-parse`).
+    fn resolve_object(&self, rev: &str) -> Result<String, GitError>;
+
+    /// The shortest unique abbreviation of an object id, at least `min` digits.
+    fn abbrev_id(&self, id: &str, min: usize) -> Result<String, GitError>;
+
+    /// The full ref name a revision goes through (`refs/heads/main`), if any.
+    fn full_ref_name(&self, rev: &str) -> Result<Option<String>, GitError>;
+
+    /// Where a symbolic ref points (`HEAD` -> `refs/heads/main`); None when direct.
+    fn symbolic_ref(&self, name: &str) -> Result<Option<String>, GitError>;
+
+    /// The repository's `.git` directory.
+    fn git_dir(&self) -> std::path::PathBuf;
+
+    /// An object's type, id and raw content (`git cat-file`).
+    fn read_object(&self, rev: &str) -> Result<crate::RawObject, GitError>;
+
+    /// A revision's tree entries under `paths`, as `git ls-tree` lists them.
+    fn ls_tree(
+        &self,
+        rev: &str,
+        paths: &[String],
+        walk: crate::TreeWalk,
+    ) -> Result<Vec<crate::TreeItem>, GitError>;
+
+    /// Every index entry with its mode, id and stage (`git ls-files -s`).
+    fn index_entries(&self) -> Result<Vec<crate::IndexItem>, GitError>;
+
+    /// Untracked, modified and deleted paths, plus ignored ones when asked.
+    fn path_states(&self, ignored: bool) -> Result<Vec<(String, crate::PathState)>, GitError>;
+
+    /// Every ref under `refs/` with its object and message, sorted by name.
+    fn ref_details(&self) -> Result<Vec<crate::RefDetail>, GitError>;
+
+    /// Commits reachable as `git rev-list` walks them, newest first.
+    fn rev_walk(&self, walk: &crate::RevWalk) -> Result<Vec<crate::WalkCommit>, GitError>;
+
+    /// The best common ancestor of two commits, or all of them.
+    fn merge_bases(&self, a: &str, b: &str, all: bool) -> Result<Vec<String>, GitError>;
+
+    /// A ref's reflog, newest first.
+    fn reflog(&self, name: &str) -> Result<Vec<crate::ReflogItem>, GitError>;
+
+    /// Search tracked files as `git grep` does: every matching line, in path order.
+    fn git_grep(&self, q: &crate::GitGrep) -> Result<Vec<crate::GrepHit>, GitError>;
+
+    /// The rule that ignores `path`, or None when it is not ignored. Tracked
+    /// paths are never ignored unless `no_index`.
+    fn check_ignore(
+        &self,
+        path: &str,
+        no_index: bool,
+    ) -> Result<Option<crate::IgnoreRule>, GitError>;
+
+    /// `Name <email> time zone` for the author or committer (`git var`).
+    fn ident(&self, committer: bool) -> Result<String, GitError>;
+
+    /// Loose and packed object counts (`git count-objects`).
+    fn count_objects(&self) -> Result<crate::ObjectCounts, GitError>;
 }
 
 /// How many stacked ancestors a branch has, for ordering parents before

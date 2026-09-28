@@ -8,7 +8,7 @@ use git2::{
     PushOptions, RemoteCallbacks, Repository, ResetType, Status, StatusOptions,
 };
 
-use crate::model::{ConfigScope, RepoState, ResetMode};
+use crate::model::{CommitOptions, ConfigScope, RepoState, ResetMode};
 
 use crate::backend::GitBackend;
 use crate::diff::{DiffLine, FileDiff, Hunk, LineOrigin};
@@ -219,6 +219,37 @@ impl GitBackend for Git2Backend {
         })
     }
 
+    fn stash_push_opts(
+        &self,
+        message: Option<&str>,
+        include_untracked: bool,
+        keep_index: bool,
+        paths: &[String],
+    ) -> Result<String, GitError> {
+        self.logged("stash", || {
+            if paths.is_empty() {
+                let mut repo = self.repo.lock().expect("repo mutex");
+                let sig = repo.signature()?;
+                let mut flags = stash_flags(include_untracked).unwrap_or_default();
+                flags.set(git2::StashFlags::KEEP_INDEX, keep_index);
+                repo.stash_save2(&sig, message, Some(flags))?;
+                return Ok(stash_saved_line(&repo));
+            }
+            // libgit2 can stash a pathspec, but git2 cannot name such a stash.
+            let mut args = vec!["stash", "push"];
+            args.extend(include_untracked.then_some("-u"));
+            args.extend(keep_index.then_some("-k"));
+            if let Some(m) = message {
+                args.extend(["-m", m]);
+            }
+            args.push("--");
+            args.extend(paths.iter().map(String::as_str));
+            let out = self.run_git(&args, &[])?;
+            sync_index(&self.repo.lock().expect("repo mutex"))?;
+            Ok(out)
+        })
+    }
+
     fn stash_pop(&self, index: usize) -> Result<(), GitError> {
         self.logged("stash pop", || {
             let mut repo = self.repo.lock().expect("repo mutex");
@@ -231,6 +262,27 @@ impl GitBackend for Git2Backend {
         self.logged("stash apply", || {
             let mut repo = self.repo.lock().expect("repo mutex");
             repo.stash_apply(index, None)?;
+            Ok(())
+        })
+    }
+
+    fn stash_apply_opts(
+        &self,
+        index: usize,
+        restore_index: bool,
+        drop: bool,
+    ) -> Result<(), GitError> {
+        self.logged(if drop { "stash pop" } else { "stash apply" }, || {
+            let mut repo = self.repo.lock().expect("repo mutex");
+            let mut opts = git2::StashApplyOptions::new();
+            if restore_index {
+                opts.reinstantiate_index();
+            }
+            if drop {
+                repo.stash_pop(index, Some(&mut opts))?;
+            } else {
+                repo.stash_apply(index, Some(&mut opts))?;
+            }
             Ok(())
         })
     }
@@ -763,6 +815,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn stage_file(&self, path: &str) -> Result<(), GitError> {
+        let path = root_dot(path);
         let repo = self.repo.lock().expect("repo mutex");
         sync_index(&repo)?;
         no_match(&repo, path)?;
@@ -779,6 +832,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn unstage_file(&self, path: &str) -> Result<(), GitError> {
+        let path = root_dot(path);
         let repo = self.repo.lock().expect("repo mutex");
         sync_index(&repo)?;
         no_match(&repo, path)?;
@@ -795,6 +849,88 @@ impl GitBackend for Git2Backend {
             }
         }
         Ok(())
+    }
+
+    fn add(&self, paths: &[String], update: bool, force: bool) -> Result<(), GitError> {
+        let paths = &root_dots(paths);
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        if !force {
+            for p in paths {
+                no_match(&repo, p)?;
+            }
+        }
+        let mut index = repo.index()?;
+        if !update {
+            let flags = if force {
+                git2::IndexAddOption::FORCE
+            } else {
+                git2::IndexAddOption::CHECK_PATHSPEC
+            };
+            index.add_all(paths, flags, None)?;
+        }
+        index.update_all(paths, None)?;
+        index.write()?;
+        Ok(())
+    }
+
+    fn restore(
+        &self,
+        paths: &[String],
+        source: Option<&str>,
+        staged: bool,
+        worktree: bool,
+        overlay: bool,
+    ) -> Result<(), GitError> {
+        self.logged("restore", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            let paths = &root_dots(paths);
+            let target = source
+                .or(staged.then_some("HEAD"))
+                .map(|s| repo.revparse_single(s))
+                .transpose()?;
+            let tree = target.as_ref().map(|t| t.peel_to_tree()).transpose()?;
+            // checkout matches a revision's paths in it alone, as git does.
+            let index = repo.index()?;
+            let index = (!overlay || tree.is_none()).then_some(&index);
+            for p in paths {
+                known(index, tree.as_ref(), p)?;
+            }
+            // Overlay: only the source's own files, so the rest stay put.
+            let paths: Vec<String> = match &tree {
+                Some(tree) if overlay => Pathspec::new(paths)?
+                    .match_tree(tree, PathspecFlags::DEFAULT)?
+                    .entries()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect(),
+                _ => paths.to_vec(),
+            };
+            if paths.is_empty() {
+                return Ok(());
+            }
+            if staged {
+                repo.reset_default(target.as_ref(), &paths)?;
+            }
+            if !worktree {
+                return Ok(());
+            }
+            let mut checkout = CheckoutBuilder::new();
+            checkout
+                .force()
+                .disable_pathspec_match(overlay && tree.is_some());
+            for p in &paths {
+                checkout.path(p);
+            }
+            match &tree {
+                Some(tree) => {
+                    checkout.update_index(false);
+                    repo.checkout_tree(tree.as_object(), Some(&mut checkout))?;
+                }
+                None => repo.checkout_index(None, Some(&mut checkout))?,
+            }
+            Ok(())
+        })
     }
 
     fn stage_hunk(&self, path: &str, new_start: u32) -> Result<(), GitError> {
@@ -2158,14 +2294,28 @@ impl GitBackend for Git2Backend {
         self.logged("reset", || {
             let repo = self.repo.lock().expect("repo mutex");
             let target = repo.revparse_single(rev)?;
+            if mode == ResetMode::Keep {
+                // A safe checkout updates only what differs from HEAD and
+                // refuses to overwrite local changes there.
+                let commit = target.peel(ObjectType::Commit)?;
+                repo.checkout_tree(&commit, Some(CheckoutBuilder::new().safe()))?;
+            }
             let kind = match mode {
                 ResetMode::Soft => ResetType::Soft,
-                ResetMode::Mixed => ResetType::Mixed,
+                ResetMode::Mixed | ResetMode::Keep => ResetType::Mixed,
                 ResetMode::Hard => ResetType::Hard,
             };
             repo.reset(&target, kind, None)?;
             Ok(())
         })
+    }
+
+    fn reset_paths(&self, rev: &str, paths: &[String]) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        let target = repo.revparse_single(rev)?.peel(ObjectType::Commit)?;
+        repo.reset_default(Some(&target), root_dots(paths))?;
+        Ok(())
     }
 
     fn pick(&self, revs: &[String], opts: &crate::PickOptions) -> Result<(), GitError> {
@@ -2325,15 +2475,32 @@ impl GitBackend for Git2Backend {
     }
 
     fn create_tag(&self, name: &str, message: &str) -> Result<(), GitError> {
+        self.create_tag_at(name, "HEAD", message, false)
+    }
+
+    fn create_tag_at(
+        &self,
+        name: &str,
+        rev: &str,
+        message: &str,
+        force: bool,
+    ) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
-        let target = repo.head()?.peel(ObjectType::Commit)?;
+        let target = repo.revparse_single(rev)?;
         if message.trim().is_empty() {
-            repo.tag_lightweight(name, &target, false)?;
+            repo.tag_lightweight(name, &target, force)?;
         } else {
             let sig = repo.signature()?;
-            repo.tag(name, &target, &sig, message, false)?;
+            repo.tag(name, &target, &sig, message, force)?;
         }
         Ok(())
+    }
+
+    fn is_ancestor(&self, ancestor: &str, rev: &str) -> Result<bool, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let a = repo.revparse_single(ancestor)?.peel_to_commit()?.id();
+        let r = repo.revparse_single(rev)?.peel_to_commit()?.id();
+        Ok(a == r || repo.graph_descendant_of(r, a)?)
     }
 
     fn delete_tag(&self, name: &str) -> Result<(), GitError> {
@@ -2402,6 +2569,63 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn remote_urls(&self, name: &str, push: bool) -> Result<Vec<String>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        repo.find_remote(name)?;
+        let config = repo.config()?;
+        let values = |key: &str| -> Result<Vec<String>, GitError> {
+            let mut out = Vec::new();
+            let mut entries = config.multivar(&format!("remote.{name}.{key}"), None)?;
+            while let Some(entry) = entries.next() {
+                out.extend(entry?.value().map(str::to_owned));
+            }
+            Ok(out)
+        };
+        let push_urls = if push { values("pushurl")? } else { Vec::new() };
+        if push_urls.is_empty() {
+            values("url")
+        } else {
+            Ok(push_urls)
+        }
+    }
+
+    fn set_remote_push_url(&self, name: &str, url: &str) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        repo.find_remote(name)?;
+        repo.remote_set_pushurl(name, Some(url))?;
+        Ok(())
+    }
+
+    fn prune_remote(&self, name: &str) -> Result<Vec<String>, GitError> {
+        self.logged("remote prune", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+            let cred = cred_guard.as_deref();
+            let tracking = |repo: &Repository| -> Result<Vec<String>, GitError> {
+                let mut out = Vec::new();
+                for b in repo.branches(Some(BranchType::Remote))? {
+                    if let Some(n) = b?.0.name()? {
+                        out.push(n.to_owned());
+                    }
+                }
+                Ok(out)
+            };
+            let before = tracking(&repo)?;
+            let rejected = std::sync::atomic::AtomicBool::new(false);
+            let mut remote = repo.find_remote(name)?;
+            let mut conn = remote.connect_auth(
+                git2::Direction::Fetch,
+                Some(remote_callbacks(&|_| {}, &rejected, cred)),
+                None,
+            )?;
+            conn.remote()
+                .prune(Some(remote_callbacks(&|_| {}, &rejected, cred)))?;
+            drop(conn);
+            let after = tracking(&repo)?;
+            Ok(before.into_iter().filter(|b| !after.contains(b)).collect())
+        })
+    }
+
     fn rename_remote(&self, old: &str, new: &str) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         // Returns the list of non-default refspecs it could not rename; ignore it.
@@ -2463,9 +2687,108 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn worktree_add(
+        &self,
+        path: &str,
+        commitish: Option<&str>,
+        new_branch: Option<&str>,
+        detach: bool,
+    ) -> Result<(), GitError> {
+        let abs = std::path::absolute(path)?;
+        let repo = self.repo.lock().expect("repo mutex");
+        let local = |b: &str| repo.find_branch(b, BranchType::Local).ok();
+        // The branch to check out there, creating it (and tracking a remote
+        // branch it starts from) when needed; None to detach.
+        let branch = match (new_branch, commitish) {
+            _ if detach => None,
+            (Some(b), start) => Some(new_worktree_branch(&repo, b, start.unwrap_or("HEAD"))?),
+            (None, Some(c)) => match local(c) {
+                Some(b) => Some(b),
+                None => {
+                    // As git does, track the one remote branch of that name.
+                    let mut remote = Vec::new();
+                    for b in repo.branches(Some(BranchType::Remote))? {
+                        if let Some(n) = b?.0.name()?
+                            && n.ends_with(&format!("/{c}"))
+                        {
+                            remote.push(n.to_owned());
+                        }
+                    }
+                    match remote.as_slice() {
+                        [one] => Some(new_worktree_branch(&repo, c, one)?),
+                        _ => None,
+                    }
+                }
+            },
+            (None, None) => {
+                let name = worktree_base_name(&abs);
+                match local(&name) {
+                    Some(b) => Some(b),
+                    None => Some(new_worktree_branch(&repo, &name, "HEAD")?),
+                }
+            }
+        };
+        if let Some(branch) = branch {
+            let base = worktree_base_name(&abs);
+            let mut name = base.clone();
+            for n in 1.. {
+                if repo.find_worktree(&name).is_err() {
+                    break;
+                }
+                name = format!("{base}{n}");
+            }
+            let mut opts = git2::WorktreeAddOptions::new();
+            opts.reference(Some(branch.get()));
+            repo.worktree(&name, &abs, Some(&opts))?;
+            return Ok(());
+        }
+        // libgit2 cannot add a worktree on a detached HEAD.
+        let abs = abs.to_string_lossy();
+        let mut args = vec!["worktree", "add", "--detach", &abs];
+        args.extend(commitish);
+        self.run_git(&args, &[])?;
+        Ok(())
+    }
+
+    fn worktree_lock(&self, worktree: &str, reason: Option<&str>) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        find_worktree(&repo, worktree)?.lock(reason)?;
+        Ok(())
+    }
+
+    fn worktree_unlock(&self, worktree: &str) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        find_worktree(&repo, worktree)?.unlock()?;
+        Ok(())
+    }
+
+    fn worktree_move(&self, worktree: &str, new_path: &str) -> Result<(), GitError> {
+        let from = {
+            let repo = self.repo.lock().expect("repo mutex");
+            find_worktree(&repo, worktree)?.path().to_path_buf()
+        };
+        let to = std::path::absolute(new_path)?;
+        // libgit2 has no worktree move.
+        self.run_git(
+            &[
+                "worktree",
+                "move",
+                &from.to_string_lossy(),
+                &to.to_string_lossy(),
+            ],
+            &[],
+        )?;
+        Ok(())
+    }
+
     fn remove_worktree(&self, name: &str, force: bool) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
-        let wt = repo.find_worktree(name)?;
+        let wt = find_worktree(&repo, name)?;
+        if !force && Repository::open(wt.path()).is_ok_and(|r| repo_is_dirty(&r)) {
+            return Err(GitError::Other(format!(
+                "worktree {name} has modified or untracked files; use --force to remove it"
+            )));
+        }
         let mut opts = git2::WorktreePruneOptions::new();
         opts.valid(true).working_tree(true).locked(force);
         wt.prune(Some(&mut opts))?;
@@ -2686,7 +3009,90 @@ impl GitBackend for Git2Backend {
         })
     }
 
+    fn branch_from(
+        &self,
+        name: &str,
+        start: &str,
+        force: bool,
+        track: bool,
+    ) -> Result<(), GitError> {
+        self.logged("create branch", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            if !git2::Branch::name_is_valid(name)? {
+                return Err(GitError::Other(format!(
+                    "'{name}' is not a valid branch name"
+                )));
+            }
+            let refname = format!("refs/heads/{name}");
+            if !force && repo.find_reference(&refname).is_ok() {
+                return Err(GitError::Other(format!(
+                    "a branch named '{name}' already exists"
+                )));
+            }
+            let commit = repo.revparse_single(start)?.peel_to_commit()?;
+            repo.checkout_tree(commit.as_object(), Some(CheckoutBuilder::new().safe()))?;
+            // A plain reference, not `branch()`, which refuses to reset HEAD's branch.
+            repo.reference(
+                &refname,
+                commit.id(),
+                true,
+                &format!("branch: Created from {start}"),
+            )?;
+            repo.set_head(&refname)?;
+            if track || repo.find_branch(start, BranchType::Remote).is_ok() {
+                repo.find_branch(name, BranchType::Local)?
+                    .set_upstream(Some(start))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn create_branch_at(&self, name: &str, start: &str, force: bool) -> Result<(), GitError> {
+        self.logged("create branch", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let commit = repo.revparse_single(start)?.peel_to_commit()?;
+            let mut branch = repo.branch(name, &commit, force)?;
+            if repo.find_branch(start, BranchType::Remote).is_ok() {
+                branch.set_upstream(Some(start))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn previous_checkout(&self) -> Result<String, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let (object, reference) = repo
+            .revparse_ext("@{-1}")
+            .map_err(|_| GitError::Other("no previous branch to switch to".to_owned()))?;
+        Ok(match reference.as_ref().filter(|r| r.is_branch()) {
+            Some(r) => r.shorthand().unwrap_or_default().to_owned(),
+            None => object.id().to_string(),
+        })
+    }
+
+    fn set_upstream(&self, name: &str, upstream: Option<&str>) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        repo.find_branch(name, BranchType::Local)?
+            .set_upstream(upstream)?;
+        Ok(())
+    }
+
+    fn branch_upstream(&self, name: &str) -> Result<Option<(String, usize, usize)>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let branch = repo.find_branch(name, BranchType::Local)?;
+        let Ok(upstream) = branch.upstream() else {
+            return Ok(None);
+        };
+        let up_name = upstream.name()?.unwrap_or_default().to_owned();
+        let (ahead, behind) = match (branch.get().target(), upstream.get().target()) {
+            (Some(local), Some(up)) => repo.graph_ahead_behind(local, up)?,
+            _ => (0, 0),
+        };
+        Ok(Some((up_name, ahead, behind)))
+    }
+
     fn discard_file(&self, path: &str) -> Result<(), GitError> {
+        let path = root_dot(path);
         self.logged("discard", || {
             let repo = self.repo.lock().expect("repo mutex");
             sync_index(&repo)?;
@@ -2743,20 +3149,23 @@ impl GitBackend for Git2Backend {
     }
 
     fn commit(&self, message: &str) -> Result<(), GitError> {
-        self.logged("commit", || {
-            let repo = self.repo.lock().expect("repo mutex");
-            let parents = match repo.head() {
-                Ok(head_ref) => vec![head_ref.peel_to_commit()?],
-                Err(_) => Vec::new(),
-            };
-            make_commit(&repo, message, &parents, true, true)
-        })
+        self.commit_with(message, &CommitOptions::default())
     }
 
     fn amend(&self, message: &str) -> Result<(), GitError> {
-        self.logged("amend", || {
+        self.commit_with(
+            message,
+            &CommitOptions {
+                amend: true,
+                ..CommitOptions::default()
+            },
+        )
+    }
+
+    fn commit_with(&self, message: &str, opts: &CommitOptions) -> Result<(), GitError> {
+        self.logged(if opts.amend { "amend" } else { "commit" }, || {
             let repo = self.repo.lock().expect("repo mutex");
-            make_amend(&repo, message, true)
+            write_commit(&repo, message, opts)
         })
     }
 
@@ -3121,21 +3530,24 @@ impl GitBackend for Git2Backend {
     }
 
     fn commit_no_verify(&self, message: &str) -> Result<(), GitError> {
-        self.logged("commit", || {
-            let repo = self.repo.lock().expect("repo mutex");
-            let parents = match repo.head() {
-                Ok(head_ref) => vec![head_ref.peel_to_commit()?],
-                Err(_) => Vec::new(),
-            };
-            make_commit(&repo, message, &parents, true, false)
-        })
+        self.commit_with(
+            message,
+            &CommitOptions {
+                no_verify: true,
+                ..CommitOptions::default()
+            },
+        )
     }
 
     fn amend_no_verify(&self, message: &str) -> Result<(), GitError> {
-        self.logged("amend", || {
-            let repo = self.repo.lock().expect("repo mutex");
-            make_amend(&repo, message, false)
-        })
+        self.commit_with(
+            message,
+            &CommitOptions {
+                amend: true,
+                no_verify: true,
+                ..CommitOptions::default()
+            },
+        )
     }
 
     fn commit_report(&self) -> Vec<String> {
@@ -3496,6 +3908,91 @@ impl GitBackend for Git2Backend {
             // An empty source ref deletes the destination on the remote.
             self.push_refspecs(remote, &[format!(":refs/heads/{branch}")], report)
         })
+    }
+
+    fn resolve_object(&self, rev: &str) -> Result<String, GitError> {
+        crate::plumbing::resolve(&self.repo.lock().expect("repo mutex"), rev)
+    }
+
+    fn abbrev_id(&self, id: &str, min: usize) -> Result<String, GitError> {
+        crate::plumbing::abbrev(&self.repo.lock().expect("repo mutex"), id, min)
+    }
+
+    fn full_ref_name(&self, rev: &str) -> Result<Option<String>, GitError> {
+        crate::plumbing::full_ref_name(&self.repo.lock().expect("repo mutex"), rev)
+    }
+
+    fn symbolic_ref(&self, name: &str) -> Result<Option<String>, GitError> {
+        crate::plumbing::symbolic_ref(&self.repo.lock().expect("repo mutex"), name)
+    }
+
+    fn git_dir(&self) -> PathBuf {
+        self.repo.lock().expect("repo mutex").path().to_path_buf()
+    }
+
+    fn read_object(&self, rev: &str) -> Result<crate::RawObject, GitError> {
+        crate::plumbing::read_object(&self.repo.lock().expect("repo mutex"), rev)
+    }
+
+    fn ls_tree(
+        &self,
+        rev: &str,
+        paths: &[String],
+        walk: crate::TreeWalk,
+    ) -> Result<Vec<crate::TreeItem>, GitError> {
+        crate::plumbing::ls_tree(&self.repo.lock().expect("repo mutex"), rev, paths, walk)
+    }
+
+    fn index_entries(&self) -> Result<Vec<crate::IndexItem>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::plumbing::index_entries(&repo)
+    }
+
+    fn path_states(&self, ignored: bool) -> Result<Vec<(String, crate::PathState)>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::plumbing::path_states(&repo, ignored)
+    }
+
+    fn ref_details(&self) -> Result<Vec<crate::RefDetail>, GitError> {
+        crate::plumbing::ref_details(&self.repo.lock().expect("repo mutex"))
+    }
+
+    fn rev_walk(&self, walk: &crate::RevWalk) -> Result<Vec<crate::WalkCommit>, GitError> {
+        crate::plumbing::rev_walk(&self.repo.lock().expect("repo mutex"), walk)
+    }
+
+    fn merge_bases(&self, a: &str, b: &str, all: bool) -> Result<Vec<String>, GitError> {
+        crate::plumbing::merge_bases(&self.repo.lock().expect("repo mutex"), a, b, all)
+    }
+
+    fn reflog(&self, name: &str) -> Result<Vec<crate::ReflogItem>, GitError> {
+        crate::plumbing::reflog(&self.repo.lock().expect("repo mutex"), name)
+    }
+
+    fn git_grep(&self, q: &crate::GitGrep) -> Result<Vec<crate::GrepHit>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::plumbing::grep(&repo, &self.workdir, q)
+    }
+
+    fn check_ignore(
+        &self,
+        path: &str,
+        no_index: bool,
+    ) -> Result<Option<crate::IgnoreRule>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::plumbing::check_ignore(&repo, &self.workdir, path, no_index)
+    }
+
+    fn ident(&self, committer: bool) -> Result<String, GitError> {
+        crate::plumbing::ident(&self.repo.lock().expect("repo mutex"), committer)
+    }
+
+    fn count_objects(&self) -> Result<crate::ObjectCounts, GitError> {
+        crate::plumbing::count_objects(&self.repo.lock().expect("repo mutex"))
     }
 }
 
@@ -4123,33 +4620,52 @@ fn remote_callbacks<'a>(
     cb
 }
 
-/// Create a commit on HEAD from the current index, running the pre-commit and
-/// commit-msg hooks. `parents` are the new commit's parents (HEAD for a normal
-/// commit, HEAD's parents for an amend). With `check_empty`, refuse a commit
-/// that would not change the tree.
-fn make_commit(
-    repo: &Repository,
-    message: &str,
-    parents: &[git2::Commit],
-    check_empty: bool,
-    verify: bool,
-) -> Result<(), GitError> {
+/// Create a commit on HEAD from the current index (or, with `paths`, from HEAD
+/// plus those paths), or rewrite HEAD when amending, running the pre-commit and
+/// commit-msg hooks unless `no_verify`. The message is cleaned up as git does.
+fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(), GitError> {
     // Refresh from disk first: a plain `git add` since the backend last touched
     // the index must not be lost by the hook machinery writing the stale cached
     // index back out.
     sync_index(repo)?;
+    let head = match repo.head() {
+        Ok(head) => Some(head.peel_to_commit()?),
+        Err(_) if !o.amend => None,
+        Err(e) => return Err(e.into()),
+    };
+    let only = if o.paths.is_empty() {
+        None
+    } else {
+        Some(only_paths_tree(repo, head.as_ref(), &o.paths)?)
+    };
 
-    let mut msg = message.to_owned();
-    if verify {
+    let mut msg = git2::message_prettify(message, None)?;
+    if msg.is_empty() {
+        return Err(GitError::Other(
+            "aborting commit due to empty commit message".to_owned(),
+        ));
+    }
+    let sig = repo.signature()?;
+    if o.signoff {
+        msg = signoff(&msg, &sig);
+    }
+    if !o.no_verify {
         run_commit_hooks(repo, &mut msg)?;
     }
     // After the commit-msg hook, which a Gerrit setup may use to add its own
-    // Change-Id, so rgit never stamps a second one.
-    let msg = crate::change_id::ensure(repo, &msg);
+    // Change-Id, so rgit never stamps a second one. Amend carries the original
+    // change id forward so the logical change keeps its identity.
+    let msg = match head.as_ref().filter(|_| o.amend) {
+        Some(head) => crate::change_id::preserve(repo, head.message().unwrap_or(""), &msg),
+        None => crate::change_id::ensure(repo, &msg),
+    };
 
-    let mut index = repo.index()?;
-    let tree_oid = index.write_tree()?;
+    let tree_oid = match only {
+        Some(oid) => oid,
+        None => repo.index()?.write_tree()?,
+    };
     let tree = repo.find_tree(tree_oid)?;
+    let author = o.author.as_deref().map(parse_ident).transpose()?;
     // Committing a stopped merge records every merged head as a parent, as git does.
     let merging = repo.state() == git2::RepositoryState::Merge;
     let mut merge_heads = Vec::new();
@@ -4158,13 +4674,29 @@ fn make_commit(
             merge_heads.push(repo.find_commit(Oid::from_str(line.trim())?)?);
         }
     }
-    if check_empty && !merging && parents.first().is_some_and(|p| p.tree_id() == tree_oid) {
-        return Err(GitError::NothingToCommit);
+    match head {
+        // Commit::amend rewrites HEAD keeping its parents, which the ref-updating
+        // commit refuses ("current tip is not the first parent").
+        Some(head) if o.amend => {
+            head.amend(
+                Some("HEAD"),
+                author.as_ref(),
+                Some(&sig),
+                None,
+                Some(&msg),
+                Some(&tree),
+            )?;
+        }
+        head => {
+            if !o.allow_empty && !merging && head.as_ref().is_some_and(|p| p.tree_id() == tree_oid)
+            {
+                return Err(GitError::NothingToCommit);
+            }
+            let parents: Vec<&git2::Commit> = head.iter().chain(&merge_heads).collect();
+            let author = author.as_ref().unwrap_or(&sig);
+            repo.commit(Some("HEAD"), author, &sig, &msg, &tree, &parents)?;
+        }
     }
-
-    let parent_refs: Vec<&git2::Commit> = parents.iter().chain(&merge_heads).collect();
-    let sig = repo.signature()?;
-    repo.commit(Some("HEAD"), &sig, &sig, &msg, &tree, &parent_refs)?;
     // Like `git commit`: the in-progress merge, cherry-pick or revert is done, but
     // a cherry-pick sequence keeps its todo for `--continue`.
     for file in [
@@ -4177,10 +4709,75 @@ fn make_commit(
         let _ = std::fs::remove_file(repo.path().join(file));
     }
 
-    if verify {
+    if !o.no_verify {
         let _ = git2_hooks::hooks_post_commit(repo, None);
     }
     Ok(())
+}
+
+/// The tree for `commit <paths>`: HEAD's tree with `paths` as they are in the
+/// working tree. The index gets the same update, as in git.
+fn only_paths_tree(
+    repo: &Repository,
+    head: Option<&git2::Commit>,
+    paths: &[String],
+) -> Result<Oid, GitError> {
+    let paths = &root_dots(paths);
+    let head_tree = head.map(|h| h.tree()).transpose()?;
+    let mut index = repo.index()?;
+    for p in paths {
+        known(Some(&index), head_tree.as_ref(), p)?;
+    }
+    index.update_all(paths, None)?;
+    index.write()?;
+    let spec = Pathspec::new(paths)?;
+    let path_of = |e: &git2::IndexEntry| PathBuf::from(String::from_utf8_lossy(&e.path).as_ref());
+    let hit = |e: &git2::IndexEntry| spec.matches_path(&path_of(e), PathspecFlags::DEFAULT);
+    let mut partial = git2::Index::new()?;
+    if let Some(tree) = &head_tree {
+        partial.read_tree(tree)?;
+    }
+    let gone: Vec<PathBuf> = partial
+        .iter()
+        .filter(|e| hit(e))
+        .map(|e| path_of(&e))
+        .collect();
+    for p in gone {
+        partial.remove_path(&p)?;
+    }
+    for e in index.iter().filter(|e| hit(e)) {
+        partial.add(&e)?;
+    }
+    Ok(partial.write_tree_to(repo)?)
+}
+
+/// `msg` with the committer's `Signed-off-by` trailer, as `git commit -s` adds it.
+fn signoff(msg: &str, sig: &git2::Signature) -> String {
+    let line = format!(
+        "Signed-off-by: {} <{}>",
+        sig.name().unwrap_or(""),
+        sig.email().unwrap_or("")
+    );
+    let body = msg.trim_end();
+    if body.lines().last() == Some(line.as_str()) {
+        return msg.to_owned();
+    }
+    let last = body.rsplit("\n\n").next().unwrap_or("");
+    let trailers = body.contains("\n\n")
+        && last.lines().all(|l| {
+            l.split_once(": ")
+                .is_some_and(|(k, _)| !k.is_empty() && !k.contains(' '))
+        });
+    let sep = if trailers { "\n" } else { "\n\n" };
+    format!("{body}{sep}{line}\n")
+}
+
+/// A `Name <email>` identity, stamped now.
+fn parse_ident(ident: &str) -> Result<git2::Signature<'static>, GitError> {
+    let bad = || GitError::Other(format!("--author '{ident}' is not 'Name <email>'"));
+    let (name, rest) = ident.split_once('<').ok_or_else(bad)?;
+    let email = rest.trim_end().strip_suffix('>').ok_or_else(bad)?;
+    Ok(git2::Signature::now(name.trim(), email.trim())?)
 }
 
 /// Git-style summary of the current HEAD commit: the `[branch sha] subject`
@@ -4249,40 +4846,6 @@ fn stash_saved_line(repo: &Repository) -> String {
         Err(_) => (String::new(), String::new()),
     };
     format!("Saved working directory and index state WIP on {branch}: {short} {subject}")
-}
-
-/// Rewrite HEAD from the index, keeping its parents. Runs the commit hooks when
-/// `verify` is set.
-fn make_amend(repo: &Repository, message: &str, verify: bool) -> Result<(), GitError> {
-    let head = repo.head()?.peel_to_commit()?;
-    let old_msg = head.message().unwrap_or("").to_owned();
-    let mut msg = message.to_owned();
-    if verify {
-        run_commit_hooks(repo, &mut msg)?;
-    }
-    // Amend rewrites the commit; carry the original change id forward so the
-    // logical change keeps its identity even though the oid changes.
-    let msg = crate::change_id::preserve(repo, &old_msg, &msg);
-
-    sync_index(repo)?;
-    let mut index = repo.index()?;
-    let tree = repo.find_tree(index.write_tree()?)?;
-    let sig = repo.signature()?;
-    // Commit::amend rewrites HEAD keeping its parents, which the ref-updating
-    // commit refuses ("current tip is not the first parent").
-    head.amend(
-        Some("HEAD"),
-        Some(&sig),
-        Some(&sig),
-        None,
-        Some(&msg),
-        Some(&tree),
-    )?;
-
-    if verify {
-        let _ = git2_hooks::hooks_post_commit(repo, None);
-    }
-    Ok(())
 }
 
 /// The first-parent chain from HEAD down to and including `target`, newest
@@ -4741,6 +5304,40 @@ fn no_match(repo: &Repository, path: &str) -> Result<(), GitError> {
         Ok(())
     } else {
         Err(did_not_match(path))
+    }
+}
+
+/// git's `.` (the whole repo, at the root) spelled as libgit2 pathspecs take it.
+fn root_dot(path: &str) -> &str {
+    if path == "." { "*" } else { path }
+}
+
+fn root_dots(paths: &[String]) -> Vec<String> {
+    paths.iter().map(|p| root_dot(p).to_owned()).collect()
+}
+
+/// Fail like git when a pathspec names nothing in `index` or `tree`, the files
+/// git knows.
+fn known(
+    index: Option<&git2::Index>,
+    tree: Option<&git2::Tree>,
+    path: &str,
+) -> Result<(), GitError> {
+    let spec = Pathspec::new([path])?;
+    let flags = PathspecFlags::DEFAULT;
+    let hit = index.is_some_and(|i| {
+        spec.match_index(i, flags)
+            .is_ok_and(|m| m.entries().len() > 0)
+    }) || tree.is_some_and(|t| {
+        spec.match_tree(t, flags)
+            .is_ok_and(|m| m.entries().len() > 0)
+    });
+    if hit {
+        Ok(())
+    } else {
+        Err(GitError::Other(format!(
+            "pathspec '{path}' did not match any file(s) known to git"
+        )))
     }
 }
 
@@ -5886,6 +6483,43 @@ fn worktree_head(repo: &Repository) -> (Option<String>, Option<String>) {
 
 /// Whether a repository/worktree has any uncommitted change: tracked edits,
 /// staged files, or new (untracked) files. Ignored files do not count.
+/// Create branch `name` at `start` for a new worktree, tracking `start` when
+/// it is a remote-tracking branch.
+fn new_worktree_branch<'r>(
+    repo: &'r Repository,
+    name: &str,
+    start: &str,
+) -> Result<git2::Branch<'r>, GitError> {
+    let commit = repo.revparse_single(start)?.peel_to_commit()?;
+    let mut branch = repo.branch(name, &commit, false)?;
+    if repo.find_branch(start, BranchType::Remote).is_ok() {
+        branch.set_upstream(Some(start))?;
+    }
+    Ok(branch)
+}
+
+/// The last folder of a worktree path, which git names the worktree after.
+fn worktree_base_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "worktree".to_owned())
+}
+
+/// A linked worktree by name, or by its path as git takes it.
+fn find_worktree(repo: &Repository, worktree: &str) -> Result<git2::Worktree, GitError> {
+    if let Ok(wt) = repo.find_worktree(worktree) {
+        return Ok(wt);
+    }
+    let want = std::fs::canonicalize(worktree).ok();
+    for name in repo.worktrees()?.iter().filter_map(|n| n.ok().flatten()) {
+        let wt = repo.find_worktree(name)?;
+        if want.is_some() && std::fs::canonicalize(wt.path()).ok() == want {
+            return Ok(wt);
+        }
+    }
+    Err(GitError::Other(format!("'{worktree}' is not a worktree")))
+}
+
 fn repo_is_dirty(repo: &Repository) -> bool {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true).include_ignored(false);

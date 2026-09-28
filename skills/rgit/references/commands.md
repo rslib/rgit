@@ -19,7 +19,9 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `unstage`: Unstage paths, some hunks of one path, or specific lines of one hunk. e.g. `rgit unstage src/lib.rs`, `rgit unstage src/lib.rs --hunk 42`
 - `stage-all`: Stage every change. e.g. `rgit stage-all`
 - `unstage-all`: Unstage everything. e.g. `rgit unstage-all`
+- `add`: Stage paths as git's `add` does: `add <paths>`, `add .`, `add -A`, `add -u`. e.g. `rgit add .`, `rgit add src/ '*.md'`, `rgit add -A`, `rgit add -u`
 - `discard`: Discard unstaged changes to paths, some hunks of one path, or specific lines. e.g. `rgit discard src/lib.rs`, `rgit discard src/lib.rs --hunk 10`
+- `restore`: Restore files in the working tree (or, with --staged, the index) from the index or a revision. e.g. `rgit restore src/lib.rs`, `rgit restore --staged src/lib.rs`, `rgit restore --source HEAD~1 src/lib.rs`
 - `resolve`: Resolve a conflicted path by taking ours or theirs. e.g. `rgit resolve src/lib.rs --ours`, `rgit resolve src/lib.rs --theirs`
 - `rm`: Remove tracked paths from the index and working tree. e.g. `rgit rm src/lib.rs`, `rgit rm src/lib.rs --cached`
 - `mv`: Rename/move tracked files or folders. e.g. `rgit mv src/old.rs src/new.rs`
@@ -27,7 +29,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 
 ## Commit and rewrite history
 
-- `commit`: Commit the staged changes (runs hooks). e.g. `rgit commit -m "<message>"`, `rgit commit -a -m "<message>"`, `rgit commit --amend`
+- `commit`: Commit the staged changes (runs hooks), or only the given paths. e.g. `rgit commit -m "<message>"`, `rgit commit -a -m "<message>"`, `rgit commit src/lib.rs -m "<message>"`, `rgit commit -m "<subject>" -m "<body>"`, `rgit commit --amend --no-edit`, `rgit commit --fixup <rev>`
 - `extend`: Amend HEAD with the staged changes, keeping its message (no editor). e.g. `rgit extend`
 - `reword`: Change any commit's message and restack its descendants (default HEAD). e.g. `rgit reword -m "<message>"`, `rgit reword -m "<message>" <rev>`
 - `uncommit`: Undo the last commit(s), keeping the changes staged (default 1). e.g. `rgit uncommit`, `rgit uncommit 2`
@@ -37,7 +39,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `absorb`: Fold each pending change into the stacked commit that last touched those lines (blame-routed fixups + autosquash). e.g. `rgit absorb`
 - `cherry-pick`: Cherry-pick commits onto HEAD, or continue/skip/abort a stopped one. e.g. `rgit cherry-pick <rev>`, `rgit cherry-pick <rev> --no-commit`, `rgit cherry-pick <a> <b>`, `rgit cherry-pick main~3..main -x`, `rgit cherry-pick <merge> -m 1`, `rgit cherry-pick --continue`, `rgit cherry-pick --abort`
 - `revert`: Revert commits on HEAD, or continue/skip/abort a stopped revert. e.g. `rgit revert <rev>`, `rgit revert <rev> --no-commit`, `rgit revert HEAD~2..HEAD`, `rgit revert <merge> -m 1`, `rgit revert --continue`
-- `reset`: Reset HEAD to a revision (default mixed). e.g. `rgit reset HEAD~1`, `rgit reset --hard <rev>`, `rgit reset -- src/lib.rs`
+- `reset`: Reset HEAD to a revision (default mixed). e.g. `rgit reset HEAD~1`, `rgit reset --hard <rev>`, `rgit reset src/lib.rs`, `rgit reset <rev> -- src/lib.rs`
 
 ## Undo
 
@@ -47,22 +49,26 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 
 ## Branches, tags, stashes
 
-- `branch`: Branch management (no subcommand lists local branches). e.g. `rgit branch`, `rgit branch -a`
-  - `branch create`: Create a branch and switch to it. e.g. `rgit branch create <branch>`
+- `branch`: Branch management: no subcommand lists local branches, `branch <name> [<start>]` creates one without switching to it, and git's flags work as in git. e.g. `rgit branch`, `rgit branch -vv`, `rgit branch --merged main`, `rgit branch <branch> <start>`, `rgit branch -d <branch> <branch>`, `rgit branch -u origin/<branch>`
+  - `branch create`: Create a branch (at HEAD, or START) and switch to it. e.g. `rgit branch create <branch>`, `rgit branch create <branch> origin/<branch>`
   - `branch checkout`: Check out an existing branch. e.g. `rgit branch checkout <branch>`
-  - `branch delete`: Delete a branch (multiselect prompt if no name on a terminal). e.g. `rgit branch delete <branch>`, `rgit branch delete <branch> --force`
+  - `branch delete`: Delete branches (multiselect prompt if no name on a terminal). e.g. `rgit branch delete <branch> <branch>`, `rgit branch delete <branch> --force`
   - `branch rename`: Rename a branch. e.g. `rgit branch rename <old> <new>`
   - `branch prune`: Delete every local branch already merged into a base (default HEAD). e.g. `rgit branch prune`, `rgit branch prune main`
-- `checkout`: Check out a branch or, for any other revision, a detached HEAD. e.g. `rgit checkout main`, `rgit checkout -b <new_branch>`
+- `checkout`: Check out a branch or, for any other revision, a detached HEAD; or restore paths from a revision or the index. e.g. `rgit checkout main`, `rgit checkout -b <new_branch>`, `rgit checkout -`, `rgit checkout <rev> -- src/lib.rs`
+- `switch`: Switch branches: `switch <branch>`, `-c <new> [<start>]`, `--detach <rev>`, or `-` for the previous branch. e.g. `rgit switch main`, `rgit switch -c <new_branch>`, `rgit switch -`, `rgit switch --detach <rev>`
 - `merge`: Merge revisions into the current branch (several make an octopus merge). e.g. `rgit merge <branch>`, `rgit merge <branch> --no-ff`, `rgit merge <branch> --squash`, `rgit merge <branch> -m "<message>"`, `rgit merge <a> <b>`, `rgit merge --continue`, `rgit merge --abort`
 - `rebase`: Rebase onto a revision, or continue/skip/abort an in-progress rebase. e.g. `rgit rebase main`, `rgit rebase --onto <newbase> <upstream>`, `rgit rebase --autosquash main`, `rgit rebase --exec "cargo test" main`, `rgit rebase --root`, `rgit rebase --continue`
-- `tag`: Tag management: `tag` lists, `tag <name>` creates, `tag -d <name>` deletes. e.g. `rgit tag`, `rgit tag v1.0.0 -m "<message>"`, `rgit tag -d v1.0.0`
-- `stash`: Stash management (no subcommand stashes the working tree). e.g. `rgit stash`, `rgit stash push "<message>"`
-  - `stash push`: Stash the working tree, with an optional message. e.g. `rgit stash push "<message>" --include-untracked`
-  - `stash pop`: Apply a stash and drop it (prompted for if no index on a terminal). e.g. `rgit stash pop`, `rgit stash pop 1`
+- `tag`: Tag management: `tag` lists, `tag <name> [<rev>]` creates, `tag -d <name>...` deletes, `tag -l <pattern>...` lists matching tags. e.g. `rgit tag`, `rgit tag v1.0.0 -m "<message>"`, `rgit tag v1.0.0 <rev>`, `rgit tag -l "v1.*" -n`, `rgit tag --contains <rev>`, `rgit tag -d v1.0.0 v1.0.1`
+- `stash`: Stash management (no subcommand stashes the working tree, taking `stash push`'s flags). e.g. `rgit stash`, `rgit stash -u`, `rgit stash push -m "<message>"`
+  - `stash push`: Stash the working tree, or only some paths, with an optional message. e.g. `rgit stash push -m "<message>" --include-untracked`, `rgit stash push -- src/lib.rs`
+  - `stash pop`: Apply a stash and drop it (prompted for if no index on a terminal). e.g. `rgit stash pop`, `rgit stash pop stash@{1} --index`
   - `stash apply`: Apply a stash without dropping it. e.g. `rgit stash apply`
   - `stash drop`: Drop a stash. e.g. `rgit stash drop 0`
   - `stash list`: List the stashes. e.g. `rgit stash list`
+  - `stash show`: Show the changes a stash records, as a diffstat (-p for the patch). e.g. `rgit stash show`, `rgit stash show -p stash@{1}`
+  - `stash branch`: Create and check out a branch at the stash's base commit, apply the stash there and drop it. e.g. `rgit stash branch <branch>`
+  - `stash clear`: Drop every stash. e.g. `rgit stash clear`
 - `bisect`: Run a git bisect subcommand: `start <bad> <good>`, `good`, `bad`, `reset`. e.g. `rgit bisect start HEAD main`, `rgit bisect good`, `rgit bisect bad`
 - `prune`: Prune unreachable objects (git's `prune`). For deleting merged branches, use `branch prune`. e.g. `rgit prune`, `rgit prune --dry-run`
 
@@ -95,8 +101,12 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `workspace list`: List this repo's workspaces. e.g. `rgit workspace list`
   - `workspace remove`: Remove a workspace. e.g. `rgit workspace remove <name>`
 - `worktree`: Worktree management (no subcommand lists worktrees). e.g. `rgit worktree`
-  - `worktree add`: Add a linked worktree. e.g. `rgit worktree add <branch> ../<path>`
-  - `worktree remove`: Remove a linked worktree. e.g. `rgit worktree remove <branch>`, `rgit worktree remove <branch> --force`
+  - `worktree add`: Add a linked worktree at PATH, as `git worktree add` does: on BRANCH, on a new branch with -b, detached at a commit or with --detach, or by default on a branch named after PATH's last folder. e.g. `rgit worktree add ../<path> <branch>`, `rgit worktree add -b <new_branch> ../<path> origin/main`, `rgit worktree add --detach ../<path> <rev>`
+  - `worktree list`: List the worktrees. e.g. `rgit worktree list`
+  - `worktree remove`: Remove a linked worktree (by name or path) and its folder. e.g. `rgit worktree remove ../<path>`, `rgit worktree remove <name> --force`
+  - `worktree lock`: Lock a worktree (by name or path) so prune leaves it alone. e.g. `rgit worktree lock ../<path> --reason "<reason>"`
+  - `worktree unlock`: Unlock a worktree (by name or path). e.g. `rgit worktree unlock ../<path>`
+  - `worktree move`: Move a worktree (by name or path) to a new path. e.g. `rgit worktree move ../<path> ../<new_path>`
   - `worktree prune`: Prune worktree entries whose working tree is gone (git's `worktree prune`). e.g. `rgit worktree prune`
 - `flow`: Branching workflows: pick a preset (gitflow, github, gitlab, trunk, release-flow); start/finish/release then follow its rules. e.g. `rgit flow status`
   - `flow init`: Set the active workflow: gitflow, github, gitlab, trunk, release-flow. e.g. `rgit flow init gitflow`
@@ -110,11 +120,13 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `fetch`: Fetch the current branch's remote, or `<repository> [<refspec>...]`. e.g. `rgit fetch`, `rgit fetch --all`, `rgit fetch --remote origin --prune`, `rgit fetch origin main --depth 1`, `rgit fetch --dry-run`
 - `pull`: Fetch and integrate the current branch's upstream (merges when it has diverged, unless `pull.rebase` says otherwise). e.g. `rgit pull`, `rgit pull --rebase`, `rgit pull --ff-only`, `rgit pull origin main`
 - `push`: Push the current branch to its upstream, or `<repository> [<refspec>...]`. e.g. `rgit push`, `rgit push --set-upstream`, `rgit push --force-with-lease`, `rgit push origin feature`, `rgit push origin local:remote`, `rgit push origin --delete feature`, `rgit push --all --dry-run`
-- `remote`: Remote management (no subcommand lists remotes). e.g. `rgit remote`, `rgit remote add origin https://github.com/example/repo.git`
+- `remote`: Remote management (no subcommand lists remotes). e.g. `rgit remote`, `rgit remote -v`, `rgit remote add origin https://github.com/example/repo.git`
   - `remote add`: Add a remote. e.g. `rgit remote add origin https://github.com/example/repo.git`
   - `remote remove`: Remove a remote. e.g. `rgit remote remove origin`
-  - `remote set-url`: Change a remote's URL. e.g. `rgit remote set-url origin https://github.com/example/repo.git`
+  - `remote set-url`: Change a remote's URL. e.g. `rgit remote set-url origin https://github.com/example/repo.git`, `rgit remote set-url --push origin https://github.com/fork/repo.git`
+  - `remote get-url`: Print a remote's URL. e.g. `rgit remote get-url origin`
   - `remote rename`: Rename a remote. e.g. `rgit remote rename origin upstream`
+  - `remote prune`: Delete remote-tracking branches that no longer exist on the remotes. e.g. `rgit remote prune origin`
 - `forge`: Manage GitHub repositories, branches, and pull requests without gh. e.g. `rgit forge --profile work whoami`, `rgit forge pr list`
   - `forge login`: Store a forge credential in the OS credential store. e.g. `rgit forge login github --token-stdin`, `rgit forge login gitlab --host https://gitlab.example.com --token-stdin`
   - `forge auth`: Show authentication status for configured forge providers. e.g. `rgit forge auth list`
@@ -151,6 +163,24 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `hash-object`: Print the object id of files or stdin; -w stores them. e.g. `rgit hash-object src/lib.rs`, `rgit hash-object -w --stdin`
 - `gc`: Pack the object database and prune unreachable objects. e.g. `rgit gc`, `rgit gc --prune=now`
 - `fsck`: Check the object database for corruption and dangling objects. e.g. `rgit fsck`, `rgit fsck --unreachable`
+
+## Plumbing (git's own output formats)
+
+- `rev-parse`: Resolve revisions to object ids, or print repository paths, like `git rev-parse`. e.g. `rgit rev-parse HEAD`, `rgit rev-parse --short HEAD`, `rgit rev-parse --abbrev-ref HEAD`, `rgit rev-parse --show-toplevel`
+- `ls-files`: List files in the index and the working tree, like `git ls-files`. e.g. `rgit ls-files`, `rgit ls-files -s src`, `rgit ls-files -o --exclude-standard`
+- `ls-tree`: List a tree's entries, like `git ls-tree`. e.g. `rgit ls-tree HEAD`, `rgit ls-tree -r -l HEAD src/`
+- `cat-file`: Print an object's type, size or content, like `git cat-file`. e.g. `rgit cat-file -p HEAD`, `rgit cat-file -p HEAD:src/lib.rs`, `rgit cat-file -t <rev>`
+- `show-ref`: List refs with their object ids, like `git show-ref`. e.g. `rgit show-ref --heads`, `rgit show-ref --verify refs/heads/main`
+- `for-each-ref`: List refs in a custom format, like `git for-each-ref`. e.g. `rgit for-each-ref refs/heads`, `rgit for-each-ref --sort=-committerdate --format='%(refname:short) %(subject)'`
+- `rev-list`: List commit ids reachable from revisions, like `git rev-list`. e.g. `rgit rev-list --count HEAD`, `rgit rev-list main..HEAD`, `rgit rev-list -n 1 --all`
+- `merge-base`: Find the common ancestor of two commits, like `git merge-base`. e.g. `rgit merge-base main HEAD`, `rgit merge-base --is-ancestor main HEAD`
+- `reflog`: Show where a ref pointed over time, like `git reflog show`. e.g. `rgit reflog`, `rgit reflog show main -n 10`
+- `shortlog`: Summarize commits by author, like `git shortlog`. e.g. `rgit shortlog -sn`, `rgit shortlog -sne --all`
+- `grep`: Search tracked files, the index or a revision, like `git grep`. e.g. `rgit grep -n TODO`, `rgit grep -i -e foo -e bar -- src`, `rgit grep pattern HEAD~5`
+- `check-ignore`: Show which paths are ignored and by which rule, like `git check-ignore`. e.g. `rgit check-ignore -v target/out.o`
+- `var`: Print a git variable: GIT_AUTHOR_IDENT, GIT_COMMITTER_IDENT, GIT_EDITOR, GIT_SEQUENCE_EDITOR, GIT_PAGER or GIT_DEFAULT_BRANCH, like `git var`. e.g. `rgit var GIT_AUTHOR_IDENT`, `rgit var GIT_EDITOR`
+- `symbolic-ref`: Print where a symbolic ref points (`HEAD` -> `refs/heads/main`), like `git symbolic-ref`. e.g. `rgit symbolic-ref HEAD`, `rgit symbolic-ref --short HEAD`
+- `count-objects`: Count loose and packed objects, like `git count-objects`. e.g. `rgit count-objects -v`
 
 ## Code search
 

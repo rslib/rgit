@@ -653,12 +653,9 @@ fn porcelain_renamed_git_spellings_get_targeted_hints() {
     let dir = repo("renamed");
     commit(&dir, "f", "x\n", "init");
 
-    let (out, _, ok) = rgit(&dir, &["--toon", "add", "f"]);
+    let (out, _, ok) = rgit(&dir, &["--toon", "stash", "save", "x"]);
     assert!(!ok);
-    assert!(out.contains("`rgit stage <path>`"), "{out}");
-    let (out, _, ok) = rgit(&dir, &["--toon", "branch", "-D", "x"]);
-    assert!(!ok);
-    assert!(out.contains("`rgit branch delete <name> --force`"), "{out}");
+    assert!(out.contains("`rgit stash push -m <message>`"), "{out}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -20,6 +20,7 @@ mod lanes;
 mod logging;
 mod mcp;
 mod output;
+mod plumbing;
 mod prompt;
 mod render;
 mod setup;
@@ -353,7 +354,13 @@ fn finish(result: anyhow::Result<impl Into<Output>>, emit: &Emit) -> ! {
         Err(error) => die(error, emit),
     };
     if emit.mode == OutputMode::Text {
-        println!("{}", output.text);
+        // Plumbing text ends with its own newline, or is empty, as in git.
+        if output.text.is_empty() || output.text.ends_with(['\n', '\0']) {
+            print!("{}", output.text);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        } else {
+            println!("{}", output.text);
+        }
         exit(0);
     }
     let mut value = match output.finalize(&emit.fields, emit.full, &emit.rerun) {
@@ -377,6 +384,7 @@ fn die(error: anyhow::Error, emit: &Emit) -> ! {
 /// Report an error on stdout in the output format, or on stderr for humans.
 fn fail(message: String, help: Vec<String>, code: i32, mode: OutputMode) -> ! {
     match mode {
+        OutputMode::Text if message.is_empty() => {}
         OutputMode::Text => {
             eprintln!("rgit: {message}");
             for h in &help {

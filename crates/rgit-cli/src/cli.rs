@@ -257,6 +257,8 @@ pub enum Command {
         #[arg(short = 'L', value_name = "START,END")]
         lines: Option<String>,
     },
+    #[command(flatten)]
+    Plumbing(Plumbing),
     /// All refs (local branches, remotes, tags).
     Refs,
     /// Stage paths, some hunks of one path, or specific lines of one hunk.
@@ -283,6 +285,22 @@ pub enum Command {
         #[arg(long, value_delimiter = ',', requires = "hunk")]
         lines: Vec<usize>,
     },
+    /// Stage paths as git's `add` does: `add <paths>`, `add .`, `add -A`, `add -u`.
+    Add {
+        /// The paths to add: files, folders or globs.
+        paths: Vec<String>,
+        /// Stage every change, new and deleted files too (the whole repo when
+        /// no paths are given).
+        #[arg(short = 'A', long = "all", conflicts_with = "update")]
+        all: bool,
+        /// Stage only changes to tracked files (the whole repo when no paths
+        /// are given).
+        #[arg(short = 'u', long)]
+        update: bool,
+        /// Add ignored files too.
+        #[arg(short = 'f', long)]
+        force: bool,
+    },
     /// Stage every change.
     StageAll,
     /// Unstage everything.
@@ -299,6 +317,22 @@ pub enum Command {
         #[arg(long, value_delimiter = ',', requires = "hunk")]
         lines: Vec<usize>,
     },
+    /// Restore files in the working tree (or, with --staged, the index) from
+    /// the index or a revision.
+    Restore {
+        /// The paths to restore: files, folders or globs.
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Restore from this revision (default: the index, or HEAD with --staged).
+        #[arg(short = 's', long, value_name = "REV")]
+        source: Option<String>,
+        /// Restore the index (unstage).
+        #[arg(short = 'S', long)]
+        staged: bool,
+        /// Restore the working tree (the default; with --staged, both).
+        #[arg(short = 'W', long)]
+        worktree: bool,
+    },
     /// Resolve a conflicted path by taking ours or theirs.
     Resolve {
         /// The conflicted path.
@@ -310,20 +344,48 @@ pub enum Command {
         #[arg(long)]
         theirs: bool,
     },
-    /// Commit the staged changes (runs hooks).
+    /// Commit the staged changes (runs hooks), or only the given paths.
     Commit {
-        /// The commit message (prompted for if omitted on a terminal).
+        /// The commit message; repeat for more paragraphs (prompted for if
+        /// omitted on a terminal).
         #[arg(short, long)]
-        message: Option<String>,
+        message: Vec<String>,
+        /// Read the commit message from a file (`-` for stdin).
+        #[arg(short = 'F', long, value_name = "FILE", conflicts_with = "message")]
+        file: Option<String>,
         /// Amend the previous commit instead of creating a new one.
         #[arg(long)]
         amend: bool,
+        /// Keep the amended commit's message (with --amend).
+        #[arg(long)]
+        no_edit: bool,
         /// Stage all tracked, modified files before committing (git's -a).
-        #[arg(short = 'a', long = "all")]
+        #[arg(short = 'a', long = "all", conflicts_with = "paths")]
         all: bool,
         /// Skip the pre-commit and commit-msg hooks (git's --no-verify).
         #[arg(short = 'n', long = "no-verify")]
         no_verify: bool,
+        /// Set the author, as `Name <email>`.
+        #[arg(long, value_name = "NAME <EMAIL>")]
+        author: Option<String>,
+        /// Add a Signed-off-by trailer for the committer (git's -s).
+        #[arg(short = 's', long)]
+        signoff: bool,
+        /// Commit even when nothing changed.
+        #[arg(long)]
+        allow_empty: bool,
+        /// Make a `fixup!` commit for this revision, for a later autosquash.
+        #[arg(long, value_name = "REV", conflicts_with = "squash")]
+        fixup: Option<String>,
+        /// Make a `squash!` commit for this revision, for a later autosquash.
+        #[arg(long, value_name = "REV")]
+        squash: Option<String>,
+        /// Accepted for git compatibility.
+        #[arg(short = 'q', long, hide = true)]
+        quiet: bool,
+        /// Commit only these paths, as they are in the working tree; other
+        /// staged changes stay staged.
+        paths: Vec<String>,
     },
     /// Amend HEAD with the staged changes, keeping its message (no editor).
     Extend,
@@ -462,13 +524,60 @@ pub enum Command {
         #[arg(short = 'n', long)]
         dry_run: bool,
     },
-    /// Check out a branch or, for any other revision, a detached HEAD.
+    /// Check out a branch or, for any other revision, a detached HEAD; or
+    /// restore paths from a revision or the index.
     Checkout {
-        /// The branch or revision (prompted for if omitted on a terminal).
+        /// The branch or revision, `-` for the previous one (prompted for if
+        /// omitted on a terminal). A path here restores it from the index.
         rev: Option<String>,
+        /// Paths to restore from `rev` (index and working tree), or from the
+        /// index when no revision is given.
+        #[arg(value_name = "PATH")]
+        pathspec: Vec<String>,
         /// Create a new branch and switch to it (git's -b), from `rev` or HEAD.
-        #[arg(short = 'b', value_name = "NEW_BRANCH")]
+        #[arg(
+            short = 'b',
+            value_name = "NEW_BRANCH",
+            conflicts_with = "force_branch"
+        )]
         branch: Option<String>,
+        /// Create or reset a branch and switch to it (git's -B).
+        #[arg(short = 'B', value_name = "BRANCH")]
+        force_branch: Option<String>,
+        /// Detach HEAD at `rev` (default HEAD), even when it is a branch.
+        #[arg(long, conflicts_with_all = ["branch", "force_branch"])]
+        detach: bool,
+        /// Track `rev` as the new branch's upstream; without -b, create a local
+        /// branch named after the remote one.
+        #[arg(short = 't', long)]
+        track: bool,
+        /// Paths to restore (after `--`).
+        #[arg(last = true, value_name = "PATH")]
+        paths: Vec<String>,
+    },
+    /// Switch branches: `switch <branch>`, `-c <new> [<start>]`, `--detach
+    /// <rev>`, or `-` for the previous branch.
+    Switch {
+        /// The branch to switch to (`-` for the previous one); with -c, -C or
+        /// --detach, the start point (prompted for if omitted on a terminal).
+        rev: Option<String>,
+        /// Create a new branch and switch to it.
+        #[arg(
+            short = 'c',
+            long,
+            value_name = "NEW_BRANCH",
+            conflicts_with = "force_create"
+        )]
+        create: Option<String>,
+        /// Create or reset a branch and switch to it.
+        #[arg(short = 'C', long, value_name = "BRANCH")]
+        force_create: Option<String>,
+        /// Switch to a revision as a detached HEAD.
+        #[arg(short = 'd', long, conflicts_with_all = ["create", "force_create"])]
+        detach: bool,
+        /// Track the start point as the new branch's upstream.
+        #[arg(short = 't', long)]
+        track: bool,
     },
     /// Merge revisions into the current branch (several make an octopus merge).
     Merge {
@@ -556,15 +665,26 @@ pub enum Command {
     },
     /// Reset HEAD to a revision (default mixed).
     Reset {
-        /// The revision to reset to (prompted for if omitted on a terminal).
+        /// The revision to reset to (prompted for if omitted on a terminal). A
+        /// path here unstages it (git's `reset <paths>`).
         rev: Option<String>,
+        /// Paths whose index entries to reset to `rev` (default HEAD), leaving
+        /// HEAD alone.
+        #[arg(value_name = "PATH")]
+        pathspec: Vec<String>,
         /// Move HEAD only, keep the index and working tree.
-        #[arg(long, conflicts_with = "hard")]
+        #[arg(long, conflicts_with_all = ["hard", "mixed", "keep"])]
         soft: bool,
+        /// Reset the index but not the working tree (the default).
+        #[arg(long, conflicts_with_all = ["hard", "keep"])]
+        mixed: bool,
         /// Reset the index and working tree too (discards changes).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "keep")]
         hard: bool,
-        /// Unstage these paths instead of moving HEAD (git's `reset -- <paths>`).
+        /// Like --hard, but keep local changes and refuse to overwrite them.
+        #[arg(long)]
+        keep: bool,
+        /// Paths to reset (after `--`).
         #[arg(last = true, value_name = "PATH")]
         paths: Vec<String>,
     },
@@ -623,46 +743,80 @@ pub enum Command {
         #[arg(long)]
         abort: bool,
     },
-    /// Branch management (no subcommand lists local branches).
+    /// Branch management: no subcommand lists local branches, `branch <name>
+    /// [<start>]` creates one without switching to it, and git's flags work as
+    /// in git.
+    #[command(
+        args_conflicts_with_subcommands = true,
+        group = clap::ArgGroup::new("branch_action").multiple(false)
+    )]
     Branch {
         #[command(subcommand)]
         cmd: Option<BranchCmd>,
-        /// List remote-tracking branches too (git's -a).
-        #[arg(short = 'a', long)]
-        all: bool,
-        /// List only remote-tracking branches (git's -r).
-        #[arg(short = 'r', long)]
-        remotes: bool,
+        #[command(flatten)]
+        opts: BranchOpts,
     },
-    /// Stash management (no subcommand stashes the working tree).
+    /// Stash management (no subcommand stashes the working tree, taking
+    /// `stash push`'s flags).
+    #[command(args_conflicts_with_subcommands = true)]
     Stash {
         #[command(subcommand)]
         cmd: Option<StashCmd>,
+        #[command(flatten)]
+        push: StashPush,
+        /// Stash only these paths (after `--`, as in git).
+        #[arg(last = true, value_name = "PATH")]
+        paths: Vec<String>,
     },
-    /// Tag management: `tag` lists, `tag <name>` creates, `tag -d <name>` deletes.
+    /// Tag management: `tag` lists, `tag <name> [<rev>]` creates, `tag -d
+    /// <name>...` deletes, `tag -l <pattern>...` lists matching tags.
     Tag {
-        /// The tag to create (annotated when -m/-a is given).
-        name: Option<String>,
+        /// The tag to create, then the revision to tag (default HEAD); with -d,
+        /// the tags to delete; with -l, patterns to list.
+        names: Vec<String>,
         /// Annotation message (implies an annotated tag).
         #[arg(short, long)]
         message: Option<String>,
-        /// Make an annotated tag even without a message.
+        /// Make an annotated tag (needs -m, or a prompt on a terminal).
         #[arg(short, long)]
         annotate: bool,
         /// Replace an existing tag of the same name (git's -f).
         #[arg(short, long)]
         force: bool,
-        /// Delete this tag (git's -d).
-        #[arg(short = 'd', long, value_name = "NAME")]
-        delete: Option<String>,
-        /// List tags (the default with no name); accepted for git compatibility.
+        /// Delete the named tags (git's -d).
+        #[arg(short = 'd', long)]
+        delete: bool,
+        /// List tags, only those matching the given patterns (git's -l).
         #[arg(short, long)]
         list: bool,
+        /// List tags with up to N lines of their message (git's -n, default 1).
+        #[arg(
+            short = 'n',
+            value_name = "N",
+            num_args = 0..=1,
+            default_missing_value = "1"
+        )]
+        lines: Option<usize>,
+        /// List only tags that contain this commit (default HEAD).
+        #[arg(long, value_name = "REV", num_args = 0..=1, default_missing_value = "HEAD")]
+        contains: Option<String>,
+        /// List only tags that point at this commit (default HEAD).
+        #[arg(
+            long = "points-at",
+            value_name = "REV",
+            num_args = 0..=1,
+            default_missing_value = "HEAD"
+        )]
+        points_at: Option<String>,
     },
     /// Remote management (no subcommand lists remotes).
+    #[command(args_conflicts_with_subcommands = true)]
     Remote {
         #[command(subcommand)]
         cmd: Option<RemoteCmd>,
+        /// List each remote's fetch and push URLs (git's -v).
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Worktree management (no subcommand lists worktrees).
     Worktree {
@@ -1043,6 +1197,372 @@ pub enum Command {
     },
 }
 
+/// Read-only plumbing commands, done natively with git's output formats.
+#[derive(Subcommand)]
+pub enum Plumbing {
+    /// Resolve revisions to object ids, or print repository paths, like
+    /// `git rev-parse`.
+    RevParse {
+        /// Abbreviate ids to a unique prefix of at least N digits (default 7).
+        #[arg(
+            long,
+            value_name = "N",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "7"
+        )]
+        short: Option<usize>,
+        /// Print each revision's ref name, shortened (`main`; `HEAD` when detached).
+        #[arg(long = "abbrev-ref")]
+        abbrev_ref: bool,
+        /// Print each revision's full ref name (`refs/heads/main`).
+        #[arg(long = "symbolic-full-name")]
+        symbolic_full_name: bool,
+        /// Resolve exactly one revision, failing if it does not exist.
+        #[arg(long)]
+        verify: bool,
+        /// With --verify, fail without a message.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Print the working tree's top-level folder.
+        #[arg(long = "show-toplevel")]
+        show_toplevel: bool,
+        /// Print the .git folder (relative when run at the top level).
+        #[arg(long = "git-dir")]
+        git_dir: bool,
+        /// Print the .git folder as an absolute path.
+        #[arg(long = "absolute-git-dir")]
+        absolute_git_dir: bool,
+        /// Print the current folder relative to the top level (`src/`).
+        #[arg(long = "show-prefix")]
+        show_prefix: bool,
+        /// Print the path from the current folder up to the top level (`../`).
+        #[arg(long = "show-cdup")]
+        show_cdup: bool,
+        /// Print `true` (rgit runs only inside a working tree).
+        #[arg(long = "is-inside-work-tree")]
+        inside_work_tree: bool,
+        /// Print `false` (rgit runs only inside a working tree).
+        #[arg(long = "is-inside-git-dir")]
+        inside_git_dir: bool,
+        /// Print `false` (rgit needs a working tree).
+        #[arg(long = "is-bare-repository")]
+        bare: bool,
+        /// Revisions: `HEAD`, `main~2`, `v1^{commit}`, `HEAD:path`, `^A`, `A..B`, `A...B`.
+        revs: Vec<String>,
+    },
+    /// List files in the index and the working tree, like `git ls-files`.
+    LsFiles {
+        /// Show tracked files (the default).
+        #[arg(short = 'c', long)]
+        cached: bool,
+        /// Show mode, object id and stage for each tracked file.
+        #[arg(short = 's', long)]
+        stage: bool,
+        /// Show untracked files (with ignored ones unless --exclude-standard).
+        #[arg(short = 'o', long)]
+        others: bool,
+        /// With -o and --exclude-standard, show only ignored files.
+        #[arg(short = 'i', long)]
+        ignored: bool,
+        /// Honor .gitignore, .git/info/exclude and core.excludesFile.
+        #[arg(long = "exclude-standard")]
+        exclude_standard: bool,
+        /// Show files changed in the working tree (deleted ones too).
+        #[arg(short = 'm', long)]
+        modified: bool,
+        /// Show files deleted from the working tree.
+        #[arg(short = 'd', long)]
+        deleted: bool,
+        /// Show only unmerged files, with -s's format.
+        #[arg(short = 'u', long)]
+        unmerged: bool,
+        /// End each entry with NUL instead of a newline.
+        #[arg(short = 'z')]
+        z: bool,
+        /// Accepted for git compatibility: paths are always from the top level.
+        #[arg(long = "full-name", hide = true)]
+        full_name: bool,
+        /// Limit to these paths: files, folders or globs.
+        paths: Vec<String>,
+    },
+    /// List a tree's entries, like `git ls-tree`.
+    LsTree {
+        /// Recurse into subtrees.
+        #[arg(short = 'r')]
+        recursive: bool,
+        /// Show only trees.
+        #[arg(short = 'd')]
+        only_trees: bool,
+        /// Show trees even when recursing into them.
+        #[arg(short = 't')]
+        show_trees: bool,
+        /// Show blob sizes.
+        #[arg(short = 'l', long)]
+        long: bool,
+        /// Show only paths.
+        #[arg(long = "name-only", visible_alias = "name-status")]
+        name_only: bool,
+        /// Show only object ids.
+        #[arg(long = "object-only")]
+        object_only: bool,
+        /// Abbreviate object ids to at least N digits.
+        #[arg(
+            long,
+            value_name = "N",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "7"
+        )]
+        abbrev: Option<usize>,
+        /// End each entry with NUL instead of a newline.
+        #[arg(short = 'z')]
+        z: bool,
+        /// Accepted for git compatibility: paths are always from the top level.
+        #[arg(long = "full-name", hide = true)]
+        full_name: bool,
+        /// Accepted for git compatibility: paths are always from the top level.
+        #[arg(long = "full-tree", hide = true)]
+        full_tree: bool,
+        /// The commit, tag or tree to list.
+        rev: String,
+        /// Limit to these paths; `dir/` lists inside dir.
+        paths: Vec<String>,
+    },
+    /// Print an object's type, size or content, like `git cat-file`.
+    CatFile {
+        /// Print the object's type.
+        #[arg(short = 't')]
+        kind: bool,
+        /// Print the object's size in bytes.
+        #[arg(short = 's')]
+        size: bool,
+        /// Print the object's content (a tree as `ls-tree` lists it).
+        #[arg(short = 'p')]
+        pretty: bool,
+        /// Exit 0 if the object exists, 1 if not, printing nothing.
+        #[arg(short = 'e')]
+        exists: bool,
+        /// The object (`HEAD`, `HEAD:src/lib.rs`, an id), optionally after its
+        /// type (`blob HEAD:a.txt`).
+        #[arg(required = true, num_args = 1..=2, value_name = "[TYPE] OBJECT")]
+        args: Vec<String>,
+    },
+    /// List refs with their object ids, like `git show-ref`.
+    ShowRef {
+        /// Only branches (refs/heads).
+        #[arg(long, visible_alias = "branches")]
+        heads: bool,
+        /// Only tags (refs/tags).
+        #[arg(long)]
+        tags: bool,
+        /// Match full ref names exactly (`refs/heads/main`), failing if one is missing.
+        #[arg(long)]
+        verify: bool,
+        /// Also show what annotated tags point at (`refs/tags/v1^{}`).
+        #[arg(short = 'd', long)]
+        dereference: bool,
+        /// Show only object ids, abbreviated to N digits when given.
+        #[arg(
+            short = 's',
+            long,
+            value_name = "N",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "0"
+        )]
+        hash: Option<usize>,
+        /// Also show HEAD.
+        #[arg(long)]
+        head: bool,
+        /// Print nothing; only set the exit code.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Show refs whose name ends with one of these (`main`, `origin/main`).
+        patterns: Vec<String>,
+    },
+    /// List refs in a custom format, like `git for-each-ref`.
+    ForEachRef {
+        /// The line format: `%(refname)`, `%(refname:short)`, `%(objectname)`,
+        /// `%(objectname:short)`, `%(objecttype)`, `%(subject)`, `%(body)`,
+        /// `%(authorname)`, `%(authoremail)`, `%(authordate[:short|iso|unix|relative])`,
+        /// `%(committer*)`, `%(tagger*)`, `%(creatordate)`, `%(upstream[:short])`,
+        /// `%(HEAD)`, `%(symref)`, `%(*objectname)`.
+        #[arg(long)]
+        format: Option<String>,
+        /// Sort by this field; `-` in front reverses (`-committerdate`). The
+        /// last --sort is the main key.
+        #[arg(long, value_name = "KEY")]
+        sort: Vec<String>,
+        /// Show at most N refs.
+        #[arg(long, value_name = "N")]
+        count: Option<usize>,
+        /// Show refs that start with one of these (`refs/heads`) or match a glob.
+        patterns: Vec<String>,
+    },
+    /// List commit ids reachable from revisions, like `git rev-list`.
+    RevList {
+        /// Show at most N commits.
+        #[arg(short = 'n', long = "max-count", value_name = "N")]
+        max_count: Option<usize>,
+        /// Print only the number of commits.
+        #[arg(long)]
+        count: bool,
+        /// Walk every ref and HEAD.
+        #[arg(long)]
+        all: bool,
+        /// Show the oldest commit first.
+        #[arg(long)]
+        reverse: bool,
+        /// Follow only the first parent of merges.
+        #[arg(long = "first-parent")]
+        first_parent: bool,
+        /// Show only merge commits.
+        #[arg(long, conflicts_with = "no_merges")]
+        merges: bool,
+        /// Leave out merge commits.
+        #[arg(long = "no-merges")]
+        no_merges: bool,
+        /// Print each commit's parents after it.
+        #[arg(long)]
+        parents: bool,
+        /// Revisions: `HEAD`, `^A` (exclude), `A..B`, `A...B`.
+        revs: Vec<String>,
+    },
+    /// Find the common ancestor of two commits, like `git merge-base`.
+    MergeBase {
+        /// Print every best common ancestor.
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Exit 0 if the first commit is an ancestor of the second, else 1.
+        #[arg(long = "is-ancestor")]
+        is_ancestor: bool,
+        /// The first commit.
+        a: String,
+        /// The second commit.
+        b: String,
+    },
+    /// Show where a ref pointed over time, like `git reflog show`.
+    Reflog {
+        /// Show at most N entries.
+        #[arg(short = 'n', long = "max-count", value_name = "N")]
+        max_count: Option<usize>,
+        /// `show` (optional) and the ref (default HEAD).
+        #[arg(num_args = 0..=2, value_name = "[show] REF")]
+        args: Vec<String>,
+    },
+    /// Summarize commits by author, like `git shortlog`.
+    Shortlog {
+        /// Print only each author's commit count.
+        #[arg(short = 's', long)]
+        summary: bool,
+        /// Sort by commit count instead of by name.
+        #[arg(short = 'n', long)]
+        numbered: bool,
+        /// Show email addresses.
+        #[arg(short = 'e', long)]
+        email: bool,
+        /// Group by committer instead of author.
+        #[arg(short = 'c', long)]
+        committer: bool,
+        /// Walk every ref and HEAD.
+        #[arg(long)]
+        all: bool,
+        /// Revisions or ranges (default HEAD).
+        revs: Vec<String>,
+    },
+    /// Search tracked files, the index or a revision, like `git grep`.
+    Grep {
+        /// Match regardless of case.
+        #[arg(short = 'i', long = "ignore-case")]
+        ignore_case: bool,
+        /// Match whole words only.
+        #[arg(short = 'w', long = "word-regexp")]
+        word: bool,
+        /// Show lines that do not match.
+        #[arg(short = 'v', long = "invert-match")]
+        invert: bool,
+        /// Prefix each line with its number.
+        #[arg(short = 'n', long = "line-number")]
+        line_number: bool,
+        /// Show only the names of files with matches.
+        #[arg(short = 'l', long = "files-with-matches", visible_alias = "name-only")]
+        files: bool,
+        /// Show the number of matching lines per file.
+        #[arg(short = 'c', long)]
+        count: bool,
+        /// Print nothing; exit 0 on a match, 1 otherwise.
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        /// Patterns are fixed strings, not regexes.
+        #[arg(short = 'F', long = "fixed-strings")]
+        fixed: bool,
+        /// Patterns are extended regexes (the default is basic).
+        #[arg(short = 'E', long = "extended-regexp")]
+        extended: bool,
+        /// Patterns are Perl-style regexes (read as extended).
+        #[arg(short = 'P', long = "perl-regexp")]
+        perl: bool,
+        /// A pattern; repeat to match any of several.
+        #[arg(short = 'e', value_name = "PATTERN", allow_hyphen_values = true)]
+        patterns: Vec<String>,
+        /// Search the index instead of the working tree.
+        #[arg(long)]
+        cached: bool,
+        /// The pattern (unless -e is given), then revisions or paths.
+        #[arg(value_name = "PATTERN_OR_REV")]
+        args: Vec<String>,
+        /// Limit to these paths (after `--`).
+        #[arg(last = true, value_name = "PATH")]
+        paths: Vec<String>,
+    },
+    /// Show which paths are ignored and by which rule, like `git check-ignore`.
+    CheckIgnore {
+        /// Show the rule that matched: `source:line:pattern<TAB>path`.
+        #[arg(short = 'v', long)]
+        verbose: bool,
+        /// Print nothing; only set the exit code.
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        /// With -v, also show paths that are not ignored.
+        #[arg(short = 'n', long = "non-matching")]
+        non_matching: bool,
+        /// Check tracked paths too.
+        #[arg(long = "no-index")]
+        no_index: bool,
+        /// The paths to check.
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
+    /// Print a git variable: GIT_AUTHOR_IDENT, GIT_COMMITTER_IDENT, GIT_EDITOR,
+    /// GIT_SEQUENCE_EDITOR, GIT_PAGER or GIT_DEFAULT_BRANCH, like `git var`.
+    Var {
+        /// The variable.
+        name: String,
+    },
+    /// Print where a symbolic ref points (`HEAD` -> `refs/heads/main`), like
+    /// `git symbolic-ref`.
+    SymbolicRef {
+        /// Shorten the ref name (`main`).
+        #[arg(long)]
+        short: bool,
+        /// Fail without a message when the ref is not symbolic (detached HEAD).
+        #[arg(short, long)]
+        quiet: bool,
+        /// The symbolic ref, usually HEAD.
+        name: String,
+        /// Not supported: rgit only reads symbolic refs.
+        #[arg(hide = true)]
+        target: Option<String>,
+    },
+    /// Count loose and packed objects, like `git count-objects`.
+    CountObjects {
+        /// Show packs, packed objects and sizes too.
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
+}
+
 #[derive(Subcommand)]
 pub enum HooksCmd {
     /// Install or repair the session-start hook (project scope by default).
@@ -1141,22 +1661,114 @@ pub enum IndexCmd {
     },
 }
 
+/// `rgit branch`'s git flags, for listing and changing branches.
+#[derive(clap::Args, Default)]
+pub struct BranchOpts {
+    /// List remote-tracking branches too (git's -a).
+    #[arg(short = 'a', long)]
+    pub all: bool,
+    /// List only remote-tracking branches (git's -r).
+    #[arg(short = 'r', long)]
+    pub remotes: bool,
+    /// List branches, only those matching the given patterns (git's -l).
+    #[arg(short, long)]
+    pub list: bool,
+    /// Show each branch's commit and subject; twice adds its upstream (-vv).
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+    /// List only branches merged into this commit (default HEAD).
+    #[arg(long, value_name = "REV", num_args = 0..=1, default_missing_value = "HEAD")]
+    pub merged: Option<String>,
+    /// List only branches not merged into this commit (default HEAD).
+    #[arg(
+        long = "no-merged",
+        value_name = "REV",
+        num_args = 0..=1,
+        default_missing_value = "HEAD"
+    )]
+    pub no_merged: Option<String>,
+    /// List only branches that contain this commit (default HEAD).
+    #[arg(long, value_name = "REV", num_args = 0..=1, default_missing_value = "HEAD")]
+    pub contains: Option<String>,
+    /// Print the current branch's name (nothing when detached).
+    #[arg(long = "show-current", group = "branch_action")]
+    pub show_current: bool,
+    /// Delete the named branches if merged into HEAD (git's -d).
+    #[arg(short = 'd', long, group = "branch_action")]
+    pub delete: bool,
+    /// Delete the named branches even if not merged (git's -D).
+    #[arg(short = 'D', group = "branch_action")]
+    pub force_delete: bool,
+    /// Rename `[<old>] <new>`, the current branch by default (git's -m).
+    #[arg(short = 'm', long = "move", group = "branch_action")]
+    pub rename: bool,
+    /// Rename, replacing an existing branch named `<new>` (git's -M).
+    #[arg(short = 'M', group = "branch_action")]
+    pub force_rename: bool,
+    /// Copy `[<old>] <new>`, the current branch by default (git's -c).
+    #[arg(short = 'c', long = "copy", group = "branch_action")]
+    pub copy: bool,
+    /// Copy, replacing an existing branch named `<new>` (git's -C).
+    #[arg(short = 'C', group = "branch_action")]
+    pub force_copy: bool,
+    /// Make `[<branch>]` (default current) track this upstream (git's -u).
+    #[arg(
+        short = 'u',
+        long = "set-upstream-to",
+        value_name = "UPSTREAM",
+        group = "branch_action"
+    )]
+    pub set_upstream_to: Option<String>,
+    /// Stop `[<branch>]` (default current) tracking its upstream.
+    #[arg(long = "unset-upstream", group = "branch_action")]
+    pub unset_upstream: bool,
+    /// Create even if the branch exists, moving it; delete even if unmerged.
+    #[arg(short, long)]
+    pub force: bool,
+    /// A branch to create and its start point (default HEAD); the branches
+    /// to delete, rename, copy or track; or with -l, patterns to list.
+    pub args: Vec<String>,
+}
+
+impl BranchOpts {
+    /// Whether these flags list branches rather than change one.
+    pub fn is_listing(&self) -> bool {
+        let acts = self.show_current
+            || self.delete
+            || self.force_delete
+            || self.rename
+            || self.force_rename
+            || self.copy
+            || self.force_copy
+            || self.set_upstream_to.is_some()
+            || self.unset_upstream;
+        !acts
+            && (self.args.is_empty()
+                || self.list
+                || self.merged.is_some()
+                || self.no_merged.is_some()
+                || self.contains.is_some())
+    }
+}
+
 #[derive(Subcommand)]
 pub enum BranchCmd {
-    /// Create a branch and switch to it.
+    /// Create a branch (at HEAD, or START) and switch to it.
     Create {
         /// The new branch name.
         name: String,
+        /// Where the branch starts (default HEAD).
+        start: Option<String>,
     },
     /// Check out an existing branch.
     Checkout {
         /// The branch to check out.
         name: String,
     },
-    /// Delete a branch (multiselect prompt if no name on a terminal).
+    /// Delete branches (multiselect prompt if no name on a terminal).
     Delete {
-        /// The branch to delete.
-        name: Option<String>,
+        /// The branches to delete.
+        names: Vec<String>,
         /// Delete even if not fully merged (git's -D).
         #[arg(short = 'D', long = "force")]
         force: bool,
@@ -1178,31 +1790,88 @@ pub enum BranchCmd {
 
 #[derive(Subcommand)]
 pub enum StashCmd {
-    /// Stash the working tree, with an optional message.
+    /// Stash the working tree, or only some paths, with an optional message.
     Push {
-        /// A description for the stash.
-        message: Option<String>,
-        /// Also stash untracked files (git's -u).
-        #[arg(short = 'u', long = "include-untracked")]
-        include_untracked: bool,
+        #[command(flatten)]
+        push: StashPush,
+        /// Stash only these paths: files, folders or globs.
+        paths: Vec<String>,
     },
     /// Apply a stash and drop it (prompted for if no index on a terminal).
     Pop {
-        /// The stash index (defaults to the most recent).
+        /// The stash: `N` or `stash@{N}` (defaults to the most recent).
+        #[arg(value_parser = stash_ref)]
         index: Option<usize>,
+        /// Restore the staged changes too (git's --index).
+        #[arg(long = "index")]
+        restore_index: bool,
     },
     /// Apply a stash without dropping it.
     Apply {
-        /// The stash index (defaults to the most recent).
+        /// The stash: `N` or `stash@{N}` (defaults to the most recent).
+        #[arg(value_parser = stash_ref)]
         index: Option<usize>,
+        /// Restore the staged changes too (git's --index).
+        #[arg(long = "index")]
+        restore_index: bool,
     },
     /// Drop a stash.
     Drop {
-        /// The stash index (defaults to the most recent).
+        /// The stash: `N` or `stash@{N}` (defaults to the most recent).
+        #[arg(value_parser = stash_ref)]
         index: Option<usize>,
     },
     /// List the stashes.
     List,
+    /// Show the changes a stash records, as a diffstat (-p for the patch).
+    Show {
+        /// The stash: `N` or `stash@{N}` (defaults to the most recent).
+        #[arg(value_parser = stash_ref)]
+        index: Option<usize>,
+        /// Print the full unified patch (git's -p).
+        #[arg(short, long)]
+        patch: bool,
+        /// List only the names of changed files.
+        #[arg(long = "name-only")]
+        name_only: bool,
+        /// Show a diffstat (the default).
+        #[arg(long)]
+        stat: bool,
+    },
+    /// Create and check out a branch at the stash's base commit, apply the
+    /// stash there and drop it.
+    Branch {
+        /// The new branch name.
+        name: String,
+        /// The stash: `N` or `stash@{N}` (defaults to the most recent).
+        #[arg(value_parser = stash_ref)]
+        index: Option<usize>,
+    },
+    /// Drop every stash.
+    Clear,
+}
+
+/// `stash push`'s arguments, also taken by a bare `stash`.
+#[derive(clap::Args, Default)]
+pub struct StashPush {
+    /// A description for the stash (git's -m).
+    #[arg(short, long)]
+    pub message: Option<String>,
+    /// Also stash untracked files (git's -u).
+    #[arg(short = 'u', long = "include-untracked")]
+    pub include_untracked: bool,
+    /// Leave the staged changes in the index as well (git's -k).
+    #[arg(short = 'k', long = "keep-index")]
+    pub keep_index: bool,
+}
+
+/// A stash as git names it: `N` or `stash@{N}`.
+pub(crate) fn stash_ref(s: &str) -> Result<usize, String> {
+    s.strip_prefix("stash@{")
+        .and_then(|r| r.strip_suffix('}'))
+        .unwrap_or(s)
+        .parse()
+        .map_err(|_| format!("expected N or stash@{{N}}, got {s:?}"))
 }
 
 #[derive(Subcommand)]
@@ -1253,6 +1922,7 @@ pub enum RemoteCmd {
         url: String,
     },
     /// Remove a remote.
+    #[command(alias = "rm")]
     Remove {
         /// The remote name.
         name: String,
@@ -1263,6 +1933,20 @@ pub enum RemoteCmd {
         name: String,
         /// The new URL.
         url: String,
+        /// Set the push URL instead (git's --push).
+        #[arg(long)]
+        push: bool,
+    },
+    /// Print a remote's URL.
+    GetUrl {
+        /// The remote name.
+        name: String,
+        /// Print the push URL instead (git's --push).
+        #[arg(long)]
+        push: bool,
+        /// Print every URL, not just the first (git's --all).
+        #[arg(long)]
+        all: bool,
     },
     /// Rename a remote.
     Rename {
@@ -1271,24 +1955,61 @@ pub enum RemoteCmd {
         /// The new remote name.
         new: String,
     },
+    /// Delete remote-tracking branches that no longer exist on the remotes.
+    Prune {
+        /// The remotes to prune.
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
 pub enum WorktreeCmd {
-    /// Add a linked worktree.
+    /// Add a linked worktree at PATH, as `git worktree add` does: on BRANCH,
+    /// on a new branch with -b, detached at a commit or with --detach, or by
+    /// default on a branch named after PATH's last folder.
     Add {
-        /// The worktree name (branch).
-        name: String,
         /// The path for the new worktree.
         path: String,
+        /// The branch to check out there, or the commit to start from.
+        #[arg(value_name = "BRANCH")]
+        commitish: Option<String>,
+        /// Create this branch at BRANCH (default HEAD) and check it out there.
+        #[arg(short = 'b', value_name = "NEW_BRANCH")]
+        new_branch: Option<String>,
+        /// Check out a detached HEAD (git's --detach).
+        #[arg(short = 'd', long, conflicts_with = "new_branch")]
+        detach: bool,
     },
-    /// Remove a linked worktree.
+    /// List the worktrees.
+    List,
+    /// Remove a linked worktree (by name or path) and its folder.
     Remove {
-        /// The worktree name.
+        /// The worktree's name or path.
         name: String,
-        /// Remove even if locked (git's -f/--force).
+        /// Remove even with changes or when locked (git's -f/--force).
         #[arg(short = 'f', long)]
         force: bool,
+    },
+    /// Lock a worktree (by name or path) so prune leaves it alone.
+    Lock {
+        /// The worktree's name or path.
+        name: String,
+        /// Why it is locked.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Unlock a worktree (by name or path).
+    Unlock {
+        /// The worktree's name or path.
+        name: String,
+    },
+    /// Move a worktree (by name or path) to a new path.
+    Move {
+        /// The worktree's name or path.
+        name: String,
+        /// The new path.
+        new_path: String,
     },
     /// Prune worktree entries whose working tree is gone (git's `worktree prune`).
     Prune,
@@ -1953,45 +2674,9 @@ impl std::error::Error for CliError {}
 /// Git spellings rgit names differently: (rgit command path, git tokens, fix).
 pub const GIT_SPELLINGS: &[(&str, &[&str], &str)] = &[
     (
-        "rgit",
-        &["add"],
-        "use `rgit stage <path>` (or `rgit stage-all`)",
-    ),
-    (
-        "rgit",
-        &["switch"],
-        "use `rgit checkout <branch>` (`-b <new>` to create)",
-    ),
-    (
-        "rgit",
-        &["restore"],
-        "use `rgit discard <path>` (worktree) or `rgit unstage <path>` (index)",
-    ),
-    (
-        "rgit",
-        &["rev-parse", "cat-file", "ls-files", "for-each-ref"],
-        "plumbing is not wrapped; run `rgit git <args>`",
-    ),
-    (
-        "rgit branch",
-        &["-d", "--delete"],
-        "use `rgit branch delete <name>`",
-    ),
-    (
-        "rgit branch",
-        &["-D"],
-        "use `rgit branch delete <name> --force`",
-    ),
-    (
-        "rgit branch",
-        &["-m", "--move"],
-        "use `rgit branch rename <old> <new>`",
-    ),
-    ("rgit stash", &["save"], "use `rgit stash push [<message>]`"),
-    (
         "rgit stash",
-        &["show"],
-        "use `rgit stash list`, then `rgit git stash show -p <stash>`",
+        &["save"],
+        "use `rgit stash push -m <message>`",
     ),
     (
         "rgit log",
@@ -2020,7 +2705,9 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
             "unstage",
             "stage-all",
             "unstage-all",
+            "add",
             "discard",
+            "restore",
             "resolve",
             "rm",
             "mv",
@@ -2047,7 +2734,7 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
     (
         "Branches, tags, stashes",
         &[
-            "branch", "checkout", "merge", "rebase", "tag", "stash", "bisect", "prune",
+            "branch", "checkout", "switch", "merge", "rebase", "tag", "stash", "bisect", "prune",
         ],
     ),
     (
@@ -2081,6 +2768,26 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
             "hash-object",
             "gc",
             "fsck",
+        ],
+    ),
+    (
+        "Plumbing (git's own output formats)",
+        &[
+            "rev-parse",
+            "ls-files",
+            "ls-tree",
+            "cat-file",
+            "show-ref",
+            "for-each-ref",
+            "rev-list",
+            "merge-base",
+            "reflog",
+            "shortlog",
+            "grep",
+            "check-ignore",
+            "var",
+            "symbolic-ref",
+            "count-objects",
         ],
     ),
     ("Code search", &["index"]),
@@ -2377,6 +3084,7 @@ pub fn run(
             };
             render::blame(&selected)
         }
+        Command::Plumbing(c) => crate::plumbing::run(backend, c, true)?.text,
         Command::Refs => render::refs(&backend.refs()?),
         Command::Stage { paths, hunk, lines } => partial(
             &paths,
@@ -2394,6 +3102,21 @@ pub fn run(
             |p, h| backend.unstage_hunk(p, h),
             |p, h, l| backend.unstage_lines(p, h, l),
         )?,
+        Command::Add {
+            paths,
+            all,
+            update,
+            force,
+        } => {
+            if paths.is_empty() && !all && !update {
+                return Err(anyhow::Error::new(CliError {
+                    message: "nothing specified, nothing added".to_owned(),
+                    help: Some("Run `rgit add .` or `rgit add -A` to add everything".to_owned()),
+                    code: 2,
+                }));
+            }
+            ok(backend.add(&paths, update, force))?
+        }
         Command::StageAll => ok(backend.stage_all())?,
         Command::UnstageAll => ok(backend.unstage_all())?,
         Command::Discard { paths, hunk, lines } => {
@@ -2413,6 +3136,18 @@ pub fn run(
                 |p, h, l| backend.discard_lines(p, h, l),
             )?
         }
+        Command::Restore {
+            paths,
+            source,
+            staged,
+            worktree,
+        } => ok(backend.restore(
+            &paths,
+            source.as_deref(),
+            staged,
+            worktree || !staged,
+            false,
+        ))?,
         Command::Resolve { path, ours, theirs } => {
             if !ours && !theirs {
                 anyhow::bail!("resolve needs --ours or --theirs");
@@ -2421,34 +3156,60 @@ pub fn run(
         }
         Command::Commit {
             message,
+            file,
             amend,
+            no_edit,
             all,
             no_verify,
+            author,
+            signoff,
+            allow_empty,
+            fixup,
+            squash,
+            quiet: _,
+            paths,
         } => {
-            let message = resolve(message, "a commit message", &|| {
-                crate::interactive::input("Commit message")
-            })?;
+            let mut text = match file.as_deref() {
+                Some("-") => std::io::read_to_string(std::io::stdin())?,
+                Some(f) => std::fs::read_to_string(f)
+                    .map_err(|e| anyhow::anyhow!("could not read {f}: {e}"))?,
+                None => message.join("\n\n"),
+            };
+            let target = fixup
+                .map(|r| ("fixup", r))
+                .or(squash.map(|r| ("squash", r)));
+            if let Some((kind, rev)) = target {
+                let old = backend.commit_overview(&rev)?.message;
+                let head = format!("{kind}! {}", old.lines().next().unwrap_or(""));
+                text = if text.is_empty() {
+                    head
+                } else {
+                    format!("{head}\n\n{text}")
+                };
+            }
+            if text.is_empty() && amend && no_edit {
+                text = backend.head_message().unwrap_or_default();
+            }
+            let message = resolve(
+                (!text.is_empty()).then_some(text),
+                "a commit message",
+                &|| crate::interactive::input("Commit message"),
+            )?;
             // -a: stage worktree changes to tracked files (not untracked ones).
             if all {
-                for e in backend.status()?.entries {
-                    if matches!(
-                        e.worktree,
-                        rgit_git::StatusCode::Modified
-                            | rgit_git::StatusCode::Deleted
-                            | rgit_git::StatusCode::Renamed
-                            | rgit_git::StatusCode::TypeChanged
-                    ) {
-                        backend.stage_file(&e.path)?;
-                    }
-                }
+                backend.add(&[], true, false)?;
             }
-            if amend {
-                backend.amend(&message)?;
-            } else if no_verify {
-                backend.commit_no_verify(&message)?;
-            } else {
-                backend.commit(&message)?;
-            }
+            backend.commit_with(
+                &message,
+                &rgit_git::CommitOptions {
+                    amend,
+                    no_verify,
+                    allow_empty,
+                    signoff,
+                    author,
+                    paths,
+                },
+            )?;
             backend.commit_report().join("\n")
         }
         Command::Extend => {
@@ -2620,28 +3381,55 @@ pub fn run(
                 backend.push_to(remote.as_deref(), &refspecs, &args, r)
             })?
         }
-        Command::Checkout { rev, branch } => {
-            // `-b <new>`: create the branch (from rev/HEAD) and switch to it.
-            if let Some(new) = branch {
-                if let Some(start) = &rev {
-                    backend.checkout_detached(start)?;
-                }
-                backend.create_branch(&new)?;
-                ok(backend.checkout_branch(&new))?
-            } else {
-                let rev = resolve(rev, "a branch or revision", &|| {
-                    crate::interactive::pick_branch(backend, "Check out which branch?")
-                })?;
-                let is_branch = backend
-                    .local_branches()
-                    .map(|bs| bs.iter().any(|b| b == &rev))
-                    .unwrap_or(false);
-                ok(if is_branch {
-                    backend.checkout_branch(&rev)
-                } else {
-                    backend.checkout_detached(&rev)
-                })?
+        Command::Checkout {
+            rev,
+            pathspec,
+            branch,
+            force_branch,
+            detach,
+            track,
+            paths,
+        } => {
+            let (rev, paths) = rev_and_paths(rev, pathspec, paths, |r| {
+                r == "-" || backend.rev_parse(r).is_ok() || guess_remote(backend, r).is_some()
+            });
+            if !paths.is_empty() {
+                // `checkout [<rev>] -- <paths>`: take the paths from <rev> into
+                // the index and working tree, or from the index.
+                backend.restore(&paths, rev.as_deref(), rev.is_some(), true, true)?;
+                let from = rev.as_deref().unwrap_or("the index");
+                return Ok(format!("restored {} from {from}", paths.join(" ")));
             }
+            let new = branch
+                .map(|b| (b, false))
+                .or(force_branch.map(|b| (b, true)));
+            let rev = match rev {
+                None if new.is_none() && !detach => {
+                    Some(resolve(None, "a branch or revision", &|| {
+                        crate::interactive::pick_branch(backend, "Check out which branch?")
+                    })?)
+                }
+                rev => rev,
+            };
+            switch(backend, rev, new, detach, track, true)?
+        }
+        Command::Switch {
+            rev,
+            create,
+            force_create,
+            detach,
+            track,
+        } => {
+            let new = create
+                .map(|b| (b, false))
+                .or(force_create.map(|b| (b, true)));
+            let rev = match rev {
+                None if new.is_none() && !detach => Some(resolve(None, "a branch", &|| {
+                    crate::interactive::pick_branch(backend, "Switch to which branch?")
+                })?),
+                rev => rev,
+            };
+            switch(backend, rev, new, detach, track, false)?
         }
         Command::Merge {
             mut revs,
@@ -2752,23 +3540,34 @@ pub fn run(
         }
         Command::Reset {
             rev,
+            pathspec,
             soft,
+            mixed: _,
             hard,
+            keep,
             paths,
         } => {
-            // `reset -- <paths>` unstages those paths (git's path-scoped reset).
+            let (rev, paths) =
+                rev_and_paths(rev, pathspec, paths, |r| backend.rev_parse(r).is_ok());
+            // `reset [<rev>] [--] <paths>` resets those index entries to <rev>
+            // (default HEAD), leaving HEAD and the working tree alone.
             if !paths.is_empty() {
-                for p in &paths {
-                    backend.unstage_file(p)?;
-                }
-                return Ok(format!("unstaged {}", paths.join(", ")));
+                let Some(rev) = rev else {
+                    for p in &paths {
+                        backend.unstage_file(p)?;
+                    }
+                    return Ok(format!("unstaged {}", paths.join(", ")));
+                };
+                backend.reset_paths(&rev, &paths)?;
+                return Ok(format!("reset {} to {rev}", paths.join(", ")));
             }
             let rev = resolve(rev, "a revision to reset to", &|| {
                 crate::interactive::pick_commit(backend, "Reset to which commit?")
             })?;
-            let mode = match (soft, hard) {
-                (true, _) => ResetMode::Soft,
-                (_, true) => ResetMode::Hard,
+            let mode = match (soft, hard, keep) {
+                (true, _, _) => ResetMode::Soft,
+                (_, true, _) => ResetMode::Hard,
+                (_, _, true) => ResetMode::Keep,
                 _ => ResetMode::Mixed,
             };
             if hard
@@ -2821,36 +3620,45 @@ pub fn run(
             };
             pick(backend, revs, &opts, (cont, skip, abort), interactive)?
         }
-        Command::Branch { cmd, all, remotes } => match cmd {
-            None if remotes => backend.remote_branches()?.join("\n"),
-            None => {
-                let current = backend.status().ok().and_then(|s| s.head.branch);
-                let mut names = backend.local_branches()?;
-                if all {
-                    names.extend(backend.remote_branches()?);
+        Command::Branch { cmd, opts } => match cmd {
+            None if opts.is_listing() => {
+                let rows = branch_rows(backend, &opts)?;
+                if opts.verbose == 0 {
+                    let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
+                    let current = rows.iter().find(|r| r.current).map(|r| r.name.as_str());
+                    render::branches(&names, current)
+                } else {
+                    render_branch_rows(&rows, opts.verbose)
                 }
-                render::branches(&names, current.as_deref())
             }
-            Some(BranchCmd::Create { name }) => ok(backend.create_branch(&name))?,
+            None => branch_change(backend, opts)?,
+            Some(BranchCmd::Create { name, start: None }) => ok(backend.create_branch(&name))?,
+            Some(BranchCmd::Create {
+                name,
+                start: Some(start),
+            }) => {
+                backend.create_branch_at(&name, &start, false)?;
+                ok(backend.checkout_branch(&name))?
+            }
             Some(BranchCmd::Checkout { name }) => ok(backend.checkout_branch(&name))?,
-            Some(BranchCmd::Delete { name, force }) => match name {
-                Some(name) => ok(backend.delete_branch(&name, force))?,
-                None if interactive => {
-                    let names = crate::interactive::multiselect_branches(
-                        backend,
-                        "Delete which branches?",
-                    )?;
-                    if names.is_empty() {
-                        "none selected".to_owned()
-                    } else {
-                        for n in &names {
-                            backend.delete_branch(n, force)?;
-                        }
-                        format!("deleted {}", names.join(", "))
+            Some(BranchCmd::Delete { names, force }) if !names.is_empty() => {
+                delete_branches(backend, &names, force)?
+            }
+            Some(BranchCmd::Delete { force, .. }) if interactive => {
+                let names =
+                    crate::interactive::multiselect_branches(backend, "Delete which branches?")?;
+                if names.is_empty() {
+                    "none selected".to_owned()
+                } else {
+                    for n in &names {
+                        backend.delete_branch(n, force)?;
                     }
+                    format!("deleted {}", names.join(", "))
                 }
-                None => return Err(CliError::usage("a branch name required")),
-            },
+            }
+            Some(BranchCmd::Delete { .. }) => {
+                return Err(CliError::usage("a branch name required"));
+            }
             Some(BranchCmd::Rename { old, new }) => ok(backend.rename_branch(&old, &new))?,
             Some(BranchCmd::Prune { base }) => {
                 let deleted = backend.prune_merged(&base)?;
@@ -2861,28 +3669,35 @@ pub fn run(
                 }
             }
         },
-        Command::Stash { cmd } => match cmd {
-            None => ok_msg(backend.stash_push(false))?,
-            Some(StashCmd::Push {
-                message: None,
-                include_untracked,
-            }) => ok_msg(backend.stash_push(include_untracked))?,
-            Some(StashCmd::Push {
-                message: Some(message),
-                include_untracked,
-            }) => ok_msg(backend.stash_push_message(&message, include_untracked))?,
-            Some(StashCmd::Pop { index }) => ok(backend.stash_pop(stash_index(
-                backend,
+        Command::Stash { cmd, push, paths } => match cmd {
+            None | Some(StashCmd::Push { .. }) => {
+                let (p, paths) = match cmd {
+                    Some(StashCmd::Push { push, paths }) => (push, paths),
+                    _ => (push, paths),
+                };
+                ok_msg(backend.stash_push_opts(
+                    p.message.as_deref(),
+                    p.include_untracked,
+                    p.keep_index,
+                    &paths,
+                ))?
+            }
+            Some(StashCmd::Pop {
                 index,
-                interactive,
-                "Pop which stash?",
-            )?))?,
-            Some(StashCmd::Apply { index }) => ok(backend.stash_apply(stash_index(
-                backend,
+                restore_index,
+            }) => ok(backend.stash_apply_opts(
+                stash_index(backend, index, interactive, "Pop which stash?")?,
+                restore_index,
+                true,
+            ))?,
+            Some(StashCmd::Apply {
                 index,
-                interactive,
-                "Apply which stash?",
-            )?))?,
+                restore_index,
+            }) => ok(backend.stash_apply_opts(
+                stash_index(backend, index, interactive, "Apply which stash?")?,
+                restore_index,
+                false,
+            ))?,
             Some(StashCmd::Drop { index }) => ok(backend.stash_drop(stash_index(
                 backend,
                 index,
@@ -2890,38 +3705,137 @@ pub fn run(
                 "Drop which stash?",
             )?))?,
             Some(StashCmd::List) => render::stashes(&backend.status()?.stashes),
+            Some(StashCmd::Show {
+                index,
+                patch,
+                name_only,
+                stat,
+            }) => diff_out(
+                &stash_diff(backend, index.unwrap_or(0))?,
+                DiffFormat {
+                    patch,
+                    name_only,
+                    stat,
+                    ..DiffFormat::default()
+                },
+            ),
+            Some(StashCmd::Branch { name, index }) => {
+                let i = index.unwrap_or(0);
+                backend.create_branch_at(&name, &format!("stash@{{{i}}}^1"), false)?;
+                backend.checkout_branch(&name)?;
+                backend.stash_apply_opts(i, true, true)?;
+                "ok".to_owned()
+            }
+            Some(StashCmd::Clear) => {
+                for _ in 0..backend.status()?.stashes.len() {
+                    backend.stash_drop(0)?;
+                }
+                "ok".to_owned()
+            }
         },
         Command::Tag {
-            name,
+            names,
             message,
-            annotate: _,
+            annotate,
             force,
             delete,
-            list: _,
+            list,
+            lines,
+            contains,
+            points_at,
         } => {
-            if let Some(del) = delete {
-                ok(backend.delete_tag(&del))?
-            } else if let Some(name) = name {
-                // `-f` re-tags: drop an existing tag of the same name first.
-                if force {
-                    let _ = backend.delete_tag(&name);
-                }
-                ok(backend.create_tag(&name, message.as_deref().unwrap_or("")))?
-            } else {
-                let names: Vec<String> = backend.all_tags()?.into_iter().map(|t| t.name).collect();
-                if names.is_empty() {
+            if !delete && (names.is_empty() || list || lines.is_some())
+                || contains.is_some()
+                || points_at.is_some()
+            {
+                let tags = tag_list(backend, &names, contains.as_deref(), points_at.as_deref())?;
+                if tags.is_empty() {
                     "no tags".to_owned()
                 } else {
-                    names.join("\n")
+                    tags.iter()
+                        .map(|t| match lines {
+                            Some(n) => tag_with_message(t, n),
+                            None => t.name.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 }
+            } else if delete {
+                if names.is_empty() {
+                    return Err(CliError::usage("tag -d needs a tag name"));
+                }
+                let failed: Vec<String> = names
+                    .iter()
+                    .filter_map(|n| backend.delete_tag(n).err().map(|e| format!("{n}: {e}")))
+                    .collect();
+                if !failed.is_empty() {
+                    anyhow::bail!("could not delete {}", failed.join("; "));
+                }
+                "ok".to_owned()
+            } else {
+                let (name, rev) = match names.as_slice() {
+                    [name] => (name, "HEAD"),
+                    [name, rev] => (name, rev.as_str()),
+                    _ => {
+                        return Err(CliError::usage(format!(
+                            "tag takes a name and an optional revision, got {}",
+                            names.join(" ")
+                        )));
+                    }
+                };
+                let message = match message {
+                    None if annotate => resolve(None, "an annotation message (-m)", &|| {
+                        crate::interactive::input("Tag message")
+                    })?,
+                    m => m.unwrap_or_default(),
+                };
+                ok(backend.create_tag_at(name, rev, &message, force))?
             }
         }
-        Command::Remote { cmd } => match cmd {
+        Command::Remote { cmd, verbose } => match cmd {
+            None if verbose => {
+                let mut lines = Vec::new();
+                for r in backend.remotes()? {
+                    let url = backend.remote_urls(&r.name, false)?.into_iter().next();
+                    lines.push(format!("{}\t{} (fetch)", r.name, url.unwrap_or(r.url)));
+                    for url in backend.remote_urls(&r.name, true)? {
+                        lines.push(format!("{}\t{url} (push)", r.name));
+                    }
+                }
+                if lines.is_empty() {
+                    "no remotes".to_owned()
+                } else {
+                    lines.join("\n")
+                }
+            }
             None => render::remotes(&backend.remotes()?),
             Some(RemoteCmd::Add { name, url }) => ok(backend.add_remote(&name, &url))?,
             Some(RemoteCmd::Remove { name }) => ok(backend.remove_remote(&name))?,
-            Some(RemoteCmd::SetUrl { name, url }) => ok(backend.set_remote_url(&name, &url))?,
+            Some(RemoteCmd::SetUrl { name, url, push }) => ok(if push {
+                backend.set_remote_push_url(&name, &url)
+            } else {
+                backend.set_remote_url(&name, &url)
+            })?,
+            Some(RemoteCmd::GetUrl { name, push, all }) => {
+                let urls = backend.remote_urls(&name, push)?;
+                if all {
+                    urls.join("\n")
+                } else {
+                    urls.into_iter().next().unwrap_or_default()
+                }
+            }
             Some(RemoteCmd::Rename { old, new }) => ok(backend.rename_remote(&old, &new))?,
+            Some(RemoteCmd::Prune { names }) => {
+                let mut pruned = Vec::new();
+                for name in &names {
+                    pruned.extend(backend.prune_remote(name)?);
+                }
+                if pruned.is_empty() {
+                    "nothing to prune".to_owned()
+                } else {
+                    format!("pruned {}", pruned.join(", "))
+                }
+            }
         },
         Command::Flow { cmd } => match cmd {
             FlowCmd::Init { preset } => rgit_git::workflow::init(backend.as_ref(), &preset)?,
@@ -2962,9 +3876,26 @@ pub fn run(
             WorkspaceCmd::Remove { name } => rgit_git::workspace::remove(backend.as_ref(), &name)?,
         },
         Command::Worktree { cmd } => match cmd {
-            None => render::worktrees(&backend.worktrees()?),
-            Some(WorktreeCmd::Add { name, path }) => ok(backend.add_worktree(&name, &path))?,
+            None | Some(WorktreeCmd::List) => render::worktrees(&backend.worktrees()?),
+            Some(WorktreeCmd::Add {
+                path,
+                commitish,
+                new_branch,
+                detach,
+            }) => ok(backend.worktree_add(
+                &path,
+                commitish.as_deref(),
+                new_branch.as_deref(),
+                detach,
+            ))?,
             Some(WorktreeCmd::Remove { name, force }) => ok(backend.remove_worktree(&name, force))?,
+            Some(WorktreeCmd::Lock { name, reason }) => {
+                ok(backend.worktree_lock(&name, reason.as_deref()))?
+            }
+            Some(WorktreeCmd::Unlock { name }) => ok(backend.worktree_unlock(&name))?,
+            Some(WorktreeCmd::Move { name, new_path }) => {
+                ok(backend.worktree_move(&name, &new_path))?
+            }
             Some(WorktreeCmd::Prune) => {
                 let pruned = backend.prune_worktrees()?;
                 if pruned.is_empty() {
@@ -3456,6 +4387,328 @@ fn stash_index(
     }
 }
 
+/// Split git's `<rev> <paths>...` and `[<rev>] -- <paths>...`: without `--`,
+/// the first word is a revision only when `is_rev` says so, else a path.
+fn rev_and_paths(
+    first: Option<String>,
+    mut rest: Vec<String>,
+    after_dashes: Vec<String>,
+    is_rev: impl Fn(&str) -> bool,
+) -> (Option<String>, Vec<String>) {
+    let dashes = !after_dashes.is_empty();
+    rest.extend(after_dashes);
+    match first {
+        Some(f) if !dashes && !is_rev(&f) => {
+            rest.insert(0, f);
+            (None, rest)
+        }
+        first => (first, rest),
+    }
+}
+
+/// The one remote-tracking branch named `<remote>/<name>`, which git's
+/// checkout and switch turn into a local tracking branch.
+fn guess_remote(backend: &Arc<dyn GitBackend>, name: &str) -> Option<String> {
+    let hits: Vec<String> = backend
+        .remote_branches()
+        .ok()?
+        .into_iter()
+        .filter(|r| r.split_once('/').is_some_and(|(_, b)| b == name))
+        .collect();
+    match <[String; 1]>::try_from(hits) {
+        Ok([one]) => Some(one),
+        Err(_) => None,
+    }
+}
+
+/// Switch branches for `checkout` and `switch`: create `new` at `rev`
+/// (resetting it when forced), detach at `rev`, or switch to the branch `rev`,
+/// guessing a remote one. `-` is the previous branch. Only checkout
+/// (`detach_ok`) detaches at a non-branch revision unasked.
+fn switch(
+    backend: &Arc<dyn GitBackend>,
+    rev: Option<String>,
+    new: Option<(String, bool)>,
+    detach: bool,
+    track: bool,
+    detach_ok: bool,
+) -> anyhow::Result<String> {
+    let prev = rev.as_deref() == Some("-");
+    let rev = if prev {
+        Some(backend.previous_checkout()?)
+    } else {
+        rev
+    };
+    if let Some((name, force)) = new {
+        backend.branch_from(&name, rev.as_deref().unwrap_or("HEAD"), force, track)?;
+        return Ok("ok".to_owned());
+    }
+    let rev = rev.unwrap_or_else(|| "HEAD".to_owned());
+    let tracked = |name: &str, start: &str| -> anyhow::Result<String> {
+        backend.branch_from(name, start, false, true)?;
+        Ok(format!("created branch {name} tracking {start}"))
+    };
+    if detach {
+        backend.checkout_detached(&rev)?;
+    } else if backend.local_branches()?.contains(&rev) {
+        backend.checkout_branch(&rev)?;
+    } else if let Some((_, name)) = rev.split_once('/').filter(|_| track) {
+        return tracked(name, &rev);
+    } else if detach_ok && backend.rev_parse(&rev).is_ok() {
+        backend.checkout_detached(&rev)?;
+    } else if let Some(remote) = guess_remote(backend, &rev) {
+        return tracked(&rev, &remote);
+    } else if detach_ok {
+        backend.checkout_detached(&rev)?;
+    } else if backend.rev_parse(&rev).is_ok() {
+        return Err(anyhow::Error::new(CliError {
+            message: format!("a branch is expected, got '{rev}'"),
+            help: Some(format!(
+                "Run `rgit switch --detach {rev}` to check it out as a detached HEAD"
+            )),
+            code: 1,
+        }));
+    } else {
+        anyhow::bail!("invalid reference: {rev}");
+    }
+    Ok(if prev {
+        format!("checked out {rev}")
+    } else {
+        "ok".to_owned()
+    })
+}
+
+/// One branch in a `branch` listing. `id`, `summary` and the upstream fields
+/// are filled only when asked for with -v / -vv.
+pub(crate) struct BranchRow {
+    pub name: String,
+    pub current: bool,
+    pub id: String,
+    pub summary: String,
+    pub upstream: Option<(String, usize, usize)>,
+}
+
+/// The branches `rgit branch` lists under `opts`' filters.
+pub(crate) fn branch_rows(
+    backend: &Arc<dyn GitBackend>,
+    opts: &BranchOpts,
+) -> anyhow::Result<Vec<BranchRow>> {
+    let current = backend.status().ok().and_then(|s| s.head.branch);
+    let mut names = if opts.remotes {
+        Vec::new()
+    } else {
+        backend.local_branches()?
+    };
+    let local = names.len();
+    if opts.all || opts.remotes {
+        names.extend(backend.remote_branches()?);
+    }
+    let mut rows = Vec::new();
+    for (i, name) in names.into_iter().enumerate() {
+        let keep =
+            (!opts.list || opts.args.is_empty() || rgit_git::pathspec_matches(&opts.args, &name))
+                && opts
+                    .merged
+                    .as_ref()
+                    .map_or(Ok(true), |r| backend.is_ancestor(&name, r))?
+                && opts
+                    .no_merged
+                    .as_ref()
+                    .map_or(Ok(true), |r| backend.is_ancestor(&name, r).map(|m| !m))?
+                && opts
+                    .contains
+                    .as_ref()
+                    .map_or(Ok(true), |r| backend.is_ancestor(r, &name))?;
+        if !keep {
+            continue;
+        }
+        let mut row = BranchRow {
+            current: i < local && current.as_ref() == Some(&name),
+            name,
+            id: String::new(),
+            summary: String::new(),
+            upstream: None,
+        };
+        if opts.verbose > 0 {
+            if let Some(tip) = backend
+                .log(&LogOptions {
+                    limit: 1,
+                    revs: vec![row.name.clone()],
+                    ..LogOptions::default()
+                })?
+                .into_iter()
+                .next()
+            {
+                row.id = tip.short_id;
+                row.summary = tip.summary;
+            }
+            if i < local {
+                row.upstream = backend.branch_upstream(&row.name)?;
+            }
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Branches as `git branch -v` / `-vv` prints them.
+fn render_branch_rows(rows: &[BranchRow], verbose: u8) -> String {
+    if rows.is_empty() {
+        return "no branches".to_owned();
+    }
+    let width = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
+    rows.iter()
+        .map(|r| {
+            let track = match &r.upstream {
+                Some((up, ahead, behind)) => {
+                    let mut counts = Vec::new();
+                    if *ahead > 0 {
+                        counts.push(format!("ahead {ahead}"));
+                    }
+                    if *behind > 0 {
+                        counts.push(format!("behind {behind}"));
+                    }
+                    let counts = counts.join(", ");
+                    match (verbose > 1, counts.is_empty()) {
+                        (true, true) => format!("[{up}] "),
+                        (true, false) => format!("[{up}: {counts}] "),
+                        (false, false) => format!("[{counts}] "),
+                        (false, true) => String::new(),
+                    }
+                }
+                None => String::new(),
+            };
+            let mark = if r.current { "*" } else { " " };
+            format!("{mark} {:<width$} {} {track}{}", r.name, r.id, r.summary)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Delete each of `names`, reporting every failure rather than stopping at
+/// the first.
+fn delete_branches(
+    backend: &Arc<dyn GitBackend>,
+    names: &[String],
+    force: bool,
+) -> anyhow::Result<String> {
+    let failed: Vec<String> = names
+        .iter()
+        .filter_map(|n| {
+            backend
+                .delete_branch(n, force)
+                .err()
+                .map(|e| format!("{n}: {e}"))
+        })
+        .collect();
+    if !failed.is_empty() {
+        anyhow::bail!("could not delete {}", failed.join("; "));
+    }
+    Ok(format!("deleted branch {}", names.join(", ")))
+}
+
+/// `rgit branch` with git's flags that change branches: create, delete,
+/// rename, copy, set or unset the upstream, or print the current branch.
+fn branch_change(backend: &Arc<dyn GitBackend>, o: BranchOpts) -> anyhow::Result<String> {
+    let current = || {
+        backend
+            .status()?
+            .head
+            .branch
+            .ok_or_else(|| anyhow::anyhow!("HEAD is detached; name the branch"))
+    };
+    let target = |what: &str| match o.args.as_slice() {
+        [] => current(),
+        [name] => Ok(name.clone()),
+        _ => Err(CliError::usage(format!("{what} takes at most one branch"))),
+    };
+    if o.show_current {
+        return Ok(backend.status()?.head.branch.unwrap_or_default());
+    }
+    if let Some(up) = &o.set_upstream_to {
+        let name = target("--set-upstream-to")?;
+        backend.set_upstream(&name, Some(up))?;
+        return Ok(format!("branch {name} set up to track {up}"));
+    }
+    if o.unset_upstream {
+        let name = target("--unset-upstream")?;
+        backend.set_upstream(&name, None)?;
+        return Ok(format!("branch {name} no longer tracks an upstream"));
+    }
+    if o.delete || o.force_delete {
+        if o.args.is_empty() {
+            return Err(CliError::usage("branch -d needs a branch name"));
+        }
+        return delete_branches(backend, &o.args, o.force_delete || o.force);
+    }
+    if o.rename || o.force_rename || o.copy || o.force_copy {
+        let (old, new) = match o.args.as_slice() {
+            [new] => (current()?, new.clone()),
+            [old, new] => (old.clone(), new.clone()),
+            _ => return Err(CliError::usage("branch -m/-c takes [<old>] <new>")),
+        };
+        let force = o.force_rename || o.force_copy || o.force;
+        if o.copy || o.force_copy {
+            backend.create_branch_at(&new, &old, force)?;
+            return Ok(format!("copied branch {old} to {new}"));
+        }
+        if force && old != new && backend.local_branches()?.contains(&new) {
+            backend.delete_branch(&new, true)?;
+        }
+        backend.rename_branch(&old, &new)?;
+        return Ok(format!("renamed branch {old} to {new}"));
+    }
+    let (name, start) = match o.args.as_slice() {
+        [name] => (name, "HEAD"),
+        [name, start] => (name, start.as_str()),
+        _ => {
+            return Err(CliError::usage(
+                "branch takes a new branch name and an optional start point",
+            ));
+        }
+    };
+    backend.create_branch_at(name, start, o.force)?;
+    Ok(format!("created branch {name} at {start}"))
+}
+
+/// Tags matching any of `patterns` (all when none), keeping only those that
+/// contain `contains` and point at `points_at` when given.
+pub(crate) fn tag_list(
+    backend: &Arc<dyn GitBackend>,
+    patterns: &[String],
+    contains: Option<&str>,
+    points_at: Option<&str>,
+) -> anyhow::Result<Vec<rgit_git::TagInfo>> {
+    let at = points_at.map(|r| backend.rev_parse(r)).transpose()?;
+    let mut out = Vec::new();
+    for t in backend.all_tags()? {
+        if (patterns.is_empty() || rgit_git::pathspec_matches(patterns, &t.name))
+            && contains.map_or(Ok(true), |c| backend.is_ancestor(c, &t.name))?
+            && at
+                .as_ref()
+                .is_none_or(|oid| backend.rev_parse(&t.name).ok().as_ref() == Some(oid))
+        {
+            out.push(t);
+        }
+    }
+    Ok(out)
+}
+
+/// A tag and up to `n` lines of its message, laid out like `git tag -n`.
+fn tag_with_message(t: &rgit_git::TagInfo, n: usize) -> String {
+    let body: Vec<&str> = t.message.lines().take(n).collect();
+    format!("{:<15} {}", t.name, body.join("\n    "))
+}
+
+/// The changes stash `index` records: its base commit against its tree.
+pub(crate) fn stash_diff(
+    backend: &Arc<dyn GitBackend>,
+    index: usize,
+) -> anyhow::Result<Vec<rgit_git::FileDiff>> {
+    let stash = format!("stash@{{{index}}}");
+    Ok(backend.diff_refs(&format!("{stash}^1"), &stash)?)
+}
+
 /// Status limited to `paths`, with untracked files per git's `-u` mode and
 /// ignored files when asked.
 pub(crate) fn status_view(
@@ -3508,11 +4761,38 @@ pub fn from_cwd(mut command: Command, workdir: &Path) -> Command {
         | Command::Unstage { paths, .. }
         | Command::Discard { paths, .. }
         | Command::Split { paths, .. }
-        | Command::Reset { paths, .. }
         | Command::Archive { paths, .. }
+        | Command::Add { paths, .. }
+        | Command::Restore { paths, .. }
+        | Command::Commit { paths, .. }
         | Command::Clean { paths, .. }
         | Command::Rm { paths, .. }
-        | Command::Mv { paths, .. } => paths.iter_mut().for_each(fix),
+        | Command::Mv { paths, .. }
+        | Command::Stash {
+            cmd: Some(StashCmd::Push { paths, .. }),
+            ..
+        }
+        | Command::Stash {
+            cmd: None, paths, ..
+        } => paths.iter_mut().for_each(fix),
+        Command::Reset {
+            rev,
+            pathspec,
+            paths,
+            ..
+        }
+        | Command::Checkout {
+            rev,
+            pathspec,
+            paths,
+            ..
+        } => {
+            // A first word naming a file here is a path, not a revision.
+            if let Some(r) = rev.as_mut().filter(|r| root.join(&prefix).join(r).exists()) {
+                fix(r);
+            }
+            pathspec.iter_mut().chain(paths).for_each(fix);
+        }
         Command::Resolve { path, .. } => fix(path),
         Command::Blame { args, .. } => args.last_mut().into_iter().for_each(fix),
         Command::Show { paths, .. } => paths.iter_mut().for_each(fix),
@@ -3522,6 +4802,21 @@ pub fn from_cwd(mut command: Command, workdir: &Path) -> Command {
                 .filter(|r| Path::new(r.as_str()).exists())
                 .for_each(fix);
             paths.iter_mut().for_each(fix);
+        }
+        // A trailing `/` means "inside this folder" to ls-tree and pathspecs.
+        Command::Plumbing(
+            Plumbing::LsFiles { paths, .. }
+            | Plumbing::LsTree { paths, .. }
+            | Plumbing::Grep { paths, .. }
+            | Plumbing::CheckIgnore { paths, .. },
+        ) => {
+            for p in paths {
+                let dir = p.ends_with('/');
+                fix(p);
+                if dir && !p.ends_with('/') {
+                    p.push('/');
+                }
+            }
         }
         _ => {}
     }

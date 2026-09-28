@@ -26,6 +26,8 @@ pub fn run(
 ) -> anyhow::Result<Output> {
     let done = done_message(&command);
     let next = next_steps(&command);
+    let restores = matches!(&command, Command::Checkout { pathspec, paths, .. }
+        if !pathspec.is_empty() || !paths.is_empty());
     let finish = |text: String| {
         Output::from(if text == "ok" {
             done.clone().unwrap_or(text)
@@ -127,7 +129,7 @@ pub fn run(
                 rgit_git::GitError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
                     anyhow::Error::new(crate::cli::CliError {
                         message: format!("no file {path} in this repository"),
-                        help: Some("Run `rgit git ls-files` to list tracked files".to_owned()),
+                        help: Some("Run `rgit ls-files` to list tracked files".to_owned()),
                         code: 1,
                     })
                 }
@@ -139,6 +141,7 @@ pub fn run(
             };
             blame(&all, &path, start, end)
         }
+        Command::Plumbing(c) => crate::plumbing::run(backend, c, false)?,
         Command::Refs => {
             let refs = backend.refs()?;
             let rows = refs
@@ -158,30 +161,41 @@ pub fn run(
                 "0 refs in this repository",
             )
         }
-        Command::Branch {
-            cmd: None,
-            all,
-            remotes,
-        } => {
-            let current = backend.status().ok().and_then(|s| s.head.branch);
-            let mut names = if remotes {
-                Vec::new()
-            } else {
-                backend.local_branches()?
-            };
-            if all || remotes {
-                names.extend(backend.remote_branches()?);
-            }
-            let rows = names
+        Command::Branch { cmd: None, opts } if opts.is_listing() => {
+            let list = crate::cli::branch_rows(backend, &opts)?;
+            let names: Vec<String> = list.iter().map(|r| r.name.clone()).collect();
+            let current = list.iter().find(|r| r.current).map(|r| r.name.as_str());
+            let rows = list
                 .iter()
-                .map(|n| crate::obj! { "name" => n, "current" => Some(n) == current.as_ref() })
+                .map(|r| {
+                    let (upstream, ahead, behind) = match &r.upstream {
+                        Some((u, a, b)) => (Some(u.as_str()), *a, *b),
+                        None => (None, 0, 0),
+                    };
+                    crate::obj! {
+                        "name" => r.name,
+                        "current" => r.current,
+                        "id" => r.id,
+                        "summary" => r.summary,
+                        "upstream" => upstream,
+                        "ahead" => ahead,
+                        "behind" => behind,
+                    }
+                })
                 .collect();
-            Output::new(render::branches(&names, current.as_deref()))
+            let columns: &[&str] = match opts.verbose {
+                0 => &["name", "current"],
+                1 => &["name", "current", "id", "summary"],
+                _ => &[
+                    "name", "current", "id", "upstream", "ahead", "behind", "summary",
+                ],
+            };
+            Output::new(render::branches(&names, current))
                 .list(
                     "branches",
                     rows,
-                    &["name", "current"],
-                    if remotes {
+                    columns,
+                    if opts.remotes {
                         "0 remote-tracking branches"
                     } else {
                         "0 branches in this repository"
@@ -191,25 +205,64 @@ pub fn run(
                 .help("Run `rgit branch create <name>` to add a branch")
         }
         Command::Branch {
-            cmd: Some(BranchCmd::Create { name }),
+            cmd: Some(BranchCmd::Create { name, .. }),
             ..
         } if backend.local_branches()?.contains(&name) => {
             Output::message(format!("branch {name} already exists (no-op)"))
         }
+        Command::Branch { cmd: None, opts }
+            if !opts.is_listing()
+                && !opts.force
+                && opts.set_upstream_to.is_none()
+                && ![
+                    opts.show_current,
+                    opts.delete,
+                    opts.force_delete,
+                    opts.rename,
+                    opts.force_rename,
+                    opts.copy,
+                    opts.force_copy,
+                    opts.unset_upstream,
+                ]
+                .contains(&true)
+                && opts.args.len() == 1
+                && backend.local_branches()?.contains(&opts.args[0]) =>
+        {
+            Output::message(format!("branch {} already exists (no-op)", opts.args[0]))
+        }
         Command::Branch {
-            cmd: Some(BranchCmd::Delete {
-                name: Some(name), ..
-            }),
+            cmd: Some(BranchCmd::Delete { names, .. }),
             ..
-        } if !backend.local_branches()?.contains(&name) => {
-            Output::message(format!("branch {name} does not exist (no-op)"))
+        } if !names.is_empty() && !any_branch_exists(backend, &names)? => Output::message(format!(
+            "branch {} does not exist (no-op)",
+            names.join(", ")
+        )),
+        Command::Branch { cmd: None, opts }
+            if (opts.delete || opts.force_delete)
+                && !opts.args.is_empty()
+                && !any_branch_exists(backend, &opts.args)? =>
+        {
+            Output::message(format!(
+                "branch {} does not exist (no-op)",
+                opts.args.join(", ")
+            ))
         }
         Command::Tag {
-            name: None,
-            delete: None,
+            names,
+            delete: false,
+            list,
+            lines,
+            contains,
+            points_at,
             ..
-        } => {
-            let tags = backend.all_tags()?;
+        } if names.is_empty()
+            || list
+            || lines.is_some()
+            || contains.is_some()
+            || points_at.is_some() =>
+        {
+            let tags =
+                crate::cli::tag_list(backend, &names, contains.as_deref(), points_at.as_deref())?;
             let text = if tags.is_empty() {
                 "no tags".to_owned()
             } else {
@@ -223,24 +276,51 @@ pub fn run(
                 .map(|t| crate::obj! { "name" => t.name, "when" => t.when, "message" => t.message })
                 .collect();
             Output::new(text)
-                .list("tags", rows, &["name", "when"], "0 tags in this repository")
+                .list(
+                    "tags",
+                    rows,
+                    if lines.is_some() {
+                        &["name", "when", "message"]
+                    } else {
+                        &["name", "when"]
+                    },
+                    "0 tags in this repository",
+                )
                 .help("Run `rgit tag <name> -m \"<message>\"` to create a tag")
         }
         Command::Tag {
-            name: Some(name),
+            names,
             force: false,
-            delete: None,
+            delete: false,
             ..
-        } if tag_exists(backend, &name)? => {
-            Output::message(format!("tag {name} already exists (no-op)"))
+        } if names.len() == 1 && tag_exists(backend, &names[0])? => {
+            Output::message(format!("tag {} already exists (no-op)", names[0]))
         }
         Command::Tag {
-            delete: Some(name), ..
-        } if !tag_exists(backend, &name)? => {
-            Output::message(format!("tag {name} does not exist (no-op)"))
+            names,
+            delete: true,
+            ..
+        } if !names.is_empty() && !any_tag_exists(backend, &names)? => {
+            Output::message(format!("tag {} does not exist (no-op)", names.join(", ")))
+        }
+        Command::Stash {
+            cmd:
+                Some(StashCmd::Show {
+                    index,
+                    patch,
+                    name_only,
+                    ..
+                }),
+            ..
+        } => {
+            let i = index.unwrap_or(0);
+            let files = crate::cli::stash_diff(backend, i)?;
+            let base = format!("rgit stash show stash@{{{i}}}");
+            diff(&files, &format!("stash@{{{i}}}"), &base, patch, name_only)
         }
         Command::Stash {
             cmd: Some(StashCmd::List),
+            ..
         } => {
             let stashes = backend.status()?.stashes;
             let rows = stashes
@@ -251,18 +331,25 @@ pub fn run(
                 .list("stashes", rows, &["index", "message"], "0 stashes")
                 .help("Run `rgit stash pop <index>` to restore a stash")
         }
-        Command::Remote { cmd: None } => {
+        Command::Remote { cmd: None, verbose } => {
             let remotes = backend.remotes()?;
-            let rows = remotes
-                .iter()
-                .map(|r| crate::obj! { "name" => r.name, "url" => r.url })
-                .collect();
+            let mut rows = Vec::new();
+            for r in &remotes {
+                let push = backend.remote_urls(&r.name, true)?.join(" ");
+                rows.push(crate::obj! { "name" => r.name, "url" => r.url, "push" => push });
+            }
+            let columns: &[&str] = if verbose {
+                &["name", "url", "push"]
+            } else {
+                &["name", "url"]
+            };
             Output::new(render::remotes(&remotes))
-                .list("remotes", rows, &["name", "url"], "0 remotes configured")
+                .list("remotes", rows, columns, "0 remotes configured")
                 .help("Run `rgit remote add <name> <url>` to add a remote")
         }
         Command::Remote {
             cmd: Some(RemoteCmd::Add { name, url }),
+            ..
         } if backend.remotes()?.iter().any(|r| r.name == name) => {
             let existing = backend
                 .remotes()?
@@ -283,10 +370,13 @@ pub fn run(
         }
         Command::Remote {
             cmd: Some(RemoteCmd::Remove { name }),
+            ..
         } if !backend.remotes()?.iter().any(|r| r.name == name) => {
             Output::message(format!("remote {name} does not exist (no-op)"))
         }
-        Command::Worktree { cmd: None } => {
+        Command::Worktree {
+            cmd: None | Some(WorktreeCmd::List),
+        } => {
             let list = backend.worktrees()?;
             let rows = list
                 .iter()
@@ -311,11 +401,16 @@ pub fn run(
         }
         Command::Worktree {
             cmd: Some(WorktreeCmd::Remove { name, .. }),
-        } if !backend.worktrees()?.iter().any(|w| w.name == name) => {
+        } if !backend
+            .worktrees()?
+            .iter()
+            .any(|w| w.name == name || same_path(&w.path, &name)) =>
+        {
             Output::message(format!("worktree {name} does not exist (no-op)"))
         }
         Command::Remote {
             cmd: Some(RemoteCmd::Rename { old, new }),
+            ..
         } if !backend.remotes()?.iter().any(|r| r.name == old)
             && backend.remotes()?.iter().any(|r| r.name == new) =>
         {
@@ -336,13 +431,27 @@ pub fn run(
         | Command::Checkout {
             rev: Some(name),
             branch: None,
-        } if backend.status()?.head.branch.as_deref() == Some(name.as_str()) => {
+            force_branch: None,
+            detach: false,
+            ..
+        }
+        | Command::Switch {
+            rev: Some(name),
+            create: None,
+            force_create: None,
+            detach: false,
+            ..
+        } if !restores && backend.status()?.head.branch.as_deref() == Some(name.as_str()) => {
             Output::message(format!("already on {name} (no-op)"))
         }
         Command::Worktree {
-            cmd: Some(WorktreeCmd::Add { name, .. }),
-        } if backend.worktrees()?.iter().any(|w| w.name == name) => {
-            Output::message(format!("worktree {name} already exists (no-op)"))
+            cmd: Some(WorktreeCmd::Add { path, .. }),
+        } if backend
+            .worktrees()?
+            .iter()
+            .any(|w| same_path(&w.path, &path)) =>
+        {
+            Output::message(format!("worktree {path} already exists (no-op)"))
         }
         Command::Stack {
             cmd: Some(StackCmd::New { name }),
@@ -566,7 +675,21 @@ fn code(c: StatusCode) -> &'static str {
 }
 
 fn tag_exists(backend: &Arc<dyn GitBackend>, name: &str) -> anyhow::Result<bool> {
-    Ok(backend.all_tags()?.iter().any(|t| t.name == name))
+    any_tag_exists(backend, &[name.to_owned()])
+}
+
+/// Whether two paths name the same existing folder.
+fn same_path(a: &str, b: &str) -> bool {
+    let canon = |p: &str| std::fs::canonicalize(p).ok();
+    canon(a).is_some() && canon(a) == canon(b)
+}
+
+fn any_branch_exists(backend: &Arc<dyn GitBackend>, names: &[String]) -> anyhow::Result<bool> {
+    Ok(backend.local_branches()?.iter().any(|b| names.contains(b)))
+}
+
+fn any_tag_exists(backend: &Arc<dyn GitBackend>, names: &[String]) -> anyhow::Result<bool> {
+    Ok(backend.all_tags()?.iter().any(|t| names.contains(&t.name)))
 }
 
 pub(crate) fn line_counts(f: &FileDiff) -> (usize, usize) {
@@ -960,6 +1083,21 @@ fn done_message(c: &Command) -> Option<String> {
             format!("unstaged {}", paths.join(" "))
         }
         Command::Unstage { paths, .. } => format!("unstaged part of {}", paths.join(" ")),
+        Command::Add { paths, update, .. } if paths.is_empty() => {
+            if *update {
+                "staged changes to tracked files".to_owned()
+            } else {
+                "staged all changes".to_owned()
+            }
+        }
+        Command::Add { paths, .. } => format!("staged {}", paths.join(" ")),
+        Command::Restore {
+            paths,
+            staged: true,
+            worktree: false,
+            ..
+        } => format!("unstaged {}", paths.join(" ")),
+        Command::Restore { paths, .. } => format!("restored {}", paths.join(" ")),
         Command::StageAll => "staged all changes".to_owned(),
         Command::UnstageAll => "unstaged all changes".to_owned(),
         Command::Discard { paths, .. } if !paths.is_empty() => {
@@ -973,8 +1111,27 @@ fn done_message(c: &Command) -> Option<String> {
         }
         Command::Checkout {
             branch: Some(new), ..
+        }
+        | Command::Checkout {
+            force_branch: Some(new),
+            ..
+        }
+        | Command::Switch {
+            create: Some(new), ..
+        }
+        | Command::Switch {
+            force_create: Some(new),
+            ..
         } => format!("created and checked out {new}"),
-        Command::Checkout { rev: Some(rev), .. } => format!("checked out {rev}"),
+        Command::Checkout {
+            detach: true, rev, ..
+        }
+        | Command::Switch {
+            detach: true, rev, ..
+        } => format!("detached HEAD at {}", rev.as_deref().unwrap_or("HEAD")),
+        Command::Checkout { rev: Some(rev), .. } | Command::Switch { rev: Some(rev), .. } => {
+            format!("checked out {rev}")
+        }
         Command::Merge { abort: true, .. } => "merge aborted".to_owned(),
         Command::Merge { cont: true, .. } => "merge committed".to_owned(),
         Command::Merge {
@@ -1002,11 +1159,13 @@ fn done_message(c: &Command) -> Option<String> {
             rev: Some(rev),
             soft,
             hard,
+            keep,
             ..
         } => {
-            let mode = match (soft, hard) {
-                (true, _) => "soft",
-                (_, true) => "hard",
+            let mode = match (soft, hard, keep) {
+                (true, _, _) => "soft",
+                (_, true, _) => "hard",
+                (_, _, true) => "keep",
                 _ => "mixed",
             };
             format!("reset to {rev} ({mode})")
@@ -1023,35 +1182,40 @@ fn done_message(c: &Command) -> Option<String> {
         Command::Revert { cont: true, .. } => "revert continued".to_owned(),
         Command::Revert { revs, .. } if !revs.is_empty() => format!("reverted {}", revs.join(" ")),
         Command::Branch { cmd: Some(cmd), .. } => match cmd {
-            BranchCmd::Create { name } => format!("created and checked out branch {name}"),
+            BranchCmd::Create { name, .. } => format!("created and checked out branch {name}"),
             BranchCmd::Checkout { name } => format!("checked out {name}"),
-            BranchCmd::Delete {
-                name: Some(name), ..
-            } => format!("deleted branch {name}"),
             BranchCmd::Rename { old, new } => format!("renamed branch {old} to {new}"),
             _ => return None,
         },
-        Command::Stash { cmd: Some(cmd) } => match cmd {
-            StashCmd::Pop { index } => stash("popped", index),
-            StashCmd::Apply { index } => stash("applied", index),
+        Command::Stash { cmd: Some(cmd), .. } => match cmd {
+            StashCmd::Pop { index, .. } => stash("popped", index),
+            StashCmd::Apply { index, .. } => stash("applied", index),
             StashCmd::Drop { index } => stash("dropped", index),
+            StashCmd::Branch { name, index } => {
+                format!("{} onto new branch {name}", stash("popped", index))
+            }
+            StashCmd::Clear => "dropped every stash".to_owned(),
             _ => return None,
         },
         Command::Tag {
-            delete: Some(name), ..
-        } => format!("deleted tag {name}"),
-        Command::Tag {
-            name: Some(name), ..
-        } => format!("created tag {name}"),
-        Command::Remote { cmd: Some(cmd) } => match cmd {
+            names,
+            delete: true,
+            ..
+        } => format!("deleted tag {}", names.join(", ")),
+        Command::Tag { names, .. } if !names.is_empty() => format!("created tag {}", names[0]),
+        Command::Remote { cmd: Some(cmd), .. } => match cmd {
             RemoteCmd::Add { name, url } => format!("added remote {name} -> {url}"),
             RemoteCmd::Remove { name } => format!("removed remote {name}"),
-            RemoteCmd::SetUrl { name, url } => format!("set remote {name} -> {url}"),
+            RemoteCmd::SetUrl { name, url, .. } => format!("set remote {name} -> {url}"),
             RemoteCmd::Rename { old, new } => format!("renamed remote {old} to {new}"),
+            _ => return None,
         },
         Command::Worktree { cmd: Some(cmd) } => match cmd {
-            WorktreeCmd::Add { name, path } => format!("added worktree {name} at {path}"),
+            WorktreeCmd::Add { path, .. } => format!("added worktree {path}"),
             WorktreeCmd::Remove { name, .. } => format!("removed worktree {name}"),
+            WorktreeCmd::Lock { name, .. } => format!("locked worktree {name}"),
+            WorktreeCmd::Unlock { name } => format!("unlocked worktree {name}"),
+            WorktreeCmd::Move { name, new_path } => format!("moved worktree {name} to {new_path}"),
             _ => return None,
         },
         Command::Fetch { .. } => "fetched".to_owned(),
@@ -1102,7 +1266,7 @@ fn done_message(c: &Command) -> Option<String> {
 /// result. Concrete names are used when the command supplied them.
 fn next_steps(c: &Command) -> Vec<String> {
     match c {
-        Command::Stage { .. } | Command::StageAll => {
+        Command::Stage { .. } | Command::StageAll | Command::Add { .. } => {
             vec!["Run `rgit commit -m \"<message>\"` to commit staged changes".into()]
         }
         Command::Commit { .. } | Command::Extend | Command::Reword { .. } => {
@@ -1120,24 +1284,26 @@ fn next_steps(c: &Command) -> Vec<String> {
             "Run `rgit forge pr create --title \"<title>\" --head <branch> --base <branch>` to open a pull request".into(),
         ],
         Command::Branch {
-            cmd: Some(BranchCmd::Create { name }),
+            cmd: Some(BranchCmd::Create { name, .. }),
             ..
         } => vec![format!(
             "Run `rgit push --set-upstream` to publish {name}"
         )],
         Command::Tag {
-            name: Some(_),
-            delete: None,
+            names,
+            delete: false,
             ..
-        } => vec!["Run `rgit push --tags` to publish tags".into()],
+        } if !names.is_empty() => vec!["Run `rgit push --tags` to publish tags".into()],
         Command::Stash {
             cmd: None | Some(StashCmd::Push { .. }),
+            ..
         } => vec![
             "Run `rgit stash list` to see stashes".into(),
             "Run `rgit stash pop` to restore the newest one".into(),
         ],
         Command::Remote {
             cmd: Some(RemoteCmd::Add { name, .. }),
+            ..
         } => vec![format!("Run `rgit fetch --remote {name}` to download its refs")],
         Command::Worktree {
             cmd: Some(WorktreeCmd::Add { .. }),

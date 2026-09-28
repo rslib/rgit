@@ -35,15 +35,7 @@ If `rgit` is not on PATH, install it with `cargo install --locked --git https://
 
 ## Git spellings
 
-- `git add`: use `rgit stage <path>` (or `rgit stage-all`)
-- `git switch`: use `rgit checkout <branch>` (`-b <new>` to create)
-- `git restore`: use `rgit discard <path>` (worktree) or `rgit unstage <path>` (index)
-- `git rev-parse`, `git cat-file`, `git ls-files`, `git for-each-ref`: plumbing is not wrapped; run `rgit git <args>`
-- `git branch -d`, `git branch --delete`: use `rgit branch delete <name>`
-- `git branch -D`: use `rgit branch delete <name> --force`
-- `git branch -m`, `git branch --move`: use `rgit branch rename <old> <new>`
-- `git stash save`: use `rgit stash push [<message>]`
-- `git stash show`: use `rgit stash list`, then `rgit git stash show -p <stash>`
+- `git stash save`: use `rgit stash push -m <message>`
 - `git log --graph`: use `rgit smartlog` for the branch graph
 - `git push -f`: use `--force-with-lease` (or `--force`)
 

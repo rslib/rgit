@@ -41,6 +41,84 @@ const EXAMPLES: &[Entry] = &[
     ),
     ("refs", &["rgit refs"]),
     (
+        "rev-parse",
+        &[
+            "rgit rev-parse HEAD",
+            "rgit rev-parse --short HEAD",
+            "rgit rev-parse --abbrev-ref HEAD",
+            "rgit rev-parse --show-toplevel",
+        ],
+    ),
+    (
+        "ls-files",
+        &[
+            "rgit ls-files",
+            "rgit ls-files -s src",
+            "rgit ls-files -o --exclude-standard",
+        ],
+    ),
+    (
+        "ls-tree",
+        &["rgit ls-tree HEAD", "rgit ls-tree -r -l HEAD src/"],
+    ),
+    (
+        "cat-file",
+        &[
+            "rgit cat-file -p HEAD",
+            "rgit cat-file -p HEAD:src/lib.rs",
+            "rgit cat-file -t <rev>",
+        ],
+    ),
+    (
+        "show-ref",
+        &[
+            "rgit show-ref --heads",
+            "rgit show-ref --verify refs/heads/main",
+        ],
+    ),
+    (
+        "for-each-ref",
+        &[
+            "rgit for-each-ref refs/heads",
+            "rgit for-each-ref --sort=-committerdate --format='%(refname:short) %(subject)'",
+        ],
+    ),
+    (
+        "rev-list",
+        &[
+            "rgit rev-list --count HEAD",
+            "rgit rev-list main..HEAD",
+            "rgit rev-list -n 1 --all",
+        ],
+    ),
+    (
+        "merge-base",
+        &[
+            "rgit merge-base main HEAD",
+            "rgit merge-base --is-ancestor main HEAD",
+        ],
+    ),
+    ("reflog", &["rgit reflog", "rgit reflog show main -n 10"]),
+    (
+        "shortlog",
+        &["rgit shortlog -sn", "rgit shortlog -sne --all"],
+    ),
+    (
+        "grep",
+        &[
+            "rgit grep -n TODO",
+            "rgit grep -i -e foo -e bar -- src",
+            "rgit grep pattern HEAD~5",
+        ],
+    ),
+    ("check-ignore", &["rgit check-ignore -v target/out.o"]),
+    ("var", &["rgit var GIT_AUTHOR_IDENT", "rgit var GIT_EDITOR"]),
+    (
+        "symbolic-ref",
+        &["rgit symbolic-ref HEAD", "rgit symbolic-ref --short HEAD"],
+    ),
+    ("count-objects", &["rgit count-objects -v"]),
+    (
         "stage",
         &[
             "rgit stage src/lib.rs",
@@ -59,10 +137,27 @@ const EXAMPLES: &[Entry] = &[
     ("stage-all", &["rgit stage-all"]),
     ("unstage-all", &["rgit unstage-all"]),
     (
+        "add",
+        &[
+            "rgit add .",
+            "rgit add src/ '*.md'",
+            "rgit add -A",
+            "rgit add -u",
+        ],
+    ),
+    (
         "discard",
         &[
             "rgit discard src/lib.rs",
             "rgit discard src/lib.rs --hunk 10",
+        ],
+    ),
+    (
+        "restore",
+        &[
+            "rgit restore src/lib.rs",
+            "rgit restore --staged src/lib.rs",
+            "rgit restore --source HEAD~1 src/lib.rs",
         ],
     ),
     (
@@ -77,7 +172,10 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit commit -m \"<message>\"",
             "rgit commit -a -m \"<message>\"",
-            "rgit commit --amend",
+            "rgit commit src/lib.rs -m \"<message>\"",
+            "rgit commit -m \"<subject>\" -m \"<body>\"",
+            "rgit commit --amend --no-edit",
+            "rgit commit --fixup <rev>",
         ],
     ),
     ("extend", &["rgit extend"]),
@@ -149,7 +247,21 @@ const EXAMPLES: &[Entry] = &[
     ),
     (
         "checkout",
-        &["rgit checkout main", "rgit checkout -b <new_branch>"],
+        &[
+            "rgit checkout main",
+            "rgit checkout -b <new_branch>",
+            "rgit checkout -",
+            "rgit checkout <rev> -- src/lib.rs",
+        ],
+    ),
+    (
+        "switch",
+        &[
+            "rgit switch main",
+            "rgit switch -c <new_branch>",
+            "rgit switch -",
+            "rgit switch --detach <rev>",
+        ],
     ),
     (
         "merge",
@@ -191,7 +303,8 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit reset HEAD~1",
             "rgit reset --hard <rev>",
-            "rgit reset -- src/lib.rs",
+            "rgit reset src/lib.rs",
+            "rgit reset <rev> -- src/lib.rs",
         ],
     ),
     (
@@ -221,7 +334,10 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit tag",
             "rgit tag v1.0.0 -m \"<message>\"",
-            "rgit tag -d v1.0.0",
+            "rgit tag v1.0.0 <rev>",
+            "rgit tag -l \"v1.*\" -n",
+            "rgit tag --contains <rev>",
+            "rgit tag -d v1.0.0 v1.0.1",
         ],
     ),
     ("absorb", &["rgit absorb"]),
@@ -326,13 +442,29 @@ const EXAMPLES: &[Entry] = &[
             "rgit serve --root ~/code --clone-base https://git.example.dev",
         ],
     ),
-    ("branch", &["rgit branch", "rgit branch -a"]),
-    ("branch create", &["rgit branch create <branch>"]),
+    (
+        "branch",
+        &[
+            "rgit branch",
+            "rgit branch -vv",
+            "rgit branch --merged main",
+            "rgit branch <branch> <start>",
+            "rgit branch -d <branch> <branch>",
+            "rgit branch -u origin/<branch>",
+        ],
+    ),
+    (
+        "branch create",
+        &[
+            "rgit branch create <branch>",
+            "rgit branch create <branch> origin/<branch>",
+        ],
+    ),
     ("branch checkout", &["rgit branch checkout <branch>"]),
     (
         "branch delete",
         &[
-            "rgit branch delete <branch>",
+            "rgit branch delete <branch> <branch>",
             "rgit branch delete <branch> --force",
         ],
     ),
@@ -341,19 +473,39 @@ const EXAMPLES: &[Entry] = &[
         "branch prune",
         &["rgit branch prune", "rgit branch prune main"],
     ),
-    ("stash", &["rgit stash", "rgit stash push \"<message>\""]),
+    (
+        "stash",
+        &[
+            "rgit stash",
+            "rgit stash -u",
+            "rgit stash push -m \"<message>\"",
+        ],
+    ),
     (
         "stash push",
-        &["rgit stash push \"<message>\" --include-untracked"],
+        &[
+            "rgit stash push -m \"<message>\" --include-untracked",
+            "rgit stash push -- src/lib.rs",
+        ],
     ),
-    ("stash pop", &["rgit stash pop", "rgit stash pop 1"]),
+    (
+        "stash pop",
+        &["rgit stash pop", "rgit stash pop stash@{1} --index"],
+    ),
     ("stash apply", &["rgit stash apply"]),
     ("stash drop", &["rgit stash drop 0"]),
     ("stash list", &["rgit stash list"]),
     (
+        "stash show",
+        &["rgit stash show", "rgit stash show -p stash@{1}"],
+    ),
+    ("stash branch", &["rgit stash branch <branch>"]),
+    ("stash clear", &["rgit stash clear"]),
+    (
         "remote",
         &[
             "rgit remote",
+            "rgit remote -v",
             "rgit remote add origin https://github.com/example/repo.git",
         ],
     ),
@@ -364,17 +516,39 @@ const EXAMPLES: &[Entry] = &[
     ("remote remove", &["rgit remote remove origin"]),
     (
         "remote set-url",
-        &["rgit remote set-url origin https://github.com/example/repo.git"],
+        &[
+            "rgit remote set-url origin https://github.com/example/repo.git",
+            "rgit remote set-url --push origin https://github.com/fork/repo.git",
+        ],
     ),
+    ("remote get-url", &["rgit remote get-url origin"]),
     ("remote rename", &["rgit remote rename origin upstream"]),
+    ("remote prune", &["rgit remote prune origin"]),
     ("worktree", &["rgit worktree"]),
-    ("worktree add", &["rgit worktree add <branch> ../<path>"]),
+    (
+        "worktree add",
+        &[
+            "rgit worktree add ../<path> <branch>",
+            "rgit worktree add -b <new_branch> ../<path> origin/main",
+            "rgit worktree add --detach ../<path> <rev>",
+        ],
+    ),
+    ("worktree list", &["rgit worktree list"]),
     (
         "worktree remove",
         &[
-            "rgit worktree remove <branch>",
-            "rgit worktree remove <branch> --force",
+            "rgit worktree remove ../<path>",
+            "rgit worktree remove <name> --force",
         ],
+    ),
+    (
+        "worktree lock",
+        &["rgit worktree lock ../<path> --reason \"<reason>\""],
+    ),
+    ("worktree unlock", &["rgit worktree unlock ../<path>"]),
+    (
+        "worktree move",
+        &["rgit worktree move ../<path> ../<new_path>"],
     ),
     ("worktree prune", &["rgit worktree prune"]),
     ("workspace", &["rgit workspace"]),

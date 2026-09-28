@@ -47,6 +47,27 @@ pub enum ResetMode {
     Soft,
     Mixed,
     Hard,
+    /// Update the files that differ from the target, refusing to overwrite
+    /// local changes to them, and keep other local changes (git's `--keep`).
+    Keep,
+}
+
+/// How [`crate::GitBackend::commit_with`] builds a commit beyond its message.
+#[derive(Debug, Clone, Default)]
+pub struct CommitOptions {
+    /// Replace HEAD, keeping its parents and author.
+    pub amend: bool,
+    /// Skip the pre-commit and commit-msg hooks.
+    pub no_verify: bool,
+    /// Commit even when the tree does not change.
+    pub allow_empty: bool,
+    /// Append a `Signed-off-by` trailer for the committer.
+    pub signoff: bool,
+    /// The author as `Name <email>`, instead of the committer.
+    pub author: Option<String>,
+    /// Commit only these paths, as they are in the working tree, on top of
+    /// HEAD; other staged changes stay staged (git's `commit <paths>`).
+    pub paths: Vec<String>,
 }
 
 /// Options for a cherry-pick or revert of one or more commits.
