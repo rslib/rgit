@@ -1,7 +1,7 @@
 //! An ordered value tree and its TOON encoding (https://toonformat.dev), for
 //! the agent output modes. Keys keep insertion order, so a schema prints in the
-//! order it is declared. A `help` list is laid out one hint per line, the AXI
-//! convention, since hints are prose rather than data.
+//! order it is declared. A list of plain values is laid out one item per
+//! line, the AXI convention.
 
 use serde::ser::{SerializeMap, SerializeSeq};
 
@@ -277,19 +277,6 @@ fn write_fields(out: &mut Vec<String>, fields: &[(String, Node)], depth: usize) 
 /// indentation plus `- ` for the first field of a list-item object.
 fn write_field(out: &mut Vec<String>, key: &str, v: &Node, depth: usize, lead: &str) {
     match v {
-        Node::List(hints) if key == "help" && hints.iter().all(|h| h.as_str().is_some()) => {
-            let hints: Vec<&str> = hints.iter().filter_map(Node::as_str).collect();
-            match hints.as_slice() {
-                [] => out.push(format!("{lead}{key}: []")),
-                [one] => out.push(format!("{lead}{key}[1]: {one}")),
-                many => {
-                    out.push(format!("{lead}{key}[{}]:", many.len()));
-                    for hint in many {
-                        out.push(format!("{}{hint}", pad(depth + 1)));
-                    }
-                }
-            }
-        }
         Node::List(items) => write_array(out, key, items, depth, lead),
         Node::Obj(fields) => {
             out.push(format!("{lead}{key}:"));
@@ -306,8 +293,10 @@ fn write_array(out: &mut Vec<String>, key: &str, items: &[Node], depth: usize, l
     }
     let n = items.len();
     if items.iter().all(Node::is_primitive) {
-        let cells: Vec<String> = items.iter().map(primitive).collect();
-        out.push(format!("{lead}{key}[{n}]: {}", cells.join(",")));
+        out.push(format!("{lead}{key}[{n}]:"));
+        for item in items {
+            out.push(format!("{}{}", pad(depth + 1), list_value(item)));
+        }
         return;
     }
     if let Some(columns) = tabular_columns(items) {
@@ -436,6 +425,22 @@ fn needs_quotes(s: &str) -> bool {
             .any(|c| matches!(c, ':' | '"' | '\\' | '[' | ']' | '{' | '}' | ',') || c.is_control())
 }
 
+/// A plain list item on its own line: unquoted unless quotes keep it intact.
+fn list_value(v: &Node) -> String {
+    match v {
+        Node::Str(s)
+            if s.trim().is_empty()
+                || s.ends_with(char::is_whitespace)
+                || s.starts_with("- ")
+                || s.chars().any(char::is_control) =>
+        {
+            quote(s)
+        }
+        Node::Str(s) => s.clone(),
+        other => primitive(other),
+    }
+}
+
 fn numeric_like(s: &str) -> bool {
     let digits = s.strip_prefix('-').unwrap_or(s);
     digits.starts_with(|c: char| c.is_ascii_digit())
@@ -478,7 +483,7 @@ mod tests {
         };
         assert_eq!(
             encode(&root),
-            "zeta: plain text\nalpha: a-b\nlead: \"-x\"\nnum: \"42\"\nempty: []\ntags[2]: a,\"b,c\""
+            "zeta: plain text\nalpha: a-b\nlead: \"-x\"\nnum: \"42\"\nempty: []\ntags[2]:\n  a\n  b,c"
         );
     }
 
@@ -509,9 +514,18 @@ mod tests {
     #[test]
     fn help_is_one_hint_per_line() {
         let one = obj! { "help" => vec!["Run `x --full` to see it"] };
-        assert_eq!(encode(&one), "help[1]: Run `x --full` to see it");
+        assert_eq!(encode(&one), "help[1]:\n  Run `x --full` to see it");
         let two = obj! { "help" => vec!["Run `a`, then `b`", "Run `c`"] };
         assert_eq!(encode(&two), "help[2]:\n  Run `a`, then `b`\n  Run `c`");
+    }
+
+    #[test]
+    fn plain_lists_keep_leading_space_and_quote_only_to_stay_intact() {
+        let root = obj! { "lines" => vec!["[main b1a7ca6] fix", " 5 files changed", "", "x ", "- y", "a\nb"] };
+        assert_eq!(
+            encode(&root),
+            "lines[6]:\n  [main b1a7ca6] fix\n   5 files changed\n  \"\"\n  \"x \"\n  \"- y\"\n  \"a\\nb\""
+        );
     }
 
     #[test]

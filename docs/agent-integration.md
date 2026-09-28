@@ -5,23 +5,29 @@ people at a terminal.
 
 ## Output modes
 
-- TOON is the default when stdout is not a TTY. It is compact and structured,
-  and it ends with `help` lines that name the next useful command.
-- `--json` prints the same data as JSON.
-- `--human` forces the terminal text form, even when piped.
-- `--toon` (alias `--axi`) forces TOON, even on a terminal. Agents should use
-  it rather than `--porcelain`, which, as in git, exists only on `status` and
-  prints git's raw script format.
+- Human text is the default, whether or not stdout is a terminal. Plain
+  `status`, `diff`, `log`, `show` and `blame` print exactly what git prints.
+  Color, the pager and prompts still need a real terminal.
+- Agents must pass `--toon` (alias `--axi`) on every command for TOON: compact,
+  structured, and ending with `help` lines that name the next useful command.
+  Those hints already carry `--toon`, so following them keeps TOON.
+- `--json` prints the same data as JSON; its hints carry `--json`.
+- Use `--toon` rather than `--porcelain`, which, as in git, exists only on
+  `status` and prints git's raw script format.
+- `--compact` (or `git config rgit.compact true`) prints rgit's older compact
+  human forms of `status`, `diff`, `log`, `show` and `blame`.
 - `--fields a,b` adds columns to a table (an unknown field lists the valid ones).
 - `--full` prints long text (patches, commit bodies) without truncation.
 
-Usage errors exit 2, other errors exit 1, and both print `error` and `help` on
-stdout in the same format. Mutations whose target state already holds (creating
+Usage errors exit 2, other errors exit 1. With `--toon` or `--json` both print
+`error` and `help` on stdout in the same format; human text errors go to
+stderr as git words them. Mutations whose target state already holds (creating
 an existing branch, deleting a missing tag) succeed with a `(no-op)` note.
 
-`rgit` with no subcommand prints a home view of the repository in the current
-directory: binary, description, status and help. Outside a repository it says
-so and still exits 0.
+`rgit --toon` with no subcommand prints a home view of the repository in the
+current directory: binary, description, status and help. Outside a repository
+it says so and still exits 0. Without `--toon` and without a terminal, `rgit`
+prints `git status`.
 
 ## Integrations
 
@@ -38,7 +44,7 @@ rgit hooks status
 ```
 
 This runs `rgit --toon` at session start, so the agent sees the repo state
-without asking:
+without asking, with a hint to pass `--toon` to every rgit command:
 
 | App         | Project file                   | User file                           |
 | ----------- | ------------------------------ | ----------------------------------- |
@@ -64,7 +70,7 @@ rgit skills install           # or: npx skills add rslib/rgit --skill rgit
 ```
 
 This installs `skills/rgit/SKILL.md` plus `references/commands.md`, which tells the agent how to use rgit when
-the task needs it.
+the task needs it, including that it must pass `--toon` or `--json`.
 
 ## Session history
 

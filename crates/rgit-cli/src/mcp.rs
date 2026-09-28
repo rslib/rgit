@@ -2915,6 +2915,10 @@ fn as_tool_call(hint: &str) -> String {
     let Some(rest) = hint.strip_prefix("Run `rgit ") else {
         return hint.to_owned();
     };
+    let rest = ["--toon ", "--axi ", "--json "]
+        .iter()
+        .find_map(|f| rest.strip_prefix(f))
+        .unwrap_or(rest);
     let Some((cmd, tail)) = rest.split_once('`') else {
         return hint.to_owned();
     };
@@ -5304,6 +5308,10 @@ mod tests {
                 "Call git_stash_pop to restore the newest one",
             ),
             (
+                "Run `rgit --toon stash pop` to restore the newest one",
+                "Call git_stash_pop to restore the newest one",
+            ),
+            (
                 "Run `rgit init` to create one here",
                 "Run `rgit init` to create one here",
             ),
@@ -5362,7 +5370,7 @@ mod tests {
         let missing = call(&backend, "git_blame", json!({})).unwrap_err();
         assert_eq!(
             missing,
-            "error: path required\nhelp[1]: Call git_blame with `path` set"
+            "error: path required\nhelp[1]:\n  Call git_blame with `path` set"
         );
 
         let nothing = call(&backend, "git_commit", json!({ "message": "m" })).unwrap_err();
@@ -5394,7 +5402,7 @@ mod tests {
         let tree = call(&backend, "git_tree", json!({})).unwrap();
         assert!(tree.starts_with("entries[1]{name,kind,size}:"), "{tree}");
         let files = call(&backend, "git_files", json!({})).unwrap();
-        assert!(files.starts_with("count: 1\nfiles[1]: f.txt"), "{files}");
+        assert!(files.starts_with("count: 1\nfiles[1]:\n  f.txt"), "{files}");
         let grep = call(&backend, "git_grep", json!({ "pattern": "zzz" })).unwrap();
         assert!(grep.starts_with("matches: \"0 matches for "), "{grep}");
         let blob = call(&backend, "git_blob", json!({ "path": "f.txt" })).unwrap();

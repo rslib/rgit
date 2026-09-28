@@ -26,6 +26,12 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 fn rgit(dir: &Path, args: &[&str]) -> (String, String, bool) {
     let out = env(&mut Command::new(env!("CARGO_BIN_EXE_rgit")), dir)
+        .args(
+            ["--human", "--text", "--json", "--toon", "--axi"]
+                .iter()
+                .all(|m| !args.contains(m))
+                .then_some("--toon"),
+        )
         .args(args)
         .current_dir(dir)
         .output()

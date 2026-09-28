@@ -17,6 +17,12 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 fn rgit(dir: &Path, args: &[&str]) {
     let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(
+            ["--human", "--text", "--json", "--toon", "--axi"]
+                .iter()
+                .all(|m| !args.contains(m))
+                .then_some("--toon"),
+        )
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
@@ -89,7 +95,7 @@ fn a_line_that_starts_no_hunk_is_an_error() {
     std::fs::write(dir.join("f.txt"), "A\nb\n").unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
-        .args(["stage", "f.txt", "--hunk", "99"])
+        .args(["--toon", "stage", "f.txt", "--hunk", "99"])
         .current_dir(&dir)
         .env("RGIT_OPLOG", "0")
         .output()

@@ -70,10 +70,23 @@ fn main() -> ! {
         .and_then(|m| Cli::from_arg_matches(&m));
     let cli = match parsed {
         Ok(cli) => cli,
-        Err(e) => usage_exit(e, &args, stdout_is_terminal),
+        Err(e) => usage_exit(e, &args),
     };
-    let output_mode = cli.output_mode(stdout_is_terminal);
+    let output_mode = cli.output_mode();
     let structured_output = output_mode != OutputMode::Text;
+    let mut cli = cli;
+    if !structured_output && cli.command.is_none() && !stdout_is_terminal {
+        // No terminal for the TUI: a human gets the status instead.
+        cli.command = Some(Command::Status {
+            fmt: Default::default(),
+            untracked: None,
+            ignored: None,
+            paths: Vec::new(),
+        });
+    }
+    if !structured_output && !cli.compact {
+        cli.command = cli.command.map(|c| cli::git_defaults(c, compact_config));
+    }
     if !structured_output
         && !matches!(
             cli.command,
@@ -505,6 +518,10 @@ fn finish(result: anyhow::Result<impl Into<Output>>, emit: &Emit) -> ! {
         Err(error) => die(error, emit),
     };
     if emit.mode == OutputMode::Text {
+        // git prints nothing for most successful changes.
+        if output.text == "ok" {
+            exit(cli::exit_code());
+        }
         // Plumbing text ends with its own newline, or is empty, as in git.
         if output.text.is_empty() || output.text.ends_with(['\n', '\0']) || cli::text_as_is() {
             print!("{}", output.text);
@@ -518,6 +535,13 @@ fn finish(result: anyhow::Result<impl Into<Output>>, emit: &Emit) -> ! {
         Ok(value) => value,
         Err(error) => die(error, emit),
     };
+    if let Some((_, Node::List(hints))) = value.iter_mut().find(|(k, _)| k == "help") {
+        for hint in hints {
+            if let Node::Str(h) = hint {
+                *h = keep_mode(h, emit.mode);
+            }
+        }
+    }
     if emit.mode == OutputMode::Json {
         value.push(("ok".to_owned(), Node::Bool(true)));
         println!("{}", json(value));
@@ -541,6 +565,7 @@ fn die(error: anyhow::Error, emit: &Emit) -> ! {
 
 /// Report an error on stdout in the output format, or on stderr for humans.
 fn fail(message: String, help: Vec<String>, code: i32, mode: OutputMode) -> ! {
+    let help: Vec<String> = help.iter().map(|h| keep_mode(h, mode)).collect();
     match mode {
         OutputMode::Text => eprintln!("error: {message}"),
         OutputMode::Json => {
@@ -558,6 +583,37 @@ fn fail(message: String, help: Vec<String>, code: i32, mode: OutputMode) -> ! {
         }
     }
     exit(code);
+}
+
+/// A hint's `rgit ...` commands with the output flag in use, so an agent that
+/// follows them keeps structured output.
+fn keep_mode(hint: &str, mode: OutputMode) -> String {
+    let flag = match mode {
+        OutputMode::Text => return hint.to_owned(),
+        OutputMode::Porcelain => "--toon",
+        OutputMode::Json => "--json",
+    };
+    let mut out = String::new();
+    let mut rest = hint;
+    while let Some(i) = rest.find("`rgit") {
+        let tail = &rest[i + 5..];
+        let command = tail.split('`').next().unwrap_or_default();
+        let has_mode = command
+            .split(' ')
+            .any(|w| matches!(w, "--toon" | "--axi" | "--json"));
+        out.push_str(&rest[..i + 5]);
+        // `valid flags for `rgit diff`` names a command rather than running it.
+        if (tail.starts_with(' ') || tail.starts_with('`'))
+            && !has_mode
+            && !rest[..i].ends_with("for ")
+        {
+            out.push(' ');
+            out.push_str(flag);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `whatchanged` is git's `log` with raw diffs and no merges (unless asked
@@ -988,12 +1044,12 @@ fn forge_output(text: String, list_cmd: Option<&str>) -> Output {
 
 /// Report a clap parse error. Humans get clap's own message; agents get the
 /// error, clap's tips, and the valid flags or subcommands at the failing level.
-fn usage_exit(e: clap::Error, args: &[String], stdout_is_terminal: bool) -> ! {
+fn usage_exit(e: clap::Error, args: &[String]) -> ! {
     use clap::error::ErrorKind;
     let has = |flags: &[&str]| args.iter().any(|a| flags.contains(&a.as_str()));
     let mode = if has(&["--json"]) {
         OutputMode::Json
-    } else if has(&["--toon", "--axi"]) || !stdout_is_terminal && !has(&["--human", "--text"]) {
+    } else if has(&["--toon", "--axi"]) {
         OutputMode::Porcelain
     } else {
         OutputMode::Text
@@ -1373,6 +1429,19 @@ const HOME_FILES: usize = 10;
 const HOME_OPS: usize = 3;
 
 /// The no-argument view for agents: who rgit is, then the repo's live state.
+/// `rgit.compact` from the repo's config, when there is a repo.
+fn compact_config() -> bool {
+    discover_or_init(false)
+        .ok()
+        .and_then(|b| b.config_get("rgit.compact").ok().flatten())
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1"))
+}
+
+/// The home view is what session hooks show an agent, so it says how to keep
+/// structured output.
+const OUTPUT_HINT: &str =
+    "Pass `--toon` (or `--json`) to every rgit command; without it rgit prints git's human text";
+
 fn home() -> Output {
     let bin = std::env::current_exe()
         .map(|p| tilde(&p))
@@ -1408,6 +1477,7 @@ fn home() -> Output {
                 data.push(("recent".to_owned(), Node::List(recent)));
             }
             out.data = data;
+            help.push(OUTPUT_HINT.to_owned());
             out.help = help;
             out
         }
@@ -1481,6 +1551,22 @@ fn discover_or_init(can_prompt: bool) -> anyhow::Result<Arc<dyn GitBackend>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hints_keep_the_structured_output_flag() {
+        let hint = "Run `rgit stash pop`, then `rgit --full --toon log` or `rgit`";
+        assert_eq!(
+            keep_mode(hint, OutputMode::Porcelain),
+            "Run `rgit --toon stash pop`, then `rgit --full --toon log` or `rgit --toon`"
+        );
+        let names = "valid flags for `rgit diff`: --stat";
+        assert_eq!(keep_mode(names, OutputMode::Porcelain), names);
+        assert_eq!(
+            keep_mode("Run `rgit status`", OutputMode::Json),
+            "Run `rgit --json status`"
+        );
+        assert_eq!(keep_mode(hint, OutputMode::Text), hint);
+    }
 
     fn render(out: Output) -> String {
         toon::encode(&out.finalize(&[], false, "rgit").unwrap())

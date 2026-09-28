@@ -4,8 +4,8 @@ A magit-style git TUI that also works as a CLI and an MCP server.
 
 ```sh
 cargo install --locked --git https://github.com/rslib/rgit rgit-cli
-rgit            # open the TUI (or, when piped, print the repo home view)
-rgit status     # any subcommand prints compact output
+rgit            # open the TUI (or, when piped, print `git status`)
+rgit status     # subcommands print git's human text; agents add --toon
 ```
 
 ## Change-Id trailers
@@ -17,9 +17,12 @@ across amend, reword, squash, and rebase.
 
 ## Using rgit from a coding agent
 
-When stdout is not a terminal, rgit prints compact TOON with next-step hints.
-`--json` prints JSON and `--human` prints terminal text. There are two ways to
-give an agent rgit context. You need only one:
+rgit prints human text by default, as git does, even when piped. Agents pass
+`--toon` (alias `--axi`) on every command for compact TOON with next-step
+hints, or `--json` for JSON. `--compact` (or `rgit.compact=true`) keeps rgit's
+short human forms of `status`, `diff`, `log`, `show` and `blame`. There are two
+ways to give an agent rgit context, and both tell it to pass `--toon`. You need
+only one:
 
 1. **Session hook (preferred).** `rgit hooks install` makes Claude Code, Codex,
    and OpenCode start every session with the repo's live state.

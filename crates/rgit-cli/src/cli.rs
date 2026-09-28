@@ -1,5 +1,6 @@
 //! The command-line surface. With no subcommand rgit launches the TUI; each
-//! subcommand drives the same `GitBackend` and prints compact, agent-friendly output.
+//! subcommand drives the same `GitBackend` and prints git's human text, or
+//! TOON/JSON for agents with `--toon`/`--json`.
 //!
 //! When a required argument is missing and stdout is a real terminal, the
 //! missing value is prompted for (our own widgets); with `--no-input` or a non-TTY
@@ -19,7 +20,8 @@ use crate::render;
     version,
     about = "A magit-style git TUI, also usable as a CLI and an MCP server.",
     long_about = "Run with no subcommand to open the TUI. Subcommands drive the same in-process \
-                  git backend and print compact, agent-friendly output.",
+                  git backend and print git's human text; agents pass --toon (or --json) for \
+                  structured output.",
     after_help = "git's global options go before the command: -C <path>, -c <name>=<value>, \
                   --config-env=<name>=<env>, --git-dir, --work-tree, --bare, --namespace, \
                   -p/--paginate, -P/--no-pager, --literal/--noglob/--icase-pathspecs, \
@@ -38,14 +40,19 @@ pub struct Cli {
     #[arg(long, global = true, conflicts_with_all = ["toon", "human"])]
     pub json: bool,
 
-    /// Print TOON for agents: no color, spinners, or prompts. The default when
-    /// stdout is not a terminal.
+    /// Print TOON for agents: no color, spinners, or prompts. Agents should
+    /// always pass it (or --json); human text is the default.
     #[arg(long, visible_alias = "axi", global = true, conflicts_with = "human")]
     pub toon: bool,
 
-    /// Force human text output, even when stdout is not a terminal.
+    /// Print human text (the default).
     #[arg(long, alias = "text", global = true)]
     pub human: bool,
+
+    /// Print rgit's compact human forms of status, diff, log, show and blame
+    /// instead of git's (config rgit.compact).
+    #[arg(long, global = true)]
+    pub compact: bool,
 
     /// Disable ANSI color even on a terminal.
     #[arg(long, global = true)]
@@ -85,10 +92,10 @@ pub enum OutputMode {
 }
 
 impl Cli {
-    pub fn output_mode(&self, stdout_is_terminal: bool) -> OutputMode {
+    pub fn output_mode(&self) -> OutputMode {
         if self.json {
             OutputMode::Json
-        } else if self.toon || !stdout_is_terminal && !self.human {
+        } else if self.toon {
             OutputMode::Porcelain
         } else {
             OutputMode::Text
@@ -325,12 +332,16 @@ pub struct BlameFormat {
     /// git's machine format, each group of lines as blame settles it.
     #[arg(long, conflicts_with_all = ["porcelain", "line_porcelain"])]
     pub incremental: bool,
+    /// git's default format; set unless --compact.
+    #[arg(skip)]
+    pub git_format: bool,
 }
 
 impl BlameFormat {
     /// Whether to print git's own blame format.
     fn git(&self, opts: &BlameArgs) -> bool {
-        self.raw_time
+        self.git_format
+            || self.raw_time
             || self.date.is_some()
             || self.show_name
             || self.show_number
@@ -856,9 +867,10 @@ pub struct PathspecFile {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Compact working-tree status. Agents: add `--toon` for a structured table.
-    /// `--long`, `--porcelain`, `--short`, `--branch`, `-z`, `-v` and git's
-    /// other status flags print git's own formats byte for byte, for scripts.
+    /// Working-tree status as git prints it (`--compact` for rgit's short form).
+    /// Agents: add `--toon` for a structured table. `--porcelain`, `--short`,
+    /// `--branch`, `-z`, `-v` and git's other status flags print git's own
+    /// formats byte for byte, for scripts.
     Status {
         #[command(flatten)]
         fmt: StatusArgs,
@@ -885,8 +897,8 @@ pub enum Command {
         /// Limit to these paths: files, folders or globs.
         paths: Vec<String>,
     },
-    /// Recent commits as `sha subject` lines, or in git's formats with
-    /// `--oneline`, `--format`, `--pretty` or `--graph`.
+    /// Commits in git's medium format (`--compact` for `sha subject` lines), or
+    /// in git's other formats with `--oneline`, `--format`, `--pretty` or `--graph`.
     #[command(visible_alias = "whatchanged")]
     Log {
         /// Maximum number of commits to show (git's -n or -<n>; default 20, or
@@ -974,8 +986,8 @@ pub enum Command {
         #[arg(last = true, value_name = "PATH")]
         paths: Vec<String>,
     },
-    /// Diffstat of unstaged changes (`--cached` for staged), against a revision,
-    /// or between two revisions (`A B`, `A..B`, `A...B`).
+    /// Patch of unstaged changes (`--cached` for staged), against a revision,
+    /// or between two revisions (`A B`, `A..B`, `A...B`); `--compact` for a diffstat.
     Diff {
         /// Revisions (none: the working tree against the index; one: it against
         /// the working tree; `A B`, `A..B`, or `A...B` from their merge base),
@@ -1020,7 +1032,8 @@ pub enum Command {
         #[arg(long, value_name = "ACDMRT")]
         diff_filter: Option<String>,
     },
-    /// A commit's header and diffstat, or a file (`rev:path`) or folder at a revision.
+    /// A commit as git shows it (`--compact` for header and diffstat), or a file
+    /// (`rev:path`) or folder at a revision.
     Show {
         /// The commits to show (branch, tag, or sha; default HEAD), or `rev:path`
         /// to print a file as it is at `rev` (`:path` for the staged version).
@@ -1046,8 +1059,8 @@ pub enum Command {
         #[arg(long)]
         first_parent: bool,
     },
-    /// Blame a file: `sha author line` per line, or git's format with its
-    /// display flags (`-t`, `--date`, `-f`, `-n`, `-c`, `--root`...).
+    /// Blame a file in git's format, with its display flags (`-t`, `--date`,
+    /// `-f`, `-n`, `-c`, `--root`...); `--compact` for `sha author line`.
     #[command(visible_alias = "annotate")]
     Blame {
         /// `[REV] PATH`: the file to annotate, as it is in the working tree or
@@ -7247,7 +7260,7 @@ description: Use for any git work in this repository - inspecting changes, commi
 
 # rgit
 
-{DESCRIPTION}. Prefer `rgit` over raw `git`. Run `rgit` with no arguments first: it prints the repo's current state and the next useful commands.
+{DESCRIPTION}. Prefer `rgit` over raw `git`. Always pass `--toon` (alias `--axi`) or `--json`: without them rgit prints git's human text. Run `rgit --toon` with no other arguments first: it prints the repo's current state and the next useful commands.
 
 If `rgit` is not on PATH, install it with `cargo install --locked --git https://github.com/rslib/rgit rgit-cli`.
 
@@ -7258,12 +7271,12 @@ If `rgit` is not on PATH, install it with `cargo install --locked --git https://
 const SKILL_RULES: &str = r#"
 ## Output
 
-- rgit prints TOON when stdout is not a terminal. If your shell runs commands in a terminal (a PTY), add `--toon` (alias `--axi`) so you still get TOON with no color, spinners, or prompts. `--json` gives the same data as JSON.
+- rgit prints human text by default, as git does, even when stdout is not a terminal. Agents must add `--toon` (alias `--axi`) to every command for structured TOON with no color, spinners, or prompts; `--json` gives the same data as JSON. Other examples in this skill and its reference omit the flag; add it.
 - Use `--toon` or `--axi`, not `--porcelain`. In rgit, as in git, `--porcelain` exists only on `status` and prints git's raw script format, with no counts, hints, or schema.
-- Output ends with `help` lines naming useful next commands; follow them. Lists include counts (`count: 20 of 65 total`) and say explicitly when they are empty.
+- Output ends with `help` lines naming useful next commands, already carrying `--toon` (or `--json`); follow them. Lists include counts (`count: 20 of 65 total`) and say explicitly when they are empty.
 - `--fields a,b` adds table columns; an unknown field lists the valid ones. `--full` disables truncation of patches, commit bodies, and long output.
-- Exit codes: 0 success (including no-ops), 1 error, 2 usage error. Errors print `error:` and `help:` on stdout.
-- rgit never prompts in agent mode. Pass every value as a flag or argument.
+- Exit codes: 0 success (including no-ops), 1 error, 2 usage error. With `--toon` or `--json`, errors print `error:` and `help:` on stdout.
+- rgit never prompts with `--toon` or `--json`, or when stdin or stdout is not a terminal. Pass every value as a flag or argument.
 
 ## Safety
 
@@ -7288,7 +7301,7 @@ rgit also covers history rewriting (reword, squash, split, move, absorb), stacke
 pub(crate) fn skill_markdown() -> String {
     let mut out = SKILL_INTRO.replace("{DESCRIPTION}", DESCRIPTION);
     for line in HOME_HELP {
-        out.push_str(&format!("- {line}\n"));
+        out.push_str(&format!("- {}\n", line.replace("`rgit ", "`rgit --toon ")));
     }
     out.push_str(SKILL_RULES);
     for (path, args, hint) in GIT_SPELLINGS {
@@ -7305,7 +7318,7 @@ pub(crate) fn skill_markdown() -> String {
 pub(crate) fn skill_reference() -> String {
     use clap::CommandFactory;
     let mut out = String::from(
-        "# rgit command reference\n\nEvery command with what it does and example invocations. Run `rgit <command> --help` for every flag.\n",
+        "# rgit command reference\n\nEvery command with what it does and example invocations. Run `rgit <command> --help` for every flag. The examples omit the output flag: agents add `--toon` (or `--json`) to each one for structured output.\n",
     );
     let root = Cli::command();
     for (group, names) in SKILL_GROUPS {
@@ -7534,6 +7547,53 @@ pub(crate) fn set_word_diff(backend: &Arc<dyn GitBackend>, command: &Command) {
             }),
         }
     }));
+}
+
+/// A human `status`, `diff`, `log`, `show` or `blame` with no format asked
+/// for prints git's default format, unless `compact()` (rgit.compact) says to
+/// keep rgit's compact form.
+pub fn git_defaults(mut command: Command, compact: impl FnOnce() -> bool) -> Command {
+    let wants = match &command {
+        Command::Status { fmt, .. } => !fmt.any(),
+        Command::Diff {
+            format,
+            quiet,
+            diff_opts,
+            ..
+        } => {
+            !quiet
+                && !format.any()
+                && diff_opts.dirstat.is_none()
+                && diff_opts.dirstat_by_file.is_none()
+                && !diff_opts.cumulative
+                && !diff_opts.check
+                && !diff_opts.compact_summary
+        }
+        Command::Log {
+            pretty,
+            walk_reflogs,
+            line_ranges,
+            ..
+        } => !pretty.any() && !walk_reflogs && line_ranges.is_empty(),
+        Command::Show { pretty, .. } => !pretty.any(),
+        Command::Blame { format, .. } => {
+            !(format.porcelain || format.line_porcelain || format.incremental)
+        }
+        _ => false,
+    };
+    if !wants || compact() {
+        return command;
+    }
+    match &mut command {
+        Command::Status { fmt, .. } => fmt.long = true,
+        Command::Diff { format, .. } => format.patch = true,
+        Command::Log { pretty, .. } | Command::Show { pretty, .. } => {
+            pretty.pretty = Some("medium".to_owned())
+        }
+        Command::Blame { format, .. } => format.git_format = true,
+        _ => {}
+    }
+    command
 }
 
 /// Run a subcommand and return its compact output. When `interactive`, a
@@ -8136,7 +8196,7 @@ fn run_command(
             no_status,
             template,
             include,
-            quiet: _,
+            quiet,
             only: _,
             verbose,
             no_verbose,
@@ -8329,6 +8389,15 @@ fn run_command(
                 return Ok(String::from_utf8_lossy(&backend.status_text(&opts)?.text).into_owned());
             }
             committed?;
+            if render::text_mode() {
+                if quiet {
+                    return Ok(String::new());
+                }
+                let show_date = (amend || reuse_message.is_some() || reedit_message.is_some())
+                    && !reset_author
+                    || date.is_some();
+                return commit_summary(backend, "HEAD", show_date);
+            }
             backend.commit_report().join("\n")
         }
         Command::Extend => {
@@ -8616,7 +8685,7 @@ fn run_command(
             no_guess,
             guess: _,
             patch,
-            quiet: _,
+            quiet,
             paths,
         } => {
             let old = head_or_zero(backend);
@@ -8647,6 +8716,9 @@ fn run_command(
                 // the index and working tree, or from the index.
                 backend.restore(&paths, rev.as_deref(), rev.is_some(), true, true)?;
                 post_checkout(backend, &old, false)?;
+                if render::text_mode() {
+                    return Ok(String::new());
+                }
                 let from = rev.as_deref().unwrap_or("the index");
                 return Ok(format!("restored {} from {from}", paths.join(" ")));
             }
@@ -8681,6 +8753,7 @@ fn run_command(
                 guess: !no_guess,
                 mode: checkout_mode(force, merge, conflict.as_deref()),
                 detach_ok: true,
+                quiet,
             };
             let out = switch(backend, rev, new, &opts)?;
             post_checkout(backend, &old, true)?;
@@ -8699,7 +8772,7 @@ fn run_command(
             orphan,
             no_guess,
             guess: _,
-            quiet: _,
+            quiet,
         } => {
             let old = head_or_zero(backend);
             if let Some(name) = orphan {
@@ -8723,6 +8796,7 @@ fn run_command(
                 guess: !no_guess,
                 mode: checkout_mode(discard_changes, merge, conflict.as_deref()),
                 detach_ok: false,
+                quiet,
             };
             let out = switch(backend, rev, new, &opts)?;
             post_checkout(backend, &old, true)?;
@@ -8829,7 +8903,19 @@ fn run_command(
             edit_todo,
             show_current_patch,
         } => {
-            let done = |out: String| if out.is_empty() { "ok".to_owned() } else { out };
+            let done = |out: String| {
+                if render::text_mode() {
+                    // git reports the finished rebase on stderr.
+                    let (done, rest): (Vec<&str>, Vec<&str>) = out
+                        .lines()
+                        .partition(|l| l.starts_with("Successfully rebased"));
+                    for l in done {
+                        eprintln!("{l}");
+                    }
+                    return rest.join("\n");
+                }
+                if out.is_empty() { "ok".to_owned() } else { out }
+            };
             // A scripted sequence editor stands in for the terminal.
             let scripted = std::env::var("GIT_SEQUENCE_EDITOR").is_ok_and(|e| !e.is_empty());
             if abort {
@@ -8936,14 +9022,22 @@ fn run_command(
             // `reset [<rev>] [--] <paths>` resets those index entries to <rev>
             // (default HEAD), leaving HEAD and the working tree alone.
             if !paths.is_empty() {
-                let Some(rev) = rev else {
-                    for p in &paths {
-                        backend.unstage_file(p)?;
+                let msg = match rev {
+                    None => {
+                        for p in &paths {
+                            backend.unstage_file(p)?;
+                        }
+                        format!("unstaged {}", paths.join(", "))
                     }
-                    return Ok(done(format!("unstaged {}", paths.join(", "))));
+                    Some(rev) => {
+                        backend.reset_paths(&rev, &paths)?;
+                        format!("reset {} to {rev}", paths.join(", "))
+                    }
                 };
-                backend.reset_paths(&rev, &paths)?;
-                return Ok(done(format!("reset {} to {rev}", paths.join(", "))));
+                if render::text_mode() {
+                    return Ok(done(unstaged_after_reset(backend)?));
+                }
+                return Ok(done(msg));
             }
             let rev = match rev {
                 None if merge || keep || hard || !interactive => "HEAD".to_owned(),
@@ -8965,6 +9059,13 @@ fn run_command(
                 )?
             {
                 "cancelled".to_owned()
+            } else if render::text_mode() {
+                backend.reset(&rev, mode)?;
+                done(match mode {
+                    ResetMode::Soft => String::new(),
+                    ResetMode::Mixed => unstaged_after_reset(backend)?,
+                    _ => format!("HEAD is now at {}", short_subject(backend, "HEAD")?),
+                })
             } else {
                 done(ok(backend.reset(&rev, mode))?)
             }
@@ -9120,48 +9221,48 @@ fn run_command(
                         &paths,
                     ))?
                 } else {
-                    ok_msg(backend.stash_push_opts(
+                    match backend.stash_push_opts(
                         p.message.as_deref(),
                         p.include_untracked,
                         p.all,
                         p.keep_index,
                         &paths,
-                    ))?
+                    ) {
+                        Err(e)
+                            if render::text_mode()
+                                && e.to_string().contains("there is nothing to stash") =>
+                        {
+                            "No local changes to save".to_owned()
+                        }
+                        r => ok_msg(r)?,
+                    }
                 }
             }
             Some(StashCmd::Pop {
                 index,
                 restore_index,
                 quiet,
-            }) => quietly(
-                quiet,
-                ok(backend.stash_apply_opts(
-                    stash_index(backend, index, interactive, "Pop which stash?")?,
-                    restore_index,
-                    true,
-                ))?,
-            ),
+            }) => {
+                let i = stash_index(backend, index, interactive, "Pop which stash?")?;
+                let dropped = stash_dropped(backend, i);
+                let out = ok(backend.stash_apply_opts(i, restore_index, true))?;
+                quietly(quiet, stash_applied(backend, out, dropped)?)
+            }
             Some(StashCmd::Apply {
                 index,
                 restore_index,
                 quiet,
-            }) => quietly(
-                quiet,
-                ok(backend.stash_apply_opts(
-                    stash_index(backend, index, interactive, "Apply which stash?")?,
-                    restore_index,
-                    false,
-                ))?,
-            ),
-            Some(StashCmd::Drop { index, quiet }) => quietly(
-                quiet,
-                ok(backend.stash_drop(stash_index(
-                    backend,
-                    index,
-                    interactive,
-                    "Drop which stash?",
-                )?))?,
-            ),
+            }) => {
+                let i = stash_index(backend, index, interactive, "Apply which stash?")?;
+                let out = ok(backend.stash_apply_opts(i, restore_index, false))?;
+                quietly(quiet, stash_applied(backend, out, None)?)
+            }
+            Some(StashCmd::Drop { index, quiet }) => {
+                let i = stash_index(backend, index, interactive, "Drop which stash?")?;
+                let dropped = stash_dropped(backend, i);
+                let out = ok(backend.stash_drop(i))?;
+                quietly(quiet, dropped.unwrap_or(out))
+            }
             Some(StashCmd::List {
                 pretty,
                 diff,
@@ -9253,14 +9354,31 @@ fn run_command(
                 if names.is_empty() {
                     return Err(CliError::usage("tag -d needs a tag name"));
                 }
+                let mut deleted = String::new();
                 let failed: Vec<String> = names
                     .iter()
-                    .filter_map(|n| backend.delete_tag(n).err().map(|e| format!("{n}: {e}")))
+                    .filter_map(|n| {
+                        let was = backend
+                            .read_object(&format!("refs/tags/{n}"))
+                            .and_then(|o| backend.abbrev_id(&o.id, 7))
+                            .unwrap_or_default();
+                        match backend.delete_tag(n) {
+                            Ok(()) => {
+                                deleted.push_str(&format!("Deleted tag '{n}' (was {was})\n"));
+                                None
+                            }
+                            Err(e) => Some(format!("{n}: {e}")),
+                        }
+                    })
                     .collect();
                 if !failed.is_empty() {
                     anyhow::bail!("could not delete {}", failed.join("; "));
                 }
-                "ok".to_owned()
+                if render::text_mode() {
+                    deleted
+                } else {
+                    "ok".to_owned()
+                }
             } else if opts.verify {
                 if names.is_empty() {
                     return Err(CliError::usage("tag -v needs a tag name"));
@@ -9280,12 +9398,17 @@ fn run_command(
                         lines.push(format!("{}\t{url} (push)", r.name));
                     }
                 }
-                if lines.is_empty() {
+                if lines.is_empty() && !render::text_mode() {
                     "no remotes".to_owned()
                 } else {
                     lines.join("\n")
                 }
             }
+            None if render::text_mode() => backend
+                .remotes()?
+                .iter()
+                .map(|r| format!("{}\n", r.name))
+                .collect(),
             None => render::remotes(&backend.remotes()?),
             Some(RemoteCmd::Add {
                 name,
@@ -9624,7 +9747,7 @@ fn run_command(
                                     GitError::Other(format!("no note found for object {oid}"))
                                 })?
                         }
-                        None if notes.is_empty() => "no notes".to_owned(),
+                        None if notes.is_empty() && !render::text_mode() => "no notes".to_owned(),
                         None => notes
                             .into_iter()
                             .map(|(note, obj)| format!("{note} {obj}"))
@@ -10846,7 +10969,12 @@ fn pick(
             &format!("{verb} which commit?"),
         )?);
     }
-    ok(backend.pick(&revs, opts))
+    let old = backend.rev_parse("HEAD").unwrap_or_default();
+    let out = ok(backend.pick(&revs, opts))?;
+    if render::text_mode() && !opts.no_commit {
+        return pick_summaries(backend, &old);
+    }
+    Ok(out)
 }
 
 /// The bytes of a file, or of stdin for `-`.
@@ -12285,6 +12413,7 @@ struct SwitchOpts {
     guess: bool,
     mode: rgit_git::CheckoutMode,
     detach_ok: bool,
+    quiet: bool,
 }
 
 /// The checkout mode for -f/-m and `--conflict`, which implies -m.
@@ -12360,13 +12489,42 @@ fn switch(
         }
         Ok(())
     };
+    let text = render::text_mode();
+    // git reports a switch on stderr, after the local changes on stdout.
+    let switched = |line: String| -> anyhow::Result<String> {
+        if o.quiet {
+            return Ok(String::new());
+        }
+        let changes = local_changes(backend, true)?;
+        eprintln!("{line}");
+        Ok(changes)
+    };
     if let Some((name, force)) = new {
         create(&name, rev.as_deref().unwrap_or("HEAD"), force, o.track)?;
+        if text {
+            // From HEAD the tree is left alone, so git lists no changes.
+            if rev.is_none() {
+                if !o.quiet {
+                    eprintln!("Switched to a new branch '{name}'");
+                }
+                return Ok(String::new());
+            }
+            return switched(format!("Switched to a new branch '{name}'"));
+        }
         return Ok("ok".to_owned());
     }
     let rev = rev.unwrap_or_else(|| "HEAD".to_owned());
+    let old = backend.status()?.head;
     let tracked = |name: &str, start: &str| -> anyhow::Result<String> {
         create(name, start, false, !o.no_track)?;
+        if text {
+            let set_up = if o.no_track || o.quiet {
+                String::new()
+            } else {
+                format!("branch '{name}' set up to track '{start}'.\n")
+            };
+            return Ok(set_up + &switched(format!("Switched to a new branch '{name}'"))?);
+        }
         Ok(if o.no_track {
             format!("created branch {name} from {start}")
         } else {
@@ -12397,11 +12555,169 @@ fn switch(
     } else {
         anyhow::bail!("invalid reference: {rev}");
     }
+    if text {
+        let head = backend.status()?.head;
+        return match &head.branch {
+            Some(b) if old.branch.as_ref() == Some(b) => switched(format!("Already on '{b}'")),
+            Some(b) => switched(format!("Switched to branch '{b}'")),
+            None => {
+                let now = short_subject(backend, "HEAD")?;
+                if old.branch.is_some() && !o.detach && !o.quiet {
+                    eprint!("{}", detach_advice(&rev));
+                }
+                switched(format!("HEAD is now at {now}"))
+            }
+        };
+    }
     Ok(if prev {
         format!("checked out {rev}")
     } else {
         "ok".to_owned()
     })
+}
+
+/// `<abbrev> <subject>` of `rev`, as git's "HEAD is now at" names a commit.
+fn short_subject(backend: &Arc<dyn GitBackend>, rev: &str) -> anyhow::Result<String> {
+    let id = backend.rev_parse(rev)?;
+    let c = crate::pretty::parse(&backend.read_object(&id)?);
+    Ok(format!(
+        "{} {}",
+        backend.abbrev_id(&id, 7)?,
+        crate::pretty::subject(&c.message, " ")
+    ))
+}
+
+/// git's `<letter>\t<path>` lines for tracked changes: the working tree
+/// against the index (`diff-files`), or against HEAD (`diff-index HEAD`).
+fn local_changes(backend: &Arc<dyn GitBackend>, against_head: bool) -> anyhow::Result<String> {
+    use rgit_git::StatusCode as S;
+    let mut out = String::new();
+    for e in backend.status()?.entries {
+        if matches!(e.worktree, S::Untracked | S::Ignored) {
+            continue;
+        }
+        let letter = match (e.index, e.worktree) {
+            (S::Unmerged, _) | (_, S::Unmerged) => "U",
+            (_, S::Deleted) => "D",
+            (S::Added, _) if against_head => "A",
+            (S::Deleted, _) if against_head => "D",
+            (_, S::Unmodified) if !against_head => continue,
+            (S::Unmodified, S::Unmodified) => continue,
+            _ => "M",
+        };
+        out.push_str(&format!("{letter}\t{}\n", e.path));
+    }
+    Ok(out)
+}
+
+/// git's summaries of the commits the sequencer just made on top of `old`.
+fn pick_summaries(backend: &Arc<dyn GitBackend>, old: &str) -> anyhow::Result<String> {
+    let mut ids = Vec::new();
+    let mut id = backend.rev_parse("HEAD")?;
+    while id != old && ids.len() < 10_000 {
+        let parent = crate::pretty::parse(&backend.read_object(&id)?)
+            .parents
+            .into_iter()
+            .next();
+        ids.push(id);
+        match parent {
+            Some(p) => id = p,
+            None => break,
+        }
+    }
+    let mut out = String::new();
+    for id in ids.iter().rev() {
+        out.push_str(&commit_summary(backend, id, true)?);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// git's summary of a commit it just made: `[<branch> <abbrev>] <subject>`,
+/// the author date when it is not the commit's own, the shortstat and the
+/// created and deleted files.
+fn commit_summary(
+    backend: &Arc<dyn GitBackend>,
+    id: &str,
+    show_date: bool,
+) -> anyhow::Result<String> {
+    const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    let id = backend.rev_parse(id)?;
+    let c = crate::pretty::parse(&backend.read_object(&id)?);
+    let branch = backend
+        .status()?
+        .head
+        .branch
+        .unwrap_or_else(|| "detached HEAD".to_owned());
+    let root = if c.parents.is_empty() {
+        " (root-commit)"
+    } else {
+        ""
+    };
+    let mut out = format!(
+        "[{branch}{root} {}] {}",
+        backend.abbrev_id(&id, 7)?,
+        crate::pretty::subject(&c.message, " ")
+    );
+    if show_date {
+        let a = &c.author;
+        out.push_str(&format!(
+            "\n Date: {}",
+            crate::pretty::format_date(a.time, a.offset, "default")
+        ));
+    }
+    let parent = c.parents.first().map_or(EMPTY_TREE, String::as_str);
+    let files = backend.diff_refs(parent, &id)?;
+    if !files.is_empty() {
+        out.push('\n');
+        out.push_str(&render::stat_summary(&files));
+    }
+    for f in &files {
+        match f.status {
+            rgit_git::StatusCode::Added => {
+                out.push_str(&format!("\n create mode {:06o} {}", f.modes.1, f.path))
+            }
+            rgit_git::StatusCode::Deleted => {
+                out.push_str(&format!("\n delete mode {:06o} {}", f.modes.0, f.path))
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// git's `Unstaged changes after reset:` list, or nothing.
+fn unstaged_after_reset(backend: &Arc<dyn GitBackend>) -> anyhow::Result<String> {
+    let changes = local_changes(backend, false)?;
+    Ok(if changes.is_empty() {
+        changes
+    } else {
+        format!("Unstaged changes after reset:\n{changes}")
+    })
+}
+
+/// git's advice on detaching HEAD at `rev`.
+fn detach_advice(rev: &str) -> String {
+    format!(
+        "Note: switching to '{rev}'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+"
+    )
 }
 
 /// One branch in a `branch` listing. `id`, `summary` and the upstream fields
@@ -12786,17 +13102,28 @@ fn delete_branches(
     names: &[String],
     force: bool,
 ) -> anyhow::Result<String> {
+    let mut deleted = String::new();
     let failed: Vec<String> = names
         .iter()
         .filter_map(|n| {
-            backend
-                .delete_branch(n, force)
-                .err()
-                .map(|e| format!("{n}: {e}"))
+            let was = backend
+                .rev_parse(&format!("refs/heads/{n}"))
+                .and_then(|id| backend.abbrev_id(&id, 7))
+                .unwrap_or_default();
+            match backend.delete_branch(n, force) {
+                Ok(()) => {
+                    deleted.push_str(&format!("Deleted branch {n} (was {was}).\n"));
+                    None
+                }
+                Err(e) => Some(format!("{n}: {e}")),
+            }
         })
         .collect();
     if !failed.is_empty() {
         anyhow::bail!("could not delete {}", failed.join("; "));
+    }
+    if render::text_mode() {
+        return Ok(deleted);
     }
     Ok(format!("deleted branch {}", names.join(", ")))
 }
@@ -12875,6 +13202,9 @@ fn branch_change(
             backend.delete_branch(&new, true)?;
         }
         backend.rename_branch(&old, &new)?;
+        if render::text_mode() {
+            return Ok(String::new());
+        }
         return Ok(format!("renamed branch {old} to {new}"));
     }
     let (name, start) = match o.args.as_slice() {
@@ -12905,6 +13235,9 @@ fn branch_change(
     } else if let Some(up) = upstream {
         backend.set_upstream(name, Some(&up))?;
         return Ok(format!("branch {name} set up to track {up}"));
+    }
+    if render::text_mode() {
+        return Ok(String::new());
     }
     Ok(format!("created branch {name} at {start}"))
 }
@@ -13897,6 +14230,31 @@ pub(crate) fn hook_run(
 }
 
 /// `out`, or nothing with -q.
+/// git's `Dropped refs/stash@{<i>} (<id>)` line, for human output.
+fn stash_dropped(backend: &Arc<dyn GitBackend>, i: usize) -> Option<String> {
+    let id = backend.rev_parse(&format!("refs/stash@{{{i}}}")).ok()?;
+    render::text_mode().then(|| format!("Dropped refs/stash@{{{i}}} ({id})\n"))
+}
+
+/// After a stash is applied, git prints the long status, then any drop line.
+fn stash_applied(
+    backend: &Arc<dyn GitBackend>,
+    out: String,
+    dropped: Option<String>,
+) -> anyhow::Result<String> {
+    if !render::text_mode() {
+        return Ok(out);
+    }
+    let mut opts = rgit_git::StatusOpts {
+        format: Some(rgit_git::StatusFormat::Long),
+        ..Default::default()
+    };
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    status_env(backend, &mut opts, tty && !render::color_on(), tty);
+    let status = String::from_utf8_lossy(&backend.status_text(&opts)?.text).into_owned();
+    Ok(status + &dropped.unwrap_or_default())
+}
+
 fn quietly(quiet: bool, out: String) -> String {
     if quiet { String::new() } else { out }
 }

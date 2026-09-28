@@ -22,6 +22,12 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 fn rgit(dir: &Path, args: &[&str]) -> (String, bool) {
     let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(
+            ["--human", "--text", "--json", "--toon", "--axi"]
+                .iter()
+                .all(|m| !args.contains(m))
+                .then_some("--toon"),
+        )
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
@@ -153,7 +159,7 @@ fn stash_takes_git_flags_and_stash_refs() {
     assert_eq!(git(&dir, &["stash", "list"]), "");
 
     let out = fails(&dir, &["stash", "save", "x"]);
-    assert!(out.contains("rgit stash push -m"), "{out}");
+    assert!(out.contains("rgit --toon stash push -m"), "{out}");
 }
 
 /// Two identical repos with `a` staged and `b` and `dir/c` changed, one for

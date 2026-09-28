@@ -452,7 +452,7 @@ fn apply_handles_binary_reject_three_way_and_paths_like_git() {
 #[test]
 fn notes_add_show_append_and_remove() {
     let dir = repo("notes");
-    assert_eq!(ok(&dir, &["notes"]), "no notes\n");
+    assert_eq!(ok(&dir, &["notes"]), "");
     ok(&dir, &["notes", "add", "-m", "first"]);
     assert_eq!(git(&dir, &["notes", "show"]), "first\n");
     fails(&dir, &["notes", "add", "-m", "again"]);

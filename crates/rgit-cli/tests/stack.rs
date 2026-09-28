@@ -18,6 +18,12 @@ fn git(dir: &Path, args: &[&str]) {
 
 fn rgit(dir: &Path, args: &[&str]) -> (String, bool) {
     let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(
+            ["--human", "--text", "--json", "--toon", "--axi"]
+                .iter()
+                .all(|m| !args.contains(m))
+                .then_some("--toon"),
+        )
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")

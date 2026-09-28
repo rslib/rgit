@@ -50,7 +50,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 fn rgit(dir: &Path, args: &[&str]) -> (String, bool) {
     let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
-        .arg("--human")
+        .args(["--human", "--compact"])
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
