@@ -446,6 +446,148 @@ impl WalkArgs {
     }
 }
 
+/// git's own `status` formats; any of them prints git's output instead of
+/// rgit's compact view.
+#[derive(clap::Args, Clone, Default)]
+pub struct StatusArgs {
+    /// git's script format, `v1` (default) or `v2`. Agents should prefer `--toon`.
+    #[arg(
+        long,
+        value_name = "VERSION",
+        num_args = 0..=1,
+        require_equals = true,
+        value_parser = ["v1", "v2"],
+        default_missing_value = "v1"
+    )]
+    pub porcelain: Option<String>,
+    /// git's short format.
+    #[arg(short, long)]
+    pub short: bool,
+    /// git's long format (git's default).
+    #[arg(long)]
+    pub long: bool,
+    /// Add branch and tracking info.
+    #[arg(short, long, overrides_with = "no_branch")]
+    pub branch: bool,
+    #[arg(long, hide = true)]
+    pub no_branch: bool,
+    /// Terminate entries with NUL.
+    #[arg(short = 'z', long = "null")]
+    pub z: bool,
+    /// Also show the staged diff; repeat for the unstaged one.
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+    /// Show the number of stashes.
+    #[arg(long, overrides_with = "no_show_stash")]
+    pub show_stash: bool,
+    #[arg(long, hide = true)]
+    pub no_show_stash: bool,
+    /// Count commits ahead of and behind the upstream (git's default).
+    #[arg(long, overrides_with = "no_ahead_behind")]
+    pub ahead_behind: bool,
+    /// Only say whether the branch differs from its upstream.
+    #[arg(long)]
+    pub no_ahead_behind: bool,
+    /// Ignore submodule changes: `none`, `untracked`, `dirty` or `all` (default).
+    #[arg(
+        long,
+        value_name = "WHEN",
+        num_args = 0..=1,
+        require_equals = true,
+        value_parser = ["none", "untracked", "dirty", "all"],
+        default_missing_value = "all"
+    )]
+    pub ignore_submodules: Option<String>,
+    /// List untracked files in columns (git's column.status options).
+    #[arg(
+        long,
+        value_name = "OPTIONS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = ""
+    )]
+    pub column: Option<String>,
+    #[arg(long, hide = true)]
+    pub no_column: bool,
+    /// Do not detect renames.
+    #[arg(long)]
+    pub no_renames: bool,
+    /// Detect renames, optionally at this similarity (git's -M).
+    #[arg(
+        short = 'M',
+        long,
+        value_name = "N",
+        num_args = 0..=1,
+        default_missing_value = "",
+        value_parser = |v: &str| {
+            let score = v.trim_end_matches('%');
+            (score.is_empty() || score.parse::<f64>().is_ok())
+                .then(|| v.to_owned())
+                .ok_or_else(|| format!("invalid argument to -M: {v}"))
+        }
+    )]
+    pub find_renames: Option<String>,
+}
+
+impl StatusArgs {
+    /// Whether any git status flag asks for git's own output.
+    pub fn any(&self) -> bool {
+        self.porcelain.is_some()
+            || self.short
+            || self.long
+            || self.branch
+            || self.no_branch
+            || self.z
+            || self.verbose > 0
+            || self.show_stash
+            || self.no_show_stash
+            || self.ahead_behind
+            || self.no_ahead_behind
+            || self.ignore_submodules.is_some()
+            || self.column.is_some()
+            || self.no_column
+            || self.no_renames
+            || self.find_renames.is_some()
+    }
+
+    /// The options for git's status renderer.
+    pub fn opts(
+        &self,
+        untracked: Option<&str>,
+        ignored: Option<&str>,
+        paths: &[String],
+    ) -> rgit_git::StatusOpts {
+        use rgit_git::StatusFormat;
+        let flag = |on: bool, off: bool| (on || off).then_some(on);
+        rgit_git::StatusOpts {
+            format: match self.porcelain.as_deref() {
+                Some("v2") => Some(StatusFormat::PorcelainV2),
+                Some(_) => Some(StatusFormat::Porcelain),
+                None if self.short => Some(StatusFormat::Short),
+                None if self.long => Some(StatusFormat::Long),
+                None => None,
+            },
+            branch: flag(self.branch, self.no_branch),
+            null: self.z,
+            show_stash: flag(self.show_stash, self.no_show_stash),
+            ahead_behind: flag(self.ahead_behind, self.no_ahead_behind),
+            untracked: untracked.map(str::to_owned),
+            ignored: ignored.map(str::to_owned),
+            ignore_submodules: self.ignore_submodules.clone(),
+            column: if self.no_column {
+                Some("never".to_owned())
+            } else {
+                self.column.clone()
+            },
+            renames: self.no_renames.then_some(false),
+            find_renames: self.find_renames.clone(),
+            verbose: self.verbose,
+            paths: paths.to_vec(),
+            ..Default::default()
+        }
+    }
+}
+
 /// git's commit formats for `log` and `show`, printed byte for byte as git does.
 #[derive(clap::Args, Clone, Default)]
 pub struct PrettyArgs {
@@ -540,28 +682,11 @@ pub struct SignArgs {
 #[derive(Subcommand)]
 pub enum Command {
     /// Compact working-tree status. Agents: add `--toon` for a structured table.
-    /// `--porcelain`, `--short`, `--branch`, and `-z` print git's raw formats,
-    /// exactly as `git status` does, for scripts.
+    /// `--long`, `--porcelain`, `--short`, `--branch`, `-z`, `-v` and git's
+    /// other status flags print git's own formats byte for byte, for scripts.
     Status {
-        /// git's raw script format (`git status --porcelain`), v1 by default.
-        /// Agents should prefer `--toon`.
-        #[arg(
-            long,
-            value_name = "VERSION",
-            num_args = 0..=1,
-            require_equals = true,
-            default_missing_value = "v1"
-        )]
-        porcelain: Option<String>,
-        /// git's short format (`git status --short`).
-        #[arg(short, long)]
-        short: bool,
-        /// Add branch and tracking info (`git status --branch`).
-        #[arg(short, long)]
-        branch: bool,
-        /// Terminate entries with NUL (`git status -z`).
-        #[arg(short = 'z')]
-        z: bool,
+        #[command(flatten)]
+        fmt: StatusArgs,
         /// Show untracked files: `no`, `normal` or `all` (git's -u, default all).
         #[arg(
             short = 'u',
@@ -572,18 +697,16 @@ pub enum Command {
             default_missing_value = "all"
         )]
         untracked: Option<String>,
-        /// Also list ignored files (git's --ignored).
-        #[arg(long)]
-        ignored: bool,
-        /// Also show the staged diff; repeat for the unstaged one (git's -v).
-        #[arg(short = 'v', long, action = clap::ArgAction::Count)]
-        verbose: u8,
-        /// Count commits ahead of and behind the upstream (git's default).
-        #[arg(long, overrides_with = "no_ahead_behind")]
-        ahead_behind: bool,
-        /// Skip the ahead/behind count against the upstream.
-        #[arg(long)]
-        no_ahead_behind: bool,
+        /// Also list ignored files: `traditional` (default), `matching` or `no`.
+        #[arg(
+            long,
+            value_name = "MODE",
+            num_args = 0..=1,
+            require_equals = true,
+            value_parser = ["traditional", "matching", "no"],
+            default_missing_value = "traditional"
+        )]
+        ignored: Option<String>,
         /// Limit to these paths: files, folders or globs.
         paths: Vec<String>,
     },
@@ -813,6 +936,24 @@ pub enum Command {
         /// Pick hunks to stage, one by one (needs a terminal).
         #[arg(short = 'p', long)]
         patch: bool,
+        /// Pick what to stage from git's interactive menu (needs a terminal).
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Edit the unstaged diff in the editor and stage what is left.
+        #[arg(short = 'e', long)]
+        edit: bool,
+        /// Stage tracked files again with the clean filters and line
+        /// endings applied afresh (implies -u).
+        #[arg(long)]
+        renormalize: bool,
+        /// Set the executable bit of the added files in the index: `+x` or `-x`.
+        #[arg(
+            long,
+            value_name = "(+|-)x",
+            value_parser = ["+x", "-x"],
+            allow_hyphen_values = true
+        )]
+        chmod: Option<String>,
     },
     /// Stage every change.
     StageAll,
@@ -851,6 +992,17 @@ pub enum Command {
         /// For conflicted paths, take their side (git's --theirs).
         #[arg(long, conflicts_with_all = ["source", "staged"])]
         theirs: bool,
+        /// Recreate the merge conflicts of these paths (git's -m).
+        #[arg(short = 'm', long, conflicts_with_all = ["source", "staged"])]
+        merge: bool,
+        /// Recreate the conflicts with this marker style: merge, diff3 or zdiff3.
+        #[arg(
+            long,
+            value_name = "STYLE",
+            value_parser = ["merge", "diff3", "zdiff3"],
+            conflicts_with_all = ["source", "staged"]
+        )]
+        conflict: Option<String>,
         /// Keep files the source lacks instead of removing them.
         #[arg(long, overrides_with = "no_overlay")]
         overlay: bool,
@@ -858,7 +1010,7 @@ pub enum Command {
         #[arg(long, hide = true)]
         no_overlay: bool,
         /// Pick hunks to restore, one by one (needs a terminal).
-        #[arg(short = 'p', long, conflicts_with = "source")]
+        #[arg(short = 'p', long)]
         patch: bool,
         /// Accepted for git compatibility.
         #[arg(short = 'q', long, hide = true)]
@@ -912,18 +1064,64 @@ pub enum Command {
         /// `<unix>`, each with an optional `+HHMM` offset.
         #[arg(long, value_name = "DATE")]
         date: Option<String>,
-        /// Show what would be committed, without committing.
+        /// Show what would be committed, without committing: git's long
+        /// status, or `--short`, `--porcelain`, `-z`.
         #[arg(long)]
         dry_run: bool,
+        /// A dry run in git's short status format.
+        #[arg(long)]
+        short: bool,
+        /// A dry run in git's porcelain status format.
+        #[arg(long)]
+        porcelain: bool,
+        /// A dry run in git's long status format.
+        #[arg(long)]
+        long: bool,
+        /// A dry run with NUL-terminated entries (porcelain unless --short).
+        #[arg(short = 'z', long = "null")]
+        null: bool,
+        /// Show the branch in a --short or --porcelain dry run.
+        #[arg(long)]
+        branch: bool,
+        /// Untracked files in the dry run or template: `no`, `normal` or `all`.
+        #[arg(
+            short = 'u',
+            long = "untracked-files",
+            value_name = "MODE",
+            num_args = 0..=1,
+            value_parser = ["no", "normal", "all"],
+            default_missing_value = "all"
+        )]
+        untracked: Option<String>,
+        /// Put the status in the editor's message template (git's default;
+        /// commit.status).
+        #[arg(long, overrides_with = "no_status")]
+        status: bool,
+        /// Leave the status out of the message template.
+        #[arg(long)]
+        no_status: bool,
+        /// Start the message from this file (commit.template).
+        #[arg(short = 't', long, value_name = "FILE")]
+        template: Option<String>,
         /// Stage the given paths too, then commit the whole index (git's -i).
         #[arg(short = 'i', long, requires = "paths")]
         include: bool,
         /// Commit only the given paths (the default with paths; git's -o).
         #[arg(short = 'o', long, hide = true)]
         only: bool,
-        /// Accepted for git compatibility.
-        #[arg(short = 'v', long, hide = true)]
-        verbose: bool,
+        /// Show the diff to commit below the message template, and in a dry
+        /// run; repeat for the unstaged diff too (commit.verbose).
+        #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+        verbose: u8,
+        /// Do not show the diff in the template, whatever commit.verbose says.
+        #[arg(long)]
+        no_verbose: bool,
+        /// Pick the hunks to commit first, as `add -p` does.
+        #[arg(short = 'p', long)]
+        patch: bool,
+        /// Pick what to commit first from `add -i`'s menu.
+        #[arg(long)]
+        interactive: bool,
         /// Stage all tracked, modified files before committing (git's -a).
         #[arg(short = 'a', long = "all", conflicts_with = "paths")]
         all: bool,
@@ -1239,7 +1437,7 @@ pub enum Command {
         #[arg(short = 'm', long, conflicts_with = "force")]
         merge: bool,
         /// Conflict marker style for -m: `merge` or `diff3`.
-        #[arg(long, value_name = "STYLE", value_parser = ["merge", "diff3"])]
+        #[arg(long, value_name = "STYLE", value_parser = ["merge", "diff3", "zdiff3"])]
         conflict: Option<String>,
         /// Start a new branch with no history at `rev` (default HEAD).
         #[arg(long, value_name = "NEW_BRANCH", conflicts_with_all = ["branch", "force_branch", "detach"])]
@@ -1300,7 +1498,7 @@ pub enum Command {
         #[arg(short = 'm', long, conflicts_with = "discard_changes")]
         merge: bool,
         /// Conflict marker style for -m: `merge` or `diff3`.
-        #[arg(long, value_name = "STYLE", value_parser = ["merge", "diff3"])]
+        #[arg(long, value_name = "STYLE", value_parser = ["merge", "diff3", "zdiff3"])]
         conflict: Option<String>,
         /// Start a new branch with no history and an empty working tree.
         #[arg(long, value_name = "NEW_BRANCH", conflicts_with_all = ["create", "force_create", "detach"])]
@@ -6048,7 +6246,7 @@ pub(crate) fn parse_date(s: &str) -> anyhow::Result<i64> {
 pub(crate) fn parse_git_date(s: &str) -> anyhow::Result<(i64, i32)> {
     let s = s.trim();
     let (rest, offset) = match s.strip_suffix('Z') {
-        Some(rest) => (rest, 0),
+        Some(rest) => (rest, Some(0)),
         None => {
             let tz = s
                 .rfind(['+', '-'])
@@ -6059,21 +6257,24 @@ pub(crate) fn parse_git_date(s: &str) -> anyhow::Result<(i64, i32)> {
                 {
                     let (h, m): (i32, i32) = (tz[1..3].parse()?, tz[3..].parse()?);
                     let sign = if tz.starts_with('-') { -1 } else { 1 };
-                    (rest, sign * (h * 60 + m))
+                    (rest, Some(sign * (h * 60 + m)))
                 }
-                _ => (s, 0),
+                _ => (s, None),
             }
         }
     };
     let rest = rest.trim();
     let unix = rest.strip_prefix('@').unwrap_or(rest);
     if let Ok(secs) = unix.parse::<i64>() {
-        return Ok((secs, offset));
+        return Ok((secs, offset.unwrap_or(0)));
     }
-    Ok((
-        parse_date(&format!("{rest} +0000"))? - i64::from(offset) * 60,
-        offset,
-    ))
+    let utc = parse_date(&format!("{rest} +0000"))?;
+    // A date without a zone is local time, as git reads it.
+    let offset = offset.unwrap_or_else(|| {
+        let guess = crate::pretty::local_offset(utc);
+        crate::pretty::local_offset(utc - i64::from(guess) * 60)
+    });
+    Ok((utc - i64::from(offset) * 60, offset))
 }
 
 /// One-line identity shared by the home view and the installed skill.
@@ -6569,7 +6770,7 @@ pub fn run(
             backend,
             &paths,
             untracked.as_deref(),
-            ignored,
+            ignored.as_deref(),
         )?),
         Command::Log {
             walk_reflogs: true, ..
@@ -6807,14 +7008,33 @@ pub fn run(
             intent_to_add,
             ignore_errors,
             patch,
+            interactive: add_interactive,
+            edit,
+            renormalize,
+            chmod,
         } => {
             if patch {
                 return crate::interactive::patch(
                     backend,
                     interactive,
-                    crate::interactive::PatchMode::Stage,
+                    crate::interactive::PatchMode::Add,
+                    None,
                     &paths,
                 );
+            }
+            if add_interactive {
+                if !interactive {
+                    anyhow::bail!("add -i needs a terminal; stage with `rgit add <paths>`");
+                }
+                crate::add_interactive::run(backend, &paths)?;
+                return Ok(String::new());
+            }
+            if edit {
+                return add_edit(backend, &paths);
+            }
+            if renormalize {
+                backend.renormalize(&paths)?;
+                return Ok("ok".to_owned());
             }
             if paths.is_empty() && !all && !update {
                 return Err(anyhow::Error::new(CliError {
@@ -6861,6 +7081,20 @@ pub fn run(
                 } else {
                     backend.add(&paths, update, force)?;
                 }
+                if let Some(flip) = chmod.as_deref().filter(|_| !paths.is_empty()) {
+                    let skipped = backend.index_chmod(&paths, flip == "+x")?;
+                    if !skipped.is_empty() {
+                        let sign = &flip[..1];
+                        anyhow::bail!(
+                            "{}",
+                            skipped
+                                .iter()
+                                .map(|p| format!("cannot chmod {sign}x '{p}'"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        );
+                    }
+                }
             }
             if dry_run || verbose {
                 lines.join("\n")
@@ -6894,20 +7128,31 @@ pub fn run(
             worktree,
             ours,
             theirs,
+            merge,
+            conflict,
             overlay,
             patch,
             ..
         } => {
+            if merge || conflict.is_some() {
+                return merge_paths(backend, &paths, conflict.as_deref());
+            }
             if patch {
                 use crate::interactive::PatchMode;
-                let mode = if staged && !worktree {
-                    PatchMode::Unstage
-                } else if !staged {
-                    PatchMode::Discard
-                } else {
-                    anyhow::bail!("restore -p restores the index or the working tree, not both");
+                // git's `restore --staged` defaults its source to HEAD.
+                let source = source.or_else(|| staged.then(|| "HEAD".to_owned()));
+                let mode = match (staged, worktree || !staged) {
+                    (true, true) => PatchMode::Checkout,
+                    (true, false) => PatchMode::Reset,
+                    _ => PatchMode::Worktree,
                 };
-                return crate::interactive::patch(backend, interactive, mode, &paths);
+                return crate::interactive::patch(
+                    backend,
+                    interactive,
+                    mode,
+                    source.as_deref(),
+                    &paths,
+                );
             }
             if ours || theirs {
                 ok(backend.checkout_side(&paths, ours))?
@@ -6945,14 +7190,87 @@ pub fn run(
             reset_author,
             date,
             dry_run,
+            short,
+            porcelain,
+            long,
+            null,
+            branch,
+            untracked,
+            status,
+            no_status,
+            template,
             include,
             quiet: _,
             only: _,
-            verbose: _,
+            verbose,
+            no_verbose,
+            patch,
+            interactive: menu,
             sign,
             mut paths,
         } => {
+            if menu {
+                if !interactive {
+                    anyhow::bail!("commit --interactive needs a terminal");
+                }
+                crate::add_interactive::run(backend, &paths)?;
+                paths.clear();
+            }
+            if patch {
+                crate::interactive::patch(
+                    backend,
+                    interactive,
+                    crate::interactive::PatchMode::Add,
+                    None,
+                    &paths,
+                )?;
+                paths.clear();
+            }
+            let config_verbose = || {
+                let v = backend.config_get("commit.verbose").ok().flatten()?;
+                match v.to_ascii_lowercase().as_str() {
+                    "true" | "yes" | "on" => Some(1),
+                    "false" | "no" | "off" => Some(0),
+                    n => n.parse::<u8>().ok(),
+                }
+            };
+            let verbose = match (no_verbose, verbose) {
+                (true, _) => 0,
+                (false, 0) => config_verbose().unwrap_or(0),
+                (false, n) => n,
+            };
+            let mut opts = rgit_git::StatusOpts {
+                untracked: untracked.clone(),
+                verbose,
+                amend,
+                commit: true,
+                commit_all: all,
+                commit_include: include,
+                commit_paths: paths.clone(),
+                ..Default::default()
+            };
+            if dry_run || short || porcelain || long || null {
+                use rgit_git::StatusFormat;
+                opts.format = if short {
+                    Some(StatusFormat::Short)
+                } else if porcelain {
+                    Some(StatusFormat::Porcelain)
+                } else if long || !null {
+                    Some(StatusFormat::Long)
+                } else {
+                    None
+                };
+                opts.branch = branch.then_some(true);
+                opts.null = null;
+                let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+                status_env(backend, &mut opts, tty && !render::color_on(), tty);
+                let report = backend.status_text(&opts)?;
+                set_exit(!report.committable);
+                print_as_is();
+                return Ok(String::from_utf8_lossy(&report.text).into_owned());
+            }
             let reuse = reuse_message.as_ref().or(reedit_message.as_ref());
+            let given = file.is_some() || reuse.is_some() || !message.is_empty();
             let mut text = match (file.as_deref(), reuse) {
                 (Some("-"), _) => std::io::read_to_string(std::io::stdin())?,
                 (Some(f), _) => std::fs::read_to_string(f)
@@ -6963,6 +7281,7 @@ pub fn run(
             let target = fixup
                 .map(|r| ("fixup", r))
                 .or(squash.map(|r| ("squash", r)));
+            let fixing = target.is_some();
             if let Some((kind, rev)) = target {
                 let old = backend.commit_overview(&rev)?.message;
                 let head = format!("{kind}! {}", old.lines().next().unwrap_or(""));
@@ -6972,24 +7291,67 @@ pub fn run(
                     format!("{head}\n\n{text}")
                 };
             }
-            if text.is_empty() && amend && (no_edit || edit) {
+            // -e always opens the editor, as does a commit with no message
+            // on a terminal; -c only on a terminal, as git would have no one
+            // to edit for.
+            let use_editor = edit
+                || (!no_edit && reedit_message.is_some() && interactive)
+                || (!given && !no_edit && !fixing && interactive);
+            let git_dir = backend.git_dir();
+            let read = |name: &str| std::fs::read_to_string(git_dir.join(name)).ok();
+            let template =
+                template.or_else(|| backend.config_get("commit.template").ok().flatten());
+            let mut template_text = None;
+            if text.is_empty() && amend {
                 text = backend.head_message().unwrap_or_default();
-            }
-            // Like git: a merge, squash or stopped pick prepared the message.
-            if text.is_empty() && !amend {
-                text = backend.prepared_message().unwrap_or_default();
-            }
-            // -e always opens the editor, -c only on a terminal, as git would
-            // have no one to edit for.
-            if edit || (reedit_message.is_some() && !no_edit && interactive) {
-                text = crate::interactive::edit_message(backend, &text)?;
-            }
-            if dry_run {
-                let status = backend.status()?;
-                if status.staged.is_empty() && !all && paths.is_empty() && !allow_empty {
-                    anyhow::bail!("nothing to commit");
+            } else if text.is_empty() && !fixing {
+                // Like git: a merge, squash or stopped pick prepared the message.
+                match read("MERGE_MSG").or_else(|| read("SQUASH_MSG")) {
+                    Some(m) => text = m,
+                    None => {
+                        if let Some(t) = &template {
+                            let path = expand_home(t);
+                            let t = std::fs::read_to_string(&path).map_err(|_| {
+                                anyhow::anyhow!("could not read '{}'", path.display())
+                            })?;
+                            text = t.clone();
+                            template_text = Some(t);
+                        }
+                    }
                 }
-                return Ok(render::status(&status));
+            }
+            if use_editor {
+                let include_status = if status || no_status {
+                    status
+                } else {
+                    backend
+                        .config_get("commit.status")
+                        .ok()
+                        .flatten()
+                        .is_none_or(|v| !matches!(v.as_str(), "false" | "no" | "off" | "0"))
+                };
+                let mut body = if template_text.is_some() {
+                    text.clone()
+                } else {
+                    clean_message(&text, false)
+                };
+                if include_status {
+                    let reuse_from = reuse.cloned().or(amend.then(|| "HEAD".to_owned()));
+                    body.push_str(&commit_template_status(
+                        backend,
+                        &mut opts,
+                        author.as_deref(),
+                        reuse_from.filter(|_| !reset_author).as_deref(),
+                        date.as_deref(),
+                    )?);
+                }
+                text = crate::interactive::edit_message(backend, &body, verbose > 0)?;
+                if text.is_empty() {
+                    anyhow::bail!("Aborting commit due to empty commit message.");
+                }
+                if template_text.is_some_and(|t| clean_message(&t, true) == text) {
+                    anyhow::bail!("Aborting commit; you did not edit the message.");
+                }
             }
             let message = resolve(
                 (!text.trim().is_empty()).then_some(text),
@@ -7312,15 +7674,11 @@ pub fn run(
                 r == "-" || backend.rev_parse(r).is_ok() || guess_remote(backend, r).is_some()
             });
             if patch {
-                if let Some(rev) = rev {
-                    anyhow::bail!(
-                        "checkout -p from a revision ({rev}) is not supported; run `rgit checkout -p` to discard working-tree hunks"
-                    );
-                }
                 return crate::interactive::patch(
                     backend,
                     interactive,
-                    crate::interactive::PatchMode::Discard,
+                    crate::interactive::PatchMode::Checkout,
+                    rev.as_deref(),
                     &paths,
                 );
             }
@@ -7330,6 +7688,9 @@ pub fn run(
                 }
                 backend.checkout_side(&paths, ours)?;
                 return Ok(format!("checked out {} from the conflict", paths.join(" ")));
+            }
+            if !paths.is_empty() && rev.is_none() && (merge || conflict.is_some()) {
+                return merge_paths(backend, &paths, conflict.as_deref());
             }
             if !paths.is_empty() {
                 // `checkout [<rev>] -- <paths>`: take the paths from <rev> into
@@ -7588,15 +7949,11 @@ pub fn run(
             let (rev, paths) =
                 rev_and_paths(rev, pathspec, paths, |r| backend.rev_parse(r).is_ok());
             if patch {
-                if let Some(rev) = rev.filter(|r| r != "HEAD") {
-                    anyhow::bail!(
-                        "reset -p to a revision ({rev}) is not supported; run `rgit reset -p` to unstage hunks"
-                    );
-                }
                 return crate::interactive::patch(
                     backend,
                     interactive,
-                    crate::interactive::PatchMode::Unstage,
+                    crate::interactive::PatchMode::Reset,
+                    rev.as_deref(),
                     &paths,
                 );
             }
@@ -7773,18 +8130,18 @@ pub fn run(
                             "stash -p picks hunks on a terminal; stash whole files with `rgit stash push -- <path>`",
                         ));
                     }
-                    let files = backend.diff(&rgit_git::DiffSpec {
-                        from: Some("HEAD".to_owned()),
-                        paths: paths.clone(),
-                        ..rgit_git::DiffSpec::default()
-                    })?;
-                    let hunks = crate::interactive::pick_hunks(&files, "Stash")?;
-                    if hunks.is_empty() {
+                    let picked = crate::add_patch::run(
+                        backend,
+                        crate::add_patch::Kind::Stash,
+                        None,
+                        &paths,
+                    )?;
+                    if picked.is_empty() {
                         return Ok("No changes selected".to_owned());
                     }
                     ok_msg(backend.stash_push_part(
                         p.message.as_deref(),
-                        Some(&hunks),
+                        Some(&picked),
                         !p.no_keep_index,
                         &paths,
                     ))?
@@ -10785,6 +11142,34 @@ struct SwitchOpts {
 }
 
 /// The checkout mode for -f/-m and `--conflict`, which implies -m.
+/// `checkout -m`/`restore --merge` on paths: conflicts recreated, the rest
+/// taken from the index, reported as git does.
+fn merge_paths(
+    backend: &Arc<dyn GitBackend>,
+    paths: &[String],
+    style: Option<&str>,
+) -> anyhow::Result<String> {
+    let (recreated, updated, errors) = backend.checkout_merge(paths, style)?;
+    let s = |n: usize| if n == 1 { "" } else { "s" };
+    let mut lines = Vec::new();
+    if recreated > 0 {
+        lines.push(format!(
+            "Recreated {recreated} merge conflict{}",
+            s(recreated)
+        ));
+    }
+    if recreated == 0 || updated > 0 {
+        lines.push(format!(
+            "Updated {updated} path{} from the index",
+            s(updated)
+        ));
+    }
+    if !errors.is_empty() {
+        anyhow::bail!("{}", errors.join("\n"));
+    }
+    Ok(lines.join("\n"))
+}
+
 fn checkout_mode(force: bool, merge: bool, conflict: Option<&str>) -> rgit_git::CheckoutMode {
     if force {
         rgit_git::CheckoutMode::Force
@@ -12242,7 +12627,7 @@ pub(crate) fn status_view(
     backend: &Arc<dyn GitBackend>,
     paths: &[String],
     untracked: Option<&str>,
-    ignored: bool,
+    ignored: Option<&str>,
 ) -> anyhow::Result<rgit_git::RepoStatus> {
     let mut s = backend.status()?;
     if untracked == Some("no") {
@@ -12255,7 +12640,7 @@ pub(crate) fn status_view(
         s.entries.retain(|e| !e.is_untracked());
         s.unstaged.retain(|d| !gone.contains(&d.path));
     }
-    if ignored {
+    if ignored.is_some_and(|m| m != "no") {
         s.entries.extend(backend.ignored()?);
     }
     if !paths.is_empty() {
@@ -12265,6 +12650,157 @@ pub(crate) fn status_view(
         s.staged.retain(|d| keep(&d.path));
     }
     Ok(s)
+}
+
+/// Fill in what git's status reads from its surroundings: the current
+/// folder, the terminal and its width.
+pub fn status_env(
+    backend: &Arc<dyn GitBackend>,
+    opts: &mut rgit_git::StatusOpts,
+    no_color: bool,
+    tty: bool,
+) {
+    opts.prefix = crate::plumbing::top_and_prefix(backend)
+        .map(|(_, p)| p)
+        .unwrap_or_default();
+    opts.tty = tty;
+    if no_color {
+        opts.color = Some(false);
+    }
+    opts.width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .or_else(|| {
+            tty.then(crossterm::terminal::size)
+                .and_then(Result::ok)
+                .map(|(w, _)| usize::from(w))
+        })
+        .unwrap_or(80);
+}
+
+/// git's `add -e`: the unstaged diff (7 lines of context) in the editor,
+/// then what is left of it applied to the index.
+fn add_edit(backend: &Arc<dyn GitBackend>, paths: &[String]) -> anyhow::Result<String> {
+    let path = backend.git_dir().join("ADD_EDIT.patch");
+    std::fs::write(
+        &path,
+        backend.patch_diff(None, false, false, Some(7), paths)?,
+    )?;
+    crate::interactive::launch_editor(backend, &path)
+        .map_err(|_| anyhow::anyhow!("editing patch failed"))?;
+    let patch = std::fs::read(&path)?;
+    if patch.is_empty() {
+        anyhow::bail!("empty patch. aborted");
+    }
+    let opts = rgit_git::ApplyOpts {
+        cached: true,
+        recount: true,
+        quiet: true,
+        ..Default::default()
+    };
+    rgit_git::parse_patch(&patch, &opts)
+        .and_then(|files| backend.apply_patch(&files, &opts))
+        .map_err(|e| anyhow::anyhow!("could not apply '{}': {e}", path.display()))?;
+    let _ = std::fs::remove_file(&path);
+    Ok(String::new())
+}
+
+/// git's stripspace on a message, dropping `#` lines too with `comments`.
+pub(crate) fn clean_message(text: &str, comments: bool) -> String {
+    String::from_utf8_lossy(&rgit_git::stripspace(
+        text.as_bytes(),
+        comments.then_some("#"),
+    ))
+    .into_owned()
+}
+
+/// `~/x` as a path under the home folder, as git reads commit.template.
+fn expand_home(path: &str) -> PathBuf {
+    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(path),
+    }
+}
+
+/// The part of git's commit message template below the message: the
+/// instructions, the author and date when they are not the committer's
+/// own, and the `#` commented status (with the diff under `-v`).
+fn commit_template_status(
+    backend: &Arc<dyn GitBackend>,
+    opts: &mut rgit_git::StatusOpts,
+    author: Option<&str>,
+    reuse_from: Option<&str>,
+    date: Option<&str>,
+) -> anyhow::Result<String> {
+    let git_dir = backend.git_dir();
+    let mut out = String::new();
+    let whence = if git_dir.join("MERGE_HEAD").exists() {
+        Some(("merge", "MERGE_HEAD"))
+    } else if backend.rev_parse("CHERRY_PICK_HEAD").is_ok() {
+        Some(("cherry-pick", "CHERRY_PICK_HEAD"))
+    } else {
+        None
+    };
+    if let Some((what, head)) = whence {
+        out.push_str(&format!(
+            "#\n# It looks like you may be committing a {what}.\n\
+             # If this is not correct, please run\n\
+             #\tgit update-ref -d {head}\n# and try again.\n\n"
+        ));
+    }
+    out.push_str(
+        "\n# Please enter the commit message for your changes. Lines starting\n\
+         # with '#' will be ignored, and an empty message aborts the commit.\n",
+    );
+    let committer = crate::pretty::ident(&backend.ident(true)?);
+    let mut author_ident = match (author, reuse_from) {
+        (Some(a), _) if a.contains('<') => crate::pretty::ident(&format!("{a} 0 +0000")),
+        (_, Some(rev)) => crate::pretty::parse(&backend.read_object(rev)?).author,
+        _ => committer.clone(),
+    };
+    if author.is_some_and(|a| !a.contains('<')) {
+        author_ident = committer.clone();
+    }
+    let mut shown = false;
+    let mut line = |out: &mut String, text: String| {
+        if !shown {
+            out.push_str("#\n");
+            shown = true;
+        }
+        out.push_str(&text);
+    };
+    if (author_ident.name.as_str(), author_ident.email.as_str())
+        != (committer.name.as_str(), committer.email.as_str())
+    {
+        line(
+            &mut out,
+            format!(
+                "# Author:    {} <{}>\n",
+                author_ident.name, author_ident.email
+            ),
+        );
+    }
+    let when = match date {
+        Some(d) => Some(parse_git_date(d)?),
+        None => reuse_from.map(|_| (author_ident.time, author_ident.offset)),
+    };
+    if let Some((secs, offset)) = when {
+        line(
+            &mut out,
+            format!(
+                "# Date:      {}\n",
+                crate::pretty::format_date(secs, offset, "default")
+            ),
+        );
+    }
+    out.push_str("#\n");
+    opts.template = true;
+    opts.nowarn = true;
+    status_env(backend, opts, true, false);
+    let report = backend.status_text(opts)?;
+    out.push_str(&String::from_utf8_lossy(&report.text));
+    Ok(out)
 }
 
 /// Rewrite path arguments typed in a subfolder of the repo into repo-root

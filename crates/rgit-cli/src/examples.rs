@@ -1,7 +1,17 @@
 type Entry = (&'static str, &'static [&'static str]);
 
 const EXAMPLES: &[Entry] = &[
-    ("status", &["rgit status", "rgit status --toon"]),
+    (
+        "status",
+        &[
+            "rgit status",
+            "rgit status --toon",
+            "rgit status --long",
+            "rgit status -sb",
+            "rgit status --porcelain=v2 -b --show-stash",
+            "rgit status -vv -uall --ignored=matching",
+        ],
+    ),
     (
         "log",
         &[
@@ -351,6 +361,10 @@ const EXAMPLES: &[Entry] = &[
             "rgit add -A",
             "rgit add -u",
             "rgit add -p",
+            "rgit add -i",
+            "rgit add -e src/lib.rs",
+            "rgit add --chmod=+x build.sh",
+            "rgit add --renormalize .",
             "rgit add -n .",
         ],
     ),
@@ -368,6 +382,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit restore --staged src/lib.rs",
             "rgit restore --source HEAD~1 src/lib.rs",
             "rgit restore --ours src/lib.rs",
+            "rgit restore --merge src/lib.rs",
+            "rgit restore -p --source=HEAD~1 --staged --worktree",
         ],
     ),
     (
@@ -387,6 +403,9 @@ const EXAMPLES: &[Entry] = &[
             "rgit commit --amend --no-edit",
             "rgit commit --fixup <rev>",
             "rgit commit -C <rev> --reset-author",
+            "rgit commit --dry-run -a",
+            "rgit commit --short",
+            "rgit commit -v -e -m \"<message>\"",
         ],
     ),
     ("extend", &["rgit extend"]),
@@ -491,6 +510,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit checkout <rev> -- src/lib.rs",
             "rgit checkout -f <branch>",
             "rgit checkout --theirs -- src/lib.rs",
+            "rgit checkout --conflict=diff3 -- src/lib.rs",
+            "rgit checkout -p <rev>",
         ],
     ),
     (
@@ -602,6 +623,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit reset src/lib.rs",
             "rgit reset <rev> -- src/lib.rs",
             "rgit reset --merge",
+            "rgit reset -p <rev>",
         ],
     ),
     (

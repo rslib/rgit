@@ -10,6 +10,8 @@ use crate::cli::{Cli, CliError, Command, HooksCmd, OutputMode};
 use crate::output::Output;
 use crate::toon::{Node, Obj};
 
+mod add_interactive;
+mod add_patch;
 mod axi;
 mod clean;
 mod cli;
@@ -298,44 +300,42 @@ fn main() -> ! {
             }
         }
         // git's own status formats are for scripts: print them raw in every mode.
-        Some(Command::Status {
-            porcelain,
-            short,
-            branch,
-            z,
-            untracked,
-            ignored,
-            verbose,
-            ahead_behind,
-            no_ahead_behind,
-            paths,
-        }) if porcelain.is_some()
-            || short
-            || branch
-            || z
-            || verbose > 0
-            || ahead_behind
-            || no_ahead_behind =>
+        Some(command @ Command::Status { .. }) if matches!(&command, Command::Status { fmt, .. } if fmt.any()) =>
         {
-            if let Err(error) = discover_or_init(false) {
-                die(error, &emit);
-            }
-            let mut args = vec!["status".to_owned()];
-            args.extend(porcelain.map(|v| format!("--porcelain={v}")));
-            args.extend(short.then(|| "--short".to_owned()));
-            args.extend(branch.then(|| "--branch".to_owned()));
-            args.extend(z.then(|| "-z".to_owned()));
-            args.extend(untracked.map(|m| format!("--untracked-files={m}")));
-            args.extend(ignored.then(|| "--ignored".to_owned()));
-            args.extend((0..verbose).map(|_| "-v".to_owned()));
-            args.extend(ahead_behind.then(|| "--ahead-behind".to_owned()));
-            args.extend(no_ahead_behind.then(|| "--no-ahead-behind".to_owned()));
-            args.push("--".to_owned());
-            args.extend(paths);
-            // Run in the current folder so paths read and print as git's do.
-            match std::process::Command::new("git").args(&args).status() {
-                Ok(s) => exit(s.code().unwrap_or(1)),
-                Err(e) => die(anyhow::anyhow!("could not run git: {e}"), &emit),
+            let backend = match discover_or_init(false) {
+                Ok(backend) => backend,
+                Err(error) => die(error, &emit),
+            };
+            let Command::Status {
+                fmt,
+                untracked,
+                ignored,
+                paths,
+            } = cli::from_cwd(command, &backend)
+            else {
+                unreachable!()
+            };
+            let mut opts = fmt.opts(untracked.as_deref(), ignored.as_deref(), &paths);
+            cli::status_env(&backend, &mut opts, cli.no_color, stdout_is_terminal);
+            match backend.status_text(&opts) {
+                Ok(report) => {
+                    use std::io::Write;
+                    let mut out = std::io::stdout().lock();
+                    exit(i32::from(
+                        out.write_all(&report.text)
+                            .and_then(|()| out.flush())
+                            .is_err(),
+                    ));
+                }
+                Err(error) => die(
+                    cli::CliError {
+                        message: error.to_string(),
+                        help: None,
+                        code: 128,
+                    }
+                    .into(),
+                    &emit,
+                ),
             }
         }
         // An archive with no output file is raw bytes on stdout, as in git.

@@ -51,6 +51,7 @@ mod trailers;
 mod update_ref;
 mod walk;
 pub mod workflow;
+mod wt_status;
 
 /// Install a callback that supplies an SSH password when key-based auth over an
 /// `ssh://` remote fails and no ControlMaster socket is available to reuse. The
@@ -131,6 +132,7 @@ pub use trailers::{
     IfExists, IfMissing, NewTrailer, TrailerOpts, Where, interpret_trailers, parse_if_exists,
     parse_if_missing, parse_where,
 };
+pub use wt_status::{StatusFormat, StatusOpts, StatusReport, cut_line};
 
 /// Pathspec matching as git's GIT_LITERAL_PATHSPECS, GIT_NOGLOB_PATHSPECS and
 /// GIT_ICASE_PATHSPECS (`--literal-pathspecs` and friends) ask.

@@ -626,12 +626,15 @@ fn tools() -> Vec<Tool> {
             "Working-tree status: branch, upstream ahead/behind, change counts, and a files table \
              (path, staged, unstaged) that says so when the tree is clean. Ends with next-step help. \
              `paths` limits it to files, folders or globs; `untracked` is no/normal/all; \
-             `ignored` also lists ignored files.",
+             `ignored` also lists ignored files. `format` (long, short, porcelain, \
+             porcelain=v2) returns git's own status text instead; `branch` adds its branch line.",
             &[
                 FIELDS,
                 ("paths", "paths", false),
                 ("untracked", "string", false),
                 ("ignored", "boolean", false),
+                ("format", "string", false),
+                ("branch", "boolean", false),
             ],
         ),
         tool(
@@ -934,7 +937,9 @@ fn tools() -> Vec<Tool> {
             "Stage paths as git add does: new, changed and deleted files under `paths` (files, \
              folders, globs, `.`). `all` with no paths stages the whole repo; `update` stages \
              only tracked files; `force` adds ignored files. `dry_run` lists what would be \
-             added; `intent_to_add` records untracked paths with no content (git add -N).",
+             added; `intent_to_add` records untracked paths with no content (git add -N); \
+             `renormalize` restages tracked files through the clean filters; `chmod` (+x or -x) \
+             sets the executable bit in the index.",
             &[
                 ("paths", "paths", false),
                 ("all", "boolean", false),
@@ -942,13 +947,16 @@ fn tools() -> Vec<Tool> {
                 ("force", "boolean", false),
                 ("dry_run", "boolean", false),
                 ("intent_to_add", "boolean", false),
+                ("renormalize", "boolean", false),
+                ("chmod", "string", false),
             ],
         ),
         tool(
             "git_restore",
             "Restore paths in the working tree from the index, or from `source` (a revision). \
              `staged` restores the index instead (unstage); with `worktree` too, both. \
-             `ours`/`theirs` write that side of conflicted paths. Destructive; git_undo \
+             `ours`/`theirs` write that side of conflicted paths; `merge` recreates their \
+             conflicts, `conflict` (merge, diff3, zdiff3) in that marker style. Destructive; git_undo \
              restores them.",
             &[
                 ("paths", "paths", true),
@@ -957,6 +965,8 @@ fn tools() -> Vec<Tool> {
                 ("worktree", "boolean", false),
                 ("ours", "boolean", false),
                 ("theirs", "boolean", false),
+                ("merge", "boolean", false),
+                ("conflict", "string", false),
             ],
         ),
         tool(
@@ -973,10 +983,12 @@ fn tools() -> Vec<Tool> {
              date, `reuse_message` takes a revision's message and author (git -C), \
              `reset_author` makes you the author again, `signoff` adds Signed-off-by, \
              `allow_empty` commits no change, `fixup`/`squash` make an autosquash commit for \
-             a revision. Returns the commit report.",
+             a revision. Returns the commit report; `dry_run` instead returns git's status of \
+             what would be committed.",
             &[
                 ("message", "string", false),
                 ("paths", "paths", false),
+                ("dry_run", "boolean", false),
                 ("amend", "boolean", false),
                 ("no_edit", "boolean", false),
                 ("all", "boolean", false),
@@ -2948,15 +2960,28 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
     };
     Ok(Some(match a.tool {
         "git_status" => Command::Status {
-            porcelain: None,
-            short: false,
-            branch: false,
-            z: false,
+            fmt: {
+                let format = a.str("format");
+                let format = format.as_deref();
+                crate::cli::StatusArgs {
+                    long: format == Some("long"),
+                    short: format == Some("short"),
+                    porcelain: match format {
+                        Some("porcelain" | "porcelain=v1") => Some("v1".to_owned()),
+                        Some("porcelain=v2") => Some("v2".to_owned()),
+                        Some("long" | "short") | None => None,
+                        Some(_) => {
+                            return Err(
+                                a.invalid("format", "long, short, porcelain or porcelain=v2")
+                            );
+                        }
+                    },
+                    branch: a.flag("branch"),
+                    ..Default::default()
+                }
+            },
             untracked: a.str("untracked"),
-            ignored: a.flag("ignored"),
-            verbose: 0,
-            ahead_behind: false,
-            no_ahead_behind: false,
+            ignored: a.flag("ignored").then(|| "traditional".to_owned()),
             paths: a.strs("paths").unwrap_or_default(),
         },
         "git_log" => Command::Log {
@@ -3137,6 +3162,10 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             intent_to_add: a.flag("intent_to_add"),
             ignore_errors: false,
             patch: false,
+            interactive: false,
+            edit: false,
+            renormalize: a.flag("renormalize"),
+            chmod: a.str("chmod"),
         },
         "git_restore" => Command::Restore {
             paths: a.strs("paths")?,
@@ -3145,6 +3174,8 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             worktree: a.flag("worktree"),
             ours: a.flag("ours"),
             theirs: a.flag("theirs"),
+            merge: a.flag("merge"),
+            conflict: a.str("conflict"),
             overlay: false,
             no_overlay: false,
             patch: false,
@@ -3173,10 +3204,22 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             reedit_message: None,
             reset_author: a.flag("reset_author"),
             date: a.str("date"),
-            dry_run: false,
+            dry_run: a.flag("dry_run"),
+            short: false,
+            porcelain: false,
+            long: false,
+            null: false,
+            branch: false,
+            untracked: None,
+            status: false,
+            no_status: false,
+            template: None,
             include: false,
             only: false,
-            verbose: false,
+            verbose: 0,
+            no_verbose: false,
+            patch: false,
+            interactive: false,
             quiet: false,
             paths: a.strs("paths").unwrap_or_default(),
         },
@@ -4782,15 +4825,9 @@ mod tests {
         assert_eq!(
             call(&backend, "git_status", json!({})).unwrap(),
             cli(crate::cli::Command::Status {
-                porcelain: None,
-                short: false,
-                branch: false,
-                z: false,
+                fmt: Default::default(),
                 untracked: None,
-                ignored: false,
-                verbose: 0,
-                ahead_behind: false,
-                no_ahead_behind: false,
+                ignored: None,
                 paths: Vec::new(),
             })
         );

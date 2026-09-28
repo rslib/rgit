@@ -28,6 +28,41 @@ pub trait GitBackend: Send + Sync {
         Ok(())
     }
 
+    /// `git checkout -m -- <paths>` / `--conflict=<style>`: put back the
+    /// conflicts of resolved paths from the index's resolve-undo record,
+    /// rewrite each conflicted file with markers in `style` (merge, diff3
+    /// or zdiff3; merge.conflictStyle by default), and check out the other
+    /// paths from the index. Returns (conflicts recreated, paths updated,
+    /// errors).
+    fn checkout_merge(
+        &self,
+        paths: &[String],
+        style: Option<&str>,
+    ) -> Result<(usize, usize, Vec<String>), GitError>;
+
+    /// Stage the tracked files under `paths` again with the clean filters
+    /// and line endings applied afresh (`git add --renormalize`).
+    fn renormalize(&self, paths: &[String]) -> Result<(), GitError>;
+
+    /// Set or clear the executable bit of the index entries under `paths`
+    /// (`git add --chmod`); returns the paths that are not regular files.
+    fn index_chmod(&self, paths: &[String], executable: bool) -> Result<Vec<String>, GitError>;
+
+    /// git's own status output, long, short or porcelain, for `opts`.
+    fn status_text(&self, opts: &crate::StatusOpts) -> Result<crate::StatusReport, GitError>;
+
+    /// The plain patch of `git diff-files -p` (no `rev`), or of `git
+    /// diff-index [-R] [--cached] <rev> -p`, limited to `paths`, with
+    /// `context` lines (default 3): what the `-p` modes ask about.
+    fn patch_diff(
+        &self,
+        rev: Option<&str>,
+        cached: bool,
+        reverse: bool,
+        context: Option<u32>,
+        paths: &[String],
+    ) -> Result<Vec<u8>, GitError>;
+
     /// Ignored files and folders in the working tree (`git status --ignored`).
     fn ignored(&self) -> Result<Vec<StatusEntry>, GitError>;
 
@@ -315,14 +350,14 @@ pub trait GitBackend: Send + Sync {
     ) -> Result<String, GitError>;
 
     /// Stash part of the changes and take it out of the working tree: with
-    /// `hunks` None, only the staged changes (`git stash push --staged`);
-    /// else only those hunks, as (path, new-side start), of the HEAD to
-    /// working tree diff limited to `paths` (`git stash push -p`), resetting
-    /// the index too unless `keep_index`. Returns git's `Saved ...` line.
+    /// `picked` None, only the staged changes (`git stash push --staged`);
+    /// else the picked hunks, a patch against HEAD (`git stash push -p`),
+    /// resetting the index of `paths` too unless `keep_index`. Returns
+    /// git's `Saved ...` line.
     fn stash_push_part(
         &self,
         message: Option<&str>,
-        hunks: Option<&[(String, u32)]>,
+        picked: Option<&[u8]>,
         keep_index: bool,
         paths: &[String],
     ) -> Result<String, GitError>;

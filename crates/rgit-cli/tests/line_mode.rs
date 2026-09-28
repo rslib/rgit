@@ -16,6 +16,8 @@ fn git(dir: &Path, args: &[&str]) {
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
         .status()
         .expect("run git")
         .success();
@@ -107,7 +109,7 @@ fn patch_mode_picks_hunks() {
     let (out, ok) = run_dumb(&dir, &["add", "-p"], "y\nn\n");
     assert!(ok, "{out}");
     assert!(
-        out.contains("(1/2) Stage this hunk [y,n,q,a,d,s,?]?"),
+        out.contains("(1/2) Stage this hunk [y,n,q,a,d,j,J,g,/,s,e,p,?]?"),
         "{out}"
     );
     let staged = git_out(&dir, &["diff", "--cached"]);
@@ -180,4 +182,188 @@ fn dumb_terminal_select_by_fuzzy_text() {
         head.contains("refs/heads/feature"),
         "fuzzy text should have selected feature; HEAD was: {head}"
     );
+}
+
+/// Run `argv` in `dir` on a dumb pty with echo off, answering one line of
+/// `keys` each time the output goes quiet (then end of input), and return
+/// all it printed.
+fn drive(dir: &Path, argv: &[&str], keys: &[&str], editor: &Path) -> String {
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = CommandBuilder::new("sh");
+    cmd.arg("-c");
+    cmd.arg("stty -echo; exec \"$@\"");
+    cmd.arg("sh");
+    cmd.args(argv);
+    cmd.env("TERM", "dumb");
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd.env("GIT_PAGER", "cat");
+    cmd.env("RGIT_OPLOG", "0");
+    cmd.env("GIT_EDITOR", editor);
+    cmd.cwd(dir);
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("reader");
+    let mut writer = pair.master.take_writer().expect("writer");
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut out = Vec::new();
+    let mut keys = keys.iter();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match rx.recv_timeout(Duration::from_millis(400)) {
+            Ok(chunk) => out.extend(chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if child.try_wait().ok().flatten().is_some() || std::time::Instant::now() > deadline
+                {
+                    break;
+                }
+                match keys.next() {
+                    Some(k) => writeln!(writer, "{k}").expect("write"),
+                    None => write!(writer, "\x04").expect("eof"),
+                }
+                let _ = writer.flush();
+            }
+        }
+    }
+    while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(200)) {
+        out.extend(chunk);
+    }
+    let _ = child.kill();
+    String::from_utf8_lossy(&out).replace("\r\n", "\n")
+}
+
+/// A repo whose `f` has three hunks, `g` a staged and an unstaged change,
+/// `gone` deleted, `mode` made executable and `new` untracked.
+fn picker_repo(tag: &str) -> std::path::PathBuf {
+    let dir = repo_with_branches(tag);
+    let f = |changed: &[u32]| {
+        (1..=30)
+            .map(|i| {
+                if changed.contains(&i) {
+                    format!("x{i}\n")
+                } else {
+                    format!("{i}\n")
+                }
+            })
+            .collect::<String>()
+    };
+    std::fs::write(dir.join("f"), f(&[])).unwrap();
+    std::fs::write(dir.join("g"), "a\nb\n").unwrap();
+    std::fs::write(dir.join("gone"), "old\n").unwrap();
+    std::fs::write(dir.join("mode"), "x\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-qm", "files"]);
+    std::fs::write(dir.join("f"), f(&[1, 3, 20, 29])).unwrap();
+    std::fs::write(dir.join("g"), "a\nB\n").unwrap();
+    git(&dir, &["add", "g"]);
+    std::fs::write(dir.join("g"), "a\nBB\nc\n").unwrap();
+    std::fs::remove_file(dir.join("gone")).unwrap();
+    let mode = dir.join("mode");
+    let mut perm = std::fs::metadata(&mode).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&mode, perm).unwrap();
+    std::fs::write(dir.join("new"), "n\n").unwrap();
+    dir
+}
+
+/// git's and rgit's pickers print the same and leave the same index and
+/// working tree for the same keys.
+fn same_picker(tag: &str, args: &[&str], keys: &[&str]) {
+    let editor = std::env::temp_dir().join(format!("rgit-line-{}-hunkedit", std::process::id()));
+    std::fs::write(&editor, "#!/bin/sh\nsed -i.bak 's/^+x3$/+EDITED/' \"$1\"\n").unwrap();
+    let mut perm = std::fs::metadata(&editor).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+    std::fs::set_permissions(&editor, perm).unwrap();
+    let run = |bin: &str, side: &str| {
+        let dir = picker_repo(&format!("{tag}-{side}"));
+        let argv: Vec<&str> = std::iter::once(bin).chain(args.iter().copied()).collect();
+        let out = drive(&dir, &argv, keys, &editor);
+        let state = [
+            git_out(&dir, &["diff", "--cached"]),
+            git_out(&dir, &["diff"]),
+            git_out(&dir, &["status", "--porcelain"]),
+            git_out(&dir, &["stash", "show", "-p"]),
+        ]
+        .join("==\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        (out, state)
+    };
+    let git_side = run("git", "git");
+    let rgit_side = run(env!("CARGO_BIN_EXE_rgit"), "rgit");
+    assert_eq!(rgit_side, git_side, "{args:?} with keys {keys:?}");
+}
+
+#[test]
+fn patch_picker_matches_git() {
+    same_picker(
+        "basic",
+        &["add", "-p"],
+        &["y", "n", "y", "n", "y", "y", "n"],
+    );
+    same_picker("help", &["add", "-p"], &["?", "q"]);
+    same_picker(
+        "nav",
+        &["add", "-p"],
+        &["J", "j", "K", "k", "J", "J", "J", "K", "y", "q"],
+    );
+    same_picker("goto", &["add", "-p"], &["g", "3", "y", "g9", "g2", "q"]);
+    same_picker("search", &["add", "-p"], &["/x20", "y", "/nomatch", "q"]);
+    same_picker("split", &["add", "-p"], &["s", "y", "n", "y", "q"]);
+    same_picker("edit", &["add", "-p"], &["s", "n", "e", "q"]);
+    same_picker("bad", &["add", "-p"], &["zz", "x", "yes", "p", "q"]);
+    same_picker("reset", &["reset", "-p"], &["y", "n", "y"]);
+    same_picker("reset-rev", &["reset", "-p", "HEAD~1"], &["y", "n", "q"]);
+    same_picker("checkout", &["checkout", "-p"], &["y", "n", "s", "y", "q"]);
+    same_picker(
+        "checkout-head",
+        &["checkout", "-p", "HEAD"],
+        &["n", "y", "q"],
+    );
+    same_picker("restore", &["restore", "-p"], &["y", "n", "q"]);
+    same_picker(
+        "restore-staged",
+        &["restore", "-p", "--staged"],
+        &["y", "q"],
+    );
+    same_picker(
+        "restore-src",
+        &["restore", "-p", "--source=HEAD~1", "--staged", "--worktree"],
+        &["y", "n", "q"],
+    );
+    same_picker("stash", &["stash", "push", "-p"], &["y", "n", "y", "q"]);
+}
+
+#[test]
+fn add_interactive_matches_git() {
+    same_picker(
+        "i-status",
+        &["add", "-i"],
+        &["s", "h", "?", "9", "zz", "", "q"],
+    );
+    same_picker("i-update", &["add", "-i"], &["u", "1-2", "-1", "", "q"]);
+    same_picker("i-revert", &["add", "-i"], &["r", "*", "q"]);
+    same_picker("i-untracked", &["add", "-i"], &["a", "n", "", "q"]);
+    same_picker(
+        "i-patch",
+        &["add", "-i"],
+        &["p", "1", "", "y", "n", "q", "q"],
+    );
+    same_picker("i-diff", &["add", "-i"], &["d", "1", "quit"]);
+    same_picker("i-eof", &["add", "-i"], &[]);
 }

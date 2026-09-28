@@ -38,6 +38,17 @@ pub fn run(
     };
     Ok(match command {
         Command::Status {
+            fmt,
+            untracked,
+            ignored,
+            paths,
+        } if fmt.any() => {
+            let mut opts = fmt.opts(untracked.as_deref(), ignored.as_deref(), &paths);
+            crate::cli::status_env(backend, &mut opts, true, false);
+            let report = backend.status_text(&opts)?;
+            Output::from(String::from_utf8_lossy(&report.text).into_owned())
+        }
+        Command::Status {
             untracked,
             ignored,
             paths,
@@ -46,7 +57,7 @@ pub fn run(
             backend,
             &paths,
             untracked.as_deref(),
-            ignored,
+            ignored.as_deref(),
         )?),
         Command::Log {
             format,

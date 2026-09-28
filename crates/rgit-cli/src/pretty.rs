@@ -42,7 +42,7 @@ pub struct Reflog {
 }
 
 /// `Name <email> 1700000000 +0100` from a commit header.
-fn ident(s: &str) -> Ident {
+pub(crate) fn ident(s: &str) -> Ident {
     let (name, rest) = s.split_once(" <").unwrap_or((s, ""));
     let (email, rest) = rest.split_once("> ").unwrap_or((rest, ""));
     let (time, tz) = rest.split_once(' ').unwrap_or((rest, "+0000"));

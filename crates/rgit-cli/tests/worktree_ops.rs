@@ -810,3 +810,319 @@ fn status_formats_match_git() {
         assert_eq!(ok(&dir, args), git(&dir, args), "{args:?}");
     }
 }
+
+/// `git status <args>` and `rgit status <args>` print the same bytes in
+/// `dir`, without the user's git config.
+fn status_same(dir: &Path, args: &[&str]) {
+    let run = |bin: &str, extra: &[&str]| {
+        let out = Command::new(bin)
+            .args(extra)
+            .arg("status")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("RGIT_OPLOG", "0")
+            .env("COLUMNS", "60")
+            .output()
+            .unwrap();
+        (out.stdout, out.status.success())
+    };
+    let (g, gok) = run("git", &[]);
+    let (r, rok) = run(env!("CARGO_BIN_EXE_rgit"), &["--human"]);
+    assert_eq!(rok, gok, "status {args:?} in {dir:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&r),
+        String::from_utf8_lossy(&g),
+        "status {args:?} in {dir:?}"
+    );
+}
+
+const STATUS_FORMS: &[&[&str]] = &[
+    &["--long"],
+    &["-v"],
+    &["-vv"],
+    &["-s"],
+    &["-sb"],
+    &["--porcelain"],
+    &["--porcelain", "-b", "-z"],
+    &["--porcelain=v2", "-b", "--show-stash"],
+    &["--porcelain=v2", "-z"],
+    &["--long", "-uno"],
+    &["--long", "-uall", "--ignored"],
+    &["-s", "--ignored=matching"],
+    &["-s", "--no-renames"],
+    &["--long", "--no-ahead-behind"],
+];
+
+fn status_all_forms(dir: &Path) {
+    for args in STATUS_FORMS {
+        status_same(dir, args);
+    }
+}
+
+#[test]
+fn status_long_short_and_porcelain_match_git_in_many_states() {
+    let dir = repo("st-mixed");
+    write(&dir, "a", "3\n");
+    git(&dir, &["add", "a"]);
+    write(&dir, "a", "4\n");
+    std::fs::remove_file(dir.join("d/c")).unwrap();
+    git(&dir, &["mv", "b", "b2"]);
+    write(&dir, "new", "n\n");
+    git(&dir, &["add", "new"]);
+    write(&dir, "sp ace", "s\n");
+    std::fs::create_dir_all(dir.join("ud/x")).unwrap();
+    write(&dir, "ud/x/z", "z\n");
+    write(&dir, ".gitignore", "*.o\nig/\n");
+    write(&dir, "x.o", "o\n");
+    std::fs::create_dir_all(dir.join("ig")).unwrap();
+    write(&dir, "ig/f", "f\n");
+    write(&dir, "later", "l\n");
+    git(&dir, &["add", "-N", "later"]);
+    git(&dir, &["branch", "up", "HEAD~1"]);
+    git(&dir, &["branch", "-u", "up"]);
+    status_all_forms(&dir);
+    status_all_forms(&dir.join("d"));
+    status_same(&dir.join("d"), &["-s", ".."]);
+    status_same(&dir, &["-s", "ud/x"]);
+
+    let dir = repo("st-merge");
+    conflicted(&dir);
+    status_all_forms(&dir);
+
+    let dir = repo("st-rebase");
+    branches(&dir);
+    git(&dir, &["switch", "-q", "side"]);
+    let _ = out_of(&dir, &["rebase", "main"]);
+    status_all_forms(&dir);
+
+    let dir = repo("st-detached");
+    git(&dir, &["checkout", "-q", "HEAD~1"]);
+    write(&dir, "b", "x\n");
+    status_all_forms(&dir);
+
+    let dir = std::env::temp_dir().join(format!("rgit-wtops-{}-st-init", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    write(&dir, "a", "a\n");
+    git(&dir, &["add", "a"]);
+    write(&dir, "b", "b\n");
+    status_all_forms(&dir);
+}
+
+#[test]
+fn status_columns_and_color_match_git() {
+    let dir = repo("st-col");
+    for i in 0..25 {
+        write(&dir, &format!("file{i}"), "x\n");
+    }
+    for col in [
+        "--column",
+        "--column=row",
+        "--column=dense",
+        "--column=plain",
+    ] {
+        status_same(&dir, &["--long", col]);
+    }
+    git(&dir, &["config", "color.status", "always"]);
+    git(&dir, &["config", "color.ui", "always"]);
+    write(&dir, "a", "x  \n");
+    status_same(&dir, &["--long"]);
+    status_same(&dir, &["-sb"]);
+    status_same(&dir, &["-vv"]);
+}
+
+/// Run `git commit <args>` and `rgit commit <args>` in twin repos under an
+/// editor that saves the template it was given; require the same output,
+/// exit, template and resulting commit.
+fn commit_same(tag: &str, setup: impl Fn(&Path), args: &[&str]) {
+    let (g, r) = (repo(&format!("{tag}-git")), repo(&format!("{tag}-rgit")));
+    let editor = g.with_file_name(format!("rgit-wtops-{}-{tag}-editor", std::process::id()));
+    std::fs::write(&editor, "#!/bin/sh\ncp \"$1\" \"$1.seen\"\n").unwrap();
+    std::fs::set_permissions(&editor, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let run = |dir: &Path, bin: &str, extra: &[&str]| {
+        setup(dir);
+        let out = Command::new(bin)
+            .args(extra)
+            .arg("commit")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_EDITOR", &editor)
+            .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+            .env("RGIT_OPLOG", "0")
+            .output()
+            .unwrap();
+        let seen =
+            std::fs::read_to_string(dir.join(".git/COMMIT_EDITMSG.seen")).unwrap_or_default();
+        let dry = args
+            .iter()
+            .any(|a| ["--dry-run", "--short", "--porcelain", "--long", "-z"].contains(a));
+        (
+            if dry {
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            } else {
+                String::new()
+            },
+            out.status.success(),
+            seen,
+            [
+                git(dir, &["status", "--short", "--branch"]),
+                git(dir, &["ls-files", "--stage"]),
+                git(dir, &["diff"]),
+                // First parents only: twin merges may order their sides apart.
+                out_of(dir, &["log", "--first-parent", "--format=%T %an <%ae>%n%B"]),
+            ]
+            .join("\n"),
+        )
+    };
+    assert_eq!(
+        run(&r, env!("CARGO_BIN_EXE_rgit"), &["--human"]),
+        run(&g, "git", &[]),
+        "commit {args:?}"
+    );
+}
+
+#[test]
+fn commit_dry_run_and_editor_template_match_git() {
+    let mixed = |d: &Path| {
+        write(d, "a", "3\n");
+        git(d, &["add", "a"]);
+        write(d, "b", "3\n");
+        write(d, "u", "u\n");
+        git(d, &["branch", "-q", "up", "HEAD~1"]);
+        git(d, &["branch", "-q", "-u", "up"]);
+    };
+    for args in [
+        &["--dry-run"][..],
+        &["--dry-run", "-v"],
+        &["--short"],
+        &["--porcelain", "--branch"],
+        &["-z"],
+        &["--dry-run", "-a"],
+        &["--dry-run", "b"],
+        &["--dry-run", "--amend"],
+        &["--dry-run", "-uno"],
+        &["-e", "-m", "hello"],
+        &["-e", "-v", "-m", "hello"],
+        &["-e", "-vv", "-m", "hello"],
+        &["-e", "--no-status", "-m", "hello"],
+        &["-e", "-a", "-m", "hello"],
+        &["-e", "--author=A U <a@u>", "-m", "hello"],
+        &["--amend", "-e"],
+    ] {
+        let tag: String = args
+            .concat()
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        commit_same(&format!("tmpl-{tag}"), mixed, args);
+    }
+    commit_same("tmpl-clean", |_| {}, &["--dry-run"]);
+    commit_same("tmpl-merge", conflicted, &["--dry-run"]);
+    let merge = |d: &Path| {
+        conflicted(d);
+        write(d, "a", "fixed\n");
+        git(d, &["add", "a"]);
+    };
+    commit_same("tmpl-merge-e", merge, &["-e"]);
+    commit_same("tmpl-merge-no-edit", merge, &["--no-edit"]);
+    let template = |d: &Path| {
+        mixed(d);
+        write(d, ".git/tmpl", "Template line\n\n# comment\n");
+        git(d, &["config", "commit.template", ".git/tmpl"]);
+        git(d, &["config", "commit.verbose", "true"]);
+    };
+    commit_same("tmpl-template", template, &["-e"]);
+    commit_same("tmpl-template-m", template, &["-e", "-m", "x"]);
+    let ita = |d: &Path| {
+        write(d, "n", "n\n");
+        git(d, &["add", "-N", "n"]);
+        write(d, "a", "3\n");
+        git(d, &["add", "a"]);
+    };
+    commit_same("ita", ita, &["-m", "x"]);
+}
+
+#[test]
+fn checkout_merge_recreates_conflicts() {
+    let edited = |d: &Path| {
+        conflicted(d);
+        write(d, "a", "junk\n");
+    };
+    let resolved = |d: &Path| {
+        conflicted(d);
+        write(d, "a", "fixed\n");
+        git(d, &["add", "a"]);
+    };
+    same_res("co-m-paths", edited, &["checkout", "-m", "a"]);
+    same_res("co-diff3", edited, &["checkout", "--conflict=diff3", "a"]);
+    same_res(
+        "co-zdiff3",
+        edited,
+        &["checkout", "--conflict=zdiff3", "--", "a"],
+    );
+    same_res("co-m-resolved", resolved, &["checkout", "-m", "a"]);
+    same_res("rs-merge", edited, &["restore", "--merge", "a"]);
+    same_res(
+        "rs-conflict",
+        resolved,
+        &["restore", "--conflict=diff3", "a"],
+    );
+}
+
+#[test]
+fn add_chmod_and_renormalize() {
+    same_res(
+        "add-chmod",
+        |d| write(d, "n", "x\n"),
+        &["add", "--chmod=+x", "n", "a"],
+    );
+    same_res(
+        "add-chmod-off",
+        |d| {
+            git(d, &["update-index", "--chmod=+x", "a"]);
+        },
+        &["add", "--chmod=-x", "a"],
+    );
+    let crlf = |d: &Path| {
+        write(d, "w", "x\r\ny\r\n");
+        git(d, &["add", "w"]);
+        git(d, &["commit", "-qm", "w"]);
+        write(d, ".gitattributes", "* text=auto\n");
+    };
+    same_res("add-renormalize", crlf, &["add", "--renormalize", "."]);
+}
+
+#[test]
+fn add_edit_stages_the_edited_patch() {
+    let editor = std::env::temp_dir().join(format!("rgit-wtops-{}-add-e", std::process::id()));
+    // Keep the change to a, drop the one to b.
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\nawk '/^diff --git a\\/b/{skip=1} /^diff --git a\\/a/{skip=0} !skip' \"$1\" > \"$1.new\" && mv \"$1.new\" \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let run = |bin: &str, extra: &[&str], tag: &str| {
+        let dir = repo(tag);
+        write(&dir, "a", "3\n");
+        write(&dir, "b", "3\n");
+        let out = Command::new(bin)
+            .args(extra)
+            .args(["add", "-e"])
+            .current_dir(&dir)
+            .env("GIT_EDITOR", &editor)
+            .env("RGIT_OPLOG", "0")
+            .output()
+            .unwrap();
+        (out.status.success(), state(&dir))
+    };
+    assert_eq!(
+        run(env!("CARGO_BIN_EXE_rgit"), &["--human"], "add-e-rgit"),
+        run("git", &[], "add-e-git")
+    );
+}

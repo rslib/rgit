@@ -4,7 +4,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 
 ## Inspect
 
-- `status`: Compact working-tree status. Agents: add `--toon` for a structured table. `--porcelain`, `--short`, `--branch`, and `-z` print git's raw formats, exactly as `git status` does, for scripts. e.g. `rgit status`, `rgit status --toon`
+- `status`: Compact working-tree status. Agents: add `--toon` for a structured table. `--long`, `--porcelain`, `--short`, `--branch`, `-z`, `-v` and git's other status flags print git's own formats byte for byte, for scripts. e.g. `rgit status`, `rgit status --toon`, `rgit status --long`, `rgit status -sb`, `rgit status --porcelain=v2 -b --show-stash`, `rgit status -vv -uall --ignored=matching`
 - `log`: Recent commits as `sha subject` lines, or in git's formats with `--oneline`, `--format`, `--pretty` or `--graph`. e.g. `rgit log --limit 50`, `rgit log main -- src/lib.rs`, `rgit log main..feature`, `rgit log --author alice --since 2024-01-01`, `rgit log --grep fix --no-merges -p`, `rgit log --follow --stat -- src/lib.rs`, `rgit log --oneline --graph --all`, `rgit log --oneline -S parse_date -- src`, `rgit log --oneline --left-right --cherry-pick main...feature`, `rgit log --since='last friday' --until=yesterday`, `rgit log -g -5 --oneline`, `rgit log -3 --format='%h %an %ar %s' --date=iso`, `rgit log -L :parse_date:src/cli.rs --oneline`, `rgit log --merges --cc --oneline`
 - `diff`: Diffstat of unstaged changes (`--cached` for staged), against a revision, or between two revisions (`A B`, `A..B`, `A...B`). e.g. `rgit diff`, `rgit diff --cached -- src`, `rgit diff main...HEAD --name-status`, `rgit diff v1 HEAD --patch -U1 -w -- src`, `rgit diff --quiet && echo clean`, `rgit diff main --name-only --diff-filter=A`, `rgit diff --no-index a.txt b.txt --patch`
 - `show`: A commit's header and diffstat, or a file (`rev:path`) or folder at a revision. e.g. `rgit show HEAD`, `rgit show <rev> --patch`, `rgit show <rev> --name-only`, `rgit show <rev> --pretty=fuller --stat`, `rgit show HEAD~1:src/lib.rs`, `rgit show <merge> --remerge-diff --format=medium`, `rgit show <merge> -m --stat --oneline`
@@ -19,9 +19,9 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `unstage`: Unstage paths, some hunks of one path, or specific lines of one hunk. e.g. `rgit unstage src/lib.rs`, `rgit unstage src/lib.rs --hunk 42`
 - `stage-all`: Stage every change. e.g. `rgit stage-all`
 - `unstage-all`: Unstage everything. e.g. `rgit unstage-all`
-- `add`: Stage paths as git's `add` does: `add <paths>`, `add .`, `add -A`, `add -u`. e.g. `rgit add .`, `rgit add src/ '*.md'`, `rgit add -A`, `rgit add -u`, `rgit add -p`, `rgit add -n .`
+- `add`: Stage paths as git's `add` does: `add <paths>`, `add .`, `add -A`, `add -u`. e.g. `rgit add .`, `rgit add src/ '*.md'`, `rgit add -A`, `rgit add -u`, `rgit add -p`, `rgit add -i`, `rgit add -e src/lib.rs`, `rgit add --chmod=+x build.sh`, `rgit add --renormalize .`, `rgit add -n .`
 - `discard`: Discard unstaged changes to paths, some hunks of one path, or specific lines. e.g. `rgit discard src/lib.rs`, `rgit discard src/lib.rs --hunk 10`
-- `restore`: Restore files in the working tree (or, with --staged, the index) from the index or a revision. e.g. `rgit restore src/lib.rs`, `rgit restore --staged src/lib.rs`, `rgit restore --source HEAD~1 src/lib.rs`, `rgit restore --ours src/lib.rs`
+- `restore`: Restore files in the working tree (or, with --staged, the index) from the index or a revision. e.g. `rgit restore src/lib.rs`, `rgit restore --staged src/lib.rs`, `rgit restore --source HEAD~1 src/lib.rs`, `rgit restore --ours src/lib.rs`, `rgit restore --merge src/lib.rs`, `rgit restore -p --source=HEAD~1 --staged --worktree`
 - `resolve`: Resolve a conflicted path by taking ours or theirs. e.g. `rgit resolve src/lib.rs --ours`, `rgit resolve src/lib.rs --theirs`
 - `rm`: Remove tracked paths from the index and working tree. e.g. `rgit rm src/lib.rs`, `rgit rm src/lib.rs --cached`, `rgit rm -n -r src/`
 - `mv`: Rename/move tracked files or folders. e.g. `rgit mv src/old.rs src/new.rs`, `rgit mv -n src/old.rs src/new.rs`
@@ -29,7 +29,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 
 ## Commit and rewrite history
 
-- `commit`: Commit the staged changes (runs hooks), or only the given paths. e.g. `rgit commit -m "<message>"`, `rgit commit -a -m "<message>"`, `rgit commit src/lib.rs -m "<message>"`, `rgit commit -m "<subject>" -m "<body>"`, `rgit commit --amend --no-edit`, `rgit commit --fixup <rev>`, `rgit commit -C <rev> --reset-author`
+- `commit`: Commit the staged changes (runs hooks), or only the given paths. e.g. `rgit commit -m "<message>"`, `rgit commit -a -m "<message>"`, `rgit commit src/lib.rs -m "<message>"`, `rgit commit -m "<subject>" -m "<body>"`, `rgit commit --amend --no-edit`, `rgit commit --fixup <rev>`, `rgit commit -C <rev> --reset-author`, `rgit commit --dry-run -a`, `rgit commit --short`, `rgit commit -v -e -m "<message>"`
 - `extend`: Amend HEAD with the staged changes, keeping its message (no editor). e.g. `rgit extend`
 - `reword`: Change any commit's message and restack its descendants (default HEAD). e.g. `rgit reword -m "<message>"`, `rgit reword -m "<message>" <rev>`
 - `uncommit`: Undo the last commit(s), keeping the changes staged (default 1). e.g. `rgit uncommit`, `rgit uncommit 2`
@@ -39,7 +39,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `absorb`: Fold each pending change into the stacked commit that last touched those lines (blame-routed fixups + autosquash). e.g. `rgit absorb`
 - `cherry-pick`: Cherry-pick commits onto HEAD, or continue/skip/abort a stopped one. e.g. `rgit cherry-pick <rev>`, `rgit cherry-pick <rev> --no-commit`, `rgit cherry-pick <a> <b>`, `rgit cherry-pick main~3..main -x`, `rgit cherry-pick <merge> -m 1`, `rgit cherry-pick <rev> -s --empty=drop`, `rgit cherry-pick <rev> --strategy=ours --cleanup=strip`, `rgit cherry-pick --continue`, `rgit cherry-pick --abort`, `rgit cherry-pick --quit`
 - `revert`: Revert commits on HEAD, or continue/skip/abort a stopped revert. e.g. `rgit revert <rev>`, `rgit revert <rev> --no-commit`, `rgit revert HEAD~2..HEAD`, `rgit revert <merge> -m 1`, `rgit revert <rev> --reference`, `rgit revert --continue`
-- `reset`: Reset HEAD to a revision (default mixed). e.g. `rgit reset HEAD~1`, `rgit reset --hard <rev>`, `rgit reset src/lib.rs`, `rgit reset <rev> -- src/lib.rs`, `rgit reset --merge`
+- `reset`: Reset HEAD to a revision (default mixed). e.g. `rgit reset HEAD~1`, `rgit reset --hard <rev>`, `rgit reset src/lib.rs`, `rgit reset <rev> -- src/lib.rs`, `rgit reset --merge`, `rgit reset -p <rev>`
 
 ## Undo
 
@@ -55,7 +55,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `branch delete`: Delete branches (multiselect prompt if no name on a terminal). e.g. `rgit branch delete <branch> <branch>`, `rgit branch delete <branch> --force`
   - `branch rename`: Rename a branch. e.g. `rgit branch rename <old> <new>`
   - `branch prune`: Delete every local branch already merged into a base (default HEAD). e.g. `rgit branch prune`, `rgit branch prune main`
-- `checkout`: Check out a branch or, for any other revision, a detached HEAD; or restore paths from a revision or the index. e.g. `rgit checkout main`, `rgit checkout -b <new_branch>`, `rgit checkout -`, `rgit checkout <rev> -- src/lib.rs`, `rgit checkout -f <branch>`, `rgit checkout --theirs -- src/lib.rs`
+- `checkout`: Check out a branch or, for any other revision, a detached HEAD; or restore paths from a revision or the index. e.g. `rgit checkout main`, `rgit checkout -b <new_branch>`, `rgit checkout -`, `rgit checkout <rev> -- src/lib.rs`, `rgit checkout -f <branch>`, `rgit checkout --theirs -- src/lib.rs`, `rgit checkout --conflict=diff3 -- src/lib.rs`, `rgit checkout -p <rev>`
 - `switch`: Switch branches: `switch <branch>`, `-c <new> [<start>]`, `--detach <rev>`, or `-` for the previous branch. e.g. `rgit switch main`, `rgit switch -c <new_branch>`, `rgit switch -`, `rgit switch --detach <rev>`, `rgit switch -m <branch>`, `rgit switch --orphan <new_branch>`
 - `merge`: Merge revisions into the current branch (several make an octopus merge). e.g. `rgit merge <branch>`, `rgit merge <branch> --no-ff`, `rgit merge <branch> --squash`, `rgit merge <branch> -m "<message>"`, `rgit merge <a> <b>`, `rgit merge <a> <b> -e`, `rgit merge <branch> --autostash`, `rgit merge <branch> --into-name <other>`, `rgit merge <branch> -s ours`, `rgit merge <branch> --log --no-stat`, `rgit merge <branch> --allow-unrelated-histories`, `rgit merge --continue`, `rgit merge --abort`
 - `rebase`: Rebase onto a revision, or continue/skip/abort an in-progress rebase. e.g. `rgit rebase main`, `rgit rebase --onto <newbase> <upstream>`, `rgit rebase --autosquash main`, `rgit rebase --exec "cargo test" main`, `rgit rebase --root`, `rgit rebase -r --committer-date-is-author-date main`, `rgit rebase --update-refs --autostash main`, `GIT_SEQUENCE_EDITOR="sed -i.bak 1s/^pick/edit/" rgit rebase -i main`, `rgit rebase --continue`, `rgit rebase --abort`, `rgit rebase --show-current-patch`

@@ -372,7 +372,7 @@ impl GitBackend for Git2Backend {
     fn stash_push_part(
         &self,
         message: Option<&str>,
-        hunks: Option<&[(String, u32)]>,
+        picked: Option<&[u8]>,
         keep_index: bool,
         paths: &[String],
     ) -> Result<String, GitError> {
@@ -382,38 +382,17 @@ impl GitBackend for Git2Backend {
             let head = repo.head()?.peel_to_commit()?;
             let head_tree = head.tree()?;
             let index_tree = repo.find_tree(repo.index()?.write_tree()?)?;
-            let tree = match hunks {
+            let tree = match picked {
                 None => index_tree,
-                Some(hunks) => {
-                    let mut opts = DiffOptions::new();
-                    for p in paths {
-                        opts.pathspec(p);
-                    }
-                    let diff =
-                        repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts))?;
-                    let path = std::cell::RefCell::new(String::new());
-                    let mut apply = ApplyOptions::new();
-                    apply.delta_callback(|d| {
-                        let p = d.and_then(|d| d.new_file().path().or(d.old_file().path()));
-                        *path.borrow_mut() = p
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        hunks.iter().any(|(h, _)| *h == *path.borrow())
-                    });
-                    apply.hunk_callback(|h| {
-                        h.is_some_and(|h| {
-                            hunks
-                                .iter()
-                                .any(|(p, start)| *p == *path.borrow() && *start == h.new_start())
-                        })
-                    });
-                    let mut picked = repo.apply_to_tree(&head_tree, &diff, Some(&mut apply))?;
+                Some(patch) => {
+                    let diff = Diff::from_buffer(patch)?;
+                    let mut picked = repo.apply_to_tree(&head_tree, &diff, None)?;
                     repo.find_tree(picked.write_tree_to(&repo)?)?
                 }
             };
             if tree.id() == head_tree.id() {
                 return Err(GitError::Other(
-                    match hunks {
+                    match picked {
                         None => "no staged changes to stash",
                         Some(_) => "no changes selected",
                     }
@@ -429,7 +408,7 @@ impl GitBackend for Git2Backend {
                 .to_owned();
             store_stash(&repo, stash.id(), &line)?;
             let undo = repo.diff_tree_to_tree(Some(&tree), Some(&head_tree), None)?;
-            if hunks.is_none() {
+            if picked.is_none() {
                 repo.apply(&undo, ApplyLocation::Both, None)?;
             } else {
                 repo.apply(&undo, ApplyLocation::WorkDir, None)?;
@@ -903,6 +882,73 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn patch_diff(
+        &self,
+        rev: Option<&str>,
+        cached: bool,
+        reverse: bool,
+        context: Option<u32>,
+        paths: &[String],
+    ) -> Result<Vec<u8>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        let index = repo.index()?;
+        crate::wt_status::patch_diff(&repo, &index, rev, cached, reverse, context, paths)
+    }
+
+    fn status_text(&self, opts: &crate::StatusOpts) -> Result<crate::StatusReport, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        let mut index = repo.index()?;
+        if !opts.commit_all && opts.commit_paths.is_empty() {
+            return crate::wt_status::status(&repo, &index, opts);
+        }
+        // What `commit -a`, `-i` or `--only` would record, built in memory
+        // and dropped again: a dry run leaves the index as it was.
+        let paths = root_dots(&opts.commit_paths);
+        let result = (|| {
+            if opts.commit_all {
+                index.update_all(["*"], None)?;
+            }
+            if opts.commit_include {
+                index.update_all(&paths, None)?;
+            }
+            if opts.commit_paths.is_empty() || opts.commit_include {
+                return crate::wt_status::status(&repo, &index, opts);
+            }
+            let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+            for p in &paths {
+                known(Some(&index), head_tree.as_ref(), p)?;
+            }
+            index.update_all(&paths, None)?;
+            let spec = Pathspec::new(&paths)?;
+            let hit = |e: &git2::IndexEntry| {
+                spec.matches_path(
+                    Path::new(String::from_utf8_lossy(&e.path).as_ref()),
+                    crate::pathspec_flags(),
+                )
+            };
+            let mut partial = git2::Index::new()?;
+            if let Some(tree) = &head_tree {
+                partial.read_tree(tree)?;
+            }
+            let gone: Vec<PathBuf> = partial
+                .iter()
+                .filter(|e| hit(e))
+                .map(|e| PathBuf::from(String::from_utf8_lossy(&e.path).as_ref()))
+                .collect();
+            for p in gone {
+                partial.remove_path(&p)?;
+            }
+            for e in index.iter().filter(|e| hit(e)) {
+                partial.add(&e)?;
+            }
+            crate::wt_status::status(&repo, &partial, opts)
+        })();
+        index.read(true)?;
+        result
+    }
+
     fn ignored(&self) -> Result<Vec<StatusEntry>, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let mut opts = StatusOptions::new();
@@ -1006,6 +1052,157 @@ impl GitBackend for Git2Backend {
         index.update_all(paths, None)?;
         index.write()?;
         Ok(())
+    }
+
+    fn checkout_merge(
+        &self,
+        paths: &[String],
+        style: Option<&str>,
+    ) -> Result<(usize, usize, Vec<String>), GitError> {
+        self.logged("checkout -m", || {
+            let paths = &root_dots(paths);
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            let mut index = repo.index()?;
+            let spec = Pathspec::new(paths)?;
+            let hit = |p: &str| spec.matches_path(Path::new(p), crate::pathspec_flags());
+            unmerge_index(&mut index, &hit)?;
+            let style = style
+                .map(str::to_owned)
+                .or_else(|| repo.config().ok()?.get_string("merge.conflictStyle").ok())
+                .unwrap_or_else(|| "merge".to_owned());
+            let mut conflicted = Vec::new();
+            let mut clean = Vec::new();
+            for e in index.iter() {
+                let path = String::from_utf8_lossy(&e.path).into_owned();
+                if !hit(&path) {
+                    continue;
+                }
+                if (e.flags >> 12) & 3 != 0 {
+                    if conflicted.last() != Some(&path) {
+                        conflicted.push(path);
+                    }
+                } else {
+                    clean.push(path);
+                }
+            }
+            let mut errors = Vec::new();
+            let mut recreated = 0;
+            for path in &conflicted {
+                let c = index.conflict_get(Path::new(path))?;
+                let (Some(ours), Some(theirs)) = (c.our, c.their) else {
+                    errors.push(format!("path '{path}' does not have necessary versions"));
+                    continue;
+                };
+                let blob = |e: &git2::IndexEntry| -> Result<Vec<u8>, GitError> {
+                    Ok(repo.find_blob(e.id)?.content().to_vec())
+                };
+                let base = c
+                    .ancestor
+                    .as_ref()
+                    .map(blob)
+                    .transpose()?
+                    .unwrap_or_default();
+                let (our_text, their_text) = (blob(&ours)?, blob(&theirs)?);
+                fn merge_input<'a>(
+                    text: &'a [u8],
+                    path: &str,
+                    mode: u32,
+                ) -> git2::MergeFileInput<'a> {
+                    let mut i = git2::MergeFileInput::new();
+                    i.content(text).path(path).mode(Some(file_mode(mode)));
+                    i
+                }
+                let input = |text, mode| merge_input(text, path, mode);
+                let mut o = git2::MergeFileOptions::new();
+                o.ancestor_label("base")
+                    .our_label("ours")
+                    .their_label("theirs")
+                    .style_diff3(style == "diff3")
+                    .style_zdiff3(style == "zdiff3");
+                let base_mode = c.ancestor.as_ref().map_or(ours.mode, |a| a.mode);
+                let merged = git2::merge_file(
+                    &input(&base, base_mode),
+                    &input(&our_text, ours.mode),
+                    &input(&their_text, theirs.mode),
+                    Some(&mut o),
+                )?;
+                let target = self.workdir.join(path);
+                if let Some(dir) = target.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                let _ = std::fs::remove_file(&target);
+                std::fs::write(&target, merged.content())?;
+                if ours.mode == 0o100755 {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+                }
+                recreated += 1;
+            }
+            if !clean.is_empty() {
+                let mut co = CheckoutBuilder::new();
+                co.force().disable_pathspec_match(true);
+                for p in &clean {
+                    co.path(p);
+                }
+                repo.checkout_index(Some(&mut index), Some(&mut co))?;
+            }
+            index.write()?;
+            Ok((recreated, clean.len(), errors))
+        })
+    }
+
+    fn renormalize(&self, paths: &[String]) -> Result<(), GitError> {
+        let paths = &root_dots(paths);
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        let mut index = repo.index()?;
+        let spec = Pathspec::new(paths)?;
+        let tracked: Vec<PathBuf> = index
+            .iter()
+            .filter(|e| (e.flags >> 12) & 3 == 0 && e.mode != 0o160000)
+            .map(|e| PathBuf::from(String::from_utf8_lossy(&e.path).as_ref()))
+            .filter(|p| paths.is_empty() || spec.matches_path(p, crate::pathspec_flags()))
+            .collect();
+        for p in tracked {
+            if self.workdir.join(&p).symlink_metadata().is_ok() {
+                // add_path hashes through the filters whatever the stat says;
+                // with the old entry gone, text=auto no longer defers to a
+                // CRLF blob already in the index.
+                index.remove_path(&p)?;
+                index.add_path(&p)?;
+            }
+        }
+        index.write()?;
+        Ok(())
+    }
+
+    fn index_chmod(&self, paths: &[String], executable: bool) -> Result<Vec<String>, GitError> {
+        let paths = &root_dots(paths);
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        let mut index = repo.index()?;
+        let spec = Pathspec::new(paths)?;
+        let mut skipped = Vec::new();
+        let hits: Vec<git2::IndexEntry> = index
+            .iter()
+            .filter(|e| {
+                spec.matches_path(
+                    Path::new(String::from_utf8_lossy(&e.path).as_ref()),
+                    crate::pathspec_flags(),
+                )
+            })
+            .collect();
+        for mut e in hits {
+            if e.mode & 0o170000 != 0o100000 {
+                skipped.push(String::from_utf8_lossy(&e.path).into_owned());
+                continue;
+            }
+            e.mode = if executable { 0o100755 } else { 0o100644 };
+            index.add(&e)?;
+        }
+        index.write()?;
+        Ok(skipped)
     }
 
     fn restore(
@@ -7799,7 +7996,8 @@ fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(
             "aborting commit due to empty commit message".to_owned(),
         ));
     }
-    let sig = repo.signature()?;
+    let sig = ident_signature(repo, true)?;
+    let me = ident_signature(repo, false)?;
     if o.signoff {
         msg = signoff(&msg, &sig);
     }
@@ -7832,12 +8030,19 @@ fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(
 
     let tree_oid = match only {
         Some(oid) => oid,
-        None => repo.index()?.write_tree()?,
+        None => index_tree(repo)?,
     };
     let tree = repo.find_tree(tree_oid)?;
     let mut author = match (&o.author, &o.author_from) {
-        (Some(a), _) => Some(find_author(repo, a)?),
-        _ if o.reset_author => Some(sig.clone()),
+        (Some(a), _) => {
+            let found = find_author(repo, a)?;
+            Some(git2::Signature::new(
+                found.name().unwrap_or(""),
+                found.email().unwrap_or(""),
+                &me.when(),
+            )?)
+        }
+        _ if o.reset_author => Some(me.clone()),
         (None, Some(rev)) => Some(
             repo.revparse_single(rev)?
                 .peel_to_commit()?
@@ -7850,7 +8055,7 @@ fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(
         let base = match (&author, &head) {
             (Some(a), _) => a.clone(),
             (None, Some(h)) if o.amend => h.author().to_owned(),
-            _ => sig.clone(),
+            _ => me.clone(),
         };
         author = Some(git2::Signature::new(
             base.name().unwrap_or(""),
@@ -7905,7 +8110,7 @@ fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(
                 return Err(GitError::NothingToCommit);
             }
             let parents: Vec<&git2::Commit> = head.iter().chain(&merge_heads).collect();
-            let author = author.as_ref().unwrap_or(&sig);
+            let author = author.as_ref().unwrap_or(&me);
             crate::sign::commit(
                 repo,
                 Some("HEAD"),
@@ -8059,6 +8264,112 @@ pub(crate) fn signoff(msg: &str, sig: &git2::Signature) -> String {
         });
     let sep = if trailers { "\n" } else { "\n\n" };
     format!("{body}{sep}{line}\n")
+}
+
+fn file_mode(mode: u32) -> git2::FileMode {
+    match mode {
+        0o100755 => git2::FileMode::BlobExecutable,
+        0o120000 => git2::FileMode::Link,
+        0o160000 => git2::FileMode::Commit,
+        _ => git2::FileMode::Blob,
+    }
+}
+
+/// One entry of the index's resolve-undo record, which libgit2 keeps but
+/// git2 does not wrap.
+#[repr(C)]
+struct ReucEntry {
+    mode: [u32; 3],
+    oid: [libgit2_sys::git_oid; 3],
+    path: *const std::ffi::c_char,
+}
+
+unsafe extern "C" {
+    fn git_index_reuc_entrycount(index: *mut libgit2_sys::git_index) -> usize;
+    fn git_index_reuc_get_byindex(index: *mut libgit2_sys::git_index, n: usize)
+    -> *const ReucEntry;
+    fn git_index_reuc_remove(index: *mut libgit2_sys::git_index, n: usize) -> std::ffi::c_int;
+}
+
+/// git's unmerge_index: the paths `hit` picks that were resolved get their
+/// conflict stages back from the resolve-undo record.
+fn unmerge_index(index: &mut git2::Index, hit: &dyn Fn(&str) -> bool) -> Result<(), GitError> {
+    let raw = git2::Binding::raw(&*index);
+    // SAFETY: `raw` is the live index; entries are read before removal.
+    let count = unsafe { git_index_reuc_entrycount(raw) };
+    for n in (0..count).rev() {
+        let (path, stages) = unsafe {
+            let e = &*git_index_reuc_get_byindex(raw, n);
+            let path = std::ffi::CStr::from_ptr(e.path)
+                .to_string_lossy()
+                .into_owned();
+            let stages: Vec<(u16, u32, Oid)> = (0..3)
+                .filter(|&s| e.mode[s] != 0)
+                .map(|s| {
+                    let oid = Oid::from_bytes(&e.oid[s].id).unwrap_or(Oid::ZERO_SHA1);
+                    (s as u16 + 1, e.mode[s], oid)
+                })
+                .collect();
+            (path, stages)
+        };
+        if !hit(&path) {
+            continue;
+        }
+        let _ = index.remove(Path::new(&path), 0);
+        for (stage, mode, id) in stages {
+            index.add(&git2::IndexEntry {
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id,
+                flags: (stage << 12) | (path.len().min(0xfff) as u16),
+                flags_extended: 0,
+                path: path.clone().into_bytes(),
+            })?;
+        }
+        // SAFETY: `n` is still in range, as removals go from the end.
+        unsafe { git_index_reuc_remove(raw, n) };
+    }
+    Ok(())
+}
+
+/// The tree of the index as a commit records it: intent-to-add entries
+/// (`add -N`) are left out, as git leaves them.
+fn index_tree(repo: &Repository) -> Result<Oid, GitError> {
+    let mut index = repo.index()?;
+    const INTENT_TO_ADD: u16 = 1 << 13;
+    if !index.iter().any(|e| e.flags_extended & INTENT_TO_ADD != 0) {
+        return Ok(index.write_tree()?);
+    }
+    let mut kept = git2::Index::new()?;
+    for e in index
+        .iter()
+        .filter(|e| e.flags_extended & INTENT_TO_ADD == 0)
+    {
+        kept.add(&e)?;
+    }
+    Ok(kept.write_tree_to(repo)?)
+}
+
+/// The committer or author as git takes it: GIT_{COMMITTER,AUTHOR}_{NAME,
+/// EMAIL,DATE} first, then user.name and user.email, dated now.
+fn ident_signature(
+    repo: &Repository,
+    committer: bool,
+) -> Result<git2::Signature<'static>, GitError> {
+    let ident = crate::plumbing::ident(repo, committer)?;
+    let (name, rest) = ident.split_once(" <").unwrap_or((&ident, ""));
+    let (email, when) = rest.split_once("> ").unwrap_or((rest, ""));
+    let (secs, zone) = when.split_once(' ').unwrap_or((when, "+0000"));
+    let n: i32 = zone.get(1..).and_then(|n| n.parse().ok()).unwrap_or(0);
+    let sign = if zone.starts_with('-') { -1 } else { 1 };
+    let time = git2::Time::new(secs.parse().unwrap_or(0), sign * (n / 100 * 60 + n % 100));
+    Ok(git2::Signature::new(name, email, &time)?)
 }
 
 /// A `Name <email>` identity, stamped now.
@@ -10400,7 +10711,7 @@ pub fn diff_no_index(
 
 /// git's rename score for a delta in percent (diffcore-delta's span hashing):
 /// the share of the larger file's bytes that both sides have in common.
-fn similarity(repo: &Repository, delta: &git2::DiffDelta) -> u16 {
+pub(crate) fn similarity(repo: &Repository, delta: &git2::DiffDelta) -> u16 {
     let (old, new) = (delta.old_file(), delta.new_file());
     if old.id() == new.id() && !old.id().is_zero() {
         return 100;
@@ -10429,7 +10740,7 @@ fn similarity(repo: &Repository, delta: &git2::DiffDelta) -> u16 {
     (copied * 60000 / max * 100 / 60000) as u16
 }
 
-fn span_hashes(data: &[u8]) -> std::collections::HashMap<u32, u64> {
+pub(crate) fn span_hashes(data: &[u8]) -> std::collections::HashMap<u32, u64> {
     let mut out = std::collections::HashMap::new();
     let text = !data.contains(&0);
     let (mut a1, mut a2, mut n) = (0u32, 0u32, 0u64);

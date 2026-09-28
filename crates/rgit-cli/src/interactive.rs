@@ -2,7 +2,7 @@
 //! When stdin/stdout are not a TTY (an agent, a pipe, CI) or `--no-input` is
 //! set, the caller errors instead, so scripted use stays non-interactive.
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::sync::Arc;
 
 use rgit_git::{GitBackend, LogOptions};
@@ -108,52 +108,38 @@ pub fn input(prompt: &str) -> anyhow::Result<String> {
     .map_err(err)
 }
 
-/// Let the user edit a commit message in git's editor; `#` lines are dropped.
-pub fn edit_message(backend: &Arc<dyn GitBackend>, text: &str) -> anyhow::Result<String> {
+/// Let the user edit a commit message template in git's editor, then clean
+/// it as git does: everything below the scissors line goes when `cut`, then
+/// `#` lines and extra blank lines.
+pub fn edit_message(
+    backend: &Arc<dyn GitBackend>,
+    text: &str,
+    cut: bool,
+) -> anyhow::Result<String> {
     let path = backend.commit_msg_path();
-    std::fs::write(&path, format!("{}\n", text.trim_end()))?;
-    let editor = crate::plumbing::editor(backend);
-    let ran = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$@\""))
-        .arg(&editor)
-        .arg(&path)
-        .status()?;
-    if !ran.success() {
-        anyhow::bail!("there was a problem with the editor '{editor}'");
+    std::fs::write(&path, text)?;
+    launch_editor(backend, &path)?;
+    let mut text = std::fs::read_to_string(&path)?;
+    let scissors = "# ------------------------ >8 ------------------------\n";
+    if cut {
+        if text.starts_with(scissors) {
+            text.clear();
+        } else if let Some(i) = text.find(&format!("\n{scissors}")) {
+            text.truncate(i + 1);
+        }
     }
-    let text = std::fs::read_to_string(&path)?;
-    Ok(text
-        .lines()
-        .filter(|l| !l.starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n"))
+    Ok(crate::cli::clean_message(&text, true))
 }
 
-/// Which way `-p` moves the hunks it asks about.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PatchMode {
-    /// `add -p`: stage working-tree hunks.
-    Stage,
-    /// `reset -p` / `restore -p --staged`: unstage staged hunks.
-    Unstage,
-    /// `checkout -p` / `restore -p`: discard working-tree hunks.
-    Discard,
-}
+pub use crate::add_patch::Kind as PatchMode;
 
-/// One question in the `-p` loop: a whole hunk, or one change group of a
-/// split hunk (its line indices, and the lines shown for it).
-struct Ask {
-    hunk: usize,
-    part: Option<(Vec<usize>, std::ops::Range<usize>)>,
-}
-
-/// git's `-p` loop: show each hunk of the changes under `paths`, ask
-/// y/n/q/a/d/s/?, then stage, unstage or discard the chosen hunks.
+/// git's `-p` loop over the changes under `paths`, comparing with `rev`
+/// where the command takes one (`reset -p`, `checkout -p`, `restore -p`).
 pub fn patch(
     backend: &Arc<dyn GitBackend>,
     interactive: bool,
     mode: PatchMode,
+    rev: Option<&str>,
     paths: &[String],
 ) -> anyhow::Result<String> {
     if !interactive {
@@ -161,226 +147,53 @@ pub fn patch(
             "-p needs a terminal; pick hunks with `rgit stage`, `rgit unstage` or `rgit discard` and --hunk/--lines"
         );
     }
-    let (verb, done) = match mode {
-        PatchMode::Stage => ("Stage", "staged"),
-        PatchMode::Unstage => ("Unstage", "unstaged"),
-        PatchMode::Discard => ("Discard", "discarded"),
-    };
-    let files = backend.diff(&rgit_git::DiffSpec {
-        cached: mode == PatchMode::Unstage,
-        paths: paths.to_vec(),
-        ..Default::default()
-    })?;
-    let mut out = std::io::stdout();
-    let mut applied = 0;
-    let mut quit = false;
-    for file in files.iter().filter(|f| !f.binary && !f.hunks.is_empty()) {
-        if quit {
-            break;
-        }
-        let mut asks: Vec<Ask> = (0..file.hunks.len())
-            .map(|hunk| Ask { hunk, part: None })
-            .collect();
-        let mut answers: Vec<Option<bool>> = vec![None; asks.len()];
-        let _ = writeln!(out, "diff --git a/{0} b/{0}", file.path);
-        let mut i = 0;
-        while i < asks.len() {
-            let hunk = &file.hunks[asks[i].hunk];
-            let groups = change_groups(&hunk.lines);
-            let splittable = asks[i].part.is_none() && groups.len() > 1;
-            let shown = match &asks[i].part {
-                Some((_, range)) => range.clone(),
-                None => 0..hunk.lines.len(),
-            };
-            if asks[i].part.is_none() {
-                let _ = writeln!(out, "{}", hunk.header);
-            }
-            for line in &hunk.lines[shown] {
-                let _ = writeln!(
-                    out,
-                    "{}{}",
-                    origin(line.origin),
-                    line.text.trim_end_matches('\n')
-                );
-            }
-            let keys = if splittable {
-                "y,n,q,a,d,s,?"
-            } else {
-                "y,n,q,a,d,?"
-            };
-            let what = if mode == PatchMode::Discard {
-                "this hunk from worktree"
-            } else {
-                "this hunk"
-            };
-            let _ = write!(out, "({}/{}) {verb} {what} [{keys}]? ", i + 1, asks.len());
-            let _ = out.flush();
-            let mut line = String::new();
-            let answer = match std::io::stdin().read_line(&mut line) {
-                Ok(0) | Err(_) => "q",
-                Ok(_) => line.trim(),
-            };
-            match answer.chars().next() {
-                Some('y') => answers[i] = Some(true),
-                Some('n') => answers[i] = Some(false),
-                Some(c @ ('a' | 'd')) => answers[i..].fill(Some(c == 'a')),
-                Some('q') => {
-                    quit = true;
-                    break;
-                }
-                Some('s') if splittable => {
-                    let _ = writeln!(out, "Split into {} hunks.", groups.len());
-                    let hunk = asks[i].hunk;
-                    let parts: Vec<Ask> = groups
-                        .into_iter()
-                        .map(|(changes, range)| Ask {
-                            hunk,
-                            part: Some((changes, range)),
-                        })
-                        .collect();
-                    let n = parts.len();
-                    asks.splice(i..=i, parts);
-                    answers.splice(i..=i, vec![None; n]);
-                    continue;
-                }
-                _ => {
-                    let lower = verb.to_lowercase();
-                    let _ = writeln!(
-                        out,
-                        "y - {lower} this hunk\nn - do not {lower} this hunk\n\
-                         q - quit; do not {lower} this hunk or any of the remaining ones\n\
-                         a - {lower} this hunk and all later hunks in the file\n\
-                         d - do not {lower} this hunk or any of the later hunks in the file\n\
-                         s - split the current hunk into smaller hunks\n? - print help"
-                    );
-                    continue;
-                }
-            }
-            if answers[i..].iter().all(Option::is_some) {
-                break;
-            }
-            i += 1;
-        }
-        // Bottom hunk first, so the hunks above keep their start lines.
-        for h in (0..file.hunks.len()).rev() {
-            let start = file.hunks[h].new_start;
-            let mine = asks.iter().zip(&answers).filter(|(a, _)| a.hunk == h);
-            let whole = mine.clone().all(|(_, yes)| *yes == Some(true));
-            let lines: Vec<usize> = mine
-                .filter(|(_, yes)| **yes == Some(true))
-                .flat_map(|(a, _)| a.part.iter().flat_map(|(c, _)| c.clone()))
-                .collect();
-            let path = file.path.as_str();
-            match (mode, whole) {
-                (PatchMode::Stage, true) => backend.stage_hunk(path, start)?,
-                (PatchMode::Unstage, true) => backend.unstage_hunk(path, start)?,
-                (PatchMode::Discard, true) => backend.discard_hunk(path, start)?,
-                _ if lines.is_empty() => continue,
-                (PatchMode::Stage, false) => backend.stage_lines(path, start, &lines)?,
-                (PatchMode::Unstage, false) => backend.unstage_lines(path, start, &lines)?,
-                (PatchMode::Discard, false) => backend.discard_lines(path, start, &lines)?,
-            }
-            applied += 1;
-        }
-    }
-    Ok(if applied == 0 {
-        format!("no hunks {done}")
-    } else {
-        format!("{done} {applied} hunk(s)")
-    })
+    crate::add_patch::run(backend, mode, rev, paths)?;
+    Ok(String::new())
 }
 
-/// The runs of changed lines in a hunk that `s` splits it into: each run's
-/// line indices, and the lines to show for it (with the context around it).
-fn change_groups(lines: &[rgit_git::DiffLine]) -> Vec<(Vec<usize>, std::ops::Range<usize>)> {
-    use rgit_git::LineOrigin::{Added, Removed};
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut prev_change = false;
-    for (i, l) in lines.iter().enumerate() {
-        let change = matches!(l.origin, Added | Removed);
-        if change && !prev_change {
-            groups.push(Vec::new());
-        }
-        if change && let Some(g) = groups.last_mut() {
-            g.push(i);
-        }
-        prev_change = change;
+/// Open `path` in git's editor, with git's "Waiting for your editor" hint
+/// on a terminal; `:` as the editor leaves the file as it is.
+pub fn launch_editor(backend: &Arc<dyn GitBackend>, path: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    let editor = crate::plumbing::editor(backend);
+    if editor == ":" {
+        return Ok(());
     }
-    let bounds: Vec<(usize, usize)> = groups.iter().map(|g| (g[0], g[g.len() - 1] + 1)).collect();
-    groups
-        .into_iter()
-        .enumerate()
-        .map(|(k, g)| {
-            let from = if k == 0 { 0 } else { bounds[k - 1].1 };
-            let to = bounds.get(k + 1).map_or(lines.len(), |b| b.0);
-            (g, from..to)
-        })
-        .collect()
-}
-
-fn origin(o: rgit_git::LineOrigin) -> char {
-    match o {
-        rgit_git::LineOrigin::Added => '+',
-        rgit_git::LineOrigin::Removed => '-',
-        rgit_git::LineOrigin::Context => ' ',
-        rgit_git::LineOrigin::Meta => '\\',
+    let hint = std::io::stderr().is_terminal()
+        && backend
+            .config_get("advice.waitingForEditor")
+            .ok()
+            .flatten()
+            .is_none_or(|v| {
+                !matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "false" | "no" | "off" | "0"
+                )
+            });
+    let dumb = std::env::var("TERM").map_or(true, |t| t == "dumb");
+    if hint {
+        eprint!(
+            "hint: Waiting for your editor to close the file...{}",
+            if dumb { '\n' } else { ' ' }
+        );
+        let _ = std::io::stderr().flush();
     }
+    let ran = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg(&editor)
+        .arg(path)
+        .status()?;
+    if !ran.success() {
+        anyhow::bail!("there was a problem with the editor '{editor}'");
+    }
+    if hint && !dumb {
+        eprint!("\r\x1b[K");
+    }
+    Ok(())
 }
 
 /// A yes/no confirmation.
 pub fn confirm(prompt: &str) -> anyhow::Result<bool> {
     prompt::confirm(prompt, false).map_err(err)
-}
-
-/// Ask about each hunk of `files` as git's `-p` modes do (y, n, q, a, d),
-/// showing it on stderr; returns the chosen hunks as (path, new-side start).
-pub fn pick_hunks(files: &[rgit_git::FileDiff], verb: &str) -> anyhow::Result<Vec<(String, u32)>> {
-    use rgit_git::LineOrigin;
-    let files: Vec<_> = files.iter().filter(|f| !f.binary).collect();
-    let total: usize = files.iter().map(|f| f.hunks.len()).sum();
-    let mut picked = Vec::new();
-    let mut n = 0;
-    'files: for f in files {
-        eprintln!("diff --git a/{0} b/{0}", f.path);
-        for (i, h) in f.hunks.iter().enumerate() {
-            n += 1;
-            eprintln!("{}", h.header);
-            for l in &h.lines {
-                let mark = match l.origin {
-                    LineOrigin::Added => '+',
-                    LineOrigin::Removed => '-',
-                    LineOrigin::Context => ' ',
-                    LineOrigin::Meta => '\\',
-                };
-                eprintln!("{mark}{}", l.text.trim_end_matches('\n'));
-            }
-            let answer = prompt::line(
-                &format!("({n}/{total}) {verb} this hunk [y,n,q,a,d,?]"),
-                |v| match v.trim() {
-                    "y" | "n" | "q" | "a" | "d" => Ok(()),
-                    _ => Err(format!(
-                        "y: {verb} this hunk, n: skip it, q: quit, a: this and the rest \
-                         of the file, d: none of the rest of the file"
-                    )),
-                },
-            )
-            .map_err(err)?;
-            let rest = f.hunks[i..].iter().map(|h| (f.path.clone(), h.new_start));
-            match answer.trim() {
-                "y" => picked.push((f.path.clone(), h.new_start)),
-                "a" => {
-                    n += f.hunks.len() - i - 1;
-                    picked.extend(rest);
-                    continue 'files;
-                }
-                "d" => {
-                    n += f.hunks.len() - i - 1;
-                    continue 'files;
-                }
-                "q" => break 'files,
-                _ => {}
-            }
-        }
-    }
-    Ok(picked)
 }

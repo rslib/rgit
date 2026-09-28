@@ -82,6 +82,11 @@ pub fn column_mode(opts: &mut u32, spec: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the option bits lay items out in columns.
+pub fn column_active(opts: u32) -> bool {
+    opts & COL_ENABLE_MASK == COL_ENABLED
+}
+
 /// Resolve `auto` against whether stdout is a terminal.
 pub fn column_finalize(opts: &mut u32, tty: bool) {
     if *opts & COL_ENABLE_MASK == COL_AUTO {
