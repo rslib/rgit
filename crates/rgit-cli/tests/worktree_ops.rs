@@ -1126,3 +1126,58 @@ fn add_edit_stages_the_edited_patch() {
         run("git", &[], "add-e-git")
     );
 }
+
+#[test]
+fn status_pairs_intent_to_add_renames_like_git() {
+    let dir = repo("st-ita-rename");
+    std::fs::rename(dir.join("a"), dir.join("moved")).unwrap();
+    git(&dir, &["add", "-N", "moved"]);
+    std::fs::rename(dir.join("d/c"), dir.join("d/c2")).unwrap();
+    write(&dir, "d/c2", "1\nmore\n");
+    git(&dir, &["add", "-N", "d/c2"]);
+    write(&dir, "fresh", "unlike anything\n");
+    git(&dir, &["add", "-N", "fresh"]);
+    status_all_forms(&dir);
+    status_same(&dir, &["--long", "--no-renames"]);
+}
+
+#[test]
+fn status_submodule_summary_matches_git() {
+    let dir = repo("st-sm");
+    let lib = repo("st-sm-lib");
+    let add = |path: &str| {
+        let out = Command::new("git")
+            .args(["-c", "protocol.file.allow=always", "-C"])
+            .arg(&dir)
+            .args(["submodule", "add", "-q"])
+            .arg(&lib)
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    add("sub");
+    git(&dir, &["commit", "-qm", "add sub"]);
+    add("sub2");
+    let sub = dir.join("sub");
+    for n in ["3", "4"] {
+        write(&sub, "a", &format!("{n}\n"));
+        git(&sub, &["commit", "-qam", &format!("lib {n}")]);
+    }
+    git(&dir, &["add", "sub"]);
+    write(&sub, "a", "5\n");
+    git(&sub, &["commit", "-qam", "lib 5"]);
+    for value in ["true", "1", "false"] {
+        git(&dir, &["config", "status.submoduleSummary", value]);
+        status_same(&dir, &["--long"]);
+        status_same(&dir, &["-v"]);
+    }
+    git(&dir, &["config", "status.submoduleSummary", "true"]);
+    status_same(&dir, &["--long", "--ignore-submodules=all"]);
+    git(&dir, &["config", "submodule.sub.ignore", "all"]);
+    status_same(&dir, &["--long"]);
+}

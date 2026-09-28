@@ -1282,6 +1282,10 @@ pub enum Command {
         /// Add to FETCH_HEAD instead of replacing it.
         #[arg(short = 'a', long)]
         append: bool,
+        /// Leave out objects, e.g. `blob:none` or `tree:0`, and make the
+        /// remote a promisor that later reads fetch them from.
+        #[arg(long, value_name = "SPEC")]
+        filter: Option<String>,
     },
     /// Fetch and integrate the current branch's upstream (merges when it has
     /// diverged, unless `pull.rebase` says otherwise).
@@ -2066,9 +2070,13 @@ pub enum Command {
         /// Keep unreachable objects in the pack.
         #[arg(short = 'k', long)]
         keep_unreachable: bool,
-        /// Write a reachability bitmap.
-        #[arg(short = 'b', long)]
+        /// Write a reachability bitmap (with -a; default
+        /// repack.writeBitmaps).
+        #[arg(short = 'b', long, overrides_with = "no_write_bitmap_index")]
         write_bitmap_index: bool,
+        /// Write no bitmap, whatever repack.writeBitmaps says.
+        #[arg(long)]
+        no_write_bitmap_index: bool,
         /// Put unreachable objects in a cruft pack.
         #[arg(long)]
         cruft: bool,
@@ -2081,6 +2089,12 @@ pub enum Command {
         /// Maximum delta depth.
         #[arg(long, value_name = "N")]
         depth: Option<u32>,
+        /// Bytes the delta window may hold (k, m and g suffixes).
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        window_memory: Option<u64>,
+        /// Delta search threads (0: one per CPU).
+        #[arg(long, value_name = "N")]
+        threads: Option<u32>,
         /// Leave this pack (`pack-<hash>.pack`) as it is; repeatable.
         #[arg(long, value_name = "PACK")]
         keep_pack: Vec<String>,
@@ -2121,6 +2135,17 @@ pub enum Command {
         /// The rgit command and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
+    },
+    /// Write or check the commit-graph file or chain (`git commit-graph`).
+    CommitGraph {
+        #[command(subcommand)]
+        cmd: CommitGraphCmd,
+    },
+    /// Write, check, expire or repack the multi-pack-index
+    /// (`git multi-pack-index`).
+    MultiPackIndex {
+        #[command(subcommand)]
+        cmd: MidxCmd,
     },
     /// Background upkeep (`git maintenance`): run tasks now, schedule them,
     /// or (un)register this repository.
@@ -5234,6 +5259,94 @@ pub enum MaintenanceCmd {
 }
 
 #[derive(Subcommand)]
+pub enum CommitGraphCmd {
+    /// Write the commit-graph: the commits in every pack, or those the refs
+    /// reach, or those given on stdin.
+    Write {
+        /// The commits the refs reach.
+        #[arg(long, conflicts_with_all = ["stdin_packs", "stdin_commits"])]
+        reachable: bool,
+        /// The commits in the packs named on stdin.
+        #[arg(long, conflicts_with = "stdin_commits")]
+        stdin_packs: bool,
+        /// The commits named on stdin (and what they reach).
+        #[arg(long)]
+        stdin_commits: bool,
+        /// Keep the commits already in the graph.
+        #[arg(long)]
+        append: bool,
+        /// Add a layer to a split chain: merge layers as git does,
+        /// `no-merge` never, `replace` into one new layer.
+        #[arg(long, value_name = "STRATEGY", num_args = 0..=1, require_equals = true,
+              default_missing_value = "", value_parser = ["", "no-merge", "replace"])]
+        split: Option<String>,
+        /// Merge a layer that is at most this many times the new one (2).
+        #[arg(long, value_name = "N")]
+        size_multiple: Option<u64>,
+        /// Merge layers while the new one would pass this many commits.
+        #[arg(long, value_name = "N")]
+        max_commits: Option<usize>,
+        /// Only remove unused layer files older than this date.
+        #[arg(long, value_name = "DATE")]
+        expire_time: Option<String>,
+        /// Write changed-path Bloom filters.
+        #[arg(long, overrides_with = "no_changed_paths")]
+        changed_paths: bool,
+        /// Write none, even if the graph has them.
+        #[arg(long)]
+        no_changed_paths: bool,
+        /// Accepted for git compatibility; rgit prints no progress.
+        #[arg(long, overrides_with = "progress")]
+        no_progress: bool,
+        #[arg(long, hide = true)]
+        progress: bool,
+    },
+    /// Check the commit-graph against the commits it lists.
+    Verify {
+        /// Only the top layer of a split chain.
+        #[arg(long)]
+        shallow: bool,
+        /// Accepted for git compatibility; rgit prints no progress.
+        #[arg(long)]
+        no_progress: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MidxCmd {
+    /// Index every pack in objects/pack.
+    Write {
+        /// Take duplicate objects from this pack (`pack-<hash>.pack`).
+        #[arg(long, value_name = "PACK")]
+        preferred_pack: Option<String>,
+        /// Accepted for git compatibility; rgit prints no progress.
+        #[arg(long)]
+        no_progress: bool,
+    },
+    /// Check the multi-pack-index against the packs.
+    Verify {
+        /// Accepted for git compatibility; rgit prints no progress.
+        #[arg(long)]
+        no_progress: bool,
+    },
+    /// Delete packs the multi-pack-index takes no object from.
+    Expire {
+        /// Accepted for git compatibility; rgit prints no progress.
+        #[arg(long)]
+        no_progress: bool,
+    },
+    /// Pack the objects of the oldest small packs into one new pack.
+    Repack {
+        /// How much to repack (k, m, g suffixes; 0: every pack).
+        #[arg(long, value_name = "SIZE", value_parser = parse_size, default_value = "0")]
+        batch_size: u64,
+        /// Accepted for git compatibility; rgit prints no progress.
+        #[arg(long)]
+        no_progress: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum BundleCmd {
     /// Write a bundle of the refs and ranges given (`--all`, `main`,
     /// `v1..main`, `^old main`).
@@ -6424,6 +6537,8 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
             "verify-tag",
             "repack",
             "pack-refs",
+            "commit-graph",
+            "multi-pack-index",
             "maintenance",
             "for-each-repo",
             "cherry",
@@ -7484,6 +7599,7 @@ pub fn run(
             verbose: _,
             jobs,
             append,
+            filter,
         } => {
             let multiple = multiple.then(|| {
                 let names = remote.iter().chain(&repository).chain(&refspecs);
@@ -7507,6 +7623,7 @@ pub fn run(
                 remotes: multiple.clone().unwrap_or_default(),
                 jobs: jobs.unwrap_or(0),
                 append,
+                filter,
             };
             let out = if multiple.is_some() {
                 net(interactive, "fetch", |r| backend.fetch(None, &[], &args, r))?
@@ -9106,6 +9223,14 @@ pub fn run(
             unpack_unreachable,
             no_update_server_info,
             quiet,
+            no_reuse_delta,
+            no_reuse_object,
+            write_bitmap_index,
+            no_write_bitmap_index,
+            window,
+            depth,
+            window_memory,
+            threads,
             ..
         } => {
             let date = |d: Option<String>| -> anyhow::Result<Option<i64>> {
@@ -9125,6 +9250,14 @@ pub fn run(
                 unpack_unreachable: date(unpack_unreachable)?,
                 keep_pack,
                 no_update_server_info,
+                no_reuse_delta,
+                no_reuse_object,
+                window,
+                depth,
+                window_memory,
+                threads,
+                write_bitmap: (write_bitmap_index || no_write_bitmap_index)
+                    .then_some(write_bitmap_index),
             })?;
             if quiet { String::new() } else { out }
         }
@@ -9135,6 +9268,64 @@ pub fn run(
         } => {
             backend.pack_refs(all, no_prune, auto)?;
             String::new()
+        }
+        Command::CommitGraph { cmd } => {
+            let op = match cmd {
+                CommitGraphCmd::Write {
+                    reachable,
+                    stdin_packs,
+                    stdin_commits,
+                    append,
+                    split,
+                    size_multiple,
+                    max_commits,
+                    expire_time,
+                    changed_paths,
+                    no_changed_paths,
+                    ..
+                } => {
+                    let words = || -> anyhow::Result<Vec<String>> {
+                        let input = read_input("-")?;
+                        Ok(String::from_utf8_lossy(&input)
+                            .split_whitespace()
+                            .map(str::to_owned)
+                            .collect())
+                    };
+                    rgit_git::CommitGraphOp::Write(rgit_git::CommitGraphWrite {
+                        reachable,
+                        commits: if stdin_commits { Some(words()?) } else { None },
+                        packs: if stdin_packs { Some(words()?) } else { None },
+                        append,
+                        split: split.map(|s| match s.as_str() {
+                            "no-merge" => rgit_git::CommitGraphSplit::NoMerge,
+                            "replace" => rgit_git::CommitGraphSplit::Replace,
+                            _ => rgit_git::CommitGraphSplit::Merge,
+                        }),
+                        size_multiple,
+                        max_commits,
+                        expire_time: expire_time
+                            .map(|d| {
+                                rgit_git::expiry_date(&d)
+                                    .ok_or_else(|| anyhow::anyhow!("malformed date '{d}'"))
+                            })
+                            .transpose()?,
+                        changed_paths: (changed_paths || no_changed_paths).then_some(changed_paths),
+                    })
+                }
+                CommitGraphCmd::Verify { shallow, .. } => {
+                    rgit_git::CommitGraphOp::Verify { shallow }
+                }
+            };
+            complaints(backend.commit_graph(&op)?)
+        }
+        Command::MultiPackIndex { cmd } => {
+            let errors = backend.multi_pack_index(&match cmd {
+                MidxCmd::Write { preferred_pack, .. } => rgit_git::MidxOp::Write { preferred_pack },
+                MidxCmd::Verify { .. } => rgit_git::MidxOp::Verify,
+                MidxCmd::Expire { .. } => rgit_git::MidxOp::Expire,
+                MidxCmd::Repack { batch_size, .. } => rgit_git::MidxOp::Repack { batch_size },
+            })?;
+            complaints(errors)
         }
         Command::Maintenance { cmd } => crate::maintenance::run(backend, cmd)?,
         Command::Cherry {
@@ -13639,6 +13830,32 @@ pub(crate) fn diff_files(
 }
 
 static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// A verify's complaints on stderr, failing the run as git exits 1.
+fn complaints(errors: Vec<String>) -> String {
+    for e in &errors {
+        eprintln!("{e}");
+    }
+    if !errors.is_empty() {
+        set_exit_code(1);
+    }
+    String::new()
+}
+
+/// A size as git's options take it: bytes, or with a k, m or g suffix.
+fn parse_size(v: &str) -> Result<u64, String> {
+    let lower = v.to_ascii_lowercase();
+    let (num, unit) = match lower.char_indices().last() {
+        Some((i, 'k')) => (&lower[..i], 1 << 10),
+        Some((i, 'm')) => (&lower[..i], 1 << 20),
+        Some((i, 'g')) => (&lower[..i], 1 << 30),
+        _ => (lower.as_str(), 1),
+    };
+    num.parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(unit))
+        .ok_or_else(|| format!("invalid size '{v}'"))
+}
 
 /// `rgit fsck`'s report; a problem sets the exit code as git's does.
 pub fn fsck(

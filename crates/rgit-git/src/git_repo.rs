@@ -55,6 +55,7 @@ impl Git2Backend {
 
     fn from_repo(repo: Repository) -> Result<Self, GitError> {
         crate::config::add_command_line(&repo.config()?)?;
+        crate::promisor::install(&repo);
         let workdir = repo
             .workdir()
             .ok_or_else(|| GitError::Bare(repo.path().to_path_buf()))?
@@ -2484,6 +2485,14 @@ impl GitBackend for Git2Backend {
 
     fn repack(&self, opts: &crate::RepackOptions) -> Result<String, GitError> {
         crate::maintenance::repack(&self.repo.lock().expect("repo mutex"), opts)
+    }
+
+    fn commit_graph(&self, op: &crate::CommitGraphOp) -> Result<Vec<String>, GitError> {
+        crate::commit_graph::run(&self.repo.lock().expect("repo mutex"), op)
+    }
+
+    fn multi_pack_index(&self, op: &crate::MidxOp) -> Result<Vec<String>, GitError> {
+        crate::midx::run(&self.repo.lock().expect("repo mutex"), op)
     }
 
     fn pack_refs(&self, all: bool, no_prune: bool, auto: bool) -> Result<(), GitError> {
@@ -5631,8 +5640,8 @@ fn do_fetch(
 /// Fetch `name`, making its history as shallow as `args` asks. From a local
 /// repository the objects are copied here, just those of the history the
 /// fetch takes (libgit2's local transport sends every object, and no shallow
-/// history); over the network deepening by a count or a date is turned into
-/// the depth libgit2 fetches to.
+/// history); over the network rgit's own protocol client fetches what
+/// libgit2 cannot ask for: a filter, a date or a deepening.
 fn fetch_one(
     repo: &Repository,
     name: &str,
@@ -5656,6 +5665,15 @@ fn fetch_one(
         ..args.clone()
     };
     let url = repo.find_remote(name)?.url().unwrap_or_default().to_owned();
+    // A promisor remote is fetched through its own filter, as in git.
+    let given = match &args.filter {
+        Some(s) => Some(crate::promisor::Filter::parse(s)?.spec()),
+        None => None,
+    };
+    if let Some(spec) = &given {
+        crate::promisor::mark(repo, name, spec)?;
+    }
+    let spec = given.or_else(|| crate::promisor::remote_filter(repo, name));
     if is_local_url(&url) {
         let cut = match since {
             _ if args.unshallow => Some(shallow::Cut::Full),
@@ -5665,50 +5683,45 @@ fn fetch_one(
             None => None,
         };
         let src = Repository::open(local_path(repo, &url))?;
-        copy_history(repo, &src, name, refspecs, args, cut)?;
+        copy_history(
+            repo,
+            &src,
+            name,
+            refspecs,
+            args,
+            cut,
+            spec.as_deref(),
+            report,
+        )?;
         return do_fetch(repo, name, refspecs, &plain(0), report, cred);
     }
-    let Some(since) = since else {
-        let depth = match args.deepen {
-            n if n > 0 => history_depth(repo) as i32 + n,
-            _ => args.depth,
-        };
-        let args = crate::FetchArgs {
-            unshallow: args.unshallow,
-            ..plain(depth)
-        };
-        return do_fetch(repo, name, refspecs, &args, report, cred);
-    };
-    // Over the network: fetch ever deeper until every boundary is older than
-    // the date, then move the boundary up to the date.
-    let mut depth = 1;
-    loop {
-        do_fetch(repo, name, refspecs, &plain(depth), report, cred)?;
-        let roots = shallow::roots(repo);
-        let past = roots.iter().all(|r| {
-            repo.find_commit(*r)
-                .is_ok_and(|c| c.committer().when().seconds() < since)
-        });
-        if past || depth >= 1 << 20 {
-            break;
-        }
-        depth *= 2;
+    // libgit2 can neither filter nor cut history at a date or deepen it.
+    if spec.is_some() || since.is_some() || args.deepen > 0 {
+        fetch_smart(
+            repo,
+            name,
+            &url,
+            refspecs,
+            args,
+            since,
+            spec.as_deref(),
+            report,
+        )?;
+        return do_fetch(repo, name, refspecs, &plain(0), report, cred);
     }
-    let tips: Vec<Oid> = std::fs::read_to_string(repo.path().join("FETCH_HEAD"))
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| Oid::from_str(l.split('\t').next()?).ok())
-        .filter_map(|id| Some(repo.find_object(id, None).ok()?.peel_to_commit().ok()?.id()))
-        .collect();
-    let mut roots: std::collections::HashSet<Oid> = shallow::roots(repo).into_iter().collect();
-    let (_, cutoff) = shallow::select(repo, &tips, &shallow::Cut::Since(since), &roots, None)?;
-    roots.extend(cutoff);
-    shallow::write_roots(repo, &roots)
+    let args = crate::FetchArgs {
+        unshallow: args.unshallow,
+        ..plain(args.depth)
+    };
+    do_fetch(repo, name, refspecs, &args, report, cred)
 }
 
 /// Copy from the local repository `src` the history of the refs a fetch of
 /// `name` takes, as far back as `cut` says (else down to what is here), with
-/// the annotated tags on it, and mark where it now stops shallow.
+/// the annotated tags on it, and mark where it now stops shallow. With a
+/// filter `spec` the objects go into a promisor pack, without what the
+/// filter leaves out when `src` allows filtering.
+#[allow(clippy::too_many_arguments)]
 fn copy_history(
     repo: &Repository,
     src: &Repository,
@@ -5716,6 +5729,8 @@ fn copy_history(
     refspecs: &[String],
     args: &crate::FetchArgs,
     cut: Option<shallow::Cut>,
+    spec: Option<&str>,
+    report: &dyn Fn(OpProgress),
 ) -> Result<(), GitError> {
     let remote = repo.find_remote(name)?;
     let configured = remote.fetch_refspecs()?;
@@ -5729,6 +5744,7 @@ fn copy_history(
         .collect();
     let all_tags = args.tags || args.prune_tags;
     let (mut tips, mut tags) = (Vec::new(), Vec::new());
+    let mut wanted = String::new();
     if patterns.contains(&"HEAD") {
         tips.extend(
             src.head()
@@ -5749,6 +5765,7 @@ fn copy_history(
         }
         if (tag && all_tags) || patterns.iter().any(|p| ref_matches(p, refname)) {
             tips.extend(peeled);
+            wanted.push_str(&format!("{target} {refname}\n"));
         }
     }
     let odb = repo.odb()?;
@@ -5765,9 +5782,115 @@ fn copy_history(
         .filter(|(_, peeled)| peeled.is_some_and(|p| kept.contains(&p) || odb.exists(p)))
         .map(|(t, _)| *t)
         .collect();
-    shallow::copy(src, repo, &kept, &followed)?;
+    match spec {
+        Some(spec) => {
+            let filter = match src.config()?.get_bool("uploadpack.allowFilter") {
+                Ok(true) => Some(crate::promisor::Filter::parse(spec)?),
+                _ => {
+                    report(OpProgress::Line(
+                        "warning: filtering not recognized by server, ignoring".to_owned(),
+                    ));
+                    None
+                }
+            };
+            let set: std::collections::HashSet<Oid> = kept.iter().copied().collect();
+            let pack = crate::promisor::local_pack(src, &set, &followed, filter, &odb)?;
+            crate::promisor::store(repo, Some(&wanted), |w| Ok(w.write_all(&pack)?))?;
+        }
+        None => shallow::copy(src, repo, &kept, &followed)?,
+    }
     let mut roots = shallow::incomplete(repo, &old);
     roots.extend(cutoff);
+    shallow::write_roots(repo, &roots)
+}
+
+/// Fetch the objects of the refs a fetch of `name` takes from `url` through
+/// rgit's own protocol client, for what libgit2 cannot ask a server for: a
+/// filter `spec` (the pack then kept as a promisor pack) and a history cut
+/// at a depth or date. The refs are left for the fetch to update.
+#[allow(clippy::too_many_arguments)]
+fn fetch_smart(
+    repo: &Repository,
+    name: &str,
+    url: &str,
+    refspecs: &[String],
+    args: &crate::FetchArgs,
+    since: Option<i64>,
+    spec: Option<&str>,
+    report: &dyn Fn(OpProgress),
+) -> Result<(), GitError> {
+    use std::io::Write;
+    let config = repo.config()?;
+    let configured = config_values(repo, &format!("remote.{name}.fetch"))?;
+    let patterns: Vec<&str> = match refspecs.is_empty() {
+        true => configured.iter().map(String::as_str).collect(),
+        false => refspecs.iter().map(String::as_str).collect(),
+    };
+    let patterns: Vec<&str> = patterns
+        .iter()
+        .map(|s| s.trim_start_matches('+').split(':').next().unwrap_or(""))
+        .collect();
+    let tag_opt = config
+        .get_string(&format!("remote.{name}.tagOpt"))
+        .unwrap_or_default();
+    let all_tags = args.tags || args.prune_tags || (tag_opt == "--tags" && !args.no_tags);
+    let mut session = crate::smart::Session::open(url, Some(&config))?;
+    let odb = repo.odb()?;
+    let (mut wants, mut wanted) = (Vec::new(), String::new());
+    for r in session.ls_refs(&[])? {
+        let tag = r.name.starts_with("refs/tags/");
+        if r.id.is_zero()
+            || !((tag && all_tags) || patterns.iter().any(|p| ref_matches(p, &r.name)))
+        {
+            continue;
+        }
+        wanted.push_str(&format!("{} {}\n", r.id, r.name));
+        let deepen = args.unshallow || args.deepen > 0 || args.depth > 0 || since.is_some();
+        if (deepen || !odb.exists(r.id)) && !wants.contains(&r.id) {
+            wants.push(r.id);
+        }
+    }
+    if wants.is_empty() {
+        return session.finish();
+    }
+    let haves = repo
+        .references()?
+        .flatten()
+        .filter_map(|r| r.peel_to_commit().ok().map(|c| c.id()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let filter = match spec {
+        Some(_) if !session.filters() => {
+            report(OpProgress::Line(
+                "warning: filtering not recognized by server, ignoring".to_owned(),
+            ));
+            None
+        }
+        s => s.map(str::to_owned),
+    };
+    let old: std::collections::HashSet<Oid> = shallow::roots(repo).into_iter().collect();
+    let req = crate::smart::FetchRequest {
+        wants,
+        haves: haves.into_iter().collect(),
+        shallow: old.iter().copied().collect(),
+        depth: match () {
+            _ if args.unshallow => i32::MAX,
+            _ if args.deepen > 0 => args.deepen,
+            _ => args.depth,
+        },
+        deepen_since: since,
+        deepen_relative: args.deepen > 0,
+        filter,
+        include_tag: !args.no_tags,
+    };
+    let got = crate::promisor::store(repo, spec.map(|_| wanted.as_str()), |w: &mut dyn Write| {
+        session.fetch(&req, w, report)
+    })?;
+    session.finish()?;
+    let mut roots = old;
+    roots.extend(got.shallow);
+    for id in got.unshallow {
+        roots.remove(&id);
+    }
     shallow::write_roots(repo, &roots)
 }
 
@@ -5781,29 +5904,6 @@ fn ref_matches(pattern: &str, name: &str) -> bool {
         || ["refs/", "refs/heads/", "refs/tags/"]
             .iter()
             .any(|p| name.strip_prefix(p) == Some(pattern))
-}
-
-/// How many commits deep the longest shallow history of `repo`'s refs is.
-fn history_depth(repo: &Repository) -> usize {
-    let mut seen = std::collections::HashMap::new();
-    let mut queue: std::collections::VecDeque<(Oid, usize)> = repo
-        .references()
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|r| Some((r.peel_to_commit().ok()?.id(), 1)))
-        .collect();
-    let mut deepest = 0;
-    while let Some((id, depth)) = queue.pop_front() {
-        if seen.insert(id, depth).is_some() {
-            continue;
-        }
-        deepest = deepest.max(depth);
-        if let Ok(c) = repo.find_commit(id) {
-            queue.extend(c.parent_ids().map(|p| (p, depth + 1)));
-        }
-    }
-    deepest
 }
 
 /// The folder a local remote URL names; a relative one is taken from the
@@ -6851,6 +6951,9 @@ pub fn init(path: &Path, args: &crate::InitArgs) -> Result<String, GitError> {
     };
     let existed = Repository::open(&at).is_ok();
     let repo = Repository::init_opts(&at, &opts)?;
+    if !existed {
+        order_core(&repo.path().join("config"))?;
+    }
     let shared = if args
         .shared
         .as_deref()
@@ -6869,6 +6972,38 @@ pub fn init(path: &Path, args: &crate::InitArgs) -> Result<String, GitError> {
         "{verb} {shared}Git repository in {}",
         repo.path().display()
     ))
+}
+
+/// Put the `[core]` keys libgit2's init wrote in the order git's init
+/// writes them.
+fn order_core(path: &Path) -> Result<(), GitError> {
+    const ORDER: [&str; 7] = [
+        "repositoryformatversion",
+        "filemode",
+        "bare",
+        "logallrefupdates",
+        "symlinks",
+        "ignorecase",
+        "precomposeunicode",
+    ];
+    let text = std::fs::read_to_string(path)?;
+    let mut lines: Vec<&str> = text.lines().collect();
+    let Some(start) = lines.iter().position(|l| l.trim() == "[core]") else {
+        return Ok(());
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map_or(lines.len(), |i| start + 1 + i);
+    lines[start + 1..end].sort_by_key(|l| {
+        let key = l.trim().split([' ', '=']).next().unwrap_or("");
+        ORDER
+            .iter()
+            .position(|k| k.eq_ignore_ascii_case(key))
+            .unwrap_or(ORDER.len())
+    });
+    std::fs::write(path, lines.join("\n") + "\n")?;
+    Ok(())
 }
 
 /// Open the repository git would use from `start`, honouring GIT_DIR and the
@@ -6902,6 +7037,7 @@ pub fn open_env(start: &Path) -> Result<Repository, GitError> {
             .map_err(not_found)?
     };
     crate::config::add_command_line(&repo.config()?)?;
+    crate::promisor::install(&repo);
     Ok(repo)
 }
 
@@ -6968,8 +7104,8 @@ pub fn clone(
     args: &crate::CloneArgs,
     report: &dyn Fn(OpProgress),
 ) -> Result<(), GitError> {
-    if let Some(filter) = &args.filter {
-        return clone_filtered(url, path, args, filter);
+    if let Some(spec) = &args.filter {
+        crate::promisor::Filter::parse(spec)?;
     }
     if path.is_file() || path.read_dir().is_ok_and(|mut d| d.next().is_some()) {
         return Err(GitError::Other(format!(
@@ -6997,12 +7133,14 @@ fn clone_into(
     report: &dyn Fn(OpProgress),
 ) -> Result<(), GitError> {
     let plain = is_local_url(url) && !url.starts_with("file://");
-    // git records a local path as an absolute one.
+    // git records a local path as an absolute one, symlinks and all.
     let url = match plain {
-        true => std::fs::canonicalize(url)
-            .map_err(|_| GitError::Other(format!("repository '{url}' does not exist")))?
-            .to_string_lossy()
-            .into_owned(),
+        true if Path::new(url).exists() => std::path::absolute(url)?.to_string_lossy().into_owned(),
+        true => {
+            return Err(GitError::Other(format!(
+                "repository '{url}' does not exist"
+            )));
+        }
         false => url.to_owned(),
     };
     let (mut depth, mut since) = (args.depth, args.shallow_since.clone());
@@ -7017,6 +7155,11 @@ fn clone_into(
             "warning: --shallow-since is ignored in local clones; use file:// instead.".to_owned(),
         ));
         since = None;
+    }
+    if plain && args.filter.is_some() {
+        report(OpProgress::Line(
+            "warning: --filter is ignored in local clones; use file:// instead.".to_owned(),
+        ));
     }
     let bare = args.bare || args.mirror;
     init(
@@ -7074,7 +7217,13 @@ fn clone_into(
         }
         None => false,
     };
-    let branch = args.branch.clone().or(default.clone());
+    // An empty remote's HEAD names the branch to start, as git's ls-refs
+    // `unborn` says.
+    let unborn = match heads.is_empty() && args.branch.is_none() {
+        true => unborn_head(&repo, &url),
+        false => None,
+    };
+    let branch = args.branch.clone().or(default.clone()).or(unborn.clone());
     // A shallow clone takes one branch unless told otherwise, as in git.
     let single = !args.mirror
         && (args.single_branch || ((depth > 0 || since.is_some()) && !args.no_single_branch));
@@ -7088,17 +7237,24 @@ fn clone_into(
         Some(b) if single => format!("+refs/heads/{b}:{top}{b}"),
         _ => format!("+refs/heads/*:{top}*"),
     };
-    repo.remote_with_fetch(&origin, &url, &fetch)?;
-    let mut config = repo.config()?;
-    if args.mirror {
-        config.set_bool(&format!("remote.{origin}.mirror"), true)?;
+    if !git2::Remote::is_valid_name(&origin) {
+        return Err(GitError::Other(format!(
+            "'{origin}' is not a valid remote name"
+        )));
     }
+    // In the order git writes them: -c settings, then the remote's keys.
+    let mut config = repo.config()?;
+    for kv in &args.config {
+        let (key, value) = kv.split_once('=').unwrap_or((kv, "true"));
+        config.set_multivar(&canonical_key(key), "$^", value)?;
+    }
+    config.set_str(&format!("remote.{origin}.url"), &url)?;
     if args.no_tags || args.mirror {
         config.set_str(&format!("remote.{origin}.tagOpt"), "--no-tags")?;
     }
-    for kv in &args.config {
-        let (key, value) = kv.split_once('=').unwrap_or((kv, "true"));
-        config.set_multivar(key, "$^", value)?;
+    config.set_multivar(&format!("remote.{origin}.fetch"), "$^", &fetch)?;
+    if args.mirror {
+        config.set_bool(&format!("remote.{origin}.mirror"), true)?;
     }
 
     // Like git: every tag with all branches, those on the history with one.
@@ -7107,9 +7263,13 @@ fn clone_into(
         no_tags: args.no_tags,
         depth,
         shallow_since: since,
+        filter: args.filter.clone().filter(|_| !plain),
         ..Default::default()
     };
     fetch_one(&repo, &origin, &[], &fetch_args, report, None)?;
+    if let Some(spec) = args.filter.as_deref().filter(|_| plain) {
+        crate::promisor::mark(&repo, &origin, spec)?;
+    }
     let _ = std::fs::remove_file(repo.path().join("FETCH_HEAD"));
     if bare && !args.mirror {
         config.remove_multivar(&format!("remote.{origin}.fetch"), ".*")?;
@@ -7130,7 +7290,18 @@ fn clone_into(
         shallow::write_pack(&mut pack, &repo.odb()?)?;
         std::fs::remove_file(&alternates_file)?;
     }
+    // git writes the refs a clone fetches straight into packed-refs, with
+    // no reflog; the tags one branch's history brings stay loose.
+    let _ = std::fs::remove_dir_all(repo.path().join("logs/refs"));
+    let dst = fetch
+        .trim_start_matches('+')
+        .split_once(':')
+        .map_or("", |(_, d)| d);
+    pack_refs_where(&repo, |name| {
+        !single || ref_matches(dst, name) || map_glob(dst, dst, name).is_some()
+    })?;
     let repo = Repository::open(path)?;
+    crate::promisor::install(&repo);
 
     if heads.is_empty() {
         report(OpProgress::Line(
@@ -7138,6 +7309,8 @@ fn clone_into(
         ));
     }
     let tracking = |b: &str| repo.refname_to_id(&format!("{top}{b}")).ok();
+    let msg = format!("clone: from {url}");
+    let mut logged = vec!["HEAD".to_owned()];
     match &branch {
         Some(b) if tag_head => {
             let tag = repo.revparse_single(&format!("refs/tags/{b}"))?;
@@ -7145,8 +7318,12 @@ fn clone_into(
         }
         Some(b) if bare => repo.set_head(&format!("refs/heads/{b}"))?,
         Some(b) => {
-            if let Some(id) = tracking(b) {
-                repo.branch(b, &repo.find_commit(id)?, true)?;
+            let id = tracking(b);
+            if let Some(id) = id {
+                repo.reference(&format!("refs/heads/{b}"), id, true, &msg)?;
+                logged.push(format!("refs/heads/{b}"));
+            }
+            if id.is_some() || unborn.is_some() {
                 config.set_str(&format!("branch.{b}.remote"), &origin)?;
                 config.set_str(&format!("branch.{b}.merge"), &format!("refs/heads/{b}"))?;
             }
@@ -7161,10 +7338,18 @@ fn clone_into(
             &format!("refs/remotes/{origin}/HEAD"),
             &format!("refs/remotes/{origin}/{d}"),
             true,
-            &format!("clone: from {url}"),
+            &msg,
         )?;
+        logged.push(format!("refs/remotes/{origin}/HEAD"));
+    }
+    if !bare {
+        clone_reflogs(&repo, &logged, &msg)?;
     }
     let checkout = !bare && !args.no_checkout && repo.head().is_ok();
+    if checkout && args.filter.is_some() {
+        let tree = repo.head()?.peel_to_tree()?.id();
+        crate::promisor::prefetch(&repo, tree, args.sparse)?;
+    }
     if args.sparse && !bare {
         sparse_checkout(&repo, checkout)?;
     } else if checkout {
@@ -7224,64 +7409,86 @@ fn sparse_checkout(repo: &Repository, checkout: bool) -> Result<(), GitError> {
     Ok(())
 }
 
-/// A partial clone through git: libgit2 cannot fetch with a filter, nor
-/// fetch the objects left out later, on demand, as a partial clone needs.
-fn clone_filtered(
-    url: &str,
-    path: &Path,
-    args: &crate::CloneArgs,
-    filter: &str,
-) -> Result<(), GitError> {
-    let mut cmd = std::process::Command::new("git");
-    cmd.args(["clone", "--quiet", &format!("--filter={filter}")]);
-    if args.depth > 0 {
-        cmd.arg(format!("--depth={}", args.depth));
+/// A config key as git writes it: section and name lowercased, the
+/// subsection as given.
+fn canonical_key(key: &str) -> String {
+    match (key.split_once('.'), key.rsplit_once('.')) {
+        (Some((section, _)), Some((head, name))) => format!(
+            "{}{}.{}",
+            section.to_ascii_lowercase(),
+            &head[section.len()..],
+            name.to_ascii_lowercase()
+        ),
+        _ => key.to_owned(),
     }
-    for (flag, value) in [
-        ("--branch", &args.branch),
-        ("--origin", &args.origin),
-        ("--template", &args.template),
-        ("--shallow-since", &args.shallow_since),
-        ("--separate-git-dir", &args.separate_git_dir),
-    ] {
-        if let Some(v) = value {
-            cmd.arg(format!("{flag}={v}"));
+}
+
+/// The branch an empty remote's HEAD points at, as ls-refs' `unborn` (or,
+/// from a local repository, its HEAD) says.
+fn unborn_head(repo: &Repository, url: &str) -> Option<String> {
+    let target = if is_local_url(url) {
+        let src = Repository::open(local_path(repo, url)).ok()?;
+        let head = src.find_reference("HEAD").ok()?;
+        head.symbolic_target().ok()??.to_owned()
+    } else {
+        let mut session = crate::smart::Session::open(url, repo.config().ok().as_ref()).ok()?;
+        let refs = session.ls_refs(&["HEAD".to_owned()]).ok()?;
+        let _ = session.finish();
+        refs.into_iter()
+            .find(|r| r.name == "HEAD" && r.id.is_zero())?
+            .symref?
+    };
+    target.strip_prefix("refs/heads/").map(str::to_owned)
+}
+
+/// Write the direct refs `keep` names into packed-refs, fully peeled and
+/// sorted as git writes them, and drop their loose files.
+fn pack_refs_where(repo: &Repository, keep: impl Fn(&str) -> bool) -> Result<(), GitError> {
+    let mut refs = Vec::new();
+    for r in repo.references()? {
+        let r = r?;
+        if let (Ok(name), Some(id)) = (r.name(), r.target())
+            && keep(name)
+        {
+            refs.push((name.to_owned(), id));
         }
     }
-    for (on, flag) in [
-        (args.bare, "--bare"),
-        (args.mirror, "--mirror"),
-        (args.recurse_submodules, "--recurse-submodules"),
-        (args.single_branch, "--single-branch"),
-        (args.no_single_branch, "--no-single-branch"),
-        (args.no_checkout, "--no-checkout"),
-        (args.no_tags, "--no-tags"),
-        (args.dissociate, "--dissociate"),
-        (args.shared, "--shared"),
-        (args.sparse, "--sparse"),
-    ] {
-        if on {
-            cmd.arg(flag);
+    if refs.is_empty() {
+        return Ok(());
+    }
+    refs.sort();
+    let mut out = String::from("# pack-refs with: peeled fully-peeled sorted \n");
+    for (name, id) in &refs {
+        out.push_str(&format!("{id} {name}\n"));
+        if let Ok(tag) = repo.find_tag(*id)
+            && let Ok(peeled) = tag.as_object().peel(ObjectType::Any)
+        {
+            out.push_str(&format!("^{}\n", peeled.id()));
         }
     }
-    for r in &args.reference {
-        cmd.arg(format!("--reference={r}"));
+    let common = repo.commondir();
+    std::fs::write(common.join("packed-refs"), out)?;
+    for (name, _) in &refs {
+        let _ = std::fs::remove_file(common.join(name));
     }
-    for r in &args.reference_if_able {
-        cmd.arg(format!("--reference-if-able={r}"));
-    }
-    for kv in &args.config {
-        cmd.args(["--config", kv]);
-    }
-    let out = cmd
-        .arg(url)
-        .arg(path)
-        .output()
-        .map_err(|e| GitError::Cli(format!("could not run git: {e}")))?;
-    if !out.status.success() {
-        return Err(GitError::Cli(
-            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
-        ));
+    Ok(())
+}
+
+/// Leave each of `refs` a reflog of one entry, `msg`, as a clone does.
+fn clone_reflogs(repo: &Repository, refs: &[String], msg: &str) -> Result<(), GitError> {
+    let sig = ident_signature(repo, true)
+        .or_else(|_| repo.signature())
+        .or_else(|_| git2::Signature::now("unknown", "unknown"))?;
+    for name in refs {
+        let Ok(id) = repo.refname_to_id(name) else {
+            continue;
+        };
+        let mut log = repo.reflog(name)?;
+        while !log.is_empty() {
+            log.remove(0, false)?;
+        }
+        log.append(id, &sig, Some(msg))?;
+        log.write()?;
     }
     Ok(())
 }

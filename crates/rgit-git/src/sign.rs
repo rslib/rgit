@@ -336,6 +336,40 @@ pub fn check(
     Ok(c)
 }
 
+/// `-Overify-time=<YYYYmmddHHMMSS>` for the committer or tagger date of a
+/// commit or tag payload, in local time as git passes it (ssh key validity
+/// has no time zone).
+fn verify_time(payload: &[u8]) -> Option<String> {
+    let secs: i64 = payload
+        .split(|b| *b == b'\n')
+        .take_while(|l| !l.is_empty())
+        .find_map(|l| {
+            l.strip_prefix(b"committer ")
+                .or_else(|| l.strip_prefix(b"tagger "))
+        })
+        .and_then(|ident| {
+            let text = String::from_utf8_lossy(ident).into_owned();
+            let after = text.rsplit_once('>')?.1.to_owned();
+            after.split_whitespace().next()?.parse().ok()
+        })?;
+    // SAFETY: localtime_r only writes the tm it is given.
+    let tm = unsafe {
+        let t = secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        tm
+    };
+    Some(format!(
+        "-Overify-time={:04}{:02}{:02}{:02}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    ))
+}
+
 fn check_ssh(
     repo: &Repository,
     prog: &str,
@@ -351,16 +385,26 @@ fn check_ssh(
     };
     let sig = Temp::new("vtag", signature.as_bytes())?;
     let sig_path = sig.0.to_string_lossy().into_owned();
+    let when = verify_time(payload);
+    let when: Vec<&str> = when.as_deref().into_iter().collect();
     let (found, principals, principals_err) = pipe(
         prog,
-        &["-Y", "find-principals", "-f", &allowed, "-s", &sig_path],
+        &[
+            &["-Y", "find-principals", "-f", &allowed, "-s", &sig_path][..],
+            &when,
+        ]
+        .concat(),
         b"",
     )?;
     let (mut good, mut out, mut err) = (false, String::new(), String::new());
     if !found || principals.trim().is_empty() {
         let (_, o, e) = pipe(
             prog,
-            &["-Y", "check-novalidate", "-n", "git", "-s", &sig_path],
+            &[
+                &["-Y", "check-novalidate", "-n", "git", "-s", &sig_path][..],
+                &when,
+            ]
+            .concat(),
             payload,
         )?;
         (out, err) = (o, e);
@@ -370,6 +414,7 @@ fn check_ssh(
             let mut args = vec![
                 "-Y", "verify", "-n", "git", "-f", &allowed, "-I", principal, "-s", &sig_path,
             ];
+            args.extend(&when);
             if let Some(r) = revocation
                 .as_deref()
                 .filter(|r| std::path::Path::new(r).exists())

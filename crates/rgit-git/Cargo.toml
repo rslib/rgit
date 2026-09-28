@@ -30,6 +30,9 @@ reflink-copy = "0.1"
 regex = "1"
 fancy-regex = "0.16"
 sha1 = "0.10"
+# The smart http transport for partial clones; base64 for its Basic auth.
+ureq = "2"
+base64 = "0.22"
 thiserror = "2.0.20"
 tracing.workspace = true
 walkdir = "2"

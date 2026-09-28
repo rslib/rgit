@@ -789,6 +789,14 @@ pub trait GitBackend: Send + Sync {
     /// Pack objects as `git repack` does; returns what it reports.
     fn repack(&self, opts: &crate::RepackOptions) -> Result<String, GitError>;
 
+    /// Write or verify the commit-graph (`git commit-graph`); what verify
+    /// finds wrong, in git's words.
+    fn commit_graph(&self, op: &crate::CommitGraphOp) -> Result<Vec<String>, GitError>;
+
+    /// Write, verify, expire or repack the multi-pack-index
+    /// (`git multi-pack-index`); what verify finds wrong, in git's words.
+    fn multi_pack_index(&self, op: &crate::MidxOp) -> Result<Vec<String>, GitError>;
+
     /// Move loose refs into packed-refs (`git pack-refs`): every ref with
     /// `all`, else tags and refs already packed; `auto` only when enough loose
     /// refs piled up.

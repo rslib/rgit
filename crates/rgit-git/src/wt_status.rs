@@ -193,6 +193,7 @@ struct Wt<'r> {
     rename_score: Option<u16>,
     rename_limit: Option<usize>,
     hints: bool,
+    submodule_summary: i64,
     use_color: bool,
     palette: [String; 9],
     prefix: Option<String>,
@@ -449,6 +450,14 @@ impl<'r> Wt<'r> {
             rename_score,
             rename_limit,
             hints: !opts.template && get_bool("advice.statusHints").unwrap_or(true),
+            // A number limits the commits shown; true (-1) shows them all.
+            submodule_summary: match get("status.submoduleSummary") {
+                Some(v) => match v.trim().parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) => -i64::from(bool_value(&v).unwrap_or(false)),
+                },
+                None => 0,
+            },
             use_color,
             palette,
             prefix,
@@ -590,6 +599,7 @@ impl<'r> Wt<'r> {
             d.worktree_status = b'A';
             d.mode_worktree = mode;
         }
+        self.pair_ita_renames(ita)?;
         for path in unmerged.keys() {
             if !self.in_spec(path) {
                 continue;
@@ -600,8 +610,8 @@ impl<'r> Wt<'r> {
             d.worktree_status = b'U';
             d.mode_worktree = mode;
         }
-        let ignore = self.submodule_ignore();
         for (path, oid) in gitlinks {
+            let ignore = self.sub_ignore(path);
             if ignore == "all" || !self.in_spec(path) {
                 continue;
             }
@@ -650,6 +660,78 @@ impl<'r> Wt<'r> {
             d.oid_index = *oid;
         }
         Ok(())
+    }
+
+    /// Pair files deleted from the work tree with intent-to-add ones as
+    /// renames, as git's diff-files does, seeing the latter as new files.
+    fn pair_ita_renames(&mut self, ita: &HashSet<String>) -> Result<(), GitError> {
+        let deleted: Vec<String> = self
+            .change
+            .iter()
+            .filter(|(_, d)| d.worktree_status == b'D')
+            .map(|(p, _)| p.clone())
+            .collect();
+        let added: Vec<&String> = ita
+            .iter()
+            .filter(|p| {
+                self.change
+                    .get(*p)
+                    .is_some_and(|d| d.worktree_status == b'A')
+            })
+            .collect();
+        if deleted.is_empty() || added.is_empty() {
+            return Ok(());
+        }
+        let (Some(mut find), Some(index)) = (self.rename_find(), self.tracked_index(ita)?) else {
+            return Ok(());
+        };
+        let mut o = DiffOptions::new();
+        o.include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .disable_pathspec_match(true)
+            .ignore_submodules(true);
+        for p in deleted.iter().chain(added) {
+            o.pathspec(p);
+        }
+        let mut diff = self
+            .repo
+            .diff_index_to_workdir(Some(&index), Some(&mut o))?;
+        find.for_untracked(true);
+        diff.find_similar(Some(&mut find))?;
+        for delta in diff.deltas() {
+            if delta.status() != Delta::Renamed {
+                continue;
+            }
+            let (one, two) = (delta.old_file(), delta.new_file());
+            let from = one
+                .path()
+                .map_or(String::new(), |p| p.to_string_lossy().into());
+            let score = crate::git_repo::similarity(self.repo, &delta);
+            if self.change.get(&from).is_some_and(|d| d.index_status == 0) {
+                self.change.remove(&from);
+            } else if let Some(d) = self.change.get_mut(&from) {
+                d.worktree_status = 0;
+            }
+            let d = self.entry(&delta_path(&delta));
+            d.worktree_status = b'R';
+            d.rename_source = Some(from);
+            d.rename_status = b'R';
+            d.rename_score = score;
+            d.mode_index = one.mode().into();
+            d.oid_index = one.id();
+            d.mode_worktree = two.mode().into();
+        }
+        Ok(())
+    }
+
+    /// The submodule at `path`'s ignore mode: `--ignore-submodules`, else
+    /// its own `submodule.<name>.ignore` (config, then .gitmodules), else
+    /// the default.
+    fn sub_ignore(&self, path: &str) -> String {
+        if let Some(v) = &self.opts.ignore_submodules {
+            return v.clone();
+        }
+        crate::submodule::ignore_of(self.repo, path).unwrap_or_else(|| self.submodule_ignore())
     }
 
     fn submodule_ignore(&self) -> String {
@@ -742,9 +824,14 @@ impl<'r> Wt<'r> {
         if let Some(mut f) = self.rename_find() {
             diff.find_similar(Some(&mut f))?;
         }
+        let hide_gitlinks = self.submodule_ignore() == "all";
         for delta in diff.deltas() {
             let path = delta_path(&delta);
             if unmerged.contains_key(&path) || !self.in_spec(&path) {
+                continue;
+            }
+            let gitlink = |f: git2::DiffFile| f.mode() == git2::FileMode::Commit;
+            if hide_gitlinks && (gitlink(delta.old_file()) || gitlink(delta.new_file())) {
                 continue;
             }
             let Some(status) = delta_char(delta.status()) else {
@@ -1258,6 +1345,10 @@ impl<'r> Wt<'r> {
         self.print_updated();
         self.print_unmerged();
         self.print_changed();
+        if self.submodule_summary != 0 && self.submodule_ignore() != "all" {
+            self.print_submodule_summary(false);
+            self.print_submodule_summary(true);
+        }
         if self.untracked_mode != Untracked::No {
             let list: Vec<String> = self.untracked.iter().cloned().collect();
             self.print_other(&list, "Untracked files", "add");
@@ -1316,6 +1407,36 @@ impl<'r> Wt<'r> {
             }
         }
         Ok(())
+    }
+
+    /// git's wt_longstatus_print_submodule_summary: `submodule summary
+    /// --for-status` of the staged (`--cached`) or unstaged (`--files`)
+    /// submodule changes, under a heading.
+    fn print_submodule_summary(&mut self, unstaged: bool) {
+        use crate::submodule::{checked_out, index_gitlinks, summary_lines, tree_gitlinks};
+        let index = index_gitlinks(self.index);
+        let (src, dst) = match unstaged {
+            true => (index.clone(), checked_out(self.repo, &index)),
+            false => {
+                let head = self.reference_tree().and_then(|t| tree_gitlinks(&t).ok());
+                (head.unwrap_or_default(), index)
+            }
+        };
+        let limit = self.submodule_summary.max(0) as usize;
+        let lines = summary_lines(self.repo, &src, &dst, &[], limit, true);
+        if lines.is_empty() {
+            return;
+        }
+        let mut text = match unstaged {
+            true => "Submodules changed but not updated:\n\n",
+            false => "Submodule changes to be committed:\n\n",
+        }
+        .to_owned();
+        for l in lines {
+            text.push_str(&l);
+            text.push('\n');
+        }
+        self.printf("", &text);
     }
 
     fn stash_count(&self) -> usize {
@@ -1946,9 +2067,23 @@ impl<'r> Wt<'r> {
         if self.opts.verbose > 1 && worktree {
             self.ln(&c, "--------------------------------------------------");
             self.ln(&c, "Changes not staged for commit:");
+            // The deletions paired with intent-to-add files show as renames.
+            let sources: Vec<String> = self
+                .change
+                .values()
+                .filter(|d| d.worktree_status == b'R')
+                .filter_map(|d| d.rename_source.clone())
+                .collect();
+            let mut rest = Index::new()?;
+            for e in index.iter() {
+                if !sources.contains(&String::from_utf8_lossy(&e.path).into_owned()) {
+                    rest.add(&e)?;
+                }
+            }
             let mut o = DiffOptions::new();
             o.old_prefix("i/").new_prefix("w/");
-            let diff = self.repo.diff_index_to_workdir(Some(index), Some(&mut o))?;
+            let rest = if sources.is_empty() { index } else { &rest };
+            let diff = self.repo.diff_index_to_workdir(Some(rest), Some(&mut o))?;
             let mut diffs = vec![diff];
             if !ita.is_empty() {
                 // Intent-to-add files diff as new files.
@@ -1957,11 +2092,16 @@ impl<'r> Wt<'r> {
                     .new_prefix("w/")
                     .include_untracked(true)
                     .show_untracked_content(true)
+                    .recurse_untracked_dirs(true)
                     .disable_pathspec_match(true);
-                for p in &ita {
+                for p in ita.iter().chain(&sources) {
                     o.pathspec(p);
                 }
-                diffs.push(self.repo.diff_index_to_workdir(Some(index), Some(&mut o))?);
+                let mut diff = self.repo.diff_index_to_workdir(Some(index), Some(&mut o))?;
+                if let (false, Some(mut f)) = (sources.is_empty(), self.rename_find()) {
+                    diff.find_similar(Some(f.for_untracked(true)))?;
+                }
+                diffs.push(diff);
             }
             let refs: Vec<&Diff> = diffs.iter().collect();
             let text = patch_text(self.repo, &refs, color, &unmerged)?;

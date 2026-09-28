@@ -1106,6 +1106,9 @@ pub struct FetchArgs {
     pub jobs: usize,
     /// Add to FETCH_HEAD instead of replacing it (`--append`).
     pub append: bool,
+    /// Leave out the objects this filter spec names, fetching them when they
+    /// are read (`--filter`); a promisor remote's own filter by default.
+    pub filter: Option<String>,
 }
 
 /// `git pull` flags beyond the remote and branch.

@@ -32,16 +32,20 @@ mod line_log;
 mod lowlevel;
 mod mail;
 mod maintenance;
+mod midx;
 mod model;
 mod name_rev;
 mod notes;
 mod oplog;
+mod pack;
 mod plumbing;
+mod promisor;
 mod range_diff;
 mod rebase;
 mod shallow;
 mod show_branch;
 mod sign;
+mod smart;
 #[cfg(feature = "ssh")]
 mod ssh;
 mod stash;
@@ -79,6 +83,7 @@ pub use blame::{Blame, BlameOptions};
 pub use bundle::{BundleHeader, bundle_header};
 pub use clean::{CleanOptions, ignore_match, relative as clean_relative};
 pub use combine::CombinedFile;
+pub use commit_graph::{CommitGraphOp, CommitGraphWrite, Split as CommitGraphSplit};
 pub use config::{
     ConfigEntry, ConfigScope, SetMode, ansi_color, command_line_config, config_file,
     config_fixed_value, config_get, config_key, config_list, config_name_matcher, config_section,
@@ -106,6 +111,7 @@ pub use mail::{MailinfoOpts, MailsplitOpts, mailinfo, mailsplit};
 pub use maintenance::{
     GcOptions, MaintenanceRun, ReflogExpire, RepackOptions, TASKS as MAINTENANCE_TASKS,
 };
+pub use midx::MidxOp;
 pub use model::{
     BlameLine, Blob, CheckoutMode, CloneArgs, Commit, CommitDetails, CommitFile, CommitOptions,
     CommitOverview, CommitRef, Deco, DiffSpec, EmptyCommit, FetchArgs, FileActivity, GrepMatch,

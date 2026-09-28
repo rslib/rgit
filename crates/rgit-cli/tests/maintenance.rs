@@ -2285,6 +2285,22 @@ fn signs_and_verifies_with_ssh_like_git() {
     std::fs::write(&allowed, format!("x@x {public}")).unwrap();
     let (want, good) = git_all(&dir, &["verify-commit", "HEAD"]);
     assert_eq!(rgit_in(&dir, &["verify-commit", "HEAD"], b""), (want, good));
+
+    // A key's validity is checked at the commit's date (-Overify-time).
+    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    std::fs::write(&allowed, format!("t@t valid-before=\"20210101\" {public}")).unwrap();
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(&dir)
+        .args(["commit", "-q", "--allow-empty", "-S", "-m", "old"])
+        .env("GIT_COMMITTER_DATE", "2020-06-01T00:00:00Z");
+    isolate(&mut cmd, &dir);
+    assert!(cmd.status().unwrap().success());
+    for (rev, valid) in [("HEAD", true), ("HEAD~1", false)] {
+        let (want, good) = git_all(&dir, &["verify-commit", rev]);
+        assert_eq!(good, valid, "{want}");
+        assert_eq!(rgit_in(&dir, &["verify-commit", rev], b""), (want, good));
+    }
 }
 
 /// A repo with history old enough for every expiry: tags, a merge, extra
@@ -2875,4 +2891,258 @@ fn range_diff_pairs_like_git() {
             "{args:?}"
         );
     }
+}
+
+/// A repo with many revisions of a few files, so packs have deltas to find.
+fn history(tag: &str) -> PathBuf {
+    let dir = repo(tag);
+    for i in 1..=40 {
+        let text: String = (0..150 + i * 4).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(dir.join("a.txt"), format!("{text}rev {i}\n")).unwrap();
+        commit(
+            &dir,
+            "src/lib.rs",
+            &format!("fn f{i}() {{}}\n"),
+            &format!("c{i}"),
+        );
+    }
+    git(&dir, &["tag", "-a", "-m", "t", "v1", "HEAD~3"]);
+    dir
+}
+
+fn pack_files(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(dir.join(".git/objects/pack"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn repack_searches_deltas_and_writes_bitmaps_git_reads() {
+    let dir = history("delta");
+    ok(
+        &dir,
+        &[
+            "repack",
+            "-a",
+            "-d",
+            "-f",
+            "--window=20",
+            "--depth=3",
+            "--threads=2",
+            "--window-memory=1m",
+            "-b",
+        ],
+    );
+    let packs = pack_files(&dir);
+    for ext in ["pack", "idx", "rev", "bitmap"] {
+        let n = packs.iter().filter(|p| p.ends_with(ext)).count();
+        assert_eq!(n, 1, "{packs:?}");
+    }
+    let idx = packs.iter().find(|p| p.ends_with(".idx")).unwrap();
+    let verify = git(
+        &dir,
+        &["verify-pack", "-v", &format!(".git/objects/pack/{idx}")],
+    );
+    assert!(verify.contains("chain length = 1:"), "{verify}");
+    assert!(!verify.contains("chain length = 4:"), "{verify}");
+    git(&dir, &["fsck", "--full", "--strict"]);
+    for args in [
+        &["rev-list", "--count", "HEAD"][..],
+        &["rev-list", "--objects", "--all"],
+        &["rev-list", "--count", "v1"],
+    ] {
+        let with = [&args[..1], &["--use-bitmap-index"], &args[1..]].concat();
+        // Bitmap walks list objects without their paths.
+        let ids = |s: String| -> Vec<String> {
+            s.lines()
+                .map(|l| l.split(' ').next().unwrap_or("").to_owned())
+                .collect()
+        };
+        let mut a = ids(git(&dir, &with));
+        let mut b = ids(git(&dir, args));
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "{args:?}");
+    }
+    git(&dir, &["rev-list", "--test-bitmap", "HEAD"]);
+    assert!(fails(&dir, &["repack", "-b"]).contains("incompatible with bitmap"));
+
+    ok(&dir, &["gc", "--aggressive"]);
+    git(&dir, &["fsck", "--full"]);
+    let idx = pack_files(&dir)
+        .into_iter()
+        .find(|p| p.ends_with(".idx"))
+        .unwrap();
+    git(&dir, &["verify-pack", &format!(".git/objects/pack/{idx}")]);
+}
+
+/// A commit with fixed dates, so twins stay twins.
+fn commit_fixed(dir: &Path, file: &str, msg: &str) {
+    std::fs::write(dir.join(file), msg).unwrap();
+    git(dir, &["add", "."]);
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(["commit", "-qm", msg])
+        .env("GIT_AUTHOR_DATE", "2021-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2021-01-01T00:00:00Z");
+    isolate(&mut cmd, dir);
+    assert!(cmd.status().unwrap().success());
+}
+
+fn graph_files(d: &Path) -> Vec<(String, Vec<u8>)> {
+    let info = d.join(".git/objects/info");
+    let mut out = vec![(
+        "commit-graph".to_owned(),
+        std::fs::read(info.join("commit-graph")).unwrap_or_default(),
+    )];
+    for e in std::fs::read_dir(info.join("commit-graphs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        out.push((
+            e.file_name().to_string_lossy().into_owned(),
+            std::fs::read(e.path()).unwrap(),
+        ));
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn commit_graph_chains_and_bloom_filters_match_git() {
+    let (g, r) = twins("cgraph");
+    let same = |args: &[&str]| {
+        let all = [&["commit-graph", "write"][..], args].concat();
+        git(&g, &all);
+        ok(&r, &all);
+        assert_eq!(graph_files(&r), graph_files(&g), "{args:?}");
+        git(&r, &["commit-graph", "verify"]);
+        ok(&r, &["commit-graph", "verify"]);
+    };
+    let grow = |n: &str| {
+        for d in [&g, &r] {
+            commit_fixed(d, n, n);
+        }
+    };
+    same(&["--reachable", "--changed-paths"]);
+    same(&["--reachable", "--split"]);
+    grow("x1");
+    same(&["--reachable", "--split=no-merge"]);
+    grow("x2");
+    grow("x3");
+    same(&["--reachable", "--split", "--size-multiple=10"]);
+    grow("x4");
+    same(&["--reachable", "--split", "--max-commits=2"]);
+    same(&["--reachable", "--split=replace"]);
+    same(&[]);
+    same(&["--reachable"]);
+    // git's log -- <path> reads rgit's filters.
+    assert_eq!(
+        git(&r, &["log", "--format=%s", "--", "x2"]),
+        git(&g, &["log", "--format=%s", "--", "x2"])
+    );
+
+    let graph = r.join(".git/objects/info/commit-graph");
+    let mut data = std::fs::read(&graph).unwrap();
+    let at = data.len() - 30;
+    data[at] ^= 0xff;
+    std::fs::write(&graph, data).unwrap();
+    let out = fails(&r, &["commit-graph", "verify"]);
+    assert!(out.contains("incorrect checksum"), "{out}");
+    let (report, good) = rgit_in(&r, &["fsck"], b"");
+    assert!(!good && report.contains("incorrect checksum"), "{report}");
+}
+
+#[test]
+fn multi_pack_index_writes_what_git_writes() {
+    let (g, r) = twins("midx");
+    for d in [&g, &r] {
+        for i in 0..4 {
+            commit_fixed(d, &format!("p{i}"), &format!("p{i}"));
+            git(d, &["repack", "-q"]);
+        }
+    }
+    git(&g, &["multi-pack-index", "write"]);
+    ok(&r, &["multi-pack-index", "write"]);
+    let midx = |d: &Path| std::fs::read(d.join(".git/objects/pack/multi-pack-index")).unwrap();
+    assert_eq!(midx(&r), midx(&g));
+    ok(&r, &["multi-pack-index", "verify"]);
+    ok(&r, &["multi-pack-index", "repack", "--batch-size=0"]);
+    git(&r, &["multi-pack-index", "verify"]);
+    ok(&r, &["multi-pack-index", "expire"]);
+    let packs = pack_files(&r);
+    assert_eq!(packs.iter().filter(|p| p.ends_with(".pack")).count(), 1);
+    git(&r, &["multi-pack-index", "verify"]);
+    git(&r, &["fsck"]);
+
+    // The incremental-repack task: write, expire, then repack a batch.
+    for i in 0..3 {
+        commit(&r, &format!("q{i}"), "y", &format!("q{i}"));
+        git(&r, &["repack", "-q"]);
+    }
+    for _ in 0..2 {
+        ok(&r, &["maintenance", "run", "--task=incremental-repack"]);
+        git(&r, &["multi-pack-index", "verify"]);
+    }
+    git(&r, &["fsck"]);
+
+    let file = r.join(".git/objects/pack/multi-pack-index");
+    let mut data = std::fs::read(&file).unwrap();
+    let at = data.len() - 30;
+    data[at] ^= 0xff;
+    std::fs::write(&file, data).unwrap();
+    assert!(fails(&r, &["multi-pack-index", "verify"]).contains("incorrect checksum"));
+}
+
+#[test]
+fn fsck_checks_gitmodules_and_attributes_like_git() {
+    let dir = repo("fsck-special");
+    std::fs::write(
+        dir.join(".gitmodules"),
+        "[submodule \"../evil\"]\n\tpath = -x\n\turl = -oProxyCommand=boom\n\tupdate = !rm\n\
+         [submodule \"ok\"]\n\tpath = ok\n\turl = https:///example.com/x.git\n\
+         [submodule \"rel\"]\n\turl = ../../:foo\n",
+    )
+    .unwrap();
+    let long = format!("{} text\n", "a".repeat(3000));
+    std::fs::write(dir.join(".gitattributes"), long).unwrap();
+    std::os::unix::fs::symlink("target", dir.join(".gitignore")).unwrap();
+    std::os::unix::fs::symlink("target", dir.join(".mailmap")).unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-qm", "special"]);
+    let (link, _) = git_in(&dir, &["hash-object", "-w", "--stdin"], b"x");
+    let entries = format!(
+        "120000 blob {0}\t.gitmodules\n120000 blob {0}\t.GITATTRIBUTES\n",
+        link.trim()
+    );
+    let (tree, _) = git_in(&dir, &["mktree"], entries.as_bytes());
+    let (head, _) = git_in(
+        &dir,
+        &["commit-tree", tree.trim(), "-p", "HEAD", "-m", "links"],
+        b"",
+    );
+    git(&dir, &["update-ref", "refs/heads/main", head.trim()]);
+    let sorted = |s: String| {
+        let mut l: Vec<String> = s.lines().map(str::to_owned).collect();
+        l.sort();
+        l
+    };
+    let check = |args: &[&str]| {
+        let (want, good) = git_all(&dir, args);
+        let (got, rgood) = rgit_in(&dir, args, b"");
+        assert_eq!(sorted(got), sorted(want), "{args:?}");
+        assert_eq!(rgood, good, "{args:?}");
+    };
+    check(&["fsck"]);
+    check(&["fsck", "--strict"]);
+    git(&dir, &["config", "fsck.gitmodulesUrl", "warn"]);
+    git(&dir, &["config", "fsck.gitmodulesName", "ignore"]);
+    git(&dir, &["config", "fsck.gitattributesLineLength", "ignore"]);
+    check(&["fsck"]);
 }

@@ -979,49 +979,6 @@ pub fn is_local_url(url: &str) -> bool {
     }
 }
 
-/// `s` in single quotes for a POSIX shell, as git's sq_quote_buf writes it.
-fn sq_quote(s: &str) -> String {
-    let mut out = String::from("'");
-    for c in s.chars() {
-        match c {
-            '\'' | '!' => {
-                out.push_str("'\\");
-                out.push(c);
-                out.push('\'');
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('\'');
-    out
-}
-
-/// Write one pkt-line.
-fn pkt(w: &mut impl std::io::Write, data: &[u8]) -> std::io::Result<()> {
-    w.write_all(format!("{:04x}", data.len() + 4).as_bytes())?;
-    w.write_all(data)
-}
-
-/// Read one pkt-line; None is a flush (or the end of the stream).
-fn read_pkt(r: &mut impl std::io::Read) -> Result<Option<Vec<u8>>, GitError> {
-    let mut len = [0u8; 4];
-    match r.read_exact(&mut len) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let len = std::str::from_utf8(&len)
-        .ok()
-        .and_then(|s| usize::from_str_radix(s, 16).ok())
-        .ok_or_else(|| GitError::Other("protocol error: bad line length character".into()))?;
-    if len < 4 {
-        return Ok(None);
-    }
-    let mut data = vec![0u8; len - 4];
-    r.read_exact(&mut data)?;
-    Ok(Some(data))
-}
-
 /// `git archive --remote` over git:// or ssh: send the arguments to the
 /// remote's upload-archive and return the archive it streams back on
 /// sideband 1, showing its sideband 2 messages on stderr as git does.
@@ -1032,82 +989,12 @@ pub fn remote_archive(
     args: &[String],
     ssh: Option<&str>,
 ) -> Result<Vec<u8>, GitError> {
-    use std::io::{Read, Write};
-    // [user@]host[:port] and the path, with `/~user` read as `~user`.
-    let (scheme, authority, path) = match url.split_once("://") {
-        Some((scheme, rest)) => {
-            let (a, p) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-            (scheme, a, p)
-        }
-        None => {
-            let (a, p) = url.split_once(':').unwrap_or((url, ""));
-            ("ssh", a, p)
-        }
-    };
-    let path = path
-        .strip_prefix('/')
-        .filter(|p| p.starts_with('~'))
-        .unwrap_or(path);
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if url.contains("://") && !p.contains(']') => (h, Some(p)),
-        _ => (authority, None),
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let mut child = None;
-    let (mut reader, mut writer): (Box<dyn Read>, Box<dyn Write>) = match scheme {
-        "git" => {
-            let port: u16 = port.and_then(|p| p.parse().ok()).unwrap_or(9418);
-            let stream = std::net::TcpStream::connect((host, port))?;
-            let mut w = stream.try_clone()?;
-            pkt(
-                &mut w,
-                format!("{exec} {path}\0host={authority}\0").as_bytes(),
-            )?;
-            (Box::new(stream), Box::new(w))
-        }
-        "ssh" | "git+ssh" | "ssh+git" => {
-            if host.starts_with('-') {
-                return Err(GitError::Other(format!(
-                    "strange hostname '{host}' blocked"
-                )));
-            }
-            let command = format!("{exec} {}", sq_quote(path));
-            let mut ssh_args: Vec<String> = Vec::new();
-            if let Some(p) = port {
-                ssh_args.extend(["-p".to_owned(), p.to_owned()]);
-            }
-            ssh_args.extend([host.to_owned(), command]);
-            let git_ssh = std::env::var("GIT_SSH").ok();
-            let shell = std::env::var("GIT_SSH_COMMAND")
-                .ok()
-                .or_else(|| ssh.filter(|_| git_ssh.is_none()).map(str::to_owned));
-            let mut cmd = match (shell, git_ssh) {
-                (Some(sh), _) => {
-                    let mut c = std::process::Command::new("sh");
-                    c.args(["-c", &format!("{sh} \"$@\""), &sh]);
-                    c
-                }
-                (None, Some(prog)) => std::process::Command::new(prog),
-                (None, None) => std::process::Command::new("ssh"),
-            };
-            let mut c = cmd
-                .args(&ssh_args)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()?;
-            let r = c.stdout.take().expect("piped stdout");
-            let w = c.stdin.take().expect("piped stdin");
-            child = Some(c);
-            (Box::new(r), Box::new(w))
-        }
-        _ => {
-            return Err(GitError::Other(
-                "operation not supported by protocol".into(),
-            ));
-        }
-    };
+    use crate::smart::{pkt, read_pkt};
+    use std::io::Write;
+    let mut stream = crate::smart::connect(url, exec, ssh, false)?;
+    let (reader, writer) = (&mut stream.reader, &mut stream.writer);
     for a in args {
-        pkt(&mut writer, format!("argument {a}\n").as_bytes())?;
+        pkt(writer, format!("argument {a}\n").as_bytes())?;
     }
     writer.write_all(b"0000")?;
     writer.flush()?;
@@ -1119,7 +1006,7 @@ pub fn remote_archive(
         l.strip_prefix("ERR ")
             .map(|m| GitError::Other(format!("remote error: {m}")))
     };
-    let Some(ack) = read_pkt(&mut reader)?.map(chomp) else {
+    let Some(ack) = read_pkt(reader)?.map(chomp) else {
         return Err(GitError::Other(
             "git archive: expected ACK/NAK, got a flush packet".into(),
         ));
@@ -1133,7 +1020,7 @@ pub fn remote_archive(
             None => "git archive: protocol error".to_owned(),
         }));
     }
-    if let Some(l) = read_pkt(&mut reader)? {
+    if let Some(l) = read_pkt(reader)? {
         return Err(remote_err(&chomp(l))
             .unwrap_or_else(|| GitError::Other("git archive: expected a flush".into())));
     }
@@ -1142,7 +1029,7 @@ pub fn remote_archive(
     let stderr_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
     let suffix: &[u8] = if stderr_tty { b"\x1b[K" } else { b"        " };
     let mut failure = None;
-    while let Some(p) = read_pkt(&mut reader)? {
+    while let Some(p) = read_pkt(reader)? {
         let Some((&band, data)) = p.split_first() else {
             continue;
         };
@@ -1183,12 +1070,11 @@ pub fn remote_archive(
         line.extend(&progress);
         let _ = std::io::stderr().write_all(&line);
     }
-    drop(writer);
-    let status = child.map(|mut c| c.wait()).transpose()?;
+    let finished = stream.finish()?;
     if let Some(msg) = failure {
         return Err(GitError::Other(msg));
     }
-    if status.is_some_and(|s| !s.success()) {
+    if !finished {
         return Err(GitError::Other(
             "the remote end hung up unexpectedly".into(),
         ));

@@ -4377,6 +4377,7 @@ dependencies = [
 name = "rgit-git"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "fancy-regex 0.16.2",
  "flate2",
  "git2",
@@ -4397,6 +4398,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "ureq",
  "walkdir",
 ]
 

@@ -1547,3 +1547,298 @@ fn push_recurse_submodules_checks_and_pushes_them() {
     );
     ok(&up, &["push", "origin", "main"]);
 }
+
+/// A `git daemon` serving the repositories under a folder on a free local
+/// port, stopped when dropped.
+struct Daemon(std::process::Child, u16);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Daemon {
+    fn start(base: &Path) -> Daemon {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let child = env(&mut Command::new("git"), base)
+            .args([
+                "daemon",
+                "--reuseaddr",
+                "--export-all",
+                "--listen=127.0.0.1",
+            ])
+            .arg(format!("--port={port}"))
+            .arg(format!("--base-path={}", base.display()))
+            .arg(base)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..200 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        Daemon(child, port)
+    }
+
+    fn url(&self, repo: &str) -> String {
+        format!("git://127.0.0.1:{}/{repo}", self.1)
+    }
+}
+
+/// What git keeps of a clone: its config, refs and reflog messages, the
+/// objects it has and lacks, and the state of its working tree.
+fn clone_state(dir: &Path) -> String {
+    let gitdir = match dir.join(".git").is_dir() {
+        true => dir.join(".git"),
+        false => dir.to_path_buf(),
+    };
+    let read = |p: &str| std::fs::read_to_string(gitdir.join(p)).unwrap_or_default();
+    let mut logs: Vec<String> = walkdir(&gitdir.join("logs"))
+        .into_iter()
+        .map(|p| {
+            let text = std::fs::read_to_string(&p).unwrap();
+            let msgs: Vec<&str> = text.lines().filter_map(|l| l.split('\t').nth(1)).collect();
+            format!("{}: {msgs:?}", p.strip_prefix(&gitdir).unwrap().display())
+        })
+        .collect();
+    logs.sort();
+    let mut loose: Vec<String> = walkdir(&gitdir.join("refs"))
+        .into_iter()
+        .map(|p| p.strip_prefix(&gitdir).unwrap().display().to_string())
+        .collect();
+    loose.sort();
+    let promisors = walkdir(&gitdir.join("objects/pack"))
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "promisor"))
+        .count();
+    let mut objects: Vec<String> = git(dir, &["rev-list", "--all", "--objects", "--missing=print"])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    objects.sort();
+    format!(
+        "{}\n{}\nHEAD {}\n{loose:?}\n{logs:?}\n{objects:?}\npromisor packs: {}\n{}",
+        read("config"),
+        read("packed-refs"),
+        read("HEAD"),
+        promisors > 0,
+        match gitdir == dir {
+            true => String::new(),
+            false => git(dir, &["status", "--porcelain"]),
+        }
+    )
+}
+
+fn walkdir(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walkdir(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// A remote with branches, a lightweight and an annotated tag, a file in a
+/// folder and one too big for `blob:limit=1k`, allowing filters.
+fn partial_setup(tag: &str) -> (PathBuf, PathBuf) {
+    let (remote, up, _) = fetch_setup(tag);
+    std::fs::create_dir_all(up.join("d")).unwrap();
+    std::fs::write(up.join("d/big"), "x".repeat(4096)).unwrap();
+    git(&up, &["add", "."]);
+    git(&up, &["commit", "-qm", "big"]);
+    git(&up, &["tag", "light", "main~1"]);
+    git(&up, &["tag", "-a", "-m", "v", "v1", "main~2"]);
+    git(&up, &["checkout", "-qb", "topic"]);
+    commit(&up, "t", "t\n");
+    git(&up, &["checkout", "-q", "main"]);
+    git(
+        &up,
+        &["push", "-q", "origin", "main", "topic", "light", "v1"],
+    );
+    git(&remote, &["config", "uploadpack.allowFilter", "true"]);
+    (remote.parent().unwrap().to_path_buf(), up)
+}
+
+#[test]
+fn clones_write_refs_reflogs_and_config_like_git() {
+    let (root, _) = partial_setup("clone-refs");
+    let daemon = Daemon::start(&root);
+    git(&root, &["init", "-q", "--bare", "-b", "trunk", "empty.git"]);
+    let file = format!("file://{}", root.join("r.git").display());
+    let plain = root.join("r.git").display().to_string();
+    let net = daemon.url("r.git");
+    let cases: &[(&str, Vec<&str>)] = &[
+        ("plain", vec![&plain]),
+        ("file", vec![&file]),
+        ("bare", vec!["--bare", &file]),
+        ("mirror", vec!["--mirror", &file]),
+        ("single", vec!["--single-branch", "-b", "topic", &file]),
+        (
+            "detached",
+            vec!["-b", "v1", "-c", "advice.detachedHead=false", &file],
+        ),
+        (
+            "tagless",
+            vec!["--no-tags", "-c", "a.b=c", "-o", "up", &file],
+        ),
+        ("net", vec![&net]),
+    ];
+    for (name, args) in cases {
+        let theirs = format!("g-{name}");
+        ok(&root, &[&["clone"], &args[..], &[name]].concat());
+        git(&root, &[&["clone", "-q"], &args[..], &[&theirs]].concat());
+        let strip = |s: String| s.replace(root.to_str().unwrap(), "");
+        assert_eq!(
+            strip(clone_state(&root.join(name))),
+            strip(clone_state(&root.join(&theirs))),
+            "{name}"
+        );
+    }
+    // An empty remote's HEAD names the branch to start, over the network too.
+    for url in [
+        format!("file://{}", root.join("empty.git").display()),
+        daemon.url("empty.git"),
+    ] {
+        let _ = std::fs::remove_dir_all(root.join("empty"));
+        let _ = std::fs::remove_dir_all(root.join("g-empty"));
+        ok(&root, &["clone", &url, "empty"]);
+        git(&root, &["clone", "-q", &url, "g-empty"]);
+        assert_eq!(
+            clone_state(&root.join("empty")),
+            clone_state(&root.join("g-empty"))
+        );
+        assert!(clone_state(&root.join("empty")).contains("refs/heads/trunk"));
+    }
+}
+
+#[test]
+fn partial_clones_fetch_what_they_lack_like_git() {
+    let (root, up) = partial_setup("partial");
+    let daemon = Daemon::start(&root);
+    let file = format!("file://{}", root.join("r.git").display());
+    let net = daemon.url("r.git");
+    let strip = |s: String| s.replace(root.to_str().unwrap(), "").replace(&net, "URL");
+    for (name, url, flags) in [
+        ("none", &file, &["--filter=blob:none"][..]),
+        ("limit", &file, &["--filter=blob:limit=1k"]),
+        ("tree", &file, &["--filter=tree:0"]),
+        ("sparse", &file, &["--filter=blob:none", "--sparse"]),
+        ("unchecked", &file, &["--filter=blob:none", "-n"]),
+        ("shallow", &file, &["--filter=blob:none", "--depth=1"]),
+        ("net-none", &net, &["--filter=blob:none"]),
+        ("net-tree", &net, &["--filter=tree:0"]),
+    ] {
+        let theirs = format!("g-{name}");
+        ok(&root, &[&["clone"], flags, &[url.as_str(), name]].concat());
+        git(
+            &root,
+            &[&["clone", "-q"], flags, &[url.as_str(), &theirs]].concat(),
+        );
+        assert_eq!(
+            strip(clone_state(&root.join(name))),
+            strip(clone_state(&root.join(&theirs))),
+            "{name}"
+        );
+    }
+    // What the filter left out is fetched when read.
+    for name in ["none", "tree", "net-none"] {
+        let dir = root.join(name);
+        assert_eq!(ok(&dir, &["--human", "show", "HEAD~2:a"]), "a\n", "{name}");
+        assert_eq!(git(&dir, &["cat-file", "-p", "HEAD~2:a"]), "a\n");
+    }
+
+    // A later fetch goes through the remote's filter.
+    commit(&up, "c", "c\n");
+    git(&up, &["push", "-q", "origin", "main"]);
+    let objects = |dir: &Path| {
+        let mut all: Vec<String> = git(dir, &["rev-list", "--all", "--objects", "--missing=print"])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        all.sort();
+        all
+    };
+    for name in ["none", "net-none"] {
+        ok(&root.join(name), &["fetch"]);
+        git(&root.join(format!("g-{name}")), &["fetch", "-q"]);
+        assert_eq!(
+            objects(&root.join(name)),
+            objects(&root.join(format!("g-{name}"))),
+            "{name}"
+        );
+    }
+
+    // fetch --filter makes a full clone's remote a promisor.
+    ok(&root, &["clone", "-q", &file, "full"]);
+    ok(
+        &root.join("full"),
+        &["fetch", "--filter=blob:limit=2k", "origin"],
+    );
+    let config = git(
+        &root.join("full"),
+        &["config", "--get-regexp", "promisor|filter|format"],
+    );
+    assert_eq!(
+        config,
+        "core.repositoryformatversion 1\nremote.origin.promisor true\n\
+         remote.origin.partialclonefilter blob:limit=2048\n"
+    );
+
+    // A server that does not filter sends everything, and git's warnings.
+    git(
+        &root.join("r.git"),
+        &["config", "uploadpack.allowFilter", "false"],
+    );
+    let (_, err, success) = rgit(&root, &["clone", "--filter=blob:none", &file, "unfiltered"]);
+    assert!(
+        success && err.contains("filtering not recognized by server, ignoring"),
+        "{err}"
+    );
+    let plain = root.join("r.git").display().to_string();
+    let (_, err, success) = rgit(&root, &["clone", "--filter=blob:none", &plain, "local"]);
+    assert!(
+        success && err.contains("--filter is ignored in local clones"),
+        "{err}"
+    );
+    let msg = fails(&root, &["clone", "--filter=bogus", &file, "bogus"]);
+    assert!(msg.contains("invalid filter-spec 'bogus'"), "{msg}");
+    assert!(!root.join("bogus").exists());
+}
+
+#[test]
+fn shallow_since_over_the_network_matches_git() {
+    let (root, _) = dated_setup("shallow-net");
+    let daemon = Daemon::start(&root);
+    let url = daemon.url("r.git");
+    ok(
+        &root,
+        &["clone", "--shallow-since=2021-06-01", &url, "since"],
+    );
+    git(
+        &root,
+        &["clone", "-q", "--shallow-since=2021-06-01", &url, "gsince"],
+    );
+    let (mine, theirs) = (root.join("since"), root.join("gsince"));
+    same_history(&mine, &theirs);
+    for step in [
+        &["fetch", "--shallow-since=2020-06-01"][..],
+        &["fetch", "--deepen", "1"],
+    ] {
+        ok(&mine, step);
+        git(&theirs, &[step, &["-q"]].concat());
+        same_history(&mine, &theirs);
+    }
+}

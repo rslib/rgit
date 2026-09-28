@@ -591,26 +591,81 @@ pub struct RepackOptions {
     pub keep_pack: Vec<String>,
     /// Don't write objects/info/packs (-n).
     pub no_update_server_info: bool,
+    /// Recompute deltas (-f); with any delta setting below, rgit's own pack
+    /// writer runs git's delta search instead of libgit2's.
+    pub no_reuse_delta: bool,
+    /// Recompress every object (-F).
+    pub no_reuse_object: bool,
+    /// Delta window (--window, default pack.window or 10).
+    pub window: Option<u32>,
+    /// Maximum delta chain (--depth, default pack.depth or 50).
+    pub depth: Option<u32>,
+    /// Bytes the delta window may hold (--window-memory, pack.windowMemory).
+    pub window_memory: Option<u64>,
+    /// Delta search threads (--threads, pack.threads; 0 is one per CPU).
+    pub threads: Option<u32>,
+    /// Write a reachability bitmap (-b; default repack.writeBitmaps, on in
+    /// bare repositories when everything goes into one pack).
+    pub write_bitmap: Option<bool>,
 }
 
-/// Pack exactly `ids` into a new pack; its `pack-<hash>` name, if any.
-// ponytail: libgit2 picks deltas itself, so -f, -F, --window, --depth and
-// --aggressive do not change the pack.
-fn new_pack(repo: &Repository, ids: &[Oid]) -> Result<Option<String>, GitError> {
+impl RepackOptions {
+    /// git's delta search settings, when any is asked for.
+    fn delta(&self, repo: &Repository) -> Option<crate::pack::DeltaOpts> {
+        let own = self.no_reuse_delta
+            || self.no_reuse_object
+            || self.window.is_some()
+            || self.depth.is_some()
+            || self.window_memory.is_some()
+            || self.threads.is_some();
+        let int = |key: &str, default: i64| cfg_int(repo, key, default).max(0) as usize;
+        own.then(|| crate::pack::DeltaOpts {
+            window: self
+                .window
+                .map_or_else(|| int("pack.window", 10), |w| w as usize),
+            depth: self
+                .depth
+                .map_or_else(|| int("pack.depth", 50), |d| d as usize)
+                .min(4095),
+            window_memory: self
+                .window_memory
+                .unwrap_or_else(|| int("pack.windowMemory", 0) as u64),
+            threads: self
+                .threads
+                .map_or_else(|| int("pack.threads", 0), |t| t as usize),
+        })
+    }
+}
+
+/// Pack exactly `ids` into a new pack with libgit2's delta choices; its
+/// `pack-<hash>` name, if any.
+pub(crate) fn new_pack(repo: &Repository, ids: &[Oid]) -> Result<Option<String>, GitError> {
+    new_pack_with(repo, ids, None)
+}
+
+/// [`new_pack`], or with git's own delta search when `delta` is given.
+fn new_pack_with(
+    repo: &Repository,
+    ids: &[Oid],
+    delta: Option<&crate::pack::DeltaOpts>,
+) -> Result<Option<String>, GitError> {
     if ids.is_empty() {
         return Ok(None);
     }
-    let mut pb = repo.packbuilder()?;
-    for id in ids {
-        pb.insert_object(*id, None)?;
-    }
     let dir = objects_dir(repo).join("pack");
-    std::fs::create_dir_all(&dir)?;
-    pb.write(&dir, 0)?;
-    let name = pb
-        .name()?
-        .map(|n| format!("pack-{n}"))
-        .ok_or_else(|| GitError::Other("the pack was not written".to_owned()))?;
+    let name = match delta {
+        Some(d) => crate::pack::write_pack(repo, ids, d)?,
+        None => {
+            let mut pb = repo.packbuilder()?;
+            for id in ids {
+                pb.insert_object(*id, None)?;
+            }
+            std::fs::create_dir_all(&dir)?;
+            pb.write(&dir, 0)?;
+            pb.name()?.map(|n| format!("pack-{n}"))
+        }
+    }
+    .ok_or_else(|| GitError::Other("the pack was not written".to_owned()))?;
     if cfg_bool(repo, "pack.writeReverseIndex", true) {
         write_rev(&dir.join(format!("{name}.pack")))?;
     }
@@ -737,7 +792,19 @@ pub fn repack(repo: &Repository, o: &RepackOptions) -> Result<String, GitError> 
     ids.dedup();
     let odb = repo.odb()?;
     ids.retain(|id| odb.exists(*id));
-    let name = new_pack(repo, &ids)?;
+    let bitmap = o.write_bitmap.unwrap_or_else(|| {
+        cfg(repo)
+            .and_then(|c| c.get_bool("repack.writeBitmaps").ok())
+            .unwrap_or(everything && repo.is_bare())
+    });
+    if bitmap && !everything {
+        return Err(GitError::Other(
+            "Incremental repacks are incompatible with bitmap indexes.  Use\n\
+             --no-write-bitmap-index or disable the pack.writeBitmaps configuration."
+                .to_owned(),
+        ));
+    }
+    let name = new_pack_with(repo, &ids, o.delta(repo).as_ref())?;
     let mut report = String::new();
     if name.is_none() && !everything {
         report.push_str("Nothing new to pack.");
@@ -812,6 +879,13 @@ pub fn repack(repo: &Repository, o: &RepackOptions) -> Result<String, GitError> 
                 }
             }
         }
+        let listed = crate::midx::listed(repo);
+        if old
+            .iter()
+            .any(|p| listed.contains(&format!("{}.idx", p.name)))
+        {
+            let _ = std::fs::remove_file(dir.join("multi-pack-index"));
+        }
         for p in old {
             for ext in ["pack", "idx", "rev", "bitmap", "mtimes", "promisor"] {
                 let f = p.file(ext);
@@ -820,6 +894,19 @@ pub fn repack(repo: &Repository, o: &RepackOptions) -> Result<String, GitError> 
                 }
             }
         }
+    }
+    if bitmap
+        && let Some(n) = &name
+        && !crate::pack::write_bitmap(
+            repo,
+            &dir.join(format!("{n}.pack")),
+            &roots(repo, false, false),
+        )?
+    {
+        report.push_str(
+            "warning: Failed to write bitmap index. Packfile doesn't have full closure (object \
+             bitmaps are only computed for objects reachable from refs)",
+        );
     }
     if o.delete {
         prune_packed(repo, false);
@@ -1427,6 +1514,11 @@ pub fn gc(repo: &Repository, o: &GcOptions) -> Result<String, GitError> {
         keep_pack,
         ..Default::default()
     };
+    if o.aggressive {
+        ro.no_reuse_delta = true;
+        ro.window = Some(cfg_int(repo, "gc.aggressiveWindow", 250).max(0) as u32);
+        ro.depth = Some(cfg_int(repo, "gc.aggressiveDepth", 50).max(0) as u32);
+    }
     if all_loosen_or_cruft {
         if now_prune {
             ro.all = true;
@@ -1474,31 +1566,19 @@ pub fn pack_loose(repo: &Repository) -> Result<(), GitError> {
     Ok(())
 }
 
-/// The incremental-repack task without a multi-pack-index: fold every pack
-/// but the largest (and kept ones) into one.
-// ponytail: no multi-pack-index; packs are merged directly, not via
-// `multi-pack-index repack --batch-size`.
-pub fn incremental_repack(repo: &Repository) -> Result<(), GitError> {
-    let all = packs(repo);
-    let mut small: Vec<&Pack> = all.iter().filter(|p| !p.keep && !p.cruft).collect();
-    small.sort_by_key(|p| p.size);
-    small.pop();
-    if small.len() < 2 {
-        return Ok(());
+/// The incremental-repack task: through the multi-pack-index as git runs
+/// it, or (with core.multiPackIndex off) skipped with git's warning.
+pub fn incremental_repack(repo: &Repository) -> Result<String, GitError> {
+    if !cfg_bool(repo, "core.multiPackIndex", true) {
+        return Ok(
+            "warning: skipping incremental-repack task because core.multiPackIndex is \
+                   disabled"
+                .to_owned(),
+        );
     }
-    let mut ids: Vec<Oid> = small.iter().flat_map(|p| p.ids()).collect();
-    ids.sort();
-    ids.dedup();
-    let name = new_pack(repo, &ids)?;
-    for p in small {
-        if Some(&p.name) == name.as_ref() {
-            continue;
-        }
-        for ext in ["pack", "idx", "rev", "bitmap"] {
-            let _ = std::fs::remove_file(p.file(ext));
-        }
-    }
-    update_server_info(repo)
+    crate::midx::incremental_repack(repo)?;
+    update_server_info(repo)?;
+    Ok(String::new())
 }
 
 /// How many loose objects there are.
@@ -1506,9 +1586,13 @@ pub(crate) fn loose_count(repo: &Repository) -> usize {
     loose_objects(repo).len()
 }
 
-/// Packs outside kept and cruft ones.
-pub(crate) fn pack_count(repo: &Repository) -> usize {
-    packs(repo).iter().filter(|p| !p.keep && !p.cruft).count()
+/// Packs the multi-pack-index does not list yet.
+fn packs_outside_midx(repo: &Repository) -> usize {
+    let listed = crate::midx::listed(repo);
+    packs(repo)
+        .iter()
+        .filter(|p| !listed.contains(&format!("{}.idx", p.name)))
+        .count()
 }
 
 /// `git maintenance run`'s tasks, in git's order.
@@ -1554,7 +1638,7 @@ fn task_due(repo: &Repository, task: &str) -> bool {
     match task {
         "gc" => gc_needed(repo),
         "loose-objects" => over(loose_count(repo), 100),
-        "incremental-repack" => over(pack_count(repo), 10),
+        "incremental-repack" => over(packs_outside_midx(repo), 10),
         "commit-graph" => over(crate::commit_graph::missing(repo), 100),
         "pack-refs" => refs_need_packing(repo),
         "reflog-expire" => {
@@ -1684,7 +1768,9 @@ pub fn run(
         let result = match task {
             "prefetch" => prefetch(),
             "loose-objects" => pack_loose(repo),
-            "incremental-repack" => incremental_repack(repo),
+            "incremental-repack" => {
+                incremental_repack(repo).map(|r| report.extend((!r.is_empty()).then_some(r)))
+            }
             "gc" => gc(
                 repo,
                 &GcOptions {
@@ -1695,7 +1781,14 @@ pub fn run(
             )
             .map(|r| report.extend((!r.is_empty()).then_some(r))),
             "commit-graph" if cfg_bool(repo, "core.commitGraph", true) => {
-                crate::commit_graph::write(repo)
+                crate::commit_graph::write_with(
+                    repo,
+                    &crate::CommitGraphWrite {
+                        reachable: true,
+                        split: Some(crate::CommitGraphSplit::Merge),
+                        ..Default::default()
+                    },
+                )
             }
             "pack-refs" => pack_refs(repo, true, false, false),
             "reflog-expire" => reflog_expire(

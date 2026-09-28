@@ -50,13 +50,7 @@ pub fn summary(
             "--cached and --files are mutually exclusive".to_owned(),
         ));
     }
-    let top = repo.workdir().unwrap_or(repo.path()).to_path_buf();
-    let mut index = BTreeMap::new();
-    for e in repo.index()?.iter() {
-        if e.mode == GITLINK {
-            index.insert(String::from_utf8_lossy(&e.path).into_owned(), e.id);
-        }
-    }
+    let index = index_gitlinks(&repo.index()?);
     let src = if files {
         index.clone()
     } else {
@@ -66,42 +60,91 @@ pub fn summary(
             Err(_) => BTreeMap::new(),
         }
     };
-    let checked_out = |path: &str| {
-        Repository::open(top.join(path))
-            .ok()
-            .and_then(|r| r.head().ok()?.target())
+    let dst = match cached {
+        true => index,
+        false => checked_out(repo, &index),
     };
-    let dst: BTreeMap<String, Oid> = if cached {
-        index
-    } else {
-        index
-            .into_iter()
-            .map(|(p, id)| {
-                let now = checked_out(&p).unwrap_or(id);
-                (p, now)
-            })
-            .collect()
-    };
+    for line in summary_lines(repo, &src, &dst, &paths, limit, false) {
+        report(OpProgress::Line(line));
+    }
+    Ok(())
+}
+
+/// The `submodule.<name>.ignore` of the submodule at `path`: the config's,
+/// else .gitmodules'.
+pub(crate) fn ignore_of(repo: &Repository, path: &str) -> Option<String> {
+    let sub = repo.find_submodule(path).ok()?;
+    let key = format!("submodule.{}.ignore", sub.name().ok()?);
+    if let Ok(v) = repo.config().and_then(|c| c.get_string(&key)) {
+        return Some(v);
+    }
+    let top = repo.workdir()?;
+    git2::Config::open(&top.join(".gitmodules"))
+        .and_then(|c| c.get_string(&key))
+        .ok()
+}
+
+/// The gitlinks in `index`, by path.
+pub(crate) fn index_gitlinks(index: &git2::Index) -> BTreeMap<String, Oid> {
+    index
+        .iter()
+        .filter(|e| e.mode == GITLINK)
+        .map(|e| (String::from_utf8_lossy(&e.path).into_owned(), e.id))
+        .collect()
+}
+
+/// The commits the submodules at `gitlinks` have checked out, where they are.
+pub(crate) fn checked_out(
+    repo: &Repository,
+    gitlinks: &BTreeMap<String, Oid>,
+) -> BTreeMap<String, Oid> {
+    let top = repo.workdir().unwrap_or(repo.path());
+    gitlinks
+        .iter()
+        .map(|(p, id)| {
+            let now = Repository::open(top.join(p))
+                .ok()
+                .and_then(|r| r.head().ok()?.target());
+            (p.clone(), now.unwrap_or(*id))
+        })
+        .collect()
+}
+
+/// The lines of `submodule summary` for the gitlinks that differ from `src`
+/// to `dst` under `paths`, showing up to `limit` commits each (0: all).
+/// `for_status` leaves out the submodules set to ignore all, as git's
+/// `--for-status` does.
+pub(crate) fn summary_lines(
+    repo: &Repository,
+    src: &BTreeMap<String, Oid>,
+    dst: &BTreeMap<String, Oid>,
+    paths: &[String],
+    limit: usize,
+    for_status: bool,
+) -> Vec<String> {
+    let top = repo.workdir().unwrap_or(repo.path()).to_path_buf();
     let mut all: Vec<&String> = src.keys().chain(dst.keys()).collect();
     all.sort();
     all.dedup();
+    let mut out = Vec::new();
     for path in all {
-        if !paths.is_empty() && !crate::pathspec_matches(&paths, path) {
+        if !paths.is_empty() && !crate::pathspec_matches(paths, path) {
             continue;
         }
         let (from, to) = (src.get(path).copied(), dst.get(path).copied());
         if from == to {
             continue;
         }
-        for line in summarize(repo, &top, path, from, to, limit) {
-            report(OpProgress::Line(line));
+        if for_status && from.is_some() && ignore_of(repo, path).is_some_and(|i| i == "all") {
+            continue;
         }
+        out.extend(summarize(repo, &top, path, from, to, limit));
     }
-    Ok(())
+    out
 }
 
 /// The gitlinks in `tree`, by path.
-fn tree_gitlinks(tree: &git2::Tree) -> Result<BTreeMap<String, Oid>, GitError> {
+pub(crate) fn tree_gitlinks(tree: &git2::Tree) -> Result<BTreeMap<String, Oid>, GitError> {
     let mut out = BTreeMap::new();
     tree.walk(git2::TreeWalkMode::PreOrder, |root, e| {
         if e.filemode() as u32 == GITLINK {

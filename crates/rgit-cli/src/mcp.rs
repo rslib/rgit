@@ -16,10 +16,10 @@ use serde_json::{Map, Value, json};
 
 use crate::cli::{
     AmArgs, ApplyArgs, ArchiveArgs, BisectCmd, BlameArgs, BlameFormat, BranchCmd, BranchOpts,
-    BundleCmd, CliError, Command, ConfigArgs, DiffFormat, FlowCmd, FormatPatchArgs, HashObjectArgs,
-    IndexCmd, LanesCmd, MaintenanceCmd, MergeDiffArgs, NoteMessage, NotesCmd, PickFlags, Plumbing,
-    PrettyArgs, RawDiffArgs, RebaseFlags, RemoteCmd, StackCmd, StashCmd, StashPush, SubmoduleCmd,
-    TagOpts, WalkArgs, WorkspaceCmd, WorktreeCmd,
+    BundleCmd, CliError, Command, CommitGraphCmd, ConfigArgs, DiffFormat, FlowCmd, FormatPatchArgs,
+    HashObjectArgs, IndexCmd, LanesCmd, MaintenanceCmd, MergeDiffArgs, MidxCmd, NoteMessage,
+    NotesCmd, PickFlags, Plumbing, PrettyArgs, RawDiffArgs, RebaseFlags, RemoteCmd, StackCmd,
+    StashCmd, StashPush, SubmoduleCmd, TagOpts, WalkArgs, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::toon::{Node, Obj};
@@ -1016,7 +1016,7 @@ fn tools() -> Vec<Tool> {
              reports what would change (auto-followed tags included). `unshallow` fetches \
              the whole history, `prune_tags` also drops tags gone upstream, `no_tags` follows \
              none, `force` allows non-fast-forward updates, `set_upstream` tracks the fetched \
-             branch.",
+             branch, `filter` (e.g. `blob:none`) leaves objects out as a partial clone does.",
             &[
                 ("all", "boolean", false),
                 ("prune", "boolean", false),
@@ -1030,6 +1030,7 @@ fn tools() -> Vec<Tool> {
                 ("no_tags", "boolean", false),
                 ("force", "boolean", false),
                 ("set_upstream", "boolean", false),
+                ("filter", "string", false),
             ],
         ),
         tool(
@@ -2129,13 +2130,35 @@ fn tools() -> Vec<Tool> {
             "git_repack",
             "Pack the repository's objects (git repack). `all` puts everything in one pack, \
              `delete` removes what that makes redundant, `cruft` keeps unreachable objects in a \
-             cruft pack, `bitmap` writes a reachability bitmap.",
+             cruft pack, `bitmap` writes a reachability bitmap; `window` and `depth` recompute \
+             deltas with git's delta search.",
             &[
                 ("all", "boolean", false),
                 ("delete", "boolean", false),
                 ("cruft", "boolean", false),
                 ("bitmap", "boolean", false),
+                ("window", "integer", false),
+                ("depth", "integer", false),
             ],
+        ),
+        tool(
+            "git_commit_graph",
+            "The commit-graph (git commit-graph): `action` write (`reachable` from the refs, \
+             else every pack; `split` adds a layer to a chain; `changed_paths` writes Bloom \
+             filters) or verify.",
+            &[
+                ("action", "string", true),
+                ("reachable", "boolean", false),
+                ("split", "boolean", false),
+                ("changed_paths", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_multi_pack_index",
+            "The multi-pack-index (git multi-pack-index): `action` write, verify, expire (drop \
+             packs it no longer uses) or repack (`batch_size` bytes of small packs into one; 0 \
+             for all).",
+            &[("action", "string", true), ("batch_size", "integer", false)],
         ),
         tool(
             "git_pack_refs",
@@ -2677,6 +2700,8 @@ const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
     ("request-pull", "git_request_pull", &["start", "url", "end"]),
     ("range-diff", "git_range_diff", &["old", "new"]),
     ("pack-refs", "git_pack_refs", &[]),
+    ("commit-graph", "git_commit_graph", &["action"]),
+    ("multi-pack-index", "git_multi_pack_index", &["action"]),
     ("maintenance", "git_maintenance", &["action"]),
 ];
 
@@ -3246,6 +3271,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             verbose: false,
             jobs: None,
             append: false,
+            filter: a.str("filter"),
         },
         "git_pull" => Command::Pull {
             repository: a.str("remote"),
@@ -4107,15 +4133,64 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             local: false,
             keep_unreachable: false,
             write_bitmap_index: a.flag("bitmap"),
+            no_write_bitmap_index: false,
             cruft: a.flag("cruft"),
             geometric: None,
-            window: None,
-            depth: None,
+            window: a.num("window")?.map(|n| n as u32),
+            depth: a.num("depth")?.map(|n| n as u32),
+            window_memory: None,
+            threads: None,
             keep_pack: Vec::new(),
             cruft_expiration: None,
             unpack_unreachable: None,
             no_update_server_info: false,
             quiet: true,
+        },
+        "git_commit_graph" => Command::CommitGraph {
+            cmd: match a.req("action")?.as_str() {
+                "write" => CommitGraphCmd::Write {
+                    reachable: a.flag("reachable"),
+                    stdin_packs: false,
+                    stdin_commits: false,
+                    append: false,
+                    split: a.flag("split").then(String::new),
+                    size_multiple: None,
+                    max_commits: None,
+                    expire_time: None,
+                    changed_paths: a.flag("changed_paths"),
+                    no_changed_paths: false,
+                    no_progress: true,
+                    progress: false,
+                },
+                "verify" => CommitGraphCmd::Verify {
+                    shallow: false,
+                    no_progress: true,
+                },
+                other => {
+                    return Err(CliError::usage(format!(
+                        "action must be write or verify, not {other}"
+                    )));
+                }
+            },
+        },
+        "git_multi_pack_index" => Command::MultiPackIndex {
+            cmd: match a.req("action")?.as_str() {
+                "write" => MidxCmd::Write {
+                    preferred_pack: None,
+                    no_progress: true,
+                },
+                "verify" => MidxCmd::Verify { no_progress: true },
+                "expire" => MidxCmd::Expire { no_progress: true },
+                "repack" => MidxCmd::Repack {
+                    batch_size: a.num("batch_size")?.unwrap_or(0),
+                    no_progress: true,
+                },
+                other => {
+                    return Err(CliError::usage(format!(
+                        "action must be write, verify, expire or repack, not {other}"
+                    )));
+                }
+            },
         },
         "git_pack_refs" => Command::PackRefs {
             all: a.flag("all"),

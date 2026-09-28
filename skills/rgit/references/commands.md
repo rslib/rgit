@@ -133,7 +133,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 
 ## Remotes and forge (GitHub/GitLab)
 
-- `fetch`: Fetch the current branch's remote, or `<repository> [<refspec>...]`. e.g. `rgit fetch`, `rgit fetch --all`, `rgit fetch --remote origin --prune`, `rgit fetch origin main --depth 1`, `rgit fetch --dry-run`, `rgit fetch --unshallow`, `rgit fetch --prune --prune-tags`, `rgit fetch --multiple -j 4 origin upstream`
+- `fetch`: Fetch the current branch's remote, or `<repository> [<refspec>...]`. e.g. `rgit fetch`, `rgit fetch --all`, `rgit fetch --remote origin --prune`, `rgit fetch origin main --depth 1`, `rgit fetch --dry-run`, `rgit fetch --unshallow`, `rgit fetch --prune --prune-tags`, `rgit fetch --multiple -j 4 origin upstream`, `rgit fetch --filter=blob:none origin`
 - `pull`: Fetch and integrate the current branch's upstream (merges when it has diverged, unless `pull.rebase` says otherwise). e.g. `rgit pull`, `rgit pull --rebase`, `rgit pull --ff-only`, `rgit pull origin main`, `rgit pull --autostash --rebase`, `rgit pull --squash origin feature`
 - `push`: Push the current branch to its upstream, or `<repository> [<refspec>...]`. e.g. `rgit push`, `rgit push --set-upstream`, `rgit push --force-with-lease`, `rgit push origin feature`, `rgit push origin local:remote`, `rgit push origin --delete feature`, `rgit push origin :v1`, `rgit push --all --dry-run`, `rgit push --follow-tags`, `rgit push --atomic origin main v1`, `rgit push --porcelain origin main`, `rgit push --recurse-submodules=on-demand origin main`
 - `ls-remote`: List the refs in a remote repository, like `git ls-remote`. e.g. `rgit ls-remote`, `rgit ls-remote --heads origin`, `rgit ls-remote --tags https://github.com/example/repo.git 'v1.*'`, `rgit ls-remote --symref origin HEAD`
@@ -191,8 +191,16 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `fsck`: Check the object database for corruption and dangling objects. e.g. `rgit fsck`, `rgit fsck --unreachable --no-reflogs`, `rgit fsck --lost-found`, `rgit fsck --name-objects --full`
 - `verify-commit`: Check commits' gpg, x509 or ssh signatures (`git verify-commit`). e.g. `rgit verify-commit HEAD`, `rgit verify-commit -v --raw HEAD`
 - `verify-tag`: Check annotated tags' gpg, x509 or ssh signatures (`git verify-tag`). e.g. `rgit verify-tag v1.0`, `rgit verify-tag -v v1.0`
-- `repack`: Pack the repository's objects (`git repack`). e.g. `rgit repack -a -d`, `rgit repack -a -d -b --cruft`
+- `repack`: Pack the repository's objects (`git repack`). e.g. `rgit repack -a -d`, `rgit repack -a -d -b --cruft`, `rgit repack -a -d -f --window=250 --depth=50`
 - `pack-refs`: Move loose refs into packed-refs (`git pack-refs`). e.g. `rgit pack-refs --all`
+- `commit-graph`: Write or check the commit-graph file or chain (`git commit-graph`). e.g. `rgit commit-graph write --reachable --changed-paths`, `rgit commit-graph verify`
+  - `commit-graph write`: Write the commit-graph: the commits in every pack, or those the refs reach, or those given on stdin. e.g. `rgit commit-graph write --reachable`, `rgit commit-graph write --reachable --split --size-multiple=4`, `rgit rev-list --all | rgit commit-graph write --stdin-commits --append`
+  - `commit-graph verify`: Check the commit-graph against the commits it lists. e.g. `rgit commit-graph verify`, `rgit commit-graph verify --shallow`
+- `multi-pack-index`: Write, check, expire or repack the multi-pack-index (`git multi-pack-index`). e.g. `rgit multi-pack-index write`, `rgit multi-pack-index verify`
+  - `multi-pack-index write`: Index every pack in objects/pack. e.g. `rgit multi-pack-index write`, `rgit multi-pack-index write --preferred-pack=pack-1234.pack`
+  - `multi-pack-index verify`: Check the multi-pack-index against the packs. e.g. `rgit multi-pack-index verify`
+  - `multi-pack-index expire`: Delete packs the multi-pack-index takes no object from. e.g. `rgit multi-pack-index expire`
+  - `multi-pack-index repack`: Pack the objects of the oldest small packs into one new pack. e.g. `rgit multi-pack-index repack --batch-size=0`, `rgit multi-pack-index repack --batch-size=100m`
 - `maintenance`: Background upkeep (`git maintenance`): run tasks now, schedule them, or (un)register this repository. e.g. `rgit maintenance run --task=gc`, `rgit maintenance start`
   - `maintenance run`: Run maintenance tasks now. e.g. `rgit maintenance run`, `rgit maintenance run --task=commit-graph --task=loose-objects`
   - `maintenance start`: Register this repository and schedule hourly/daily/weekly runs (launchd on macOS, systemd timers or cron elsewhere). e.g. `rgit maintenance start`, `rgit maintenance start --scheduler=crontab`

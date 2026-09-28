@@ -72,6 +72,8 @@ const ERROR_OBJECT: i32 = 1;
 const ERROR_REACHABLE: i32 = 2;
 const ERROR_PACK: i32 = 4;
 const ERROR_REFS: i32 = 8;
+const ERROR_COMMIT_GRAPH: i32 = 16;
+const ERROR_MULTI_PACK_INDEX: i32 = 32;
 
 #[derive(Default)]
 struct Obj {
@@ -266,6 +268,132 @@ enum Level {
     Error,
     Warn,
     Info,
+    Ignore,
+}
+
+/// fsck.<msg-id> severities (keys lowercased) and fsck.skipList's objects.
+fn severity_config(repo: &Repository) -> (HashMap<String, Level>, std::collections::HashSet<Oid>) {
+    let mut levels = HashMap::new();
+    let mut skip = std::collections::HashSet::new();
+    let Ok(cfg) = crate::config::open_config(repo, crate::ConfigScope::Any, false) else {
+        return (levels, skip);
+    };
+    if let Ok(mut entries) = cfg.entries(Some("fsck\\..*")) {
+        while let Some(Ok(e)) = entries.next() {
+            let (Ok(name), Ok(value)) = (e.name(), e.value()) else {
+                continue;
+            };
+            let id = name["fsck.".len()..].to_ascii_lowercase();
+            if id == "skiplist" {
+                let path = match (value.strip_prefix("~/"), std::env::var_os("HOME")) {
+                    (Some(rest), Some(home)) => Path::new(&home).join(rest),
+                    _ => PathBuf::from(value),
+                };
+                let text = std::fs::read_to_string(path).unwrap_or_default();
+                skip.extend(
+                    text.lines().filter_map(|l| {
+                        Oid::from_str(l.split('#').next().unwrap_or("").trim()).ok()
+                    }),
+                );
+                continue;
+            }
+            let level = match value.to_ascii_lowercase().as_str() {
+                "error" => Level::Error,
+                "warn" => Level::Warn,
+                "ignore" => Level::Ignore,
+                _ => continue,
+            };
+            levels.insert(id, level);
+        }
+    }
+    (levels, skip)
+}
+
+/// Whether a tree entry name is `.<base>` as HFS+ or NTFS would see it
+/// (any case, trailing dots or spaces, the `<short>~1`..`~4` short names).
+// ponytail: HFS+ ignorable code points and NTFS hashed short names are not
+// matched.
+fn is_dotfile(name: &str, base: &str, short: &str) -> bool {
+    let n = name.trim_end_matches(['.', ' ']).to_ascii_lowercase();
+    n.strip_prefix('.') == Some(base)
+        || n.strip_prefix(short)
+            .and_then(|r| r.strip_prefix('~'))
+            .is_some_and(|d| matches!(d, "1" | "2" | "3" | "4"))
+}
+
+/// git's check_submodule_name: not empty, no `..` path component.
+fn bad_submodule_name(name: &str) -> bool {
+    name.is_empty() || name.split(['/', '\\']).any(|c| c == "..")
+}
+
+fn url_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// git's check_submodule_url: no option-like, newline-smuggling or
+/// root-escaping urls, and curl urls must normalize.
+fn bad_submodule_url(url: &str) -> bool {
+    if url.starts_with('-') {
+        return true;
+    }
+    let dot = |u: &str| u.starts_with("./") || u.starts_with(".\\");
+    let dotdot = |u: &str| u.starts_with("../") || u.starts_with("..\\");
+    if dot(url) || dotdot(url) || url.starts_with("git://") {
+        if url_decode(url)
+            .unwrap_or_else(|| url.to_owned())
+            .contains('\n')
+        {
+            return true;
+        }
+        let mut rest = url;
+        let mut ups = 0;
+        loop {
+            if dotdot(rest) {
+                ups += 1;
+                rest = &rest[3..];
+            } else if dot(rest) {
+                rest = &rest[2..];
+            } else {
+                break;
+            }
+        }
+        return ups > 0 && (rest.starts_with(':') || rest.starts_with('/'));
+    }
+    let curl = ["http::", "https::", "ftp::", "ftps::"]
+        .iter()
+        .find_map(|p| url.strip_prefix(p))
+        .or_else(|| {
+            ["http://", "https://", "ftp://", "ftps://"]
+                .iter()
+                .any(|p| url.starts_with(p))
+                .then_some(url)
+        });
+    let Some(curl) = curl else {
+        return false;
+    };
+    let Some((_, after)) = curl.split_once("://") else {
+        return true;
+    };
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let (host, port) = host_port.split_once(':').unwrap_or((host_port, ""));
+    if host.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    url_decode(curl).is_none_or(|d| d.contains('\n'))
 }
 
 struct Fsck<'r> {
@@ -281,6 +409,10 @@ struct Fsck<'r> {
     err: String,
     code: i32,
     objects_dir: String,
+    levels: HashMap<String, Level>,
+    skip: std::collections::HashSet<Oid>,
+    gitmodules: Vec<Oid>,
+    gitattributes: Vec<Oid>,
 }
 
 impl<'r> Fsck<'r> {
@@ -307,10 +439,17 @@ impl<'r> Fsck<'r> {
 
     /// git's report(): `error in <type> <id>: <msgId>: <text>`; true for errors.
     fn report(&mut self, oid: Oid, kind: ObjectType, level: Level, id: &str, text: &str) -> bool {
-        let level = match level {
-            Level::Warn if self.o.strict => Level::Error,
-            l => l,
+        if self.skip.contains(&oid) {
+            return false;
+        }
+        let level = match (self.levels.get(&id.to_ascii_lowercase()), level) {
+            (Some(l), _) => *l,
+            (None, Level::Warn) if self.o.strict => Level::Error,
+            (None, l) => l,
         };
+        if level == Level::Ignore {
+            return false;
+        }
         let word = if level == Level::Error {
             "error"
         } else {
@@ -621,7 +760,37 @@ impl<'r> Fsck<'r> {
             (false, false, false, false, false, false);
         let (mut dups, mut unsorted) = (false, false);
         let mut last: Option<(u32, &str)> = None;
+        let mut special = Vec::new();
         for (mode, name, id) in entries {
+            let link = *mode == 0o120000;
+            if is_dotfile(name, "gitmodules", "gitmod") {
+                if link {
+                    special.push((
+                        Level::Error,
+                        "gitmodulesSymlink",
+                        ".gitmodules is a symbolic link",
+                    ));
+                } else {
+                    self.gitmodules.push(*id);
+                }
+            }
+            if is_dotfile(name, "gitattributes", "gitatt") {
+                if link {
+                    special.push((
+                        Level::Info,
+                        "gitattributesSymlink",
+                        ".gitattributes is a symlink",
+                    ));
+                } else {
+                    self.gitattributes.push(*id);
+                }
+            }
+            if link && is_dotfile(name, "gitignore", "gitign") {
+                special.push((Level::Info, "gitignoreSymlink", ".gitignore is a symlink"));
+            }
+            if link && is_dotfile(name, "mailmap", "mailma") {
+                special.push((Level::Info, "mailmapSymlink", ".mailmap is a symlink"));
+            }
             null |= id.is_zero();
             full |= name.contains('/');
             dot |= name == ".";
@@ -675,6 +844,9 @@ impl<'r> Fsck<'r> {
             })
             .unwrap_or(false);
         let mut err = false;
+        for (level, id, text) in special {
+            err |= self.report(oid, kind, level, id, text);
+        }
         for (on, level, id, text) in [
             (
                 null,
@@ -773,6 +945,179 @@ impl<'r> Fsck<'r> {
             }
         }
         self.links.insert(oid, links);
+    }
+
+    /// git's fsck_blob and fsck_finish for the blobs trees name
+    /// .gitmodules or .gitattributes.
+    fn check_special_blobs(&mut self) {
+        let mut modules = std::mem::take(&mut self.gitmodules);
+        modules.sort();
+        modules.dedup();
+        let mut attrs = std::mem::take(&mut self.gitattributes);
+        attrs.sort();
+        attrs.dedup();
+        let blob = ObjectType::Blob;
+        for (ids, file, missing, not_blob) in [
+            (
+                &modules,
+                ".gitmodules",
+                "gitmodulesMissing",
+                "gitmodulesBlob",
+            ),
+            (
+                &attrs,
+                ".gitattributes",
+                "gitattributesMissing",
+                "gitattributesBlob",
+            ),
+        ] {
+            for id in ids {
+                let read = self.odb.read(*id).map(|o| (o.kind(), o.data().to_vec()));
+                let Ok((kind, data)) = read else {
+                    if self.report(
+                        *id,
+                        blob,
+                        Level::Error,
+                        missing,
+                        &format!("unable to read {file} blob"),
+                    ) {
+                        self.code |= ERROR_OBJECT;
+                    }
+                    continue;
+                };
+                if kind != blob {
+                    if self.report(
+                        *id,
+                        kind,
+                        Level::Error,
+                        not_blob,
+                        &format!("non-blob found at {file}"),
+                    ) {
+                        self.code |= ERROR_OBJECT;
+                    }
+                    continue;
+                }
+                let err = if file == ".gitmodules" {
+                    self.check_gitmodules(*id, &data)
+                } else {
+                    self.check_gitattributes(*id, &data)
+                };
+                if err {
+                    self.code |= ERROR_OBJECT;
+                }
+            }
+        }
+    }
+
+    fn check_gitmodules(&mut self, oid: Oid, data: &[u8]) -> bool {
+        let blob = ObjectType::Blob;
+        let big = crate::maintenance::cfg_int(self.repo, "core.bigFileThreshold", 512 << 20);
+        if data.len() as i64 > big {
+            return self.report(
+                oid,
+                blob,
+                Level::Error,
+                "gitmodulesLarge",
+                ".gitmodules too large to parse",
+            );
+        }
+        let tmp =
+            std::env::temp_dir().join(format!("rgit-fsck-gitmodules-{}-{oid}", std::process::id()));
+        let entries: Option<Vec<(String, Option<String>)>> = std::fs::write(&tmp, data)
+            .ok()
+            .and_then(|()| git2::Config::open(&tmp).ok())
+            .and_then(|c| {
+                let mut out = Vec::new();
+                let mut it = c.entries(None).ok()?;
+                while let Some(e) = it.next() {
+                    let e = e.ok()?;
+                    out.push((e.name().ok()?.to_owned(), e.value().ok().map(str::to_owned)));
+                }
+                Some(out)
+            });
+        let _ = std::fs::remove_file(&tmp);
+        let Some(entries) = entries else {
+            return self.report(
+                oid,
+                blob,
+                Level::Info,
+                "gitmodulesParse",
+                "could not parse gitmodules blob",
+            );
+        };
+        let mut err = false;
+        for (name, value) in entries {
+            let Some((sub, key)) = name
+                .strip_prefix("submodule.")
+                .and_then(|r| r.rsplit_once('.'))
+            else {
+                continue;
+            };
+            if bad_submodule_name(sub) {
+                err |= self.report(
+                    oid,
+                    blob,
+                    Level::Error,
+                    "gitmodulesName",
+                    &format!("disallowed submodule name: {sub}"),
+                );
+            }
+            let Some(v) = value else {
+                continue;
+            };
+            if key == "url" && bad_submodule_url(&v) {
+                err |= self.report(
+                    oid,
+                    blob,
+                    Level::Error,
+                    "gitmodulesUrl",
+                    &format!("disallowed submodule url: {v}"),
+                );
+            }
+            if key == "path" && v.starts_with('-') {
+                err |= self.report(
+                    oid,
+                    blob,
+                    Level::Error,
+                    "gitmodulesPath",
+                    &format!("disallowed submodule path: {v}"),
+                );
+            }
+            if key == "update" && v.starts_with('!') {
+                err |= self.report(
+                    oid,
+                    blob,
+                    Level::Error,
+                    "gitmodulesUpdate",
+                    &format!("disallowed submodule update setting: {v}"),
+                );
+            }
+        }
+        err
+    }
+
+    fn check_gitattributes(&mut self, oid: Oid, data: &[u8]) -> bool {
+        let blob = ObjectType::Blob;
+        if data.len() > 100 << 20 {
+            return self.report(
+                oid,
+                blob,
+                Level::Error,
+                "gitattributesLarge",
+                ".gitattributes too large to parse",
+            );
+        }
+        let text = data.split(|b| *b == 0).next().unwrap_or_default();
+        if text.split(|b| *b == b'\n').any(|l| l.len() >= 2048) {
+            return self.report(
+                oid,
+                blob,
+                Level::Error,
+                "gitattributesLineLength",
+                ".gitattributes has too long lines to parse",
+            );
+        }
+        false
     }
 
     fn check_loose(&mut self, oid: Oid, path: &Path) {
@@ -1164,6 +1509,7 @@ pub fn fsck(repo: &Repository, o: &FsckOptions) -> Result<FsckReport, GitError> 
         }
         _ => repo.commondir().join("objects").display().to_string(),
     };
+    let (levels, skip) = severity_config(repo);
     let mut f = Fsck {
         repo,
         odb: repo.odb()?,
@@ -1177,6 +1523,10 @@ pub fn fsck(repo: &Repository, o: &FsckOptions) -> Result<FsckReport, GitError> 
         err: String::new(),
         code: 0,
         objects_dir,
+        levels,
+        skip,
+        gitmodules: Vec::new(),
+        gitattributes: Vec::new(),
     };
     let packs = packs_in_order(repo);
     f.packed = packs.iter().flat_map(|p| p.ids()).collect();
@@ -1212,6 +1562,7 @@ pub fn fsck(repo: &Repository, o: &FsckOptions) -> Result<FsckReport, GitError> 
             }
         }
     }
+    f.check_special_blobs();
     let mut heads = 0;
     for arg in &o.objects {
         match repo.revparse_single(arg) {
@@ -1315,6 +1666,20 @@ pub fn fsck(repo: &Repository, o: &FsckOptions) -> Result<FsckReport, GitError> 
                 _ => format!("{}\n", f.describe(&oid)).into_bytes(),
             };
             std::fs::write(dir.join(f.describe(&oid)), body)?;
+        }
+    }
+    if crate::maintenance::cfg_bool(repo, "core.commitGraph", true) {
+        let errors = crate::commit_graph::verify(repo, false);
+        if !errors.is_empty() {
+            f.code |= ERROR_COMMIT_GRAPH;
+            f.err.extend(errors.into_iter().map(|e| e + "\n"));
+        }
+    }
+    if crate::maintenance::cfg_bool(repo, "core.multiPackIndex", true) {
+        let errors = crate::midx::verify(repo);
+        if !errors.is_empty() {
+            f.code |= ERROR_MULTI_PACK_INDEX;
+            f.err.extend(errors.into_iter().map(|e| e + "\n"));
         }
     }
     Ok(FsckReport {

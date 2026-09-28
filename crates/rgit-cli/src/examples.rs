@@ -460,6 +460,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit fetch --unshallow",
             "rgit fetch --prune --prune-tags",
             "rgit fetch --multiple -j 4 origin upstream",
+            "rgit fetch --filter=blob:none origin",
         ],
     ),
     (
@@ -817,7 +818,11 @@ const EXAMPLES: &[Entry] = &[
     ),
     (
         "repack",
-        &["rgit repack -a -d", "rgit repack -a -d -b --cruft"],
+        &[
+            "rgit repack -a -d",
+            "rgit repack -a -d -b --cruft",
+            "rgit repack -a -d -f --window=250 --depth=50",
+        ],
     ),
     (
         "cherry",
@@ -869,6 +874,51 @@ const EXAMPLES: &[Entry] = &[
     ("bundle list-heads", &["rgit bundle list-heads repo.bundle"]),
     ("bundle unbundle", &["rgit bundle unbundle update.bundle"]),
     ("pack-refs", &["rgit pack-refs --all"]),
+    (
+        "commit-graph",
+        &[
+            "rgit commit-graph write --reachable --changed-paths",
+            "rgit commit-graph verify",
+        ],
+    ),
+    (
+        "commit-graph write",
+        &[
+            "rgit commit-graph write --reachable",
+            "rgit commit-graph write --reachable --split --size-multiple=4",
+            "rgit rev-list --all | rgit commit-graph write --stdin-commits --append",
+        ],
+    ),
+    (
+        "commit-graph verify",
+        &[
+            "rgit commit-graph verify",
+            "rgit commit-graph verify --shallow",
+        ],
+    ),
+    (
+        "multi-pack-index",
+        &[
+            "rgit multi-pack-index write",
+            "rgit multi-pack-index verify",
+        ],
+    ),
+    (
+        "multi-pack-index write",
+        &[
+            "rgit multi-pack-index write",
+            "rgit multi-pack-index write --preferred-pack=pack-1234.pack",
+        ],
+    ),
+    ("multi-pack-index verify", &["rgit multi-pack-index verify"]),
+    ("multi-pack-index expire", &["rgit multi-pack-index expire"]),
+    (
+        "multi-pack-index repack",
+        &[
+            "rgit multi-pack-index repack --batch-size=0",
+            "rgit multi-pack-index repack --batch-size=100m",
+        ],
+    ),
     (
         "maintenance",
         &["rgit maintenance run --task=gc", "rgit maintenance start"],

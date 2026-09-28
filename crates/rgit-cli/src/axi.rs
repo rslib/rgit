@@ -10,9 +10,9 @@ use rgit_git::{
 };
 
 use crate::cli::{
-    ApplyArgs, BranchCmd, BundleCmd, Command, ConfigArgs, FlowCmd, IndexCmd, LanesCmd,
-    MaintenanceCmd, NotesCmd, RemoteCmd, StackCmd, StashCmd, SubmoduleCmd, WorkspaceCmd,
-    WorktreeCmd,
+    ApplyArgs, BranchCmd, BundleCmd, Command, CommitGraphCmd, ConfigArgs, FlowCmd, IndexCmd,
+    LanesCmd, MaintenanceCmd, MidxCmd, NotesCmd, RemoteCmd, StackCmd, StashCmd, SubmoduleCmd,
+    WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::render;
@@ -1548,6 +1548,15 @@ fn done_message(c: &Command) -> Option<String> {
             cmd: BundleCmd::Create { file, .. },
         } => format!("wrote {file}"),
         Command::PackRefs { .. } => "packed the refs".to_owned(),
+        Command::CommitGraph {
+            cmd: CommitGraphCmd::Write { .. },
+        } => "wrote the commit-graph".to_owned(),
+        Command::MultiPackIndex { cmd } => match cmd {
+            MidxCmd::Write { .. } => "wrote the multi-pack-index".to_owned(),
+            MidxCmd::Expire { .. } => "expired unused packs".to_owned(),
+            MidxCmd::Repack { .. } => "repacked a batch of packs".to_owned(),
+            _ => return None,
+        },
         Command::Maintenance { cmd } => match cmd {
             MaintenanceCmd::Run { .. } => "ran the maintenance tasks".to_owned(),
             MaintenanceCmd::Start { .. } => "registered and scheduled maintenance".to_owned(),
