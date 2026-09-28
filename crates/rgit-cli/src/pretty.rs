@@ -10,6 +10,7 @@ use rgit_git::{GitBackend, Ident, RawObject};
 use crate::cli::{CliError, PrettyArgs};
 
 /// A commit as git stores it.
+#[derive(Clone)]
 pub struct Commit {
     pub id: String,
     pub tree: String,
@@ -18,6 +19,25 @@ pub struct Commit {
     pub committer: Ident,
     /// The header lines, each newline-terminated, for `--pretty=raw`.
     pub header: String,
+    pub message: String,
+    /// The parent a `-m` diff section is against, shown as ` (from <id>)`.
+    pub from: Option<String>,
+    /// The walk's mark for it (see [`rgit_git::LogEntry::mark`]).
+    pub mark: Option<char>,
+    /// The starting ref that reached it, with `--source`.
+    pub source: Option<String>,
+    /// The reflog entry it was reached from, with `--walk-reflogs`.
+    pub reflog: Option<Reflog>,
+}
+
+/// A reflog entry as `log -g` shows it.
+#[derive(Clone)]
+pub struct Reflog {
+    /// `HEAD@{0}`, the ref as given (`refs/stash@{0}`).
+    pub selector: String,
+    /// The same with the ref shortened (`stash@{0}`), for `%gd`.
+    pub short: String,
+    pub who: Ident,
     pub message: String,
 }
 
@@ -47,6 +67,10 @@ pub fn parse(obj: &RawObject) -> Commit {
         committer: ident(""),
         header: String::new(),
         message: message.to_owned(),
+        from: None,
+        mark: None,
+        source: None,
+        reflog: None,
     };
     for line in head.lines() {
         c.header.push_str(line);
@@ -88,9 +112,11 @@ pub struct Pretty {
     decorations: HashMap<String, Vec<(&'static str, String)>>,
     notes: HashSet<String>,
     backend: Arc<dyn GitBackend>,
-    /// Each commit's reflog entry when walking one (`log -g`, `stash list`):
-    /// short selector (`stash@{0}`), full one and message.
-    pub reflog: HashMap<String, [String; 3]>,
+    graph: bool,
+    /// Print the parents after each commit's id.
+    pub parents: bool,
+    /// How the log walked, for its marks.
+    pub walk: crate::cli::WalkArgs,
     /// Inside a format after `%C(auto)`.
     auto: std::cell::Cell<bool>,
 }
@@ -159,7 +185,9 @@ impl Pretty {
             decorations: decorations(backend),
             notes,
             backend: backend.clone(),
-            reflog: HashMap::new(),
+            graph: args.graph,
+            parents: false,
+            walk: Default::default(),
             auto: std::cell::Cell::new(false),
         }))
     }
@@ -230,6 +258,16 @@ impl Pretty {
         out
     }
 
+    /// The character `--graph` draws for the commit.
+    pub fn graph_mark(&self, c: &Commit) -> char {
+        match c.mark {
+            Some('-') => 'o',
+            Some('=') => '=',
+            m if self.walk.left_right => m.unwrap_or('>'),
+            _ => '*',
+        }
+    }
+
     /// One commit as git's show_log prints it, without the separator or
     /// terminator.
     pub fn show(&self, c: &Commit) -> String {
@@ -240,33 +278,55 @@ impl Pretty {
     /// The commit's header line (`commit <id>\n`, or the oneline's `<id> `)
     /// and the message that follows it.
     pub fn parts(&self, c: &Commit) -> (String, String) {
-        let hash = if self.abbrev {
-            self.abbrev(&c.id)
-        } else {
-            c.id.clone()
+        let id = |id: &str| {
+            if self.abbrev {
+                self.abbrev(id)
+            } else {
+                id.to_owned()
+            }
         };
-        let decor = if self.decorate {
+        let mut hash = id(&c.id);
+        if let Some(from) = &c.from {
+            hash.push_str(&format!(" (from {})", id(from)));
+        }
+        if self.parents {
+            for p in &c.parents {
+                hash.push(' ');
+                hash.push_str(&id(p));
+            }
+        }
+        let mut decor = if self.decorate {
             self.decor_in(&c.id, self.color, true)
         } else {
             String::new()
         };
+        if let Some(source) = &c.source {
+            decor.insert_str(0, &format!("\t{source}"));
+        }
+        // With --graph the mark is drawn in the graph instead.
+        let mark = match self.walk.mark(c.mark) {
+            Some(m) if !self.graph => format!("{m} "),
+            _ => String::new(),
+        };
         let (head, mut out) = match &self.fmt {
             Fmt::User(f) => return (String::new(), self.expand(f, c)),
             Fmt::Oneline => (
-                format!("{}{decor} ", self.paint(&hash, "33")),
-                match self.reflog.get(&c.id) {
-                    Some([_, full, msg]) => format!("{full}: {msg}"),
+                format!("{mark}{}{decor} ", self.paint(&hash, "33")),
+                match &c.reflog {
+                    Some(r) => format!("{}: {}", r.selector, r.message),
                     None => subject(&c.message, " "),
                 },
             ),
             fmt => {
-                let head = format!("{}{decor}\n", self.paint(&format!("commit {hash}"), "33"));
+                let head = format!(
+                    "{}{decor}\n",
+                    self.paint(&format!("commit {mark}{hash}"), "33")
+                );
                 let mut out = String::new();
-                if let Some([_, full, msg]) = self.reflog.get(&c.id) {
-                    let who = &c.committer;
+                if let Some(r) = &c.reflog {
                     out.push_str(&format!(
-                        "Reflog: {full} ({} <{}>)\nReflog message: {msg}\n",
-                        who.name, who.email
+                        "Reflog: {} ({} <{}>)\nReflog message: {}\n",
+                        r.selector, r.who.name, r.who.email, r.message
                     ));
                 }
                 if *fmt == Fmt::Raw {
@@ -433,20 +493,23 @@ impl Pretty {
             )),
             'b' => one(body(&c.message).to_owned()),
             'B' => one(c.message.clone()),
-            'g' => {
-                let entry = self.reflog.get(&c.id);
-                let v = match (s[1..].chars().next()?, entry) {
-                    ('d', Some([short, ..])) => short.clone(),
-                    ('D', Some([_, full, _])) => full.clone(),
-                    ('s', Some([.., msg])) => msg.clone(),
-                    ('d' | 'D' | 's', None) => String::new(),
-                    _ => return None,
-                };
-                Some((v, 2))
-            }
             'd' => one(self.decor(&c.id)),
             'D' => one(self.decor_in(&c.id, false, false)),
             'e' | 'N' => one(String::new()),
+            'm' => one(c.mark.unwrap_or('>').to_string()),
+            'S' => one(c.source.clone().unwrap_or_default()),
+            'g' => {
+                let r = c.reflog.as_ref();
+                let v = match s[1..].chars().next()? {
+                    'd' => r.map(|r| r.short.clone()),
+                    'D' => r.map(|r| r.selector.clone()),
+                    's' => r.map(|r| r.message.clone()),
+                    'n' | 'N' => r.map(|r| r.who.name.clone()),
+                    'e' | 'E' => r.map(|r| r.who.email.clone()),
+                    _ => return None,
+                };
+                Some((v.unwrap_or_default(), 2))
+            }
             'x' => {
                 let hex = s.get(1..3)?;
                 let b = u8::from_str_radix(hex, 16).ok()?;
@@ -505,7 +568,7 @@ impl Pretty {
                     'i' => format_date(who.time, who.offset, "iso"),
                     'I' => format_date(who.time, who.offset, "iso-strict"),
                     's' => format_date(who.time, who.offset, "short"),
-                    'h' => format_date(who.time, who.offset, "default"),
+                    'h' => format_date(who.time, who.offset, "human"),
                     _ => return None,
                 };
                 Some((v, 2))
@@ -810,6 +873,44 @@ pub fn format_date(time: i64, offset: i32, style: &str) -> String {
         "unix" => time.to_string(),
         "raw" => format!("{time} {sign}{oh:02}{om:02}"),
         "relative" => relative(time),
+        "human" => {
+            // git's show_date_normal against the local time now: drop what
+            // the reader already knows.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            let (ny, nm, nd, ..) = local_parts(now);
+            let same_year = y == ny;
+            let (mut hide_date, mut hide_wday) = (false, false);
+            if same_year && m == nm {
+                if d == nd {
+                    (hide_date, hide_wday) = (true, true);
+                } else if d < nd && d + 5 > nd {
+                    hide_date = true;
+                }
+            }
+            if hide_wday {
+                return relative(time);
+            }
+            let hide_tz = offset == local_offset(now) || !hide_date;
+            let mut out = String::new();
+            if same_year {
+                out.push_str(&format!("{wd} "));
+            }
+            if !hide_date {
+                out.push_str(&format!("{mon} {d} "));
+            }
+            if same_year {
+                out.push_str(&format!("{h:02}:{mi:02}"));
+            } else {
+                out.truncate(out.trim_end().len());
+                out.push_str(&format!(" {y}"));
+            }
+            if !hide_tz {
+                out.push_str(&format!(" {sign}{oh:02}{om:02}"));
+            }
+            out
+        }
         _ if local_tz => format!("{wd} {mon} {d} {h:02}:{mi:02}:{s:02} {y}"),
         _ => format!("{wd} {mon} {d} {h:02}:{mi:02}:{s:02} {y} {sign}{oh:02}{om:02}"),
     }

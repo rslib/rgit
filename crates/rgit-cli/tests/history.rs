@@ -40,7 +40,8 @@ fn same(dir: &Path, args: &[&str]) {
     };
     let want = run(&mut Command::new("git"));
     let got = run(Command::new(env!("CARGO_BIN_EXE_rgit")).arg("--human"));
-    assert_eq!(got, want, "rgit {args:?}");
+    let at = got.0.lines().zip(want.0.lines()).find(|(a, b)| a != b);
+    assert_eq!(got, want, "rgit {args:?}, first differing lines {at:?}");
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -316,6 +317,91 @@ fn log_simplifies_history_and_draws_graphs_like_git() {
         &["log", "--oneline", "--graph", "--", "f"],
         &["log", "--oneline", "--graph", "--first-parent"],
         &["log", "--oneline", "--graph", "--reverse"],
+    ];
+    for args in cases {
+        same(&dir, args);
+    }
+}
+
+#[test]
+fn log_walks_like_git() {
+    let dir = repo("walk");
+    git(&dir, &["checkout", "-q", "topic"]);
+    git_at(&dir, &["cherry-pick", "main~3"], 9);
+    git(&dir, &["checkout", "-q", "main"]);
+    let cases: &[&[&str]] = &[
+        &["log", "--oneline", "--left-right", "topic...main"],
+        &["log", "--oneline", "--cherry-mark", "topic...main"],
+        &["log", "--oneline", "--cherry-pick", "topic...main"],
+        &["log", "--oneline", "--cherry", "topic...main"],
+        &["log", "--oneline", "--right-only", "topic...main"],
+        &["log", "--format=%m %h %s", "--boundary", "topic...main"],
+        &["log", "--oneline", "--boundary", "-2"],
+        &[
+            "log",
+            "--pretty=medium",
+            "--left-right",
+            "--boundary",
+            "-3",
+            "topic...main",
+        ],
+        &[
+            "log",
+            "--oneline",
+            "--graph",
+            "--left-right",
+            "--cherry-mark",
+            "topic...main",
+        ],
+        &["log", "--oneline", "--graph", "--boundary", "topic...main"],
+        &["log", "--oneline", "--ancestry-path", "v1..main"],
+        &["log", "--oneline", "--simplify-by-decoration", "--all"],
+        &["log", "--oneline", "--full-history", "--", "a.txt"],
+        &["log", "--oneline", "--sparse", "--", "dir"],
+        &[
+            "log",
+            "--oneline",
+            "--simplify-merges",
+            "--",
+            "a.txt",
+            "dir",
+        ],
+        &["log", "--oneline", "--parents", "--", "dir"],
+        &["log", "--pretty=medium", "--parents", "-2"],
+        &["log", "--oneline", "--source", "--all"],
+        &["log", "--format=%S %h", "--source", "main", "topic"],
+        &["log", "--oneline", "--no-walk", "topic", "v1", "main"],
+        &[
+            "log",
+            "--oneline",
+            "--no-walk=unsorted",
+            "v1",
+            "topic",
+            "main",
+        ],
+        &["log", "--oneline", "--topo-order", "--all"],
+        &["log", "--oneline", "--date-order", "--all"],
+        &["log", "--oneline", "--author-date-order", "--all"],
+        &[
+            "log",
+            "--oneline",
+            "--grep=fix",
+            "--grep=bug",
+            "--all-match",
+            "-i",
+        ],
+        &["log", "--oneline", "--grep=fix", "--invert-grep"],
+        &[
+            "log",
+            "--oneline",
+            "--since=Jan 4 2024",
+            "--until=2024-01-07 noon",
+        ],
+        &["log", "--oneline", "--since=5.years.ago"],
+        &["log", "--date=human", "--format=%ad %ah"],
+        &["log", "--oneline", "-g", "-3"],
+        &["log", "-g", "-2", "--format=%gd %gs %h"],
+        &["log", "--pretty=medium", "-g", "-1"],
     ];
     for args in cases {
         same(&dir, args);
@@ -621,6 +707,366 @@ fn format_leaves_off_the_final_newline_and_tformat_keeps_it() {
 }
 
 #[test]
+fn describe_walks_as_git_does() {
+    let dir = side_repo("describe-walk");
+    let describe =
+        |extra: &[&'static str]| -> Vec<&'static str> { [&["describe"][..], extra].concat() };
+    // Tags only on the side branch and the base: the merge reaches both.
+    let none: &[&[&str]] = &[
+        &["describe"],
+        &["describe", "--always"],
+        &["describe", "--tags"],
+    ];
+    all_same(&dir, none);
+    git_at(&dir, &["tag", "-a", "base", "-m", "base", "main~3"], 1);
+    git_at(&dir, &["tag", "-a", "s1", "-m", "s1", "side~1"], 3);
+    git_at(&dir, &["tag", "-a", "s2", "-m", "s2", "side~1"], 4);
+    git(&dir, &["tag", "light", "main~1"]);
+    let cases: Vec<Vec<&str>> = vec![
+        describe(&[]),
+        describe(&["--tags"]),
+        describe(&["--all"]),
+        describe(&["--all", "side"]),
+        describe(&["--all", "--match", "s*"]),
+        describe(&["--first-parent"]),
+        describe(&["--first-parent", "--tags"]),
+        describe(&["--candidates=1"]),
+        describe(&["--candidates=0"]),
+        describe(&["--candidates=0", "s1"]),
+        describe(&["--exclude", "s*"]),
+        describe(&["--exclude", "s*", "--exclude", "base"]),
+        describe(&["--match", "base", "--match", "s1"]),
+        describe(&["--match", "s1"]),
+        describe(&["--match", "s2"]),
+        describe(&["--exclude", "s2"]),
+        describe(&["--long", "s2"]),
+        describe(&["--abbrev=4"]),
+        describe(&["--abbrev=0", "--tags"]),
+        describe(&["--dirty"]),
+        describe(&["--dirty=-mod", "--broken"]),
+        describe(&["--dirty", "HEAD"]),
+        describe(&["--long", "--abbrev=0"]),
+        describe(&["other"]),
+    ];
+    let refs: Vec<&[&str]> = cases.iter().map(Vec::as_slice).collect();
+    all_same(&dir, &refs);
+    std::fs::write(dir.join("f"), "changed\n").unwrap();
+    all_same(
+        &dir,
+        &[
+            &["describe", "--dirty"],
+            &["describe", "--dirty=.mod"],
+            &["describe", "--broken"],
+            &["describe"],
+        ],
+    );
+}
+
+/// Whitespace, moved, copied and renamed lines by three authors, for blame.
+fn blame_repo(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rgit-history-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    let who = |name: &str| {
+        git(&dir, &["config", "user.name", name]);
+        git(&dir, &["config", "user.email", &format!("{name}@x")]);
+    };
+    who("ann");
+    let c = "int main() {\n  return 0;\n}\n\nvoid helper(void) {\n  puts(\"hi\");\n}\n\n\
+             static int other = 1;\n";
+    let b = "alpha beta gamma delta\nepsilon zeta eta theta\niota kappa lambda mu\n";
+    commit(&dir, 1, &[("a.c", c), ("b.txt", b)], "init");
+    who("bob");
+    let c2 = c
+        .replace("return 0", "return  0")
+        .replace("\"hi\"", "\"hello\"");
+    commit(&dir, 2, &[("a.c", &c2)], "spacing and greeting");
+    let b2 =
+        "iota kappa lambda mu\nalpha beta gamma delta\nepsilon zeta eta theta\nnew line here\n";
+    commit(&dir, 3, &[("b.txt", b2)], "move a line");
+    who("carol");
+    let c3 = c2
+        .replace("int main() {", "/* banner */\nint  main()  {")
+        .replace("= 1", "= 2");
+    let copy = format!("{b2}extra words for the copy\n");
+    commit(&dir, 4, &[("a.c", &c3), ("c.txt", &copy)], "copy b");
+    git_at(&dir, &["mv", "b.txt", "d.txt"], 5);
+    git_at(&dir, &["commit", "-qm", "rename b"], 5);
+    dir
+}
+
+/// Every `rgit --human <args>` in `cases` prints git's bytes and exit code.
+fn all_same(dir: &Path, cases: &[&[&str]]) {
+    let run = |cmd: &mut Command, args: &[&str]| {
+        let out = cmd
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("RGIT_OPLOG", "0")
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status.code(),
+        )
+    };
+    let failed: Vec<String> = cases
+        .iter()
+        .filter_map(|args| {
+            let want = run(&mut Command::new("git"), args);
+            let got = run(
+                Command::new(env!("CARGO_BIN_EXE_rgit")).arg("--human"),
+                args,
+            );
+            (got != want).then(|| format!("{args:?}\n--- git\n{want:?}\n--- rgit\n{got:?}"))
+        })
+        .collect();
+    assert!(failed.is_empty(), "{}", failed.join("\n\n"));
+}
+
+#[test]
+fn blame_follows_git_options() {
+    let dir = blame_repo("blame-options");
+    let ws = git(&dir, &["rev-parse", "HEAD~3"]);
+    std::fs::write(dir.join("ignore-revs"), format!("# spacing\n{ws}")).unwrap();
+    all_same(
+        &dir,
+        &[
+            &["blame", "-t", "a.c"],
+            &["blame", "--root", "a.c"],
+            &["blame", "-w", "-t", "a.c"],
+            &["blame", "-n", "-f", "-t", "d.txt"],
+            &["blame", "-M", "-t", "d.txt"],
+            &["blame", "-M5", "-t", "d.txt"],
+            &["blame", "-C", "-t", "c.txt"],
+            &["blame", "-C", "-C", "-t", "c.txt"],
+            &["blame", "-C", "-C", "-C", "-t", "c.txt"],
+            &["blame", "-C10", "-C", "-n", "-t", "c.txt"],
+            &["blame", "--porcelain", "-M", "d.txt"],
+            &["blame", "--line-porcelain", "-C", "-C", "c.txt"],
+            &["blame", "-L", ":helper", "-t", "a.c"],
+            &["blame", "-L", "/return/,+2", "-t", "a.c"],
+            &["blame", "-L", "1,2", "-L", "5,6", "-t", "a.c"],
+            &["blame", "-L", "5,6", "-L", "/other/", "-t", "a.c"],
+            &["blame", "-L", "^/int/,-1", "-t", "a.c"],
+            &["blame", "-L", "2,1", "--porcelain", "a.c"],
+            &["blame", "HEAD~2..", "-t", "a.c"],
+            &["blame", "--first-parent", "-t", "a.c"],
+            &["blame", "--reverse", "HEAD~4..HEAD~1", "-t", "a.c"],
+            &["blame", "--reverse", "HEAD~4", "-t", "--", "a.c"],
+            &["blame", "--ignore-rev", "HEAD~3", "-t", "a.c"],
+            &["blame", "--ignore-revs-file", "ignore-revs", "-t", "a.c"],
+            &["blame", "-c", "a.c"],
+            &["blame", "-b", "HEAD~1", "--", "a.c"],
+            &["blame", "--date=short", "-e", "a.c"],
+            &["blame", "--date=rfc", "-s", "a.c"],
+            &["blame", "-l", "-t", "a.c"],
+            &["blame", "--abbrev=10", "-t", "a.c"],
+            &["blame", "--show-stats", "-t", "HEAD", "--", "d.txt"],
+        ],
+    );
+    git(&dir, &["config", "blame.markIgnoredLines", "true"]);
+    git(&dir, &["config", "blame.markUnblamableLines", "true"]);
+    all_same(&dir, &[&["blame", "--ignore-rev", "HEAD~1", "-t", "a.c"]]);
+    git(&dir, &["config", "blame.ignoreRevsFile", "ignore-revs"]);
+    all_same(
+        &dir,
+        &[
+            &["blame", "-t", "a.c"],
+            &["blame", "--ignore-revs-file", "", "-t", "a.c"],
+        ],
+    );
+
+    let dir = repo("blame-merges");
+    all_same(
+        &dir,
+        &[
+            &["blame", "-t", "b.txt"],
+            &["blame", "--first-parent", "-n", "-t", "b.txt"],
+            &["blame", "-C", "-t", "HEAD~3", "--", "a.txt"],
+            &["blame", "--reverse", "v1..HEAD~3", "-t", "--", "a.txt"],
+            &["blame", "--porcelain", "v1..", "--", "b.txt"],
+        ],
+    );
+}
+
+const F: &str = "int main() {\n\ta();\n\tb();\n\tc();\n\td();\n\te();\n}\n\nstatic void helper(void)\n{\n\tone();\n\ttwo();\n\tthree();\n\tfour();\n\tfive();\n\tsix();\n}\n";
+
+/// A merge with a hand-resolved conflict, an evil line, a file added on
+/// both sides, one it deletes and one whose mode it changes, then a clean
+/// octopus.
+fn merge_repo(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rgit-history-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["config", "user.email", "t@t"]);
+    git(&dir, &["config", "user.name", "t"]);
+    let x = "x1\nx2\nx3\nx4\nx5\nx6\nx7\nx8\nx9\nx10\nx11\nx12\n";
+    commit(
+        &dir,
+        1,
+        &[
+            ("f.c", F),
+            ("h", A),
+            ("e", "e\n"),
+            ("run.sh", "run\n"),
+            ("x", x),
+        ],
+        "base",
+    );
+    git(&dir, &["checkout", "-q", "-b", "side"]);
+    let side_f = F.replace("b();", "B_side();").replace("five();", "FIVE();");
+    commit(
+        &dir,
+        2,
+        &[
+            ("f.c", &side_f),
+            ("h", &A.replace("2\n", "two\n")),
+            ("both", "side\n"),
+        ],
+        "side work",
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+    let main_f = F
+        .replace("b();", "B_main();")
+        .replace("three();\n", "three();\n\tthree_and_half();\n");
+    commit(
+        &dir,
+        3,
+        &[
+            ("f.c", &main_f),
+            ("h", &A.replace("9\n", "nine\n")),
+            ("both", "main\n"),
+        ],
+        "main work",
+    );
+    git_at(
+        &dir,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--no-commit",
+            "-s",
+            "ours",
+            "side",
+        ],
+        4,
+    );
+    let merged = main_f
+        .replace("B_main();", "B_merged();")
+        .replace("five();", "FIVE();")
+        + "/* evil */\n";
+    std::fs::write(dir.join("f.c"), merged).unwrap();
+    std::fs::write(
+        dir.join("h"),
+        A.replace("2\n", "two\n").replace("9\n", "nine\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("both"), "merged\n").unwrap();
+    std::fs::remove_file(dir.join("e")).unwrap();
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["update-index", "--chmod=+x", "run.sh"]);
+    git_at(&dir, &["commit", "-qm", "merge side"], 4);
+    for (i, (b, from)) in [("o1", "x2\n"), ("o2", "x6\n"), ("o3", "x10\n")]
+        .iter()
+        .enumerate()
+    {
+        git(&dir, &["checkout", "-q", "-b", b, "main"]);
+        let to = from.to_uppercase();
+        commit(&dir, 5 + i as u32, &[("x", &x.replace(from, &to))], b);
+    }
+    git(&dir, &["checkout", "-q", "main"]);
+    git_at(&dir, &["merge", "-q", "o1", "o2", "o3", "-m", "octopus"], 9);
+    dir
+}
+
+#[test]
+fn log_and_show_diff_merges_like_git() {
+    let dir = merge_repo("diff-merges");
+    let cases: &[&[&str]] = &[
+        &["show", "--format=medium", "HEAD~1"],
+        &["show", "--format=medium"],
+        &["show", "-c", "--format=medium", "HEAD~1"],
+        &["show", "-c", "--oneline"],
+        &["show", "--cc", "--stat", "--oneline", "HEAD~1"],
+        &["show", "--stat", "-p", "--format=medium", "HEAD~1"],
+        &["show", "--name-status", "--oneline", "HEAD~1"],
+        &["show", "-c", "--name-only", "--format=%h", "HEAD~1"],
+        &["show", "-m", "--oneline", "HEAD~1"],
+        &["show", "-m", "--stat", "--format=medium", "HEAD~1"],
+        &["show", "--first-parent", "--oneline", "--stat", "HEAD~1"],
+        &["show", "--remerge-diff", "--format=medium", "HEAD~1"],
+        &["show", "--diff-merges=off", "--format=medium", "HEAD~1"],
+        &["log", "-p", "--oneline"],
+        &["log", "--cc", "--oneline"],
+        &["log", "-c", "--format=%h %s"],
+        &["log", "-m", "--oneline"],
+        &["log", "-m", "-p", "--oneline"],
+        &["log", "-m", "--name-status", "--format=medium"],
+        &["log", "--diff-merges=first-parent", "--stat", "--oneline"],
+        &["log", "--first-parent", "-p", "--oneline"],
+        &["log", "--dd", "--oneline", "-2"],
+        &["log", "--remerge-diff", "--oneline"],
+        &["log", "-m", "-p", "--oneline", "--graph"],
+        &["log", "--cc", "--stat", "--oneline", "--graph"],
+        &["log", "--cc", "--oneline", "--", "h"],
+        &["log", "-c", "-m", "--oneline"],
+        &["log", "-m", "-c", "--oneline"],
+        &["log", "-m", "-p", "--format=medium", "--graph", "-5"],
+        &[
+            "log",
+            "--cc",
+            "--stat",
+            "-p",
+            "--format=medium",
+            "--graph",
+            "-5",
+        ],
+        &["show", "--cc", "--numstat", "--format=%h", "HEAD~1"],
+        &["show", "-c", "--name-status", "--format=%h"],
+        &["log", "-g", "-p", "-4"],
+        &["show", "--color=always", "--format=medium", "HEAD~1"],
+        &["show", "--color=always", "-c", "--oneline", "HEAD~1"],
+        &["log", "--color=always", "-L:helper:f.c", "--oneline"],
+        &["log", "-g", "--stat", "--oneline", "-6"],
+    ];
+    for args in cases {
+        same(&dir, args);
+    }
+}
+
+#[test]
+fn log_traces_line_ranges_like_git() {
+    let dir = merge_repo("line-log");
+    let cases: &[&[&str]] = &[
+        &["log", "-L:helper:f.c"],
+        &["log", "-L:main:f.c", "--oneline"],
+        &["log", "-L/three/,+3:f.c", "--format=%h %s"],
+        &["log", "-L1,3:h", "-L8,10:h", "--oneline"],
+        &["log", "-L2,2:x", "-L1,1:h", "--oneline"],
+        &["log", "-L12,:f.c", "--oneline", "-n", "2"],
+        &["log", "-L3,+2:x", "--first-parent", "--oneline"],
+        &["log", "-L1,5:h", "--oneline", "side"],
+    ];
+    for args in cases {
+        same(&dir, args);
+    }
+    let dir = repo("line-log-rename");
+    std::fs::write(dir.join("b.txt"), "1\n3\n4\nfive\n6\n7\n8\nnine\n10\n").unwrap();
+    git_at(&dir, &["commit", "-qam", "drop a line"], 9);
+    for args in [
+        &["log", "-L7,9:b.txt", "--oneline"][..],
+        &["log", "-L1,4:b.txt", "--format=medium"],
+        &["log", "-L/five/,/nine/:b.txt", "--oneline", "--reverse"],
+    ] {
+        same(&dir, args);
+    }
+}
+
+#[test]
 fn colors_match_gits_palette() {
     let dir = repo("colors");
     // An octopus merge, for its dashes.
@@ -648,6 +1094,31 @@ fn colors_match_gits_palette() {
         &["grep", "--heading", "-n", "-C1", "five"],
         &["grep", "-o", "t.o"],
         &["grep", "-n", "e", "HEAD~1"],
+        &[
+            "grep", "-n", "-e", "two", "--or", "-e", "nine", "--and", "--not", "-e", "x",
+        ],
+        &["grep", "-p", "-n", "nine"],
+        &["grep", "-W", "five"],
+        &[
+            "log",
+            "--graph",
+            "--oneline",
+            "--left-right",
+            "--boundary",
+            "main...topic",
+        ],
+        &[
+            "log",
+            "--graph",
+            "--oneline",
+            "--cherry-mark",
+            "main...side",
+        ],
+        &["show", "--format=medium"],
+        &["show", "--format=medium", "HEAD~3"],
+        &["show", "-c", "--oneline", "HEAD~3"],
+        &["log", "-m", "-p", "--oneline", "-1", "HEAD~3"],
+        &["log", "-L2,4:b.txt", "--oneline"],
     ] {
         same(&dir, args);
     }

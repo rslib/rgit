@@ -49,8 +49,11 @@ pub fn run(
             ignored,
         )?),
         Command::Log {
-            format, ref pretty, ..
-        } if !format.any() && !pretty.any() => {
+            format,
+            ref pretty,
+            ref line_ranges,
+            ..
+        } if !format.any() && !pretty.any() && line_ranges.is_empty() => {
             let opts: LogOptions = crate::cli::log_options(backend, &command)?;
             let filtered = opts.author.is_some()
                 || opts.committer.is_some()
@@ -67,17 +70,14 @@ pub fn run(
             } else if filtered {
                 None
             } else {
-                let mut args = vec!["rev-list".to_owned(), "--count".to_owned()];
-                if opts.first_parent {
-                    args.push("--first-parent".to_owned());
-                }
-                if opts.all {
-                    args.push("--all".to_owned());
-                } else if opts.revs.is_empty() {
-                    args.push("HEAD".to_owned());
-                }
-                args.extend(opts.revs.iter().cloned());
-                backend.git(&args).ok().and_then(|n| n.trim().parse().ok())
+                backend
+                    .rev_walk(&LogOptions {
+                        limit: usize::MAX,
+                        offset: 0,
+                        ..opts.clone()
+                    })
+                    .ok()
+                    .map(|c| c.len())
             };
             let mut base = String::from("rgit log");
             if opts.all {
@@ -120,6 +120,7 @@ pub fn run(
             format,
             ref pretty,
             no_patch,
+            ..
         } if revs.len() <= 1
             && !revs.iter().any(|r| r.contains(':'))
             && !(pretty.any() || format.name_status || format.numstat) =>
@@ -138,9 +139,17 @@ pub fn run(
             args,
             lines,
             format,
+            opts,
         } if !(format.porcelain || format.line_porcelain) => {
             let path = args.join(" ");
-            let all = crate::cli::blame(backend, &args).map_err(|e| match e {
+            // Plain `START,END` ranges page through the whole blame.
+            let paged = match &lines[..] {
+                [] => Some((1, BLAME_LINES)),
+                [spec] => crate::cli::parse_line_range(spec).ok(),
+                _ => None,
+            };
+            let ranges = if paged.is_some() { &[][..] } else { &lines[..] };
+            let all = crate::cli::blame(backend, &args, ranges, &opts).map_err(|e| match e {
                 rgit_git::GitError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
                     anyhow::Error::new(crate::cli::CliError {
                         message: format!("no file {path} in this repository"),
@@ -150,11 +159,8 @@ pub fn run(
                 }
                 other => other.into(),
             })?;
-            let (start, end) = match lines {
-                Some(spec) => crate::cli::parse_line_range(&spec)?,
-                None => (1, BLAME_LINES),
-            };
-            blame(&all, &path, start, end)
+            let (start, end) = paged.unwrap_or((1, usize::MAX));
+            blame(&all.lines, &path, start, end)
         }
         Command::Plumbing(c) => crate::plumbing::run(backend, c, false)?,
         command @ Command::LsRemote { .. } => {
@@ -1172,10 +1178,9 @@ fn blame(all: &[BlameLine], path: &str, start: usize, end: usize) -> Output {
     let shown = &all[lo..hi];
     let rows = shown
         .iter()
-        .enumerate()
-        .map(|(i, b)| {
+        .map(|b| {
             crate::obj! {
-                "line" => lo + i + 1,
+                "line" => b.final_line,
                 "id" => b.short_id,
                 "author" => b.author,
                 "text" => b.line,

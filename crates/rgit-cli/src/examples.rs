@@ -13,7 +13,12 @@ const EXAMPLES: &[Entry] = &[
             "rgit log --follow --stat -- src/lib.rs",
             "rgit log --oneline --graph --all",
             "rgit log --oneline -S parse_date -- src",
+            "rgit log --oneline --left-right --cherry-pick main...feature",
+            "rgit log --since='last friday' --until=yesterday",
+            "rgit log -g -5 --oneline",
             "rgit log -3 --format='%h %an %ar %s' --date=iso",
+            "rgit log -L :parse_date:src/cli.rs --oneline",
+            "rgit log --merges --cc --oneline",
         ],
     ),
     (
@@ -36,6 +41,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit show <rev> --name-only",
             "rgit show <rev> --pretty=fuller --stat",
             "rgit show HEAD~1:src/lib.rs",
+            "rgit show <merge> --remerge-diff --format=medium",
+            "rgit show <merge> -m --stat --oneline",
         ],
     ),
     (
@@ -45,6 +52,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit blame src/lib.rs -L 10,20",
             "rgit blame v1 -- src/lib.rs",
             "rgit blame --porcelain -L 10,20 src/lib.rs",
+            "rgit blame -w -C -L :main src/lib.rs",
+            "rgit blame --ignore-rev <rev> --date=short src/lib.rs",
         ],
     ),
     ("refs", &["rgit refs"]),
@@ -77,6 +86,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit cat-file -p HEAD:src/lib.rs",
             "rgit cat-file -t <rev>",
             "rgit cat-file --batch-check < ids.txt",
+            "rgit cat-file --textconv HEAD:doc.pdf",
         ],
     ),
     (
@@ -92,6 +102,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit for-each-ref refs/heads",
             "rgit for-each-ref --sort=-committerdate --format='%(refname:short) %(subject)'",
             "rgit for-each-ref --merged main refs/heads",
+            "rgit for-each-ref --format='%(refname:short) %(ahead-behind:main) %(*subject)'",
         ],
     ),
     (
@@ -101,6 +112,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit rev-list main..HEAD",
             "rgit rev-list -n 1 --all",
             "rgit rev-list HEAD -- src/lib.rs",
+            "rgit rev-list --count --left-right main...feature",
+            "rgit rev-list --objects main..feature",
         ],
     ),
     (
@@ -122,6 +135,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit grep -i -e foo -e bar -- src",
             "rgit grep pattern HEAD~5",
             "rgit grep -n -C2 --heading TODO",
+            "rgit grep -e TODO --and --not -e FIXME",
+            "rgit grep -W -n parse_args -- src",
         ],
     ),
     (
@@ -677,6 +692,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit describe HEAD --tags",
             "rgit describe --tags --abbrev=0",
             "rgit describe --contains <rev>",
+            "rgit describe --all --dirty=-wip",
+            "rgit describe --first-parent --exclude 'rc*'",
         ],
     ),
     (

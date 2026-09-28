@@ -13,6 +13,7 @@ use crate::toon::{Node, Obj};
 mod axi;
 mod cli;
 mod creds;
+mod date;
 mod examples;
 mod forge;
 mod graph;
@@ -48,7 +49,10 @@ fn main() -> ! {
     logging::init();
     let stdout_is_terminal = std::io::stdout().is_terminal();
     let parsed = examples::apply(Cli::command())
-        .try_get_matches_from(std::iter::once("rgit".to_owned()).chain(count_shorthand(&args)))
+        .try_get_matches_from(
+            std::iter::once("rgit".to_owned())
+                .chain(blame_scores(count_shorthand(&plumbing::grep_tokens(&args)))),
+        )
         .and_then(|m| Cli::from_arg_matches(&m));
     let cli = match parsed {
         Ok(cli) => cli,
@@ -508,13 +512,17 @@ fn fail(message: String, help: Vec<String>, code: i32, mode: OutputMode) -> ! {
     exit(code);
 }
 
-/// git's `-<n>` count for `log` and `stash list`: `rgit log -3` is `rgit log -n 3`.
+/// git's `-<n>` count for `log`, `rev-list` and `stash list`: `rgit log -3` is
+/// `rgit log -n 3`.
 fn count_shorthand(args: &[String]) -> Vec<String> {
-    let log = args.iter().position(|a| a == "log").or_else(|| {
-        args.windows(2)
-            .position(|w| w[0] == "stash" && w[1] == "list")
-            .map(|i| i + 1)
-    });
+    let log = args
+        .iter()
+        .position(|a| a == "log" || a == "rev-list")
+        .or_else(|| {
+            args.windows(2)
+                .position(|w| w[0] == "stash" && w[1] == "list")
+                .map(|i| i + 1)
+        });
     let Some(log) = log else {
         return args.to_vec();
     };
@@ -529,6 +537,33 @@ fn count_shorthand(args: &[String]) -> Vec<String> {
             Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
                 out.extend(["-n".to_owned(), n.to_owned()]);
             }
+            _ => out.push(a.clone()),
+        }
+    }
+    out.extend(rest.cloned());
+    out
+}
+
+/// git's attached scores for `blame`: `-M30` is `-M --move-score=30`, and
+/// `-C50` is `-C --copy-score=50`.
+fn blame_scores(args: Vec<String>) -> Vec<String> {
+    let Some(at) = args.iter().position(|a| a == "blame" || a == "annotate") else {
+        return args;
+    };
+    let mut out = args[..=at].to_vec();
+    let mut rest = args[at + 1..].iter();
+    for a in rest.by_ref() {
+        if a == "--" {
+            out.push(a.clone());
+            break;
+        }
+        let score = |flag: &str| {
+            a.strip_prefix(flag)
+                .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        };
+        match (score("-M"), score("-C")) {
+            (Some(n), _) => out.extend(["-M".to_owned(), format!("--move-score={n}")]),
+            (_, Some(n)) => out.extend(["-C".to_owned(), format!("--copy-score={n}")]),
             _ => out.push(a.clone()),
         }
     }

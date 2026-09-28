@@ -1811,6 +1811,8 @@ mod graph_tests {
             parents: parents.iter().map(|p| p.to_string()).collect(),
             refs: Vec::new(),
             unpushed: false,
+            mark: None,
+            source: None,
         }
     }
 

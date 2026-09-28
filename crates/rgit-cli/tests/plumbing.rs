@@ -407,6 +407,72 @@ fn history_matches_git() {
 }
 
 #[test]
+fn rev_list_walks_like_git() {
+    let dir = repo("walk");
+    git(&dir, &["checkout", "-q", "-b", "topic", "lw"], &[]);
+    let date = "2024-01-06T10:00:00+0200";
+    git(
+        &dir,
+        &["cherry-pick", "side"],
+        &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+    );
+    git(&dir, &["checkout", "-q", "main"], &[]);
+    same(
+        &dir,
+        &[
+            &["rev-list", "--left-right", "--cherry-mark", "topic...main"][..],
+            &[
+                "rev-list",
+                "--count",
+                "--left-right",
+                "--cherry-mark",
+                "topic...main",
+            ],
+            &["rev-list", "--count", "--left-right", "topic...main"],
+            &[
+                "rev-list",
+                "--cherry-pick",
+                "--left-right",
+                "--boundary",
+                "topic...main",
+            ],
+            &["rev-list", "--cherry", "topic...main"],
+            &["rev-list", "--left-only", "topic...main"],
+            &["rev-list", "--parents", "--boundary", "-2", "HEAD"],
+            &["rev-list", "--objects", "HEAD~1..HEAD"],
+            &["rev-list", "--objects-edge", "HEAD~1..HEAD"],
+            &["rev-list", "--objects", "--all"],
+            &["rev-list", "--objects", "-2", "HEAD"],
+            &["rev-list", "--missing=print", "--objects", "HEAD"],
+            &["rev-list", "--date-order", "--all"],
+            &["rev-list", "--author-date-order", "--all"],
+            &["rev-list", "--topo-order", "--all"],
+            &[
+                "rev-list",
+                "--since=2024-01-03",
+                "--until=2024-01-05",
+                "HEAD",
+            ],
+            &["rev-list", "--since=2024-01-03 12:00", "--all"],
+            &["rev-list", "--author=Alice", "--all"],
+            &["rev-list", "--author=alice", "-i", "--all"],
+            &[
+                "rev-list",
+                "--grep=side",
+                "--grep=merge",
+                "--all-match",
+                "--all",
+            ],
+            &["rev-list", "--grep=side", "--invert-grep", "--all"],
+            &["rev-list", "--parents", "--all", "--", "s.txt"],
+            &["rev-list", "--ancestry-path", "lw..main"],
+            &["rev-list", "--no-walk", "topic", "main"],
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn grep_matches_git() {
     let dir = repo("grep");
     same(
@@ -466,6 +532,112 @@ fn grep_matches_git() {
     );
     git(&dir, &["repack", "-a", "-d", "-q"], &[]);
     same(&dir, &[&["count-objects", "-v"]]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn grep_expressions_and_functions_match_git() {
+    let dir = repo("grep-expr");
+    write(
+        &dir,
+        "f.c",
+        b"/* the main\n * comment */\nint main(void)\n{\n  foo bar\n\n  baz\n  return 0;\n}\n\n\n\
+          static int helper(int x)\n{\n  bar only\n  foo only\n  return x;\n}\n",
+    );
+    write(&dir, "m.x", b"fn one\n  x foo\nhelper\n  y foo\n");
+    write(&dir, ".gitattributes", b"*.x diff=mine\n");
+    git(&dir, &["config", "diff.mine.xfuncname", "^fn (.*)$"], &[]);
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 6, "functions", "T");
+    write(&dir, "u.txt", b"foo untracked\n");
+    write(&dir, "x.log", b"foo ignored\n");
+    let sub = dir.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    git(&sub, &["init", "-q"], &[]);
+    write(&sub, "g", b"foo in sub\n");
+    git(&sub, &["add", "."], &[]);
+    commit(&sub, 1, "sub", "T");
+    write(
+        &dir,
+        ".gitmodules",
+        b"[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+    );
+    git(&dir, &["add", "sub", ".gitmodules"], &[]);
+    git(&dir, &["config", "submodule.sub.url", "./sub"], &[]);
+    commit(&dir, 7, "add sub", "T");
+    same(
+        &dir,
+        &[
+            &["grep", "-e", "foo", "--or", "-e", "bar"][..],
+            &["grep", "-e", "foo", "--and", "-e", "bar"],
+            &["grep", "-n", "--not", "-e", "foo"],
+            &["grep", "-e", "foo", "--and", "--not", "-e", "bar"],
+            &[
+                "grep", "(", "-e", "foo", "--or", "-e", "baz", ")", "--and", "-e", "bar",
+            ],
+            &["grep", "-e", "foo", "-e", "bar", "--and", "-e", "baz"],
+            &["grep", "-e", "foo", "--not", "-e", "bar"],
+            &["grep", "--all-match", "-e", "foo", "-e", "baz"],
+            &[
+                "grep",
+                "--all-match",
+                "-e",
+                "foo",
+                "--and",
+                "-e",
+                "bar",
+                "-e",
+                "only",
+            ],
+            &["grep", "-c", "--all-match", "-e", "foo", "-e", "baz"],
+            &["grep", "-o", "--not", "-e", "bar", "-e", "foo"],
+            &["grep", "-l", "--not", "-e", "foo"],
+            &["grep", "-e", "foo", "--and"],
+            &["grep", "(", "-e", "foo"],
+            &["grep", "-e", "-e", "foo"],
+            &["grep", "-p", "-e", "bar"],
+            &["grep", "-n", "-p", "only"],
+            &["grep", "-p", "-C1", "return"],
+            &["grep", "-W", "bar"],
+            &["grep", "-W", "-n", "baz"],
+            &["grep", "-W", "-A1", "foo"],
+            &["grep", "-p", "foo", "--", "m.x"],
+            &["grep", "-W", "foo", "--", "m.x"],
+            &["grep", "-m1", "-A2", "foo"],
+            &["grep", "-P", "foo(?= only)"],
+            &["grep", "-P", "-w", "ba."],
+            &["grep", "--threads", "2", "foo"],
+            &["grep", "--untracked", "foo"],
+            &["grep", "--untracked", "--no-exclude-standard", "foo"],
+            &["grep", "--no-index", "foo"],
+            &["grep", "--no-index", "--exclude-standard", "-n", "foo"],
+            &["grep", "--recurse-submodules", "foo"],
+            &["grep", "--recurse-submodules", "--cached", "foo"],
+            &["grep", "--recurse-submodules", "foo", "HEAD"],
+        ],
+    );
+    let bare = std::env::temp_dir().join(format!("rgit-plumbing-{}-noindex", std::process::id()));
+    let _ = std::fs::remove_dir_all(&bare);
+    write(&bare, "a", b"foo 1\n");
+    write(&bare, "s/b", b"foo 2\nbar\n");
+    same(
+        &bare,
+        &[
+            &[
+                "grep",
+                "--no-index",
+                "-n",
+                "-e",
+                "foo",
+                "--and",
+                "--not",
+                "-e",
+                "2",
+            ][..],
+            &["grep", "--no-index", "foo", "--", "s"],
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&bare);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -562,6 +734,137 @@ fn batch_symbolic_ref_and_path_limits_match_git() {
             &["symbolic-ref", "-d", "-q", "refs/heads/main"],
         ],
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn peeled_atoms_batch_command_and_filters_match_git() {
+    let dir = repo("peel");
+    #[cfg(unix)]
+    for (link, target) in [
+        ("link", "c.txt"),
+        ("out", "/etc/hosts"),
+        ("up", "../x"),
+        ("dang", "nothere"),
+        ("loop1", "loop2"),
+        ("loop2", "loop1"),
+        ("dlink", "dir"),
+        ("dir/back", "../c.txt"),
+        ("notdir", "c.txt/b"),
+    ] {
+        std::os::unix::fs::symlink(target, dir.join(link)).unwrap();
+        git(&dir, &["add", link], &[]);
+    }
+    write(&dir, ".gitattributes", b"c.txt diff=up filter=rot\n");
+    git(&dir, &["add", ".gitattributes"], &[]);
+    commit(&dir, 6, "links", "T");
+    git(&dir, &["config", "diff.up.textconv", "sed s/o/0/"], &[]);
+    git(&dir, &["config", "filter.rot.smudge", "sed s/e/E/"], &[]);
+    git(&dir, &["repack", "-adq"], &[]);
+    same(
+        &dir,
+        &[
+            &[
+                "for-each-ref",
+                "--format=%(refname)|%(*subject)|%(*authorname)|%(*authordate:unix)|\
+                 %(*objectname:short)|%(*tree)|%(*parent)|%(*body)|%(*refname)",
+            ][..],
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(describe) %(describe:tags)",
+            ],
+            &[
+                "for-each-ref",
+                "--format=%(describe:tags,abbrev=4,match=v*)",
+            ],
+            &["for-each-ref", "--format=%(refname) %(ahead-behind:side)"],
+            &["for-each-ref", "--no-merged=main"],
+            &["cat-file", "--textconv", "HEAD:c.txt"],
+            &["cat-file", "--filters", "HEAD:c.txt"],
+            &["cat-file", "--filters", "--path=c.txt", "HEAD:e.txt"],
+            &["cat-file", "--filters", "HEAD:link"],
+            &["cat-file", "--filters", "HEAD"],
+            &["cat-file", "--textconv", "HEAD:nope"],
+            &[
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname) %(objectsize:disk) %(deltabase)",
+            ],
+        ],
+    );
+    let names = b"HEAD:link\nHEAD:out\nHEAD:up\nHEAD:dang\nHEAD:loop1\nHEAD:dlink/a\n\
+                  HEAD:dir/back\nHEAD:notdir\nHEAD:nope\n:c.txt\n";
+    same_input(&dir, &["cat-file", "--batch", "--follow-symlinks"], names);
+    same_input(
+        &dir,
+        &["cat-file", "--batch-check", "--follow-symlinks"],
+        names,
+    );
+    let commands = b"info HEAD\ncontents HEAD:c.txt\ninfo nope\nflush\ncontents v1\n";
+    same_input(&dir, &["cat-file", "--batch-command", "--buffer"], commands);
+    same_input(
+        &dir,
+        &["cat-file", "--batch-command=%(objecttype)"],
+        b"info HEAD\n",
+    );
+    same_input(
+        &dir,
+        &["cat-file", "--batch-command", "-Z"],
+        b"info HEAD\0contents HEAD:e.txt\0",
+    );
+    same_input(&dir, &["cat-file", "--batch", "-Z"], b"HEAD:e.txt\0nope\0");
+    same_input(
+        &dir,
+        &["cat-file", "--batch", "--textconv"],
+        b"HEAD:c.txt c.txt\n",
+    );
+    same_input(
+        &dir,
+        &["cat-file", "--batch", "--filters"],
+        b"HEAD:e.txt c.txt\n",
+    );
+    write(&dir, "dir/.gitignore", b"# temp\n*.tmp\n!keep.tmp\n");
+    let paths = b"x.log\ndir/y.tmp\ndir/keep.tmp\nc.txt\n";
+    same_input(&dir, &["check-ignore", "--stdin", "-v", "-n"], paths);
+    same_input(&dir, &["check-ignore", "--stdin"], paths);
+    same_input(
+        &dir,
+        &["check-ignore", "--stdin", "-z", "-v"],
+        b"x.log\0dir/keep.tmp\0",
+    );
+    same(
+        &dir,
+        &[
+            &["check-ignore", "dir/keep.tmp"][..],
+            &["check-ignore", "-v", "dir/keep.tmp"],
+        ],
+    );
+
+    // Each answer comes back before the next path is sent.
+    use std::io::{BufRead, Write};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(["--human", "check-ignore", "--stdin", "-v", "-n"])
+        .current_dir(&dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("RGIT_OPLOG", "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+    for (path, want) in [
+        ("x.log", ".gitignore:1:*.log\tx.log\n"),
+        ("c.txt", "::\tc.txt\n"),
+    ] {
+        writeln!(stdin, "{path}").unwrap();
+        stdin.flush().unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line, want);
+    }
+    drop(stdin);
+    child.wait().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

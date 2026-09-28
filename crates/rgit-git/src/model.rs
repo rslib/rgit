@@ -522,6 +522,54 @@ pub struct LogOptions {
     pub occurrences: Option<String>,
     /// Keep only commits adding or removing a line that matches this regex (git's -G).
     pub changes_matching: Option<String>,
+    /// Ref globs to walk too (`refs/heads/*` for `--branches`).
+    pub globs: Vec<String>,
+    /// The order commits come in.
+    pub order: LogOrder,
+    /// Keep only the commits of one side of a symmetric range: `Some(true)`
+    /// the left (`--left-only`), `Some(false)` the right.
+    pub side: Option<bool>,
+    /// Between the sides of a symmetric range, drop commits with the same
+    /// patch as one on the other side (`Some(true)`, `--cherry-pick`) or mark
+    /// them `=` (`Some(false)`, `--cherry-mark`).
+    pub cherry: Option<bool>,
+    /// After the commits, the excluded commits they have as parents, marked `-`.
+    pub boundary: bool,
+    /// Only commits that descend from a range's excluded ends.
+    pub ancestry_path: bool,
+    /// Only commits that refs point at (and those touching `paths`).
+    pub simplify_by_decoration: bool,
+    /// Walk every parent of a merge under path limits, not just a same one.
+    pub full_history: bool,
+    /// With `full_history`, leave out merges the shown history does not need.
+    pub simplify_merges: bool,
+    /// Show every walked commit under path limits, not only those changing them.
+    pub sparse: bool,
+    /// Show the given commits only, by date (`Some(true)`) or as given.
+    pub no_walk: Option<bool>,
+    /// Walk `HEAD...MERGE_HEAD` (or the other in-progress pick's head),
+    /// limited to the conflicted paths.
+    pub merge: bool,
+    /// Require every `grep` pattern to match, not any.
+    pub all_match: bool,
+    /// Keep commits whose message does not match `grep`.
+    pub invert_grep: bool,
+    /// Record which starting ref reached each commit (`--source`).
+    pub source: bool,
+}
+
+/// The order a log walk lists commits in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogOrder {
+    /// Newest committer date first, as commits are reached.
+    #[default]
+    Walk,
+    /// No parent before all its children, a merge's branches kept together.
+    Topo,
+    /// No parent before all its children, else by committer date.
+    Date,
+    /// No parent before all its children, else by author date.
+    AuthorDate,
 }
 
 /// Which two sides [`crate::GitBackend::diff`] compares, and how.
@@ -567,6 +615,21 @@ impl Default for LogOptions {
             committer: None,
             occurrences: None,
             changes_matching: None,
+            globs: Vec::new(),
+            order: LogOrder::Walk,
+            side: None,
+            cherry: None,
+            boundary: false,
+            ancestry_path: false,
+            simplify_by_decoration: false,
+            full_history: false,
+            simplify_merges: false,
+            sparse: false,
+            no_walk: None,
+            merge: false,
+            all_match: false,
+            invert_grep: false,
+            source: false,
         }
     }
 }
@@ -778,6 +841,11 @@ pub struct LogEntry {
     pub refs: Vec<CommitRef>,
     /// Not reachable from any remote-tracking branch, i.e. local-only.
     pub unpushed: bool,
+    /// git's mark: `<`/`>` for a symmetric range's side, `-` for a boundary
+    /// commit, `=` for one whose patch the other side has too.
+    pub mark: Option<char>,
+    /// The starting ref that reached this commit, with `source` set.
+    pub source: Option<String>,
 }
 
 /// A ref decorating a log entry: a branch, upstream, or tag that points at it.
@@ -902,6 +970,14 @@ pub struct BlameLine {
     pub orig_path: String,
     /// The commit is where blame stopped: a root commit, as git marks with `^`.
     pub boundary: bool,
+    /// The line's number in the blamed file.
+    pub final_line: usize,
+    /// Passed through an ignored revision (`--ignore-rev`), or left with
+    /// one because no line before it matched.
+    pub ignored: bool,
+    pub unblamable: bool,
+    /// The commit and path the suspect was compared with, if any.
+    pub previous: Option<(String, String)>,
 }
 
 /// A commit's metadata and its diff against its first parent.

@@ -9,16 +9,20 @@ mod apply;
 mod archive;
 mod backend;
 mod bisect;
+mod blame;
 mod bundle;
 mod change_id;
+mod combine;
 mod config;
 mod creds;
+mod describe;
 mod diff;
 mod error;
 mod fetch_display;
 mod format_patch;
 mod git_repo;
 mod lanes;
+mod line_log;
 mod model;
 mod oplog;
 mod plumbing;
@@ -29,6 +33,7 @@ mod shallow;
 mod ssh;
 mod stash;
 mod submodule;
+mod walk;
 pub mod workflow;
 
 /// Install a callback that supplies an SSH password when key-based auth over an
@@ -49,13 +54,16 @@ pub use apply::{
 };
 pub use archive::{ArchiveOpts, add_file as archive_file};
 pub use backend::GitBackend;
+pub use blame::{Blame, BlameOptions};
 pub use bundle::{BundleHeader, bundle_header};
+pub use combine::CombinedFile;
 pub use config::{
     ConfigEntry, ConfigScope, SetMode, ansi_color, config_file, config_fixed_value, config_key,
     config_list, config_name_matcher, config_section, config_set, config_typed, config_unset,
     expiry_date, value_matcher,
 };
 pub use creds::CredentialPrompt;
+pub use describe::DescribeOptions;
 pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 pub use error::GitError;
 pub use format_patch::{CherryCommit, FormatPatchOpts, PatchMail, Thread, mbox};
@@ -66,14 +74,14 @@ pub use model::{
     BlameLine, Blob, CheckoutMode, CloneArgs, Commit, CommitDetails, CommitFile, CommitOptions,
     CommitOverview, CommitRef, Deco, DiffSpec, EmptyCommit, FetchArgs, FileActivity, GrepMatch,
     GrepQuery, Head, HunkRef, InitArgs, Lane, LanesState, LastCommit, LogEntry, LogOptions,
-    MergeOptions, OpLogEntry, OpProgress, PickOptions, PullArgs, PushArgs, RebaseOptions,
+    LogOrder, MergeOptions, OpLogEntry, OpProgress, PickOptions, PullArgs, PushArgs, RebaseOptions,
     RebaseProgress, RefEntry, RefKind, RefUpdate, Remote, RepoState, RepoStatus, ResetMode,
     RestackOutcome, RmOptions, SmartlogEntry, Stash, StatusCode, StatusEntry, SubmoduleInfo,
     SubmoduleOp, TagInfo, TreeEntry, Worktree, WorktreeAddArgs, activity_weights,
     group_decorations,
 };
 pub use plumbing::{
-    GitGrep, GrepHit, GrepSyntax, Ident, IgnoreRule, IndexItem, ObjectCounts, PathState, RawObject,
-    RefDetail, ReflogItem, RevWalk, TreeItem, TreeWalk, WalkCommit, hash_object,
+    GitGrep, GrepExpr, GrepHit, GrepSyntax, Ident, IgnoreRule, IndexItem, ObjectCounts, PathState,
+    RawObject, RefDetail, ReflogItem, TreeItem, TreeWalk, WalkCommit, grep_dir, hash_object,
 };
 pub use range_diff::RangeDiffOpts;

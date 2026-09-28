@@ -530,7 +530,7 @@ fn used(opts: &ApplyOpts, path: &str) -> bool {
 }
 
 /// git's `wildmatch` without flags: `*` also matches `/`.
-fn wildmatch(glob: &str, path: &str) -> bool {
+pub(crate) fn wildmatch(glob: &str, path: &str) -> bool {
     let mut re = String::from("^");
     let mut chars = glob.chars().peekable();
     while let Some(c) = chars.next() {

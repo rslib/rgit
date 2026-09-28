@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rgit_git::{GitBackend, GitGrep, GrepSyntax, Ident, PathState, RefDetail, RevWalk, TreeWalk};
+use rgit_git::{GitBackend, GitGrep, GrepExpr, GrepSyntax, Ident, PathState, RefDetail, TreeWalk};
 
 use crate::cli::{CliError, Plumbing};
 use crate::output::Output;
@@ -216,7 +216,11 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             let mut last = "";
             for e in &index {
                 if !keep(&e.path)
-                    || cached && ignored && backend.check_ignore(&e.path, true)?.is_none()
+                    || cached
+                        && ignored
+                        && backend
+                            .check_ignore(&e.path, true)?
+                            .is_none_or(|r| r.negated)
                 {
                     continue;
                 }
@@ -369,18 +373,84 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             batch,
             batch_check,
             batch_all_objects,
+            batch_command,
             buffer,
+            nul,
+            nul_input,
+            follow_symlinks,
+            textconv,
+            filters,
+            path,
             args,
         } => {
-            if let Some(fmt) = batch.as_ref().or(batch_check.as_ref()) {
+            let convert = (textconv || filters).then_some(textconv);
+            let mode = match (&batch, &batch_check, &batch_command) {
+                (Some(f), _, _) => Some((f, BatchMode::Contents)),
+                (_, Some(f), _) => Some((f, BatchMode::Info)),
+                (_, _, Some(f)) => Some((f, BatchMode::Command)),
+                _ => None,
+            };
+            if let Some((fmt, mode)) = mode {
                 return cat_file_batch(
                     backend,
-                    fmt,
-                    batch.is_some(),
-                    batch_all_objects,
-                    buffer,
+                    &CatBatch {
+                        fmt,
+                        mode,
+                        all: batch_all_objects,
+                        buffer,
+                        input: if nul || nul_input { b'\0' } else { b'\n' },
+                        output: if nul { b'\0' } else { b'\n' },
+                        follow: follow_symlinks,
+                        convert,
+                    },
                     raw,
                 );
+            }
+            if let Some(textconv) = convert {
+                let [spec] = args.as_slice() else {
+                    return Err(CliError::usage(
+                        "cat-file --textconv/--filters takes one object",
+                    ));
+                };
+                let (rev, file) = match (&path, spec.split_once(':')) {
+                    (Some(p), _) => (None, p.clone()),
+                    (None, Some((rev, file))) => (Some(rev), file.to_owned()),
+                    (None, None) => {
+                        return Err(fatal(format!(
+                            "<object>:<path> required, only <object> '{spec}' given"
+                        )));
+                    }
+                };
+                let obj = backend
+                    .read_object(spec)
+                    .map_err(|e| fatal(e.to_string()))?;
+                // Symlinks and trees print as they are, as in git.
+                let link = rev.is_some_and(|rev| {
+                    backend
+                        .ls_tree(
+                            if rev.is_empty() { "HEAD" } else { rev },
+                            std::slice::from_ref(&file),
+                            TreeWalk::default(),
+                        )
+                        .is_ok_and(|items| {
+                            items.iter().any(|i| i.path == file && i.mode == 0o120000)
+                        })
+                });
+                let data = if obj.kind == "blob" && !link {
+                    backend.convert_blob(&file, &obj.data, textconv)?
+                } else {
+                    obj.data
+                };
+                if raw {
+                    let mut stdout = std::io::stdout();
+                    stdout.write_all(&data)?;
+                    stdout.flush()?;
+                    return Ok(Output::new(String::new()));
+                }
+                let text = String::from_utf8_lossy(&data).into_owned();
+                return Ok(Output::new(text.clone())
+                    .with("id", obj.id)
+                    .long("content", text));
             }
             let (ty, spec) = match args.as_slice() {
                 [spec] => (None, spec.clone()),
@@ -627,9 +697,17 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             branches,
             tags,
             remotes,
-            topo_order,
-            date_order: _,
             abbrev_commit,
+            since,
+            until,
+            author,
+            committer,
+            grep,
+            ignore_case,
+            objects,
+            objects_edge,
+            missing,
+            walk,
             revs,
             paths,
         } => {
@@ -649,26 +727,74 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                     globs.push(format!("{base}{p}{slash}"));
                 }
             }
-            if revs.is_empty() && !all && globs.is_empty() {
+            if revs.is_empty() && !all && globs.is_empty() && !walk.merge {
                 return Err(CliError::usage("rev-list needs a revision, e.g. HEAD"));
             }
-            let mut commits = backend.rev_walk(&RevWalk {
-                revs,
-                all,
-                first_parent,
-                merges,
-                no_merges,
-                max: max_count,
-                skip: skip.unwrap_or(0),
-                globs,
-                topo: topo_order,
-                paths,
-            })?;
-            if count {
-                return Ok(lines(format!("{}\n", commits.len())).with("count", commits.len()));
+            let missing = missing.as_deref().unwrap_or("error");
+            if !["error", "allow-any", "allow-promisor", "print"].contains(&missing) {
+                return Err(fatal(format!("invalid argument to --missing: '{missing}'")));
             }
-            if reverse {
-                commits.reverse();
+            let objects = objects || objects_edge;
+            let mut opts = rgit_git::LogOptions {
+                limit: max_count.unwrap_or(usize::MAX),
+                offset: skip.unwrap_or(0),
+                all,
+                revs: revs.clone(),
+                paths,
+                first_parent,
+                merges: (merges || no_merges).then_some(merges),
+                reverse,
+                globs,
+                since: since.as_deref().map(crate::cli::parse_date).transpose()?,
+                until: until.as_deref().map(crate::cli::parse_date).transpose()?,
+                author,
+                committer,
+                grep,
+                grep_ignore_case: ignore_case,
+                rewrite_parents: parents,
+                ..Default::default()
+            };
+            walk.apply(&mut opts);
+            opts.boundary |= objects;
+            let mut commits = backend.rev_walk(&opts)?;
+            if objects && !walk.boundary {
+                commits.retain(|c| c.mark != Some('-'));
+            }
+            // The edges are the excluded parents of the whole range, not only
+            // of the commits -n and --skip leave.
+            let mut edges: Vec<String> = Vec::new();
+            if objects {
+                let all = backend.rev_walk(&rgit_git::LogOptions {
+                    limit: usize::MAX,
+                    offset: 0,
+                    boundary: false,
+                    ..opts.clone()
+                })?;
+                let ids: std::collections::HashSet<&str> =
+                    all.iter().map(|c| c.id.as_str()).collect();
+                for p in all.iter().flat_map(|c| &c.parents) {
+                    if !ids.contains(p.as_str()) && !edges.contains(p) {
+                        edges.push(p.clone());
+                    }
+                }
+            }
+            if count {
+                let (mut left, mut right, mut same) = (0usize, 0usize, 0usize);
+                for c in &commits {
+                    match c.mark {
+                        Some('=') => same += 1,
+                        Some('<') => left += 1,
+                        _ => right += 1,
+                    }
+                }
+                let cherry = walk.cherry_mark || walk.cherry;
+                let text = match (walk.left_right, cherry) {
+                    (true, true) => format!("{left}\t{right}\t{same}\n"),
+                    (true, false) => format!("{left}\t{right}\n"),
+                    (false, true) => format!("{}\t{same}\n", left + right),
+                    (false, false) => format!("{}\n", left + right + same),
+                };
+                return Ok(lines(text).with("count", left + right + same));
             }
             let id = |id: &str| -> anyhow::Result<String> {
                 Ok(if abbrev_commit {
@@ -678,8 +804,12 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                 })
             };
             let mut out = Vec::new();
+            if objects_edge {
+                out.extend(edges.iter().map(|e| format!("-{e}")));
+            }
             for c in &commits {
-                let mut line = id(&c.id)?;
+                let mut line = walk.mark(c.mark).map(String::from).unwrap_or_default();
+                line.push_str(&id(&c.id)?);
                 if parents {
                     for p in &c.parents {
                         line.push(' ');
@@ -687,6 +817,48 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                     }
                 }
                 out.push(line);
+            }
+            if objects {
+                // Annotated tags the walk starts from come first, by their names.
+                let mut tips: Vec<String> = revs
+                    .iter()
+                    .filter(|r| !r.starts_with('^') && !r.contains(".."))
+                    .cloned()
+                    .collect();
+                if all {
+                    tips.splice(0..0, backend.ref_details()?.into_iter().map(|r| r.name));
+                }
+                let mut tagged = std::collections::HashSet::new();
+                for tip in tips {
+                    let Ok(obj) = backend.read_object(&tip) else {
+                        continue;
+                    };
+                    if obj.kind != "tag" || !tagged.insert(obj.id.clone()) {
+                        continue;
+                    }
+                    let text = String::from_utf8_lossy(&obj.data);
+                    let name = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("tag "))
+                        .unwrap_or_default();
+                    out.push(format!("{} {name}", obj.id));
+                }
+                let ids: Vec<String> = commits
+                    .iter()
+                    .filter(|c| c.mark != Some('-'))
+                    .map(|c| c.id.clone())
+                    .collect();
+                let mut absent = Vec::new();
+                for (oid, path, gone) in backend.list_objects(&ids, &edges)? {
+                    if !gone {
+                        out.push(format!("{oid} {path}"));
+                    } else if missing == "error" {
+                        return Err(fatal(format!("missing object {oid}")));
+                    } else if missing == "print" {
+                        absent.push(format!("?{oid}"));
+                    }
+                }
+                out.extend(absent);
             }
             lines(terminated(out, false))
         }
@@ -755,10 +927,11 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             if revs.is_empty() && !all {
                 revs.push("HEAD".to_owned());
             }
-            let commits = backend.rev_walk(&RevWalk {
+            let commits = backend.rev_walk(&rgit_git::LogOptions {
                 revs,
                 all,
-                ..RevWalk::default()
+                limit: usize::MAX,
+                ..Default::default()
             })?;
             let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
             for c in commits.iter().rev() {
@@ -792,217 +965,7 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                 .collect();
             table(text, "authors", rows, &["author", "count"], "0 commits")
         }
-        Plumbing::Grep {
-            help: _,
-            after,
-            before,
-            context,
-            only_matching,
-            files_without_match,
-            heading,
-            break_,
-            no_filename,
-            with_filename: _,
-            max_count,
-            skip_binary,
-            null,
-            full_name,
-            ignore_case,
-            word,
-            invert,
-            line_number,
-            files,
-            count,
-            quiet,
-            fixed,
-            extended,
-            perl,
-            mut patterns,
-            cached,
-            mut args,
-            mut paths,
-        } => {
-            if patterns.is_empty() {
-                if args.is_empty() {
-                    return Err(CliError::usage("grep needs a pattern"));
-                }
-                patterns.push(args.remove(0));
-            }
-            let (top, prefix) = top_and_prefix(backend)?;
-            let mut revs = Vec::new();
-            for a in args {
-                if backend.resolve_object(&a).is_ok() {
-                    revs.push(a);
-                } else {
-                    paths.push(crate::cli::repo_path(
-                        &top,
-                        std::path::Path::new(&prefix),
-                        &a,
-                    ));
-                }
-            }
-            if paths.is_empty() && !prefix.is_empty() {
-                paths.push(prefix.clone());
-            }
-            let syntax = if fixed {
-                GrepSyntax::Fixed
-            } else if extended || perl {
-                GrepSyntax::Extended
-            } else {
-                GrepSyntax::Basic
-            };
-            let sources: Vec<Option<String>> = if revs.is_empty() {
-                vec![None]
-            } else {
-                revs.into_iter().map(Some).collect()
-            };
-            let (sep, ctx_sep, end) = if null {
-                ('\0', '\0', '\0')
-            } else {
-                (':', '-', '\n')
-            };
-            let before = before.or(context).unwrap_or(0);
-            let after = after.or(context).unwrap_or(0);
-            let show_name = !no_filename && !heading;
-            // git's default grep colors.
-            let color = crate::render::color_on();
-            let paint = |s: &str, code: &str| {
-                if color && !s.is_empty() {
-                    format!("\x1b[{code}m{s}\x1b[m")
-                } else {
-                    s.to_owned()
-                }
-            };
-            let psep = |c: char| {
-                if c == '\0' {
-                    c.to_string()
-                } else {
-                    paint(&c.to_string(), "36")
-                }
-            };
-            let mut text = String::new();
-            let mut rows = Vec::new();
-            let mut last: Option<(String, u64)> = None;
-            for rev in sources {
-                let hits = backend.git_grep(&GitGrep {
-                    patterns: patterns.clone(),
-                    syntax,
-                    ignore_case,
-                    word,
-                    invert,
-                    cached,
-                    rev: rev.clone(),
-                    paths: paths.clone(),
-                    before,
-                    after,
-                    max_count,
-                    only_matching,
-                    files_without_match,
-                    skip_binary,
-                    spans: color,
-                })?;
-                let mut per_file: Vec<(String, usize)> = Vec::new();
-                for h in &hits {
-                    let name = if full_name {
-                        h.path.clone()
-                    } else {
-                        relative(&h.path, &prefix)
-                    };
-                    let file = match &rev {
-                        Some(r) => format!("{r}:{name}"),
-                        None => name,
-                    };
-                    let n = usize::from(!h.context);
-                    match per_file.last_mut() {
-                        Some((p, c)) if *p == file => *c += n,
-                        _ => per_file.push((file.clone(), n)),
-                    }
-                    if !h.context {
-                        let mut row = crate::obj! { "path" => h.path, "line" => h.line as usize, "text" => h.text };
-                        if let Some(r) = &rev {
-                            row.push(("rev".to_owned(), r.as_str().into()));
-                        }
-                        rows.push(row);
-                    }
-                    if files || files_without_match || count {
-                        continue;
-                    }
-                    let hunks = before + after > 0;
-                    let new_file = last.as_ref().is_none_or(|(f, _)| *f != file);
-                    match &last {
-                        Some(_) if new_file && break_ => text.push('\n'),
-                        Some((_, l)) if hunks && (new_file || h.line != l + 1) => {
-                            text.push_str(&format!("{}\n", paint("--", "36")))
-                        }
-                        _ => {}
-                    }
-                    last = Some((file.clone(), h.line));
-                    // git prints nothing for a binary match with context or
-                    // --break, though it still separates it from the next file.
-                    if h.binary {
-                        if !hunks && !break_ {
-                            text.push_str(&format!("Binary file {file} matches\n"));
-                        }
-                        continue;
-                    }
-                    if heading && new_file {
-                        text.push_str(&format!("{}\n", paint(&file, "35")));
-                    }
-                    let s = psep(if h.context { ctx_sep } else { sep });
-                    let mut lead = String::new();
-                    if show_name {
-                        lead.push_str(&format!("{}{s}", paint(&file, "35")));
-                    }
-                    if line_number {
-                        lead.push_str(&format!("{}{s}", paint(&h.line.to_string(), "32")));
-                    }
-                    if only_matching {
-                        for part in &h.parts {
-                            text.push_str(&format!("{lead}{}\n", paint(part, "1;31")));
-                        }
-                    } else if color && !h.spans.is_empty() {
-                        let mut line = String::new();
-                        let mut at = 0;
-                        for &(a, b) in &h.spans {
-                            if a < at || b > h.text.len() {
-                                continue;
-                            }
-                            line.push_str(&h.text[at..a]);
-                            line.push_str(&paint(&h.text[a..b], "1;31"));
-                            at = b;
-                        }
-                        line.push_str(&h.text[at..]);
-                        text.push_str(&format!("{lead}{line}\n"));
-                    } else {
-                        text.push_str(&format!("{lead}{}\n", h.text));
-                    }
-                }
-                for (p, n) in per_file {
-                    if files && n > 0 || files_without_match {
-                        text.push_str(&format!("{}{end}", paint(&p, "35")));
-                    } else if count && n > 0 {
-                        if no_filename {
-                            text.push_str(&format!("{n}\n"));
-                        } else {
-                            text.push_str(&format!("{}{}{n}\n", paint(&p, "35"), psep(sep)));
-                        }
-                    }
-                }
-            }
-            if rows.is_empty() && raw {
-                return Err(fail(raw, true, ""));
-            }
-            if quiet {
-                text.clear();
-            }
-            table(
-                text,
-                "matches",
-                rows,
-                &["path", "line", "text"],
-                &format!("0 matches for {:?}", patterns.join("|")),
-            )
-        }
+        command @ Plumbing::Grep { .. } => grep(Some(backend), command, raw)?,
         Plumbing::CheckIgnore {
             verbose,
             quiet,
@@ -1020,41 +983,60 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             if z && !stdin {
                 return Err(CliError::usage("-z only makes sense with --stdin"));
             }
-            if stdin {
-                // ponytail: reads all of stdin before answering; answer per
-                // line if a caller drives it as a coprocess.
-                let mut input = String::new();
-                std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-                let end = if z { '\0' } else { '\n' };
-                paths.extend(
-                    input
-                        .split(end)
-                        .filter(|p| !p.is_empty())
-                        .map(str::to_owned),
-                );
-            } else if paths.is_empty() {
+            if !stdin && paths.is_empty() {
                 return Err(CliError::usage("no path specified"));
             }
+            // With --stdin each answer goes out before the next line is read,
+            // so a caller can drive it as a coprocess.
+            let input: Box<dyn Iterator<Item = std::io::Result<Vec<u8>>>> = if stdin {
+                Box::new(std::io::BufRead::split(
+                    std::io::stdin().lock(),
+                    if z { b'\0' } else { b'\n' },
+                ))
+            } else {
+                Box::new(
+                    std::mem::take(&mut paths)
+                        .into_iter()
+                        .map(|p| Ok(p.into_bytes())),
+                )
+            };
+            let stream = stdin && raw && !quiet;
+            let mut stdout = std::io::stdout();
             let (top, prefix) = top_and_prefix(backend)?;
             let (sep, tab) = if z { ("\0", "\0") } else { (":", "\t") };
             let mut out = Vec::new();
             let mut rows = Vec::new();
             let mut any = false;
-            for p in &paths {
-                let full = crate::cli::repo_path(&top, std::path::Path::new(&prefix), p);
-                let rule = backend.check_ignore(&full, no_index)?;
+            for p in input {
+                let p = String::from_utf8_lossy(&p?).into_owned();
+                if p.is_empty() {
+                    continue;
+                }
+                let full = crate::cli::repo_path(&top, std::path::Path::new(&prefix), &p);
+                // Only -v shows (and counts) the `!pattern` that matched.
+                let rule = backend
+                    .check_ignore(&full, no_index)?
+                    .filter(|r| verbose || !r.negated);
                 any |= rule.is_some();
-                match &rule {
-                    Some(r) if verbose => out.push(format!(
+                let line = match &rule {
+                    Some(r) if verbose => Some(format!(
                         "{}{sep}{}{sep}{}{tab}{p}",
                         r.source, r.line, r.pattern
                     )),
-                    Some(_) => out.push(p.clone()),
-                    None if non_matching => out.push(format!("{sep}{sep}{tab}{p}")),
-                    None => {}
-                }
-                if let Some(r) = rule {
+                    Some(_) => Some(p.clone()),
+                    None if non_matching => Some(format!("{sep}{sep}{tab}{p}")),
+                    None => None,
+                };
+                if let Some(r) = rule.filter(|r| !r.negated) {
                     rows.push(crate::obj! { "path" => full, "source" => r.source, "line" => r.line, "pattern" => r.pattern });
+                }
+                match line {
+                    Some(line) if stream => {
+                        write!(stdout, "{line}{}", if z { '\0' } else { '\n' })?;
+                        stdout.flush()?;
+                    }
+                    Some(line) => out.push(line),
+                    None => {}
                 }
             }
             if !any && raw {
@@ -1129,42 +1111,172 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
     })
 }
 
-/// `git cat-file --batch[-check][=FORMAT]`: one answer per object name on
-/// stdin (or per object with `all`), written as it is read so a caller can
-/// drive it as a coprocess. `contents` adds each object's content (--batch).
-fn cat_file_batch(
-    backend: &Arc<dyn GitBackend>,
-    fmt: &str,
-    contents: bool,
+#[derive(Clone, Copy, PartialEq)]
+enum BatchMode {
+    Contents,
+    Info,
+    Command,
+}
+
+/// How `cat-file --batch`, `--batch-check` or `--batch-command` answers.
+struct CatBatch<'a> {
+    fmt: &'a str,
+    mode: BatchMode,
     all: bool,
     buffer: bool,
+    /// What ends each input line and each answer (`-z`, `-Z`).
+    input: u8,
+    output: u8,
+    follow: bool,
+    /// `Some(true)` for --textconv, `Some(false)` for --filters.
+    convert: Option<bool>,
+}
+
+/// Where `--follow-symlinks` leads a `<tree-ish>:<path>` name.
+enum Followed {
+    Found(String),
+    Missing,
+    /// A link out of the tree, with its target.
+    Outside(String),
+    Dangling,
+    Loop,
+    NotDir,
+}
+
+/// Resolve `path` in `rev`'s tree, following symlinks inside it as git's
+/// get_tree_entry_follow_symlinks does.
+fn follow_symlinks(backend: &Arc<dyn GitBackend>, rev: &str, path: &str) -> Followed {
+    let Ok(tree) = backend.resolve_object(&format!("{rev}^{{tree}}")) else {
+        return Followed::Missing;
+    };
+    let mut todo: std::collections::VecDeque<String> = path.split('/').map(str::to_owned).collect();
+    let mut cur: Vec<String> = Vec::new();
+    let mut hops = 0;
+    while let Some(part) = todo.pop_front() {
+        match part.as_str() {
+            "" | "." => continue,
+            ".." => {
+                if cur.pop().is_none() {
+                    todo.push_front(part);
+                    return Followed::Outside(Vec::from(todo).join("/"));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(part);
+        let here = cur.join("/");
+        let item = backend
+            .ls_tree(&tree, std::slice::from_ref(&here), TreeWalk::default())
+            .ok()
+            .and_then(|items| items.into_iter().find(|i| i.path == here));
+        let Some(item) = item else {
+            return if hops == 0 {
+                Followed::Missing
+            } else {
+                Followed::Dangling
+            };
+        };
+        if item.mode == 0o120000 {
+            hops += 1;
+            if hops > 40 {
+                return Followed::Loop;
+            }
+            let target = backend
+                .read_object(&item.id)
+                .map(|o| String::from_utf8_lossy(&o.data).into_owned())
+                .unwrap_or_default();
+            if target.starts_with('/') {
+                return Followed::Outside(target);
+            }
+            cur.pop();
+            for p in target.split('/').rev() {
+                todo.push_front(p.to_owned());
+            }
+        } else if item.kind != "tree" && !todo.is_empty() {
+            return Followed::NotDir;
+        } else if todo.is_empty() {
+            return Followed::Found(item.id);
+        }
+    }
+    match cur.is_empty() {
+        true => Followed::Found(tree),
+        false => Followed::Missing,
+    }
+}
+
+/// `git cat-file --batch[-check|-command][=FORMAT]`: one answer per object
+/// name (or command) on stdin, or per object with `all`, written as it is
+/// read so a caller can drive it as a coprocess.
+fn cat_file_batch(
+    backend: &Arc<dyn GitBackend>,
+    opts: &CatBatch,
     raw: bool,
 ) -> anyhow::Result<Output> {
-    let fmt = if fmt.is_empty() {
+    let fmt = if opts.fmt.is_empty() {
         "%(objectname) %(objecttype) %(objectsize)"
     } else {
-        fmt
+        opts.fmt
     };
-    let split_rest = fmt.contains("%(rest)");
-    let names: Box<dyn Iterator<Item = std::io::Result<String>>> = if all {
-        Box::new(backend.all_objects()?.into_iter().map(Ok))
+    let split_rest = fmt.contains("%(rest)") || opts.convert.is_some();
+    let names: Box<dyn Iterator<Item = std::io::Result<Vec<u8>>>> = if opts.all {
+        Box::new(
+            backend
+                .all_objects()?
+                .into_iter()
+                .map(|n| Ok(n.into_bytes())),
+        )
     } else {
-        Box::new(std::io::BufRead::lines(std::io::stdin().lock()))
+        Box::new(std::io::BufRead::split(std::io::stdin().lock(), opts.input))
     };
     let mut stdout = std::io::stdout().lock();
+    // --batch-command --buffer holds its answers until `flush` or the end.
+    let mut held: Vec<u8> = Vec::new();
     let mut rows = Vec::new();
+    let delim = opts.output as char;
     for line in names {
-        let line = line?;
+        let line = String::from_utf8_lossy(&line?).into_owned();
+        let line = line
+            .strip_suffix('\r')
+            .filter(|_| opts.input == b'\n')
+            .unwrap_or(&line);
+        let (contents, line) = match opts.mode {
+            BatchMode::Command => match line.split_once(' ') {
+                _ if line.is_empty() => return Err(fatal("empty command in input")),
+                Some(("contents", arg)) => (true, arg),
+                Some(("info", arg)) => (false, arg),
+                None if line == "flush" => {
+                    if !opts.buffer {
+                        return Err(fatal("flush is only for --buffer mode"));
+                    }
+                    stdout.write_all(&std::mem::take(&mut held))?;
+                    stdout.flush()?;
+                    continue;
+                }
+                _ => return Err(fatal(format!("unknown command: '{line}'"))),
+            },
+            mode => (mode == BatchMode::Contents, line),
+        };
         let (name, rest) = if split_rest {
             let line = line.trim_start();
             line.split_once(char::is_whitespace)
                 .map_or((line, ""), |(n, r)| (n, r.trim_start()))
         } else {
-            (line.as_str(), "")
+            (line, "")
         };
         let mut out = Vec::new();
-        match backend.read_object(name) {
-            Ok(obj) => {
+        let followed = match name.split_once(':') {
+            Some((rev, path)) if opts.follow && !rev.is_empty() => {
+                follow_symlinks(backend, rev, path)
+            }
+            _ => Followed::Found(name.to_owned()),
+        };
+        let obj = match &followed {
+            Followed::Found(id) => backend.read_object(id).ok(),
+            _ => None,
+        };
+        match (obj, followed) {
+            (Some(obj), _) => {
                 let mut header = String::new();
                 let mut text = fmt;
                 while let Some(i) = text.find("%(") {
@@ -1178,32 +1290,68 @@ fn cat_file_batch(
                         "objectname" => header.push_str(&obj.id),
                         "objecttype" => header.push_str(obj.kind),
                         "objectsize" => header.push_str(&obj.data.len().to_string()),
+                        "objectsize:disk" => {
+                            header.push_str(&backend.object_disk(&obj.id)?.0.to_string())
+                        }
+                        "deltabase" => header.push_str(
+                            &backend
+                                .object_disk(&obj.id)?
+                                .1
+                                .unwrap_or_else(|| "0".repeat(obj.id.len())),
+                        ),
                         "rest" => header.push_str(rest),
                         atom => return Err(fatal(format!("unknown format element: %({atom})"))),
                     }
                     text = &text[i + end + 1..];
                 }
                 header.push_str(text);
-                header.push('\n');
+                header.push(delim);
                 out.extend_from_slice(header.as_bytes());
                 if contents {
-                    out.extend_from_slice(&obj.data);
-                    out.push(b'\n');
+                    match opts.convert {
+                        Some(textconv) if obj.kind == "blob" => {
+                            if rest.is_empty() {
+                                stdout.write_all(&out)?;
+                                stdout.flush()?;
+                                return Err(fatal(format!("missing path for '{}'", obj.id)));
+                            }
+                            out.extend(backend.convert_blob(rest, &obj.data, textconv)?);
+                        }
+                        _ => out.extend_from_slice(&obj.data),
+                    }
+                    out.push(opts.output);
                 }
                 rows.push(crate::obj! { "object" => obj.id, "type" => obj.kind, "size" => obj.data.len() });
             }
-            Err(_) => {
-                out.extend_from_slice(format!("{name} missing\n").as_bytes());
+            (None, Followed::Outside(target)) => {
+                out.extend(format!("symlink {}{delim}{target}{delim}", target.len()).bytes());
+            }
+            (None, f @ (Followed::Dangling | Followed::Loop | Followed::NotDir)) => {
+                let what = match f {
+                    Followed::Dangling => "dangling",
+                    Followed::Loop => "loop",
+                    _ => "notdir",
+                };
+                out.extend(format!("{what} {}{delim}{name}{delim}", name.len()).bytes());
+            }
+            (None, _) => {
+                out.extend(format!("{name} missing{delim}").bytes());
                 rows.push(crate::obj! { "object" => name, "type" => "missing", "size" => 0usize });
             }
         }
-        if raw {
-            stdout.write_all(&out)?;
-            if !buffer {
-                stdout.flush()?;
-            }
+        if !raw {
+            continue;
+        }
+        if opts.mode == BatchMode::Command && opts.buffer {
+            held.extend(out);
+            continue;
+        }
+        stdout.write_all(&out)?;
+        if !opts.buffer {
+            stdout.flush()?;
         }
     }
+    stdout.write_all(&held)?;
     stdout.flush()?;
     Ok(if raw {
         Output::new(String::new())
@@ -1741,11 +1889,13 @@ impl<'a> RefFormat<'a> {
         };
         let (atom, arg) = spec.split_once(':').unwrap_or((spec, ""));
         if deref {
-            return Ok(match (atom, &r.peeled) {
-                ("objectname", Some(p)) => p.clone(),
-                ("objecttype", Some(p)) => self.backend.read_object(p)?.kind.to_owned(),
-                _ => String::new(),
-            });
+            if atom == "refname" {
+                return Ok(format!("{}^{{}}", self.atom(r, spec)?));
+            }
+            return match &r.deref {
+                Some(d) => self.atom(d, spec),
+                None => Ok(String::new()),
+            };
         }
         // A signed tag's signature ends its message; only %(contents:body)
         // leaves it out, as in git.
@@ -1887,6 +2037,45 @@ impl<'a> RefFormat<'a> {
                 let code = crate::render::ansi(arg)
                     .ok_or_else(|| anyhow::anyhow!("unrecognized color: %(color:{arg})"))?;
                 if self.color { code } else { String::new() }
+            }
+            ("describe", _) => {
+                let (mut tags, mut abbrev, mut pattern) = (false, None, None);
+                for opt in arg.split(',').filter(|o| !o.is_empty()) {
+                    match opt.split_once('=') {
+                        None if opt == "tags" => tags = true,
+                        Some(("tags", v)) => tags = v != "false",
+                        Some(("abbrev", n)) => abbrev = n.parse().ok(),
+                        Some(("match", m)) => pattern = Some(m),
+                        _ => {
+                            return Err(CliError::usage(format!(
+                                "unrecognized %(describe) argument: {opt}"
+                            )));
+                        }
+                    }
+                }
+                let opts = rgit_git::DescribeOptions {
+                    tags,
+                    abbrev,
+                    matches: pattern.into_iter().map(str::to_owned).collect(),
+                    ..Default::default()
+                };
+                self.backend.describe(&r.id, &opts).unwrap_or_default()
+            }
+            ("ahead-behind", base) if !base.is_empty() => {
+                let count = |range: String| {
+                    self.backend
+                        .rev_walk(&rgit_git::LogOptions {
+                            revs: vec![range],
+                            ..Default::default()
+                        })
+                        .map(|c| c.len())
+                };
+                let tip = r.peeled.as_deref().unwrap_or(&r.id);
+                format!(
+                    "{} {}",
+                    count(format!("{base}..{tip}"))?,
+                    count(format!("{tip}..{base}"))?
+                )
             }
             _ => {
                 for (role, ident) in [
@@ -2152,6 +2341,401 @@ fn strip(name: &str, arg: &str) -> anyhow::Result<String> {
         "rstrip" => parts[..parts.len() - drop].join("/"),
         _ => return Err(bad()),
     })
+}
+
+/// The raw `--and`, `--or`, `--not`, `(` and `)` of `grep`, which
+/// [`grep_tokens`] passes as `-e` values behind this mark to keep their order
+/// among the patterns.
+pub(crate) const GREP_OP: char = '\0';
+
+/// `grep`'s arguments with its expression operators turned into marked `-e`
+/// values, so they stay in order among the patterns as git reads them.
+pub(crate) fn grep_tokens(args: &[String]) -> Vec<String> {
+    let mut skip = false;
+    let mut sub = None;
+    for (i, a) in args.iter().enumerate() {
+        if skip {
+            skip = false;
+        } else if a == "--fields" {
+            skip = true;
+        } else if !a.starts_with('-') {
+            sub = Some(i);
+            break;
+        }
+    }
+    let Some(sub) = sub.filter(|&i| args[i] == "grep") else {
+        return args.to_vec();
+    };
+    let mut out = args[..=sub].to_vec();
+    let mut rest = args[sub + 1..].iter();
+    let mut value = false;
+    for a in rest.by_ref() {
+        if a == "--" {
+            out.push(a.clone());
+            break;
+        }
+        let op = matches!(a.as_str(), "--and" | "--or" | "--not" | "(" | ")");
+        if op && !value {
+            out.push("-e".to_owned());
+            out.push(format!("{GREP_OP}{}", a.trim_start_matches('-')));
+        } else {
+            out.push(a.clone());
+        }
+        value = !value && matches!(a.as_str(), "-e" | "--regexp");
+    }
+    out.extend(rest.cloned());
+    out
+}
+
+/// git's grep expression over `tokens` (patterns and marked operators): the
+/// patterns alone and how they combine, `None` when no operator is given.
+fn grep_expr(tokens: Vec<String>) -> anyhow::Result<(Vec<String>, Option<GrepExpr>)> {
+    enum Tok {
+        Pat(usize),
+        And,
+        Not,
+        Open,
+        Close,
+    }
+    let mut patterns = Vec::new();
+    let mut toks = Vec::new();
+    for t in tokens {
+        match t.strip_prefix(GREP_OP) {
+            // git takes `--or` as the default and ignores it.
+            Some("or") => {}
+            Some("and") => toks.push(Tok::And),
+            Some("not") => toks.push(Tok::Not),
+            Some("(") => toks.push(Tok::Open),
+            Some(_) => toks.push(Tok::Close),
+            None => {
+                toks.push(Tok::Pat(patterns.len()));
+                patterns.push(t);
+            }
+        }
+    }
+    if toks.iter().all(|t| matches!(t, Tok::Pat(_))) {
+        return Ok((patterns, None));
+    }
+    type Parsed = anyhow::Result<Option<GrepExpr>>;
+    fn or(t: &[Tok], i: &mut usize) -> Parsed {
+        let Some(x) = and(t, i)? else {
+            return Ok(None);
+        };
+        if *i < t.len() && !matches!(t[*i], Tok::Close) {
+            let Some(y) = or(t, i)? else {
+                return Err(fatal("not a pattern expression"));
+            };
+            return Ok(Some(GrepExpr::Or(Box::new(x), Box::new(y))));
+        }
+        Ok(Some(x))
+    }
+    fn and(t: &[Tok], i: &mut usize) -> Parsed {
+        let x = not(t, i)?;
+        if *i < t.len() && matches!(t[*i], Tok::And) {
+            let Some(x) = x else {
+                return Err(fatal("--and not preceded by pattern expression"));
+            };
+            *i += 1;
+            let Some(y) = and(t, i)? else {
+                return Err(fatal("--and not followed by pattern expression"));
+            };
+            return Ok(Some(GrepExpr::And(Box::new(x), Box::new(y))));
+        }
+        Ok(x)
+    }
+    fn not(t: &[Tok], i: &mut usize) -> Parsed {
+        if *i < t.len() && matches!(t[*i], Tok::Not) {
+            *i += 1;
+            if *i == t.len() {
+                return Err(fatal("--not not followed by pattern expression"));
+            }
+            let Some(x) = not(t, i)? else {
+                return Err(fatal("--not followed by non pattern expression"));
+            };
+            return Ok(Some(GrepExpr::Not(Box::new(x))));
+        }
+        atom(t, i)
+    }
+    fn atom(t: &[Tok], i: &mut usize) -> Parsed {
+        match t.get(*i) {
+            Some(Tok::Pat(n)) => {
+                *i += 1;
+                Ok(Some(GrepExpr::Atom(*n)))
+            }
+            Some(Tok::Open) => {
+                *i += 1;
+                let x = or(t, i)?;
+                if !matches!(t.get(*i), Some(Tok::Close)) {
+                    return Err(fatal("unmatched ( for expression group"));
+                }
+                *i += 1;
+                Ok(x)
+            }
+            _ => Ok(None),
+        }
+    }
+    let mut i = 0;
+    let expr = or(&toks, &mut i)?;
+    if i < toks.len() {
+        return Err(fatal("incomplete pattern expression group: )"));
+    }
+    Ok((patterns, expr))
+}
+
+/// `git grep`; without a backend (`--no-index` outside a repository) it
+/// searches the current folder.
+pub(crate) fn grep(
+    backend: Option<&Arc<dyn GitBackend>>,
+    command: Plumbing,
+    raw: bool,
+) -> anyhow::Result<Output> {
+    let Plumbing::Grep {
+        help: _,
+        after,
+        before,
+        context,
+        only_matching,
+        files_without_match,
+        heading,
+        break_,
+        no_filename,
+        with_filename: _,
+        max_count,
+        skip_binary,
+        null,
+        full_name,
+        ignore_case,
+        word,
+        invert,
+        line_number,
+        files,
+        count,
+        quiet,
+        fixed,
+        extended,
+        perl,
+        mut patterns,
+        all_match,
+        show_function,
+        function_context,
+        cached,
+        untracked,
+        no_index,
+        exclude_standard,
+        no_exclude_standard,
+        recurse_submodules,
+        threads: _,
+        mut args,
+        mut paths,
+    } = command
+    else {
+        anyhow::bail!("not a grep command");
+    };
+    if patterns.is_empty() {
+        if args.is_empty() {
+            return Err(CliError::usage("grep needs a pattern"));
+        }
+        patterns.push(args.remove(0));
+    }
+    let (patterns, expr) = grep_expr(patterns)?;
+    let backend = backend.filter(|_| !no_index);
+    let (top, prefix) = match backend {
+        Some(b) => top_and_prefix(b)?,
+        None => (std::env::current_dir()?, String::new()),
+    };
+    let mut revs = Vec::new();
+    for a in args {
+        match backend {
+            Some(b) if b.resolve_object(&a).is_ok() => revs.push(a),
+            Some(_) => paths.push(crate::cli::repo_path(
+                &top,
+                std::path::Path::new(&prefix),
+                &a,
+            )),
+            None => paths.push(a),
+        }
+    }
+    if paths.is_empty() && !prefix.is_empty() {
+        paths.push(prefix.clone());
+    }
+    let syntax = if fixed {
+        GrepSyntax::Fixed
+    } else if perl {
+        GrepSyntax::Perl
+    } else if extended {
+        GrepSyntax::Extended
+    } else {
+        GrepSyntax::Basic
+    };
+    let sources: Vec<Option<String>> = if revs.is_empty() {
+        vec![None]
+    } else {
+        revs.into_iter().map(Some).collect()
+    };
+    let (sep, ctx_sep, fn_sep, end) = if null {
+        ('\0', '\0', '\0', '\0')
+    } else {
+        (':', '-', '=', '\n')
+    };
+    let before = before.or(context).unwrap_or(0);
+    let after = after.or(context).unwrap_or(0);
+    let show_name = !no_filename && !heading;
+    // git's default grep colors.
+    let color = crate::render::color_on();
+    let paint = |s: &str, code: &str| {
+        if color && !s.is_empty() {
+            format!("\x1b[{code}m{s}\x1b[m")
+        } else {
+            s.to_owned()
+        }
+    };
+    let psep = |c: char| {
+        if c == '\0' {
+            c.to_string()
+        } else {
+            paint(&c.to_string(), "36")
+        }
+    };
+    let mut text = String::new();
+    let mut rows = Vec::new();
+    let mut last: Option<(String, u64)> = None;
+    for rev in sources {
+        let q = GitGrep {
+            patterns: patterns.clone(),
+            syntax,
+            ignore_case,
+            word,
+            invert,
+            cached,
+            rev: rev.clone(),
+            paths: paths.clone(),
+            before,
+            after,
+            max_count,
+            only_matching,
+            files_without_match,
+            skip_binary,
+            expr: expr.clone(),
+            all_match,
+            show_function,
+            function_context,
+            untracked,
+            no_exclude: no_exclude_standard,
+            recurse_submodules,
+            spans: color,
+        };
+        let hits = match backend {
+            Some(b) => b.git_grep(&q)?,
+            None => rgit_git::grep_dir(&top, &q, exclude_standard)?,
+        };
+        let mut per_file: Vec<(String, usize)> = Vec::new();
+        for h in &hits {
+            let name = if full_name {
+                h.path.clone()
+            } else {
+                relative(&h.path, &prefix)
+            };
+            let file = match &rev {
+                Some(r) => format!("{r}:{name}"),
+                None => name,
+            };
+            let n = usize::from(!h.context);
+            match per_file.last_mut() {
+                Some((p, c)) if *p == file => *c += n,
+                _ => per_file.push((file.clone(), n)),
+            }
+            if !h.context {
+                let mut row =
+                    crate::obj! { "path" => h.path, "line" => h.line as usize, "text" => h.text };
+                if let Some(r) = &rev {
+                    row.push(("rev".to_owned(), r.as_str().into()));
+                }
+                rows.push(row);
+            }
+            if files || files_without_match || count {
+                continue;
+            }
+            let hunks = before + after > 0 || function_context;
+            let new_file = last.as_ref().is_none_or(|(f, _)| *f != file);
+            match &last {
+                Some(_) if new_file && break_ => text.push('\n'),
+                Some((_, l)) if hunks && (new_file || h.line != l + 1) => {
+                    text.push_str(&format!("{}\n", paint("--", "36")))
+                }
+                _ => {}
+            }
+            last = Some((file.clone(), h.line));
+            // git prints nothing for a binary match with context or
+            // --break, though it still separates it from the next file.
+            if h.binary {
+                if !hunks && !break_ {
+                    text.push_str(&format!("Binary file {file} matches\n"));
+                }
+                continue;
+            }
+            if heading && new_file {
+                text.push_str(&format!("{}\n", paint(&file, "35")));
+            }
+            let s = psep(if h.function {
+                fn_sep
+            } else if h.context {
+                ctx_sep
+            } else {
+                sep
+            });
+            let mut lead = String::new();
+            if show_name {
+                lead.push_str(&format!("{}{s}", paint(&file, "35")));
+            }
+            if line_number {
+                lead.push_str(&format!("{}{s}", paint(&h.line.to_string(), "32")));
+            }
+            if only_matching && !h.function {
+                for part in &h.parts {
+                    text.push_str(&format!("{lead}{}\n", paint(part, "1;31")));
+                }
+            } else if color && !h.spans.is_empty() {
+                let mut line = String::new();
+                let mut at = 0;
+                for &(a, b) in &h.spans {
+                    if a < at || b > h.text.len() {
+                        continue;
+                    }
+                    line.push_str(&h.text[at..a]);
+                    line.push_str(&paint(&h.text[a..b], "1;31"));
+                    at = b;
+                }
+                line.push_str(&h.text[at..]);
+                text.push_str(&format!("{lead}{line}\n"));
+            } else {
+                text.push_str(&format!("{lead}{}\n", h.text));
+            }
+        }
+        for (p, n) in per_file {
+            if files && n > 0 || files_without_match {
+                text.push_str(&format!("{}{end}", paint(&p, "35")));
+            } else if count && n > 0 {
+                if no_filename {
+                    text.push_str(&format!("{n}\n"));
+                } else {
+                    text.push_str(&format!("{}{}{n}\n", paint(&p, "35"), psep(sep)));
+                }
+            }
+        }
+    }
+    if rows.is_empty() && raw {
+        return Err(fail(raw, true, ""));
+    }
+    if quiet {
+        text.clear();
+    }
+    Ok(table(
+        text,
+        "matches",
+        rows,
+        &["path", "line", "text"],
+        &format!("0 matches for {:?}", patterns.join("|")),
+    ))
 }
 
 #[cfg(test)]

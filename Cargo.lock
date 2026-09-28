@@ -4385,6 +4385,7 @@ dependencies = [
 name = "rgit-git"
 version = "0.0.0"
 dependencies = [
+ "fancy-regex 0.16.2",
  "flate2",
  "git2",
  "git2-hooks",

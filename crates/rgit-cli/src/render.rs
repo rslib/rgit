@@ -546,6 +546,52 @@ pub fn patch(files: &[FileDiff]) -> String {
     out
 }
 
+/// A combined diff (`diff --cc`) of `parents` parents in git's colors.
+pub fn combined_patch(text: &str, parents: usize) -> String {
+    if !color_on() {
+        return text.to_owned();
+    }
+    let at = "@".repeat(parents + 1);
+    let mut out = String::new();
+    let mut body = false;
+    for line in text.lines() {
+        if line.starts_with(&at) {
+            body = true;
+            let end = line[at.len()..]
+                .find(&at)
+                .map_or(line.len(), |i| i + 2 * at.len());
+            let (frag, func) = line.split_at(end);
+            out.push_str(&paint(frag, CYAN));
+            if let Some(func) = func.strip_prefix(' ') {
+                out.push_str(" \x1b[m");
+                out.push_str(func);
+                out.push_str("\x1b[m");
+            }
+        } else if line.starts_with("diff --") {
+            body = false;
+            out.push_str(&paint(line, BOLD));
+        } else if !body {
+            out.push_str(&if line.starts_with("Binary files ") {
+                line.to_owned()
+            } else {
+                paint(line, BOLD)
+            });
+        } else {
+            let marks = &line[..parents.min(line.len())];
+            if marks.contains('-') {
+                out.push_str(&paint(line, RED));
+            } else if marks.contains('+') {
+                out.push_str(&paint(line, GREEN));
+            } else {
+                out.push_str(line);
+                out.push_str("\x1b[m");
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// `old => new` as git's diffstat prints a rename, with the shared leading and
 /// trailing folders outside braces: `dir/{a => b}/f`.
 pub fn rename_name(a: &str, b: &str) -> String {

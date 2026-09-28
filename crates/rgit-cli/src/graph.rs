@@ -67,6 +67,8 @@ pub struct Graph {
     mapping: Vec<i32>,
     old_mapping: Vec<i32>,
     mapping_size: usize,
+    /// The character that marks the commit (`*`, or `<`, `>`, `=`, `o`).
+    pub mark: char,
 }
 
 const MERGE_CHARS: [char; 3] = ['/', '|', '\\'];
@@ -94,6 +96,7 @@ impl Graph {
             mapping: Vec::new(),
             old_mapping: Vec::new(),
             mapping_size: 0,
+            mark: '*',
         }
     }
 
@@ -313,7 +316,7 @@ impl Graph {
             let color = self.colors.get(i).copied().unwrap_or(COLORS.len());
             if is_commit {
                 seen_this = true;
-                line.push('*');
+                line.push(self.mark);
                 if self.num_parents() > 2 {
                     self.octopus(line);
                 }

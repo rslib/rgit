@@ -390,6 +390,10 @@ pub trait GitBackend: Send + Sync {
     /// Blame a file as it is at revision `rev`.
     fn blame_at(&self, rev: &str, path: &str) -> Result<Vec<crate::BlameLine>, GitError>;
 
+    /// git's blame with its options: ranges, `-w`, `-M`/`-C`, `--reverse`,
+    /// ignored revisions and more.
+    fn blame_with(&self, opts: &crate::BlameOptions) -> Result<crate::Blame, GitError>;
+
     /// All references: local branches, remote branches, and tags.
     fn refs(&self) -> Result<Vec<crate::RefEntry>, GitError>;
 
@@ -687,6 +691,35 @@ pub trait GitBackend: Send + Sync {
     /// pair's patch changed.
     fn range_diff(&self, opts: &crate::RangeDiffOpts) -> Result<String, GitError>;
 
+    /// A merge's combined diff against all its parents, limited to `paths`
+    /// (git's `-c`; `dense` is `--cc`).
+    fn combined_diff(
+        &self,
+        commit: &str,
+        paths: &[String],
+        dense: bool,
+    ) -> Result<Vec<crate::CombinedFile>, GitError>;
+
+    /// A merge against a fresh re-merge of its parents, conflict markers and
+    /// all (git's `--remerge-diff`); empty unless it has two parents.
+    fn remerge_diff(
+        &self,
+        commit: &str,
+        paths: &[String],
+    ) -> Result<Vec<crate::FileDiff>, GitError>;
+
+    /// git's `log -L`: follow the `specs` line ranges (`start,end:file` or
+    /// `:funcname:file`, read at `tip`) back through `order`, git's
+    /// topological order of the walk. Per commit: the diffs of the ranges to
+    /// show, empty for a merge, or None when it did not touch them.
+    fn line_log(
+        &self,
+        tip: &str,
+        order: &[String],
+        specs: &[String],
+        first_parent: bool,
+    ) -> Result<Vec<Option<Vec<crate::FileDiff>>>, GitError>;
+
     /// Commits as mbox emails (`git format-patch`), oldest first, the cover
     /// letter (if asked for) first.
     fn format_patch(
@@ -749,22 +782,8 @@ pub trait GitBackend: Send + Sync {
     /// to the working tree, keeping the conflict (checkout's `--ours`/`--theirs`).
     fn checkout_side(&self, paths: &[String], ours: bool) -> Result<(), GitError>;
 
-    /// Describe a revision relative to the nearest tag (`git describe`).
-    /// Describe `rev` relative to the nearest tag. `tags` also considers
-    /// lightweight tags (git's `--tags`); `dirty` appends `-dirty` when the
-    /// worktree is modified; `long` always shows the long format; `abbrev` sets
-    /// the abbreviated-oid length; `pattern` only considers tags matching the
-    /// glob (git's `--match`).
-    #[allow(clippy::too_many_arguments)]
-    fn describe(
-        &self,
-        rev: &str,
-        tags: bool,
-        dirty: bool,
-        long: bool,
-        abbrev: Option<u32>,
-        pattern: Option<&str>,
-    ) -> Result<String, GitError>;
+    /// Describe `rev` relative to the nearest tag, as `git describe` does.
+    fn describe(&self, rev: &str, opts: &crate::DescribeOptions) -> Result<String, GitError>;
 
     /// Run any `git` subcommand and return its stdout - the escape hatch for
     /// operations rgit does not model natively (submodule, notes, grep, gc, ...).
@@ -1178,6 +1197,14 @@ pub trait GitBackend: Send + Sync {
     /// An object's type, id and raw content (`git cat-file`).
     fn read_object(&self, rev: &str) -> Result<crate::RawObject, GitError>;
 
+    /// An object's size on disk and the id of its delta base, if stored as
+    /// a delta (cat-file's `%(objectsize:disk)` and `%(deltabase)`).
+    fn object_disk(&self, id: &str) -> Result<(u64, Option<String>), GitError>;
+
+    /// A blob's content as checked out to `path` (cat-file's `--filters`), or
+    /// with `textconv` through its diff driver's textconv command.
+    fn convert_blob(&self, path: &str, data: &[u8], textconv: bool) -> Result<Vec<u8>, GitError>;
+
     /// Every object id in the object database, sorted.
     fn all_objects(&self) -> Result<Vec<String>, GitError>;
 
@@ -1198,8 +1225,19 @@ pub trait GitBackend: Send + Sync {
     /// Every ref under `refs/` with its object and message, sorted by name.
     fn ref_details(&self) -> Result<Vec<crate::RefDetail>, GitError>;
 
-    /// Commits reachable as `git rev-list` walks them, newest first.
-    fn rev_walk(&self, walk: &crate::RevWalk) -> Result<Vec<crate::WalkCommit>, GitError>;
+    /// The commits a `git rev-list` walk shows, as [`GitBackend::log`] picks
+    /// and orders them.
+    fn rev_walk(&self, walk: &crate::LogOptions) -> Result<Vec<crate::WalkCommit>, GitError>;
+
+    /// The trees and blobs `git rev-list --objects` lists after `commits`:
+    /// each commit's tree then what is in it, depth first, each object once
+    /// and none that `edges`' trees hold. Each comes with its path (empty for
+    /// a commit's tree) and whether it is missing from the repository.
+    fn list_objects(
+        &self,
+        commits: &[String],
+        edges: &[String],
+    ) -> Result<Vec<(String, String, bool)>, GitError>;
 
     /// The best common ancestor of two commits, or all of them.
     fn merge_bases(&self, a: &str, b: &str, all: bool) -> Result<Vec<String>, GitError>;

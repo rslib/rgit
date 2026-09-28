@@ -125,8 +125,95 @@ impl DiffFormat {
     }
 }
 
+const MERGE_DIFF_FLAGS: [&str; 7] = [
+    "separate",
+    "combined",
+    "dense_combined",
+    "first_parent_diff",
+    "diff_merges",
+    "no_diff_merges",
+    "remerge_diff",
+];
+
+/// Which diff `log` and `show` print for a merge (git's --diff-merges); the
+/// last one given wins.
+#[derive(clap::Args, Clone, Default)]
+pub struct MergeDiffArgs {
+    /// Diff each merge against every parent in turn, once -p is given (git's -m).
+    #[arg(short = 'm', overrides_with_all = MERGE_DIFF_FLAGS)]
+    pub separate: bool,
+    /// git's combined diff of merges against all parents (implies -p).
+    #[arg(short = 'c', overrides_with_all = MERGE_DIFF_FLAGS)]
+    pub combined: bool,
+    /// git's dense combined diff: only the hunks that differ from every
+    /// parent (implies -p; the default for show).
+    #[arg(long = "cc", overrides_with_all = MERGE_DIFF_FLAGS)]
+    pub dense_combined: bool,
+    /// Diff merges against their first parent (implies -p).
+    #[arg(long = "dd", overrides_with_all = MERGE_DIFF_FLAGS)]
+    pub first_parent_diff: bool,
+    /// How to diff merges: off, first-parent, separate, combined,
+    /// dense-combined or remerge (implies -p unless off).
+    #[arg(long, value_name = "FORMAT", overrides_with_all = MERGE_DIFF_FLAGS)]
+    pub diff_merges: Option<String>,
+    /// Print no diff for merges.
+    #[arg(long, overrides_with_all = MERGE_DIFF_FLAGS)]
+    pub no_diff_merges: bool,
+    /// Diff each merge against git's own re-merge of its parents, conflict
+    /// markers and all (implies -p).
+    #[arg(long, overrides_with_all = MERGE_DIFF_FLAGS)]
+    pub remerge_diff: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeDiff {
+    Off,
+    FirstParent,
+    Separate,
+    Combined,
+    Dense,
+    Remerge,
+}
+
+impl MergeDiffArgs {
+    /// The merge diff asked for, else `default`, and whether it turns on -p.
+    pub(crate) fn resolve(&self, default: MergeDiff) -> anyhow::Result<(MergeDiff, bool)> {
+        use MergeDiff::*;
+        Ok(if let Some(v) = &self.diff_merges {
+            let mode = match v.as_str() {
+                "off" | "none" => return Ok((Off, false)),
+                "on" | "m" | "separate" => Separate,
+                "first-parent" | "1" => FirstParent,
+                "combined" | "c" => Combined,
+                "dense-combined" | "cc" => Dense,
+                "remerge" | "r" => Remerge,
+                _ => {
+                    return Err(CliError::usage(format!(
+                        "invalid value for '--diff-merges': '{v}'"
+                    )));
+                }
+            };
+            (mode, true)
+        } else if self.no_diff_merges {
+            (Off, false)
+        } else if self.separate {
+            (Separate, false)
+        } else if self.combined {
+            (Combined, true)
+        } else if self.dense_combined {
+            (Dense, true)
+        } else if self.first_parent_diff {
+            (FirstParent, true)
+        } else if self.remerge_diff {
+            (Remerge, true)
+        } else {
+            (default, false)
+        })
+    }
+}
+
 /// How `blame` prints each line.
-#[derive(clap::Args, Clone, Copy, Default)]
+#[derive(clap::Args, Clone, Default)]
 pub struct BlameFormat {
     /// git's machine-readable format, each commit's details given once.
     #[arg(short = 'p', long, conflicts_with = "line_porcelain")]
@@ -143,6 +230,215 @@ pub struct BlameFormat {
     /// Full commit ids (git's -l).
     #[arg(short = 'l')]
     pub long_ids: bool,
+    /// git's format with raw timestamps (git's -t).
+    #[arg(short = 't')]
+    pub raw_time: bool,
+    /// git's format with dates in this style (default iso, or blame.date).
+    #[arg(long, value_name = "STYLE")]
+    pub date: Option<String>,
+    /// git's format with each line's file name (git's -f).
+    #[arg(short = 'f', long)]
+    pub show_name: bool,
+    /// git's format with each line's number in its commit (git's -n).
+    #[arg(short = 'n', long)]
+    pub show_number: bool,
+    /// git annotate's format (git's -c).
+    #[arg(short = 'c')]
+    pub annotate: bool,
+    /// Blank ids for boundary commits (git's -b).
+    #[arg(short = 'b')]
+    pub blank_boundary: bool,
+    /// git's format with ids this many digits long.
+    #[arg(long, value_name = "N")]
+    pub abbrev: Option<usize>,
+    /// git's format, then the work done: blobs read, patches, commits.
+    #[arg(long)]
+    pub show_stats: bool,
+}
+
+impl BlameFormat {
+    /// Whether to print git's own blame format.
+    fn git(&self, opts: &BlameArgs) -> bool {
+        self.raw_time
+            || self.date.is_some()
+            || self.show_name
+            || self.show_number
+            || self.annotate
+            || self.blank_boundary
+            || self.abbrev.is_some()
+            || self.show_stats
+            || opts.root
+    }
+}
+
+/// Which lines `blame` follows, and how far.
+#[derive(clap::Args, Clone, Default)]
+pub struct BlameArgs {
+    /// Ignore whitespace when comparing a commit with its parents (git's -w).
+    #[arg(short = 'w')]
+    pub ignore_whitespace: bool,
+    /// Find lines moved or copied within the file (git's -M[score]).
+    #[arg(short = 'M')]
+    pub moves: bool,
+    #[arg(long, hide = true)]
+    pub move_score: Option<u32>,
+    /// Find lines copied from files changed in the same commit (git's
+    /// -C[score]); twice: from any file when the file is created; three
+    /// times: from any file in any commit.
+    #[arg(short = 'C', action = clap::ArgAction::Count)]
+    pub copies: u8,
+    #[arg(long, hide = true)]
+    pub copy_score: Option<u32>,
+    /// Pass this revision's changes through to the lines before them.
+    #[arg(long, value_name = "REV")]
+    pub ignore_rev: Vec<String>,
+    /// Ignore the revisions listed in this file (after blame.ignoreRevsFile;
+    /// an empty name forgets the files before it).
+    #[arg(long, value_name = "FILE")]
+    pub ignore_revs_file: Vec<String>,
+    /// For each line, the last commit it was still in (walk `A..B` forward).
+    #[arg(long)]
+    pub reverse: bool,
+    /// Follow only the first parent of merges.
+    #[arg(long)]
+    pub first_parent: bool,
+    /// Blame root commits too, not as boundaries (and print git's format).
+    #[arg(long)]
+    pub root: bool,
+}
+
+/// How `log` and `rev-list` walk history, as git's revision options.
+#[derive(clap::Args, Clone, Default)]
+pub struct WalkArgs {
+    /// Mark each commit with the side of a symmetric range it is on (`<`, `>`).
+    #[arg(long)]
+    pub left_right: bool,
+    /// Leave out commits whose change the other side of a symmetric range has too.
+    #[arg(long)]
+    pub cherry_pick: bool,
+    /// Mark commits whose change the other side has too `=`, the others `+`.
+    #[arg(long)]
+    pub cherry_mark: bool,
+    /// The right side's commits, marking those the left side has too
+    /// (`--right-only --cherry-mark --no-merges`).
+    #[arg(long)]
+    pub cherry: bool,
+    /// Only the left side of a symmetric range.
+    #[arg(long, conflicts_with = "right_only")]
+    pub left_only: bool,
+    /// Only the right side of a symmetric range.
+    #[arg(long)]
+    pub right_only: bool,
+    /// After the commits, the excluded ones they have as parents, marked `-`.
+    #[arg(long)]
+    pub boundary: bool,
+    /// Only commits that descend from the range's excluded end.
+    #[arg(long)]
+    pub ancestry_path: bool,
+    /// Only commits that a branch or tag points at.
+    #[arg(long)]
+    pub simplify_by_decoration: bool,
+    /// With paths, leave out merges the shown history does not need.
+    #[arg(long)]
+    pub simplify_merges: bool,
+    /// With paths, follow every parent of a merge.
+    #[arg(long)]
+    pub full_history: bool,
+    /// With paths, show only commits that change them (the default).
+    #[arg(long)]
+    pub dense: bool,
+    /// With paths, show every commit walked.
+    #[arg(long, overrides_with = "dense")]
+    pub sparse: bool,
+    /// Name the starting ref that reached each commit.
+    #[arg(long)]
+    pub source: bool,
+    /// During a conflicted merge, the commits on either side that touch the
+    /// conflicted paths.
+    #[arg(long)]
+    pub merge: bool,
+    /// Show only the given commits, newest first (`=unsorted`: as given).
+    #[arg(
+        long,
+        value_name = "sorted|unsorted",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "sorted"
+    )]
+    pub no_walk: Option<String>,
+    /// Walk the history (undoes --no-walk).
+    #[arg(long)]
+    pub do_walk: bool,
+    /// Never show a parent before all of its children, keeping branches together.
+    #[arg(long)]
+    pub topo_order: bool,
+    /// Never show a parent before all of its children, else by commit date.
+    #[arg(long)]
+    pub date_order: bool,
+    /// Never show a parent before all of its children, else by author date.
+    #[arg(long)]
+    pub author_date_order: bool,
+    /// Keep commits matching every --grep, not any.
+    #[arg(long)]
+    pub all_match: bool,
+    /// Keep commits whose message matches no --grep.
+    #[arg(long)]
+    pub invert_grep: bool,
+}
+
+impl WalkArgs {
+    /// Set what these options ask of a walk.
+    pub(crate) fn apply(&self, o: &mut LogOptions) {
+        if self.cherry {
+            o.side = Some(false);
+            o.cherry = Some(false);
+            o.merges = Some(false);
+        }
+        if self.left_only {
+            o.side = Some(true);
+        } else if self.right_only {
+            o.side = Some(false);
+        }
+        if self.cherry_pick {
+            o.cherry = Some(true);
+        } else if self.cherry_mark {
+            o.cherry.get_or_insert(false);
+        }
+        o.boundary = self.boundary;
+        o.ancestry_path = self.ancestry_path;
+        o.simplify_by_decoration = self.simplify_by_decoration;
+        o.simplify_merges = self.simplify_merges;
+        o.full_history = self.full_history;
+        o.sparse = self.sparse;
+        o.source = self.source;
+        o.merge = self.merge;
+        o.no_walk = match &self.no_walk {
+            Some(v) if !self.do_walk => Some(v != "unsorted"),
+            _ => None,
+        };
+        o.order = if self.topo_order {
+            rgit_git::LogOrder::Topo
+        } else if self.date_order {
+            rgit_git::LogOrder::Date
+        } else if self.author_date_order {
+            rgit_git::LogOrder::AuthorDate
+        } else {
+            o.order
+        };
+        o.all_match = self.all_match;
+        o.invert_grep = self.invert_grep;
+    }
+
+    /// The mark shown before a commit (git's get_revision_mark), given the
+    /// walk's own mark for it.
+    pub(crate) fn mark(&self, mark: Option<char>) -> Option<char> {
+        match mark {
+            Some(m @ ('-' | '=')) => Some(m),
+            m if self.left_right => Some(m.unwrap_or('>')),
+            _ if self.cherry_mark || self.cherry => Some('+'),
+            _ => None,
+        }
+    }
 }
 
 /// git's commit formats for `log` and `show`, printed byte for byte as git does.
@@ -303,8 +599,23 @@ pub enum Command {
         /// Follow one file's history across renames.
         #[arg(long)]
         follow: bool,
+        /// Trace the history of lines `START,END:FILE` (`/regex/`, `+N`
+        /// allowed) or function `:NAME:FILE`, with their diffs (git's -L).
+        #[arg(short = 'L', value_name = "RANGE:FILE")]
+        line_ranges: Vec<String>,
+        /// Walk reflog entries (of HEAD, or the refs given) instead of history.
+        #[arg(short = 'g', long)]
+        walk_reflogs: bool,
+        /// Print each commit's parents after it (the nearest shown ones under
+        /// path limits).
+        #[arg(long)]
+        parents: bool,
+        #[command(flatten)]
+        walk: WalkArgs,
         #[command(flatten)]
         format: DiffFormat,
+        #[command(flatten)]
+        merge_diff: MergeDiffArgs,
         #[command(flatten)]
         pretty: PrettyArgs,
         /// Revisions to walk (`main`, `^main`, `A..B`, `A...B`; default HEAD),
@@ -369,23 +680,33 @@ pub enum Command {
         #[command(flatten)]
         format: DiffFormat,
         #[command(flatten)]
+        merge_diff: MergeDiffArgs,
+        #[command(flatten)]
         pretty: PrettyArgs,
         /// Only the header, no changed files (git's -s).
         #[arg(short = 's', long = "no-patch")]
         no_patch: bool,
+        /// Diff a merge against its first parent only.
+        #[arg(long)]
+        first_parent: bool,
     },
-    /// Blame a file: `sha author line` per line.
+    /// Blame a file: `sha author line` per line, or git's format with its
+    /// display flags (`-t`, `--date`, `-f`, `-n`, `-c`, `--root`...).
     #[command(visible_alias = "annotate")]
     Blame {
         /// `[REV] PATH`: the file to annotate, as it is in the working tree or
-        /// at REV (`rgit blame <rev> -- <path>` also works).
-        #[arg(value_name = "REV_OR_PATH", required = true, num_args = 1..=2)]
+        /// at REV (`rgit blame <rev> -- <path>` also works); `A..B` or `^A`
+        /// stops at A.
+        #[arg(value_name = "REV_OR_PATH", required = true, num_args = 1..)]
         args: Vec<String>,
-        /// Limit to a 1-based line range `START,END` or `START,+COUNT` (git's -L).
+        /// Limit to line ranges (repeatable): `START,END`, `START,+COUNT`,
+        /// `/regex/`, `/regex/,+COUNT` or `:funcname` (git's -L).
         #[arg(short = 'L', value_name = "START,END")]
-        lines: Option<String>,
+        lines: Vec<String>,
         #[command(flatten)]
         format: BlameFormat,
+        #[command(flatten)]
+        opts: BlameArgs,
     },
     #[command(flatten)]
     Plumbing(Plumbing),
@@ -1618,21 +1939,49 @@ pub enum Command {
         /// Use lightweight tags too, not just annotated ones (git's --tags).
         #[arg(long)]
         tags: bool,
-        /// Append -dirty when the working tree has uncommitted changes.
+        /// Use any ref: branches as `heads/main`, tags as `tags/v1`.
         #[arg(long)]
-        dirty: bool,
+        all: bool,
+        /// Append this mark (default -dirty) when tracked files have changes.
+        #[arg(
+            long,
+            value_name = "MARK",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "-dirty"
+        )]
+        dirty: Option<String>,
+        /// Like --dirty, but append this mark (default -broken) when the
+        /// working tree cannot be read.
+        #[arg(
+            long,
+            value_name = "MARK",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "-broken"
+        )]
+        broken: Option<String>,
         /// Always use the long format (tag-count-oid), even on a tag.
         #[arg(long)]
         long: bool,
         /// Number of hex digits for the abbreviated commit oid (0: the tag only).
         #[arg(long, value_name = "N")]
         abbrev: Option<u32>,
-        /// Show the abbreviated commit oid when no tag is found (rgit always does).
+        /// Show the abbreviated commit oid when no tag is found.
         #[arg(long)]
         always: bool,
-        /// Only consider tags matching this glob.
+        /// Follow only the first parent of merges.
+        #[arg(long)]
+        first_parent: bool,
+        /// Consider this many tags (default 10; 0 is --exact-match).
+        #[arg(long, value_name = "N")]
+        candidates: Option<u32>,
+        /// Only consider tags matching this glob (repeatable).
         #[arg(long = "match", value_name = "GLOB")]
-        pattern: Option<String>,
+        pattern: Vec<String>,
+        /// Leave out tags matching this glob (repeatable).
+        #[arg(long, value_name = "GLOB")]
+        exclude: Vec<String>,
         /// Print the tag only when it points at the revision itself; else fail.
         #[arg(long)]
         exact_match: bool,
@@ -1952,7 +2301,7 @@ pub enum Plumbing {
         exists: bool,
         /// Read object names from stdin; print each one's id, type, size and
         /// content, or the given format (`%(objectname)`, `%(objecttype)`,
-        /// `%(objectsize)`, `%(rest)`).
+        /// `%(objectsize)`, `%(objectsize:disk)`, `%(deltabase)`, `%(rest)`).
         #[arg(long, value_name = "FORMAT", num_args = 0..=1, require_equals = true, default_missing_value = "")]
         batch: Option<String>,
         /// Like --batch, without the content.
@@ -1961,9 +2310,31 @@ pub enum Plumbing {
         /// With --batch or --batch-check, answer for every object instead of stdin.
         #[arg(long = "batch-all-objects")]
         batch_all_objects: bool,
+        /// Read `contents <object>`, `info <object>` and (with --buffer)
+        /// `flush` commands from stdin, answering as --batch / --batch-check.
+        #[arg(long = "batch-command", value_name = "FORMAT", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+        batch_command: Option<String>,
         /// With --batch or --batch-check, do not flush after each object.
         #[arg(long)]
         buffer: bool,
+        /// With a batch mode, NUL-separate the input and output.
+        #[arg(short = 'Z')]
+        nul: bool,
+        /// With a batch mode, NUL-separate the input.
+        #[arg(short = 'z')]
+        nul_input: bool,
+        /// With a batch mode, follow symlinks within the tree for `<tree>:<path>`.
+        #[arg(long)]
+        follow_symlinks: bool,
+        /// Show a blob through its diff driver's textconv command.
+        #[arg(long, conflicts_with = "filters")]
+        textconv: bool,
+        /// Show a blob as it would be checked out (smudge and eol filters).
+        #[arg(long)]
+        filters: bool,
+        /// The path whose attributes pick the --textconv / --filters driver.
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
         /// The object (`HEAD`, `HEAD:src/lib.rs`, an id), optionally after its
         /// type (`blob HEAD:a.txt`).
         #[arg(num_args = 0..=2, value_name = "[TYPE] OBJECT")]
@@ -2021,7 +2392,9 @@ pub enum Plumbing {
         /// `%(authorname)`, `%(authoremail)`, `%(authordate[:short|iso|unix|relative])`,
         /// `%(committer*)`, `%(tagger*)`, `%(creatordate)`, `%(contents[:signature])`,
         /// `%(upstream[:short|track|trackshort])`, `%(HEAD)`, `%(symref)`,
-        /// `%(objectsize)`, `%(tree)`, `%(parent)`, `%(*objectname)`,
+        /// `%(objectsize)`, `%(tree)`, `%(parent)`, `%(describe[:tags,abbrev=N,match=P])`,
+        /// `%(ahead-behind:<ref>)`, `%(*subject)` and every other field with `*`
+        /// for what an annotated tag points at,
         /// `%(align:N[,middle|right])...%(end)`,
         /// `%(if[:equals=X])...%(then)...[%(else)...]%(end)`.
         #[arg(long)]
@@ -2096,15 +2469,38 @@ pub enum Plumbing {
         /// Walk every remote-tracking branch, or those matching the pattern.
         #[arg(long, value_name = "PATTERN", num_args = 0..=1, require_equals = true, default_missing_value = "")]
         remotes: Option<String>,
-        /// Never show a parent before all of its children.
-        #[arg(long = "topo-order")]
-        topo_order: bool,
-        /// Show commits by date (the default).
-        #[arg(long = "date-order")]
-        date_order: bool,
         /// Abbreviate commit ids.
         #[arg(long = "abbrev-commit")]
         abbrev_commit: bool,
+        /// Only commits at or after this date (`2024-01-05`, `2 weeks ago`...).
+        #[arg(long, visible_alias = "after", visible_alias = "max-age")]
+        since: Option<String>,
+        /// Only commits at or before this date.
+        #[arg(long, visible_alias = "before", visible_alias = "min-age")]
+        until: Option<String>,
+        /// Keep only commits whose author matches this regex.
+        #[arg(long)]
+        author: Option<String>,
+        /// Keep only commits whose committer matches this regex.
+        #[arg(long)]
+        committer: Option<String>,
+        /// Keep only commits whose message matches this regex (repeat for any of several).
+        #[arg(long, value_name = "REGEX")]
+        grep: Vec<String>,
+        /// Match --grep, --author and --committer case-insensitively.
+        #[arg(short = 'i', long = "regexp-ignore-case")]
+        ignore_case: bool,
+        /// After the commits, the trees and blobs they need, with their paths.
+        #[arg(long)]
+        objects: bool,
+        /// --objects, first naming the excluded commits the range starts from (`-<id>`).
+        #[arg(long)]
+        objects_edge: bool,
+        /// What to do about missing objects: error, allow-any, allow-promisor or print.
+        #[arg(long, value_name = "ACTION")]
+        missing: Option<String>,
+        #[command(flatten)]
+        walk: WalkArgs,
         /// Revisions: `HEAD`, `^A` (exclude), `A..B`, `A...B`.
         revs: Vec<String>,
         /// Only commits that change these paths (after `--`), simplified as
@@ -2227,15 +2623,44 @@ pub enum Plumbing {
         /// Patterns are extended regexes (the default is basic).
         #[arg(short = 'E', long = "extended-regexp")]
         extended: bool,
-        /// Patterns are Perl-style regexes (read as extended).
+        /// Patterns are Perl-compatible regexes, with lookaround.
         #[arg(short = 'P', long = "perl-regexp")]
         perl: bool,
-        /// A pattern; repeat to match any of several.
+        /// A pattern; repeat to match any of several. Combine them with
+        /// `--and`, `--or`, `--not` and `(` `)` as git does.
         #[arg(short = 'e', value_name = "PATTERN", allow_hyphen_values = true)]
         patterns: Vec<String>,
+        /// Keep only files that match every pattern (every `--or` branch).
+        #[arg(long)]
+        all_match: bool,
+        /// Show the line naming the function around each match.
+        #[arg(short = 'p', long)]
+        show_function: bool,
+        /// Show the whole function around each match.
+        #[arg(short = 'W', long)]
+        function_context: bool,
         /// Search the index instead of the working tree.
         #[arg(long)]
         cached: bool,
+        /// Search untracked files too.
+        #[arg(long)]
+        untracked: bool,
+        /// Search every file under the current folder, tracked or not
+        /// (works outside a repository).
+        #[arg(long)]
+        no_index: bool,
+        /// Leave out ignored files with --no-index.
+        #[arg(long)]
+        exclude_standard: bool,
+        /// Search ignored files too with --untracked.
+        #[arg(long)]
+        no_exclude_standard: bool,
+        /// Search the checked-out submodules too.
+        #[arg(long)]
+        recurse_submodules: bool,
+        /// Accepted for git compatibility; the search always runs in parallel.
+        #[arg(long, value_name = "N")]
+        threads: Option<usize>,
         /// The pattern (unless -e is given), then revisions or paths.
         #[arg(value_name = "PATTERN_OR_REV")]
         args: Vec<String>,
@@ -4755,84 +5180,16 @@ pub(crate) fn index_build(
     Ok(out.trim_end().to_owned())
 }
 
-/// Parse a `--since`/`--until` date as git does: `YYYY-MM-DD` (at the current
-/// time of day), `YYYY-MM-DD[T ]HH:MM[:SS]` with an optional `Z`, `+HHMM` or
-/// `+HH:MM` zone (local time without one), `@<unix>`, `now`, `yesterday`, or
-/// `<n> <unit>s ago`.
+/// Parse a `--since`/`--until` date as git's approxidate does: full dates
+/// in most formats, or forms like `yesterday 5pm`, `last friday`, `noon`,
+/// `Jan 5` or `2 weeks 3 days ago`.
 pub(crate) fn parse_date(s: &str) -> anyhow::Result<i64> {
-    use crate::pretty::{local_parts, local_time};
-    let err =
-        || anyhow::anyhow!("bad date {s:?}; use YYYY-MM-DD, YYYY-MM-DD HH:MM:SS or `2 weeks ago`");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    let s = s.trim();
-    if let Some(t) = s.strip_prefix('@') {
-        return t.parse().map_err(|_| err());
-    }
-    let words: Vec<&str> = s
-        .split(|c: char| c.is_whitespace() || c == '.')
-        .filter(|w| !w.is_empty())
-        .collect();
-    match words[..] {
-        ["now"] => return Ok(now),
-        ["yesterday"] => return Ok(now - 86400),
-        [n, unit, "ago"] => {
-            let n: i64 = n.parse().map_err(|_| err())?;
-            let unit = unit.trim_end_matches('s');
-            let step = match unit {
-                "second" => 1,
-                "minute" => 60,
-                "hour" => 3600,
-                "day" => 86400,
-                "week" => 7 * 86400,
-                "month" | "year" => 0,
-                _ => return Err(err()),
-            };
-            if step > 0 {
-                return Ok(now - n * step);
-            }
-            let (y, m, d, h, mi, sec) = local_parts(now);
-            let months = if unit == "month" { n } else { 12 * n };
-            return Ok(local_time(y, m - months, d, h, mi, sec));
-        }
-        _ => {}
-    }
-    let (date, rest) = s.split_once(['T', ' ']).unwrap_or((s, ""));
-    let mut dp = date.split('-');
-    let mut next = || dp.next().ok_or_else(err)?.parse::<i64>().map_err(|_| err());
-    let (y, m, d) = (next()?, next()?, next()?);
-    if dp.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return Err(err());
-    }
-    let rest = rest.trim();
-    if rest.is_empty() {
-        let (_, _, _, h, mi, sec) = local_parts(now);
-        return Ok(local_time(y, m, d, h, mi, sec));
-    }
-    let (time, zone) = match rest.find(['+', '-', 'Z', ' ']) {
-        Some(i) => (&rest[..i], rest[i..].trim()),
-        None => (rest, ""),
-    };
-    let mut tp = time.split(':').filter(|p| !p.is_empty());
-    let mut part = || tp.next().unwrap_or("0").parse::<i64>().map_err(|_| err());
-    let (h, mi, sec) = (part()?, part()?, part()?);
-    let utc = (crate::pretty::days_from_civil(y, m, d) * 24 + h) * 3600 + mi * 60 + sec;
-    match zone {
-        "" => Ok(local_time(y, m, d, h, mi, sec)),
-        "Z" => Ok(utc),
-        z => {
-            let digits = z.get(1..).ok_or_else(err)?.replace(':', "");
-            let hhmm: i64 = digits.parse().map_err(|_| err())?;
-            let minutes = hhmm / 100 * 60 + hhmm % 100;
-            Ok(utc
-                - if z.starts_with('-') {
-                    -minutes
-                } else {
-                    minutes
-                } * 60)
-        }
-    }
+    crate::date::approxidate_at(s, now).ok_or_else(|| {
+        anyhow::anyhow!("bad date {s:?}; use YYYY-MM-DD, YYYY-MM-DD HH:MM:SS or `2 weeks ago`")
+    })
 }
 
 /// A commit `--date`: `@<unix>`, `<unix>` or an ISO date, each with an
@@ -5243,6 +5600,7 @@ impl Command {
             Command::Apply(a) => !a.cached && !a.index && !a.three_way,
             Command::Archive(a) => a.list || a.remote.is_some(),
             Command::LsRemote { .. } => true,
+            Command::Plumbing(Plumbing::Grep { no_index, .. }) => *no_index,
             Command::Bundle {
                 cmd: BundleCmd::ListHeads { .. },
             } => true,
@@ -5264,6 +5622,9 @@ pub fn run_without_repo(command: Command, raw: bool) -> anyhow::Result<crate::ou
         Command::Apply(a) => apply(None, a),
         Command::Archive(a) => archive_cmd(None, a),
         Command::Bundle { cmd } => bundle(None, cmd),
+        Command::Plumbing(c @ Plumbing::Grep { no_index: true, .. }) => {
+            return crate::plumbing::grep(None, c, raw);
+        }
         _ => Err(CliError::not_a_repo()),
     };
     text.map(Into::into)
@@ -5319,10 +5680,30 @@ pub fn run(
             ignored,
         )?),
         Command::Log {
-            ref pretty, format, ..
-        } if pretty.any() => {
+            walk_reflogs: true, ..
+        } => reflog_log(backend, &command)?,
+        Command::Log {
+            ref pretty,
+            format,
+            ref merge_diff,
+            first_parent,
+            ref line_ranges,
+            ..
+        } if pretty.any() || !line_ranges.is_empty() => {
             let graph = pretty.graph;
             let opts = log_options(backend, &command)?;
+            if !line_ranges.is_empty() {
+                return line_log(backend, &opts, pretty, line_ranges);
+            }
+            let (mode, format) = merge_mode(
+                merge_diff,
+                if first_parent {
+                    MergeDiff::FirstParent
+                } else {
+                    MergeDiff::Off
+                },
+                format,
+            )?;
             let (entries, shown) = if graph {
                 if opts.reverse {
                     return Err(CliError {
@@ -5333,32 +5714,41 @@ pub fn run(
                     }
                     .into());
                 }
-                // git draws the graph in topological order and counts -n and
-                // --skip after sorting; parents outside the log end their line.
+                // Parents outside the log end their line, but those past -n
+                // are still drawn.
                 let all = backend.log(&LogOptions {
                     limit: usize::MAX,
                     offset: 0,
+                    boundary: false,
                     ..opts.clone()
                 })?;
-                let shown: std::collections::HashSet<String> =
+                let mut shown: std::collections::HashSet<String> =
                     all.iter().map(|e| e.oid.clone()).collect();
-                let entries = topo_order(all)
-                    .into_iter()
-                    .skip(opts.offset)
-                    .take(opts.limit)
-                    .collect();
+                let entries: Vec<_> = if opts.boundary {
+                    backend.log(&opts)?
+                } else {
+                    all.into_iter().skip(opts.offset).take(opts.limit).collect()
+                };
+                shown.extend(entries.iter().map(|e| e.oid.clone()));
                 (entries, shown)
             } else {
                 (backend.log(&opts)?, Default::default())
             };
-            let diffs: Vec<_> = log_diffs(backend, &opts, &entries, format)?
-                .into_iter()
-                .map(|d| (!d.is_empty()).then_some(d))
-                .collect();
-            let pretty = crate::pretty::Pretty::new(backend, pretty, None)?.expect("a format");
+            let diffs = log_diffs(backend, &opts, &entries, format, mode)?;
+            let mut pretty = crate::pretty::Pretty::new(backend, pretty, None)?.expect("a format");
+            if let Command::Log { walk, parents, .. } = &command {
+                pretty.walk = walk.clone();
+                pretty.parents = *parents;
+            }
             let mut commits = Vec::new();
             for e in &entries {
-                commits.push(crate::pretty::parse(&backend.read_object(&e.oid)?));
+                let mut c = crate::pretty::parse(&backend.read_object(&e.oid)?);
+                c.mark = e.mark;
+                c.source = e.source.clone();
+                if opts.rewrite_parents {
+                    c.parents = e.parents.clone();
+                }
+                commits.push(c);
             }
             if graph {
                 let parents: Vec<Vec<String>> = entries
@@ -5381,9 +5771,13 @@ pub fn run(
         Command::Log { format, .. } if format.any() => {
             let opts = log_options(backend, &command)?;
             let entries = backend.log(&opts)?;
-            let diffs = log_diffs(backend, &opts, &entries, format)?;
+            let diffs = log_diffs(backend, &opts, &entries, format, MergeDiff::Off)?;
             let mut out = Vec::new();
-            for (e, files) in entries.iter().zip(&diffs) {
+            for (e, sections) in entries.iter().zip(&diffs) {
+                let files = match sections.first() {
+                    Some((_, Some(Changes::Files(files)))) => &files[..],
+                    _ => &[],
+                };
                 let mut text = render::log(std::slice::from_ref(e));
                 if !files.is_empty() {
                     text.push('\n');
@@ -5407,8 +5801,10 @@ pub fn run(
             revs,
             paths,
             format,
+            merge_diff,
             pretty,
             no_patch,
+            first_parent,
         } => {
             let revs = if revs.is_empty() {
                 vec!["HEAD".to_owned()]
@@ -5419,6 +5815,15 @@ pub fn run(
                 && !revs.iter().any(|r| r.contains(':'))
             {
                 // git's show: each commit in the format, then its patch.
+                let (mode, format) = merge_mode(
+                    &merge_diff,
+                    if first_parent {
+                        MergeDiff::FirstParent
+                    } else {
+                        MergeDiff::Dense
+                    },
+                    format,
+                )?;
                 let format = if format.any() {
                     format
                 } else {
@@ -5440,26 +5845,15 @@ pub fn run(
                     }
                     let id = backend.rev_parse(&format!("{rev}^{{commit}}"))?;
                     let c = crate::pretty::parse(&backend.read_object(&id)?);
-                    // A merge shows git's combined diff: empty for a clean
-                    // merge, though its stat is against the first parent.
-                    let merge = c.parents.len() > 1;
-                    let diff = if no_patch {
-                        None
-                    } else if merge && !(format.stat || format.numstat || format.shortstat) {
-                        Some(Vec::new())
+                    let sections = if no_patch {
+                        vec![(None, None)]
                     } else {
-                        let files = backend.diff(&rgit_git::DiffSpec {
-                            from: c.parents.first().cloned(),
-                            to: Some(id),
-                            paths: paths.clone(),
-                            ..Default::default()
-                        })?;
-                        (merge || !files.is_empty()).then_some(files)
+                        commit_changes(backend, &id, &c.parents, &paths, mode, format)?
                     };
                     if !out.is_empty() && !pretty.terminator {
                         out.push('\n');
                     }
-                    out.push_str(&pretty_log(&pretty, &[c], &[diff], format));
+                    out.push_str(&pretty_log(&pretty, &[c], &[sections], format));
                 }
                 return Ok(out);
             }
@@ -5473,24 +5867,16 @@ pub fn run(
             args,
             lines,
             format,
+            opts,
         } => {
-            let all = blame(backend, &args)?;
-            let (lo, mut selected) = match lines {
-                Some(spec) => {
-                    let (start, end) = parse_line_range(&spec)?;
-                    let lo = start.saturating_sub(1);
-                    let lines = all
-                        .into_iter()
-                        .skip(lo)
-                        .take(end.saturating_sub(lo))
-                        .collect();
-                    (lo, lines)
-                }
-                None => (0, all),
-            };
+            let result = blame(backend, &args, &lines, &opts)?;
             if format.porcelain || format.line_porcelain {
-                return blame_porcelain(backend, &selected, lo, format.line_porcelain);
+                return blame_porcelain(backend, &result.lines, format.line_porcelain);
             }
+            if format.git(&opts) {
+                return blame_git(backend, &result, &args[args.len() - 1], &format);
+            }
+            let mut selected = result.lines;
             for b in &mut selected {
                 if format.long_ids && !b.id.is_empty() {
                     b.short_id = b.id.clone();
@@ -7584,18 +7970,45 @@ pub fn run(
         Command::Describe {
             rev,
             tags,
+            all,
             dirty,
+            broken,
             long,
             abbrev,
             always,
+            first_parent,
+            candidates,
             pattern,
+            exclude,
             exact_match,
             contains,
         } => {
+            let fatal = |message: String| CliError {
+                message,
+                help: None,
+                code: 128,
+            };
+            if rev.is_some() && (dirty.is_some() || broken.is_some()) {
+                let flag = if broken.is_some() {
+                    "--broken"
+                } else {
+                    "--dirty"
+                };
+                return Err(fatal(format!(
+                    "option '{flag}' and commit-ishes cannot be used together"
+                ))
+                .into());
+            }
+            if long && abbrev == Some(0) {
+                return Err(fatal(
+                    "options '--long' and '--abbrev=0' cannot be used together".to_owned(),
+                )
+                .into());
+            }
             let rev = rev.as_deref().unwrap_or("HEAD");
             if contains {
                 let id = backend.rev_parse(&format!("{rev}^{{commit}}"))?;
-                match describe_contains(backend, &id, pattern.as_deref())? {
+                match describe_contains(backend, &id, &pattern, &exclude)? {
                     Some(name) => name,
                     None if always => backend.abbrev_id(&id, 0)?,
                     None => {
@@ -7609,20 +8022,27 @@ pub fn run(
                         .into());
                     }
                 }
-            } else if exact_match {
-                let tag = backend.describe(rev, tags, false, false, Some(0), pattern.as_deref())?;
-                let oid = backend.rev_parse(rev)?;
-                if oid.starts_with(&tag) || backend.rev_parse(&tag).ok() != Some(oid) {
-                    return Err(CliError {
-                        message: format!("no tag exactly matches '{rev}'"),
-                        help: Some("Run `rgit describe` for the nearest tag".to_owned()),
-                        code: 128,
-                    }
-                    .into());
-                }
-                tag
             } else {
-                backend.describe(rev, tags, dirty, long, abbrev, pattern.as_deref())?
+                let opts = rgit_git::DescribeOptions {
+                    all,
+                    tags,
+                    long,
+                    always,
+                    abbrev,
+                    first_parent,
+                    candidates: if exact_match {
+                        0
+                    } else {
+                        candidates.unwrap_or(10)
+                    },
+                    matches: pattern,
+                    excludes: exclude,
+                    dirty,
+                    broken,
+                };
+                backend
+                    .describe(rev, &opts)
+                    .map_err(|e| fatal(e.to_string()))?
             }
         }
         Command::Submodule { cmd } => submodule(backend, cmd, interactive)?,
@@ -10537,7 +10957,7 @@ fn stash_log(
     if args.format.is_none() && args.pretty.is_none() && !args.oneline {
         args.format = Some("%gd: %gs".to_owned());
     }
-    let mut pretty = crate::pretty::Pretty::new(backend, &args, None)?.expect("a format");
+    let pretty = crate::pretty::Pretty::new(backend, &args, None)?.expect("a format");
     let (mut commits, mut diffs) = (Vec::new(), Vec::new());
     for (i, item) in backend
         .reflog("refs/stash")?
@@ -10545,24 +10965,23 @@ fn stash_log(
         .enumerate()
         .take(max.unwrap_or(usize::MAX))
     {
-        let c = crate::pretty::parse(&backend.read_object(&item.id)?);
+        let mut c = crate::pretty::parse(&backend.read_object(&item.id)?);
         diffs.push(if format.any() {
-            Some(backend.diff(&rgit_git::DiffSpec {
+            let files = backend.diff(&rgit_git::DiffSpec {
                 from: c.parents.first().cloned(),
                 to: Some(c.id.clone()),
                 ..Default::default()
-            })?)
+            })?;
+            vec![(None, Some(Changes::Files(files)))]
         } else {
-            None
+            vec![(None, None)]
         });
-        pretty.reflog.insert(
-            c.id.clone(),
-            [
-                format!("stash@{{{i}}}"),
-                format!("refs/stash@{{{i}}}"),
-                item.message,
-            ],
-        );
+        c.reflog = Some(crate::pretty::Reflog {
+            selector: format!("refs/stash@{{{i}}}"),
+            short: format!("stash@{{{i}}}"),
+            who: item.who,
+            message: item.message,
+        });
         commits.push(c);
     }
     Ok(pretty_log(&pretty, &commits, &diffs, format))
@@ -10687,7 +11106,11 @@ pub fn from_cwd(mut command: Command, backend: &Arc<dyn GitBackend>) -> Command 
                 full_tree: false,
                 ..
             }
-            | Plumbing::Grep { paths, .. }
+            | Plumbing::Grep {
+                paths,
+                no_index: false,
+                ..
+            }
             | Plumbing::RevList { paths, .. },
         ) => {
             for p in paths {
@@ -10863,16 +11286,23 @@ pub(crate) fn log_options(
         reverse,
         follow,
         pretty,
+        walk,
+        parents,
         revs,
         paths,
+        line_ranges,
         ..
     } = command
     else {
         anyhow::bail!("not a log command");
     };
     let (revs, paths) = split_revs(backend, revs, paths)?;
-    Ok(LogOptions {
-        limit: limit.unwrap_or(if pretty.any() { usize::MAX } else { 20 }),
+    let mut opts = LogOptions {
+        limit: limit.unwrap_or(if pretty.any() || !line_ranges.is_empty() {
+            usize::MAX
+        } else {
+            20
+        }),
         offset: *skip,
         all: *all,
         author: author.clone(),
@@ -10886,23 +11316,231 @@ pub(crate) fn log_options(
         merges: (*merges || *no_merges).then_some(*merges),
         reverse: *reverse,
         follow: *follow,
-        rewrite_parents: pretty.graph,
+        rewrite_parents: pretty.graph || *parents,
         committer: committer.clone(),
         occurrences: occurrences.clone(),
         changes_matching: changes_matching.clone(),
+        order: if pretty.graph {
+            rgit_git::LogOrder::Topo
+        } else {
+            rgit_git::LogOrder::Walk
+        },
+        ..LogOptions::default()
+    };
+    walk.apply(&mut opts);
+    Ok(opts)
+}
+
+/// What `log -p` or `show` prints under one commit.
+pub(crate) enum Changes {
+    Files(Vec<rgit_git::FileDiff>),
+    /// A merge's combined diff; `first` is the diff against the first
+    /// parent, for a stat.
+    Combined {
+        first: Vec<rgit_git::FileDiff>,
+        files: Vec<rgit_git::CombinedFile>,
+    },
+    /// A line git prints in place of a diff.
+    Warning(&'static str),
+    /// `log -L`'s diffs of the tracked lines, after a blank line even for a
+    /// merge that shows none.
+    LineLog(Vec<rgit_git::FileDiff>),
+}
+
+/// One commit's diff sections as git's log prints them, each `(from,
+/// changes)`: several for a merge under `-m`, each against the parent `from`;
+/// `changes` None leaves the diff part out.
+type Sections = Vec<(Option<String>, Option<Changes>)>;
+
+/// The merge diff mode the flags ask for, else `default`, and the diff
+/// format with the -p it may imply.
+fn merge_mode(
+    args: &MergeDiffArgs,
+    default: MergeDiff,
+    format: DiffFormat,
+) -> anyhow::Result<(MergeDiff, DiffFormat)> {
+    let (mode, imply) = args.resolve(default)?;
+    let format = if imply && !format.any() {
+        DiffFormat {
+            patch: true,
+            ..DiffFormat::default()
+        }
+    } else {
+        format
+    };
+    Ok((mode, format))
+}
+
+/// Commit `id`'s changes in `format`, a merge's as `mode` asks.
+fn commit_changes(
+    backend: &Arc<dyn GitBackend>,
+    id: &str,
+    parents: &[String],
+    paths: &[String],
+    mode: MergeDiff,
+    format: DiffFormat,
+) -> anyhow::Result<Sections> {
+    if !format.any() {
+        return Ok(vec![(None, None)]);
+    }
+    let diff = |from: Option<&String>| {
+        backend.diff(&rgit_git::DiffSpec {
+            from: from.cloned(),
+            to: Some(id.to_owned()),
+            paths: paths.to_vec(),
+            ..Default::default()
+        })
+    };
+    let one = |files: Vec<rgit_git::FileDiff>| {
+        vec![(None, (!files.is_empty()).then_some(Changes::Files(files)))]
+    };
+    if parents.len() < 2 {
+        return Ok(one(diff(parents.first())?));
+    }
+    Ok(match mode {
+        MergeDiff::Off => vec![(None, None)],
+        MergeDiff::FirstParent => one(diff(parents.first())?),
+        MergeDiff::Separate => {
+            let mut out = Vec::new();
+            for p in parents {
+                let files = diff(Some(p))?;
+                if !files.is_empty() {
+                    out.push((Some(p.clone()), Some(Changes::Files(files))));
+                }
+            }
+            if out.is_empty() {
+                out.push((None, None));
+            }
+            out
+        }
+        MergeDiff::Combined | MergeDiff::Dense => {
+            let first = if format.stat || format.numstat || format.shortstat {
+                diff(parents.first())?
+            } else {
+                Vec::new()
+            };
+            let files = backend.combined_diff(id, paths, mode == MergeDiff::Dense)?;
+            vec![(None, Some(Changes::Combined { first, files }))]
+        }
+        MergeDiff::Remerge if parents.len() > 2 => vec![(
+            None,
+            Some(Changes::Warning(
+                "diff: warning: Skipping remerge-diff for octopus merges.",
+            )),
+        )],
+        MergeDiff::Remerge => one(backend.remerge_diff(id, paths)?),
     })
 }
 
-/// Each log entry's changes against its first parent, as `log -p` or `--stat`
-/// show them: none for a merge or without a diff format, and with `--follow`
-/// only the followed file, under the name it had in that commit.
+/// A combined diff in `format`, a stat `indent` columns narrower.
+fn combined_out(
+    first: &[rgit_git::FileDiff],
+    files: &[rgit_git::CombinedFile],
+    format: DiffFormat,
+    indent: usize,
+) -> String {
+    let mut out = String::new();
+    if format.name_only || format.name_status {
+        for f in files {
+            if format.name_status {
+                out.extend(&f.status);
+                out.push('\t');
+            }
+            out.push_str(&f.path);
+            out.push('\n');
+        }
+    } else if format.stat || format.numstat || format.shortstat {
+        let stat = DiffFormat {
+            patch: false,
+            ..format
+        };
+        out.push_str(diff_out_in(first, stat, indent).trim_end_matches('\n'));
+        if !out.is_empty() {
+            out.push('\n');
+        }
+    }
+    if format.patch {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        for f in files {
+            out.push_str(&render::combined_patch(&f.patch, f.status.len()));
+        }
+    }
+    out
+}
+
+/// A commit's changes as newline-terminated lines, a stat `indent` columns
+/// narrower.
+fn changes_out(changes: &Changes, format: DiffFormat, indent: usize) -> String {
+    let text = match changes {
+        Changes::Files(files) => diff_out_in(files, format, indent),
+        // A combined diff keeps the blank line after its stat even with no
+        // patch to follow.
+        Changes::Combined { first, files } => return combined_out(first, files, format, indent),
+        Changes::Warning(text) => text.to_string(),
+        Changes::LineLog(files) => {
+            // line-log colors an added line whole, without git diff's
+            // whitespace-error split.
+            let color = render::color_on();
+            let mut files = files.clone();
+            for l in files
+                .iter_mut()
+                .flat_map(|f| &mut f.hunks)
+                .flat_map(|h| &mut h.lines)
+            {
+                if l.origin == rgit_git::LineOrigin::Added {
+                    l.origin = rgit_git::LineOrigin::Meta;
+                    l.text = if color {
+                        format!("\x1b[32m+{}", l.text)
+                    } else {
+                        format!("+{}", l.text)
+                    };
+                }
+            }
+            render::patch(&files)
+        }
+    };
+    let text = text.trim_end_matches('\n');
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("{text}\n")
+    }
+}
+
+/// The blank line (or `---`) git puts between a commit's message and its
+/// changes.
+fn diff_separator(
+    pretty: &crate::pretty::Pretty,
+    changes: &Changes,
+    format: DiffFormat,
+) -> &'static str {
+    match changes {
+        Changes::Combined { .. } if pretty.blank_before_diff(true) => "\n",
+        Changes::LineLog(_) => "\n",
+        Changes::Files(_) if pretty.blank_before_diff(false) => {
+            if format.patch && format.stat {
+                "---\n"
+            } else {
+                "\n"
+            }
+        }
+        _ => "",
+    }
+}
+
+/// Each log entry's changes as git's log prints them (see [`commit_changes`]),
+/// with `--follow` only the followed file, under the name it had in that
+/// commit.
 fn log_diffs(
     backend: &Arc<dyn GitBackend>,
     opts: &LogOptions,
     entries: &[rgit_git::LogEntry],
     format: DiffFormat,
-) -> anyhow::Result<Vec<Vec<rgit_git::FileDiff>>> {
-    let mut out = vec![Vec::new(); entries.len()];
+    mode: MergeDiff,
+) -> anyhow::Result<Vec<Sections>> {
+    let mut out: Vec<Sections> = (0..entries.len()).map(|_| vec![(None, None)]).collect();
     if !format.any() {
         return Ok(out);
     }
@@ -10913,102 +11551,166 @@ fn log_diffs(
     }
     for i in order {
         let e = &entries[i];
+        let Some(path) = &mut follow else {
+            out[i] = commit_changes(backend, &e.oid, &e.parents, &opts.paths, mode, format)?;
+            continue;
+        };
         if e.parents.len() > 1 {
             continue;
         }
         let mut files = backend.diff(&rgit_git::DiffSpec {
             from: e.parents.first().cloned(),
             to: Some(e.oid.clone()),
-            paths: if follow.is_some() {
-                Vec::new()
-            } else {
-                opts.paths.clone()
-            },
             ..Default::default()
         })?;
-        if let Some(path) = &mut follow {
-            files.retain(|f| f.path == *path);
-            if let Some(old) = files.first().and_then(|f| f.old_path.clone()) {
-                *path = old;
-            }
+        files.retain(|f| f.path == *path);
+        if let Some(old) = files.first().and_then(|f| f.old_path.clone()) {
+            *path = old;
         }
-        out[i] = files;
+        if !files.is_empty() {
+            out[i] = vec![(None, Some(Changes::Files(files)))];
+        }
     }
     Ok(out)
+}
+
+/// `log -g`: the commits reflog entries name, newest first, each with its
+/// entry's selector and message.
+/// A ref name as git shortens it for `%gd`: `refs/heads/main` is `main`.
+fn short_ref(name: &str) -> &str {
+    ["refs/heads/", "refs/tags/", "refs/remotes/", "refs/"]
+        .iter()
+        .find_map(|p| name.strip_prefix(p))
+        .unwrap_or(name)
+}
+
+fn reflog_log(backend: &Arc<dyn GitBackend>, command: &Command) -> anyhow::Result<String> {
+    let Command::Log {
+        limit,
+        skip,
+        revs,
+        pretty,
+        format,
+        walk,
+        ..
+    } = command
+    else {
+        anyhow::bail!("not a log command");
+    };
+    let mut p = crate::pretty::Pretty::new(backend, pretty, Some("medium"))?.expect("a format");
+    p.walk = walk.clone();
+    let names = if revs.is_empty() {
+        vec!["HEAD".to_owned()]
+    } else {
+        revs.clone()
+    };
+    let mut commits = Vec::new();
+    for name in &names {
+        for (i, item) in backend.reflog(name)?.into_iter().enumerate() {
+            let mut c = crate::pretty::parse(&backend.read_object(&item.id)?);
+            c.reflog = Some(crate::pretty::Reflog {
+                selector: format!("{name}@{{{i}}}"),
+                short: format!("{}@{{{i}}}", short_ref(name)),
+                who: item.who,
+                message: item.message.trim_end().to_owned(),
+            });
+            commits.push(c);
+        }
+    }
+    let commits: Vec<_> = commits
+        .into_iter()
+        .skip(*skip)
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+    let mut diffs = Vec::new();
+    for c in &commits {
+        diffs.push(commit_changes(
+            backend,
+            &c.id,
+            &c.parents,
+            &[],
+            MergeDiff::Off,
+            *format,
+        )?);
+    }
+    Ok(pretty_log(&p, &commits, &diffs, *format))
 }
 
 /// Commits in a git format, each followed by its changes, as `git log` prints them.
 fn pretty_log(
     pretty: &crate::pretty::Pretty,
     commits: &[crate::pretty::Commit],
-    diffs: &[Option<Vec<rgit_git::FileDiff>>],
+    diffs: &[Sections],
     format: DiffFormat,
 ) -> String {
     let mut out = String::new();
-    for (i, (c, files)) in commits.iter().zip(diffs).enumerate() {
+    let sections = commits
+        .iter()
+        .zip(diffs)
+        .flat_map(|(c, s)| s.iter().map(move |s| (c, s)));
+    for (i, (c, (from, changes))) in sections.enumerate() {
         if i > 0 && !pretty.terminator {
             out.push('\n');
         }
-        out.push_str(&pretty.show(c));
+        let mut c = c.clone();
+        c.from = from.clone();
+        out.push_str(&pretty.show(&c));
         if pretty.terminator {
             out.push('\n');
         }
-        if let Some(files) = files {
-            if pretty.blank_before_diff(c.parents.len() > 1) {
-                out.push_str(if format.patch && format.stat {
-                    "---\n"
-                } else {
-                    "\n"
-                });
-            }
-            if !files.is_empty() {
-                out.push_str(diff_out(files, format).trim_end_matches('\n'));
-                out.push('\n');
-            }
+        if let Some(changes) = changes {
+            out.push_str(diff_separator(pretty, changes, format));
+            out.push_str(&changes_out(changes, format, 0));
         }
     }
     out
 }
 
-/// git's graph order (`--topo-order`): each commit after all its children,
-/// a merge's side branch right after it.
-fn topo_order(entries: Vec<rgit_git::LogEntry>) -> Vec<rgit_git::LogEntry> {
-    let index: std::collections::HashMap<&str, usize> = entries
+/// `git log -L`: the commits that changed the ranges, in git's topological
+/// order, each with the ranges' diff.
+fn line_log(
+    backend: &Arc<dyn GitBackend>,
+    opts: &LogOptions,
+    pretty: &PrettyArgs,
+    specs: &[String],
+) -> anyhow::Result<String> {
+    let entries = backend.log(&LogOptions {
+        limit: usize::MAX,
+        offset: 0,
+        reverse: false,
+        order: rgit_git::LogOrder::Topo,
+        ..opts.clone()
+    })?;
+    let order: Vec<String> = entries.iter().map(|e| e.oid.clone()).collect();
+    let tip = opts
+        .revs
         .iter()
-        .enumerate()
-        .map(|(i, e)| (e.oid.as_str(), i))
+        .find(|r| !r.starts_with('^'))
+        .map_or("HEAD", |r| r.rsplit("..").next().unwrap_or(r));
+    let tip = if tip.is_empty() { "HEAD" } else { tip };
+    let shown = backend.line_log(tip, &order, specs, opts.first_parent)?;
+    let mut picked: Vec<(String, Vec<rgit_git::FileDiff>)> = order
+        .into_iter()
+        .zip(shown)
+        .filter_map(|(id, files)| files.map(|f| (id, f)))
+        .skip(opts.offset)
+        .take(opts.limit)
         .collect();
-    let parents: Vec<Vec<usize>> = entries
-        .iter()
-        .map(|e| {
-            e.parents
-                .iter()
-                .filter_map(|p| index.get(p.as_str()).copied())
-                .collect()
-        })
-        .collect();
-    let mut indegree = vec![1usize; entries.len()];
-    for &p in parents.iter().flatten() {
-        indegree[p] += 1;
+    if opts.reverse {
+        picked.reverse();
     }
-    let mut stack: Vec<usize> = (0..entries.len()).filter(|&i| indegree[i] == 1).collect();
-    stack.reverse();
-    let mut order = Vec::with_capacity(entries.len());
-    while let Some(i) = stack.pop() {
-        for &p in &parents[i] {
-            if indegree[p] == 0 {
-                continue;
-            }
-            indegree[p] -= 1;
-            if indegree[p] == 1 {
-                stack.push(p);
-            }
-        }
-        indegree[i] = 0;
-        order.push(i);
+    let pretty = crate::pretty::Pretty::new(backend, pretty, Some("medium"))?.expect("a format");
+    let mut commits = Vec::new();
+    let mut diffs = Vec::new();
+    for (id, files) in picked {
+        commits.push(crate::pretty::parse(&backend.read_object(&id)?));
+        diffs.push(vec![(None, Some(Changes::LineLog(files)))]);
     }
-    let mut slots: Vec<Option<rgit_git::LogEntry>> = entries.into_iter().map(Some).collect();
-    order.into_iter().filter_map(|i| slots[i].take()).collect()
+    let format = DiffFormat {
+        patch: true,
+        ..DiffFormat::default()
+    };
+    Ok(pretty_log(&pretty, &commits, &diffs, format))
 }
 
 /// [`pretty_log`] with git's `--graph` drawn to the left of every line.
@@ -11016,48 +11718,61 @@ fn graph_log(
     pretty: &crate::pretty::Pretty,
     commits: &[crate::pretty::Commit],
     parents: &[Vec<String>],
-    diffs: &[Option<Vec<rgit_git::FileDiff>>],
+    diffs: &[Sections],
     format: DiffFormat,
 ) -> String {
     let mut graph = crate::graph::Graph::new();
     let mut out = String::new();
     let mut missing_newline = false;
+    let mut shown = false;
     for (i, c) in commits.iter().enumerate() {
-        graph.update(&c.id, parents[i].clone());
-        if i > 0 && !pretty.terminator {
-            if !missing_newline {
-                out.push_str(&graph.padding_line());
+        for (k, (from, changes)) in diffs[i].iter().enumerate() {
+            // Later `-m` sections of a merge continue below its graph line.
+            if k == 0 {
+                graph.update(&c.id, parents[i].clone());
+                graph.mark = pretty.graph_mark(c);
             }
-            out.push('\n');
-        }
-        out.push_str(&graph.show_commit());
-        let (head, msg) = pretty.parts(c);
-        out.push_str(&head);
-        if head.ends_with('\n') {
-            out.push_str(&graph.oneline());
-        }
-        out.push_str(&graph.commit_msg(&msg));
-        missing_newline = !msg.ends_with('\n');
-        if pretty.terminator {
-            if !missing_newline {
-                out.push_str(&graph.padding_line());
-            }
-            out.push('\n');
-        }
-        if let Some(files) = &diffs[i] {
-            let prefix = graph.padding_line();
-            if pretty.blank_before_diff(c.parents.len() > 1) {
-                out.push_str(&prefix);
-                if format.patch && format.stat {
-                    out.push_str("---");
+            if shown && !pretty.terminator {
+                if !missing_newline {
+                    out.push_str(&graph.padding_line());
                 }
                 out.push('\n');
             }
-            let text = diff_out_in(files, format, prefix.chars().count());
-            for line in text.trim_end_matches('\n').split('\n') {
-                out.push_str(&prefix);
-                out.push_str(line);
+            shown = true;
+            let mut c = c.clone();
+            c.from = from.clone();
+            out.push_str(&graph.show_commit());
+            let (head, msg) = pretty.parts(&c);
+            out.push_str(&head);
+            if head.ends_with('\n') {
+                out.push_str(&graph.oneline());
+            }
+            out.push_str(&graph.commit_msg(&msg));
+            missing_newline = !msg.ends_with('\n');
+            if pretty.terminator {
+                if !missing_newline {
+                    out.push_str(&graph.padding_line());
+                }
                 out.push('\n');
+            }
+            if let Some(changes) = changes {
+                let prefix = graph.padding_line();
+                let sep = diff_separator(pretty, changes, format);
+                if !sep.is_empty() {
+                    out.push_str(&prefix);
+                    out.push_str(sep);
+                }
+                let text = changes_out(changes, format, prefix.chars().count());
+                let combined = matches!(changes, Changes::Combined { .. });
+                for line in text.lines() {
+                    // git prints a combined diff's `mode a,b..c` line without
+                    // the graph.
+                    if !(combined && line.starts_with("mode ")) {
+                        out.push_str(&prefix);
+                    }
+                    out.push_str(line);
+                    out.push('\n');
+                }
             }
         }
     }
@@ -11235,16 +11950,171 @@ fn show_one(
     })
 }
 
-/// Blame `[rev] path`.
+/// Blame `[rev...] path` over the `-L` `ranges`.
 pub(crate) fn blame(
     backend: &Arc<dyn GitBackend>,
     args: &[String],
-) -> Result<Vec<rgit_git::BlameLine>, GitError> {
-    match args {
-        [rev, path] => backend.blame_at(rev, path),
-        [path, ..] => backend.blame(path),
-        [] => Ok(Vec::new()),
+    ranges: &[String],
+    opts: &BlameArgs,
+) -> Result<rgit_git::Blame, GitError> {
+    let Some((path, revs)) = args.split_last() else {
+        return Ok(rgit_git::Blame::default());
+    };
+    backend.blame_with(&rgit_git::BlameOptions {
+        path: path.clone(),
+        revs: revs.to_vec(),
+        ranges: ranges.to_vec(),
+        ignore_whitespace: opts.ignore_whitespace,
+        moves: (opts.moves || opts.move_score.is_some()).then(|| opts.move_score.unwrap_or(0)),
+        copies: opts.copies,
+        copy_score: opts.copy_score.unwrap_or(0),
+        first_parent: opts.first_parent,
+        reverse: opts.reverse,
+        show_root: opts.root,
+        ignore_revs: opts.ignore_rev.clone(),
+        ignore_revs_files: opts.ignore_revs_file.clone(),
+    })
+}
+
+/// git's own blame format: `id (author date line) text`, with `-f`, `-n`,
+/// `-t`, `-c`, `-b` and the blame.* display settings.
+fn blame_git(
+    backend: &Arc<dyn GitBackend>,
+    blame: &rgit_git::Blame,
+    path: &str,
+    format: &BlameFormat,
+) -> anyhow::Result<String> {
+    let config = |key: &str| backend.config_get(key).ok().flatten();
+    let flag = |key: &str| {
+        config(key).is_some_and(|v| matches!(v.as_str(), "true" | "yes" | "on" | "1" | ""))
+    };
+    let style = format
+        .date
+        .clone()
+        .or_else(|| config("blame.date"))
+        .unwrap_or_else(|| "iso".to_owned());
+    let base = style.strip_suffix("-local").unwrap_or(&style);
+    let width = match base {
+        "relative" => 22,
+        "iso" | "iso8601" | "iso-strict" | "iso8601-strict" => 25,
+        "rfc" | "rfc2822" => 31,
+        "short" | "unix" => 10,
+        "raw" | "human" => 16,
+        f if f.starts_with("format:") => crate::pretty::format_date(0, 0, &style).len(),
+        _ => 30,
+    };
+    let email = format.show_email || flag("blame.showemail");
+    let blank = format.blank_boundary || flag("blame.blankboundary");
+    let (mark_unblamable, mark_ignored) = (
+        flag("blame.markunblamablelines"),
+        flag("blame.markignoredlines"),
+    );
+    let lines = &blame.lines;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let mut people: std::collections::HashMap<&str, (String, i64, i32)> = Default::default();
+    let mut abbrev = 7;
+    for b in lines {
+        if people.contains_key(b.id.as_str()) {
+            continue;
+        }
+        let who = if b.id.is_empty() {
+            let name = if email {
+                "<not.committed.yet>"
+            } else {
+                "Not Committed Yet"
+            };
+            (name.to_owned(), now, crate::pretty::local_offset(now))
+        } else {
+            abbrev = abbrev.max(backend.abbrev_id(&b.id, 0)?.len());
+            let a = crate::pretty::parse(&backend.read_object(&b.id)?).author;
+            let name = if email {
+                format!("<{}>", a.email)
+            } else {
+                a.name
+            };
+            (name, a.time, a.offset)
+        };
+        people.insert(&b.id, who);
     }
+    let length = match format.abbrev {
+        _ if format.long_ids => 40,
+        Some(0) => 40,
+        Some(n) => (n.max(4) + 1).min(40),
+        None => abbrev + 1,
+    };
+    let show_name = format.show_name || lines.iter().any(|b| b.orig_path != path);
+    let longest_file = lines.iter().map(|b| b.orig_path.len()).max().unwrap_or(0);
+    let longest_author = people
+        .values()
+        .map(|p| p.0.chars().count())
+        .max()
+        .unwrap_or(0);
+    let digits = |n: usize| n.max(1).to_string().len();
+    let max_digits = digits(lines.iter().map(|b| b.final_line).max().unwrap_or(0));
+    let orig_digits = digits(lines.iter().map(|b| b.orig_line).max().unwrap_or(0));
+    let mut out = String::new();
+    for b in lines {
+        let (name, time, offset) = &people[b.id.as_str()];
+        let hex = if b.id.is_empty() {
+            "0".repeat(40)
+        } else {
+            b.id.clone()
+        };
+        let mut length = length;
+        if b.boundary {
+            if blank {
+                out.push_str(&" ".repeat(length));
+                length = 0;
+            } else if !format.annotate {
+                length -= 1;
+                out.push('^');
+            }
+        }
+        if mark_unblamable && b.unblamable && length > 0 {
+            length -= 1;
+            out.push('*');
+        }
+        if mark_ignored && b.ignored && length > 0 {
+            length -= 1;
+            out.push('?');
+        }
+        out.push_str(&hex[..length.min(40)]);
+        let date = if format.raw_time {
+            let tz = crate::pretty::format_date(*time, *offset, "raw");
+            format!("{time} {}", tz.split(' ').nth(1).unwrap_or("+0000"))
+        } else {
+            let d = crate::pretty::format_date(*time, *offset, &style);
+            let pad = width.saturating_sub(d.chars().count());
+            format!("{d}{}", " ".repeat(pad))
+        };
+        if format.annotate {
+            out.push_str(&format!("\t({name:>10}\t{date:>10}\t{})", b.final_line));
+        } else {
+            if show_name {
+                let p: String = b.orig_path.chars().take(longest_file).collect();
+                out.push_str(&format!(" {p:<longest_file$}"));
+            }
+            if format.show_number {
+                out.push_str(&format!(" {:>orig_digits$}", b.orig_line));
+            }
+            if !format.no_author {
+                let pad = longest_author - name.chars().count();
+                out.push_str(&format!(" ({name}{} {date:>10}", " ".repeat(pad)));
+            }
+            out.push_str(&format!(" {:>max_digits$}) ", b.final_line));
+        }
+        out.push_str(&b.line);
+        out.push('\n');
+    }
+    if format.show_stats {
+        let [blobs, patches, commits] = blame.stats;
+        out.push_str(&format!(
+            "num read blob: {blobs}\nnum get patch: {patches}\nnum commits: {commits}\n"
+        ));
+    }
+    Ok(out)
 }
 
 /// `describe --contains`: the commit `id` named from the oldest tag that
@@ -11252,7 +12122,8 @@ pub(crate) fn blame(
 fn describe_contains(
     backend: &Arc<dyn GitBackend>,
     id: &str,
-    pattern: Option<&str>,
+    patterns: &[String],
+    excludes: &[String],
 ) -> anyhow::Result<Option<String>> {
     struct Name {
         tip: String,
@@ -11277,7 +12148,8 @@ fn describe_contains(
         let Some(tag) = r.name.strip_prefix("refs/tags/") else {
             continue;
         };
-        if pattern.is_some_and(|p| !crate::plumbing::glob(p.as_bytes(), tag.as_bytes())) {
+        let glob = |p: &String| crate::plumbing::glob(p.as_bytes(), tag.as_bytes());
+        if !patterns.is_empty() && !patterns.iter().any(glob) || excludes.iter().any(glob) {
             continue;
         }
         let (target, date, deref) = match (&r.peeled, &r.tagger) {
@@ -11365,32 +12237,32 @@ fn describe_contains(
 }
 
 /// `blame --porcelain` (or `--line-porcelain` with `repeat`), as git prints
-/// it; `lo` is the number of lines before `lines` in the file.
+/// it.
 fn blame_porcelain(
     backend: &Arc<dyn GitBackend>,
     lines: &[rgit_git::BlameLine],
-    lo: usize,
     repeat: bool,
 ) -> anyhow::Result<String> {
     const ZERO: &str = "0000000000000000000000000000000000000000";
+    // Lines of one group: the same commit and file, both numbers running on.
+    let follows = |p: &rgit_git::BlameLine, b: &rgit_git::BlameLine| {
+        p.id == b.id
+            && p.orig_path == b.orig_path
+            && p.orig_line + 1 == b.orig_line
+            && p.final_line + 1 == b.final_line
+            && p.ignored == b.ignored
+            && p.unblamable == b.unblamable
+    };
     let mut shown = std::collections::HashSet::new();
     let mut out = String::new();
     for (i, b) in lines.iter().enumerate() {
         let id = if b.id.is_empty() { ZERO } else { &b.id };
-        let starts = i == 0 || {
-            let p = &lines[i - 1];
-            p.id != b.id || p.orig_path != b.orig_path || p.orig_line + 1 != b.orig_line
-        };
-        out.push_str(&format!("{id} {} {}", b.orig_line, lo + i + 1));
+        let starts = i == 0 || !follows(&lines[i - 1], b);
+        out.push_str(&format!("{id} {} {}", b.orig_line, b.final_line));
         if starts {
-            let n = lines[i..]
-                .iter()
-                .zip(i..)
-                .take_while(|(l, j)| {
-                    l.id == b.id
-                        && l.orig_path == b.orig_path
-                        && l.orig_line == b.orig_line + (j - i)
-                })
+            let n = 1 + lines[i..]
+                .windows(2)
+                .take_while(|w| follows(&w[0], &w[1]))
                 .count();
             out.push_str(&format!(" {n}"));
         }
@@ -11422,8 +12294,8 @@ fn blame_details(backend: &Arc<dyn GitBackend>, b: &rgit_git::BlameLine) -> anyh
             ));
         }
         out.push_str(&format!("summary Version of {path} from {path}\n"));
-        if let Ok(head) = backend.rev_parse("HEAD") {
-            out.push_str(&format!("previous {head} {path}\n"));
+        if let Some((p, prev)) = &b.previous {
+            out.push_str(&format!("previous {p} {prev}\n"));
         }
         out.push_str(&format!("filename {path}\n"));
         return Ok(out);
@@ -11449,12 +12321,8 @@ fn blame_details(backend: &Arc<dyn GitBackend>, b: &rgit_git::BlameLine) -> anyh
     if b.boundary {
         out.push_str("boundary\n");
     }
-    if let Some(p) = c
-        .parents
-        .iter()
-        .find(|p| backend.read_blob(p, path).is_ok())
-    {
-        out.push_str(&format!("previous {p} {path}\n"));
+    if let Some((p, prev)) = &b.previous {
+        out.push_str(&format!("previous {p} {prev}\n"));
     }
     out.push_str(&format!("filename {path}\n"));
     Ok(out)

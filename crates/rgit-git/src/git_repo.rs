@@ -463,151 +463,12 @@ impl GitBackend for Git2Backend {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-
-        let mut walk = repo.revwalk()?;
-        let mut seeded = opts.all && walk.push_glob("refs/*").is_ok();
-        for rev in &opts.revs {
-            seeded |= push_rev(&repo, &mut walk, rev)?;
-        }
-        if !opts.all && opts.revs.is_empty() {
-            seeded = walk.push_head().is_ok();
-        }
-        if !seeded {
-            return Ok(Vec::new());
-        }
-        if opts.first_parent {
-            walk.simplify_first_parent()?;
-        }
-        // libgit2 only decides which commits a range leaves in; the order
-        // is git's own.
-        let ranged = opts
-            .revs
-            .iter()
-            .any(|r| r.starts_with('^') || r.contains(".."));
-        let allowed = if ranged {
-            Some(walk.collect::<Result<std::collections::HashSet<_>, _>>()?)
-        } else {
-            None
-        };
-        let walk = DateWalk::new(&repo, &log_tips(&repo, opts)?, allowed, opts.first_parent);
-        let grep = if opts.grep.is_empty() {
-            None
-        } else {
-            let alt: Vec<String> = opts.grep.iter().map(|g| format!("(?:{g})")).collect();
-            Some(
-                regex::RegexBuilder::new(&alt.join("|"))
-                    .case_insensitive(opts.grep_ignore_case)
-                    .multi_line(true)
-                    .build()
-                    .map_err(|e| GitError::Other(format!("bad --grep pattern: {e}")))?,
-            )
-        };
-        let mut follow = match (opts.follow, &opts.paths[..]) {
-            (true, [path]) => Some(path.clone()),
-            (true, _) => {
-                return Err(GitError::Other(
-                    "--follow requires exactly one pathspec".into(),
-                ));
-            }
-            _ => None,
-        };
-
+        let walked = crate::walk::walk(&repo, opts)?;
         let unpushed = unpushed_oids(&repo);
         let decorations = log_decorations(&repo);
-        let author_needle = opts.author.as_ref().map(|a| a.to_lowercase());
-        let committer_needle = opts.committer.as_ref().map(|a| a.to_lowercase());
-        let changes = opts
-            .changes_matching
-            .as_deref()
-            .map(regex::Regex::new)
-            .transpose()
-            .map_err(|e| GitError::Other(format!("bad -G pattern: {e}")))?;
-        let mut entries = Vec::new();
-        let mut passed = 0usize;
-        // git's default history simplification for paths: a merge that matches
-        // one parent there follows only that parent, so side branches it
-        // dropped are not walked. `kept` are the parents still followed,
-        // `seen` every parent named so far.
-        let (mut kept, mut seen) = (
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-        );
-        // A skipped commit's followed parent, for rewriting parents.
-        let mut skipped: std::collections::HashMap<Oid, Option<Oid>> = Default::default();
-        for oid in walk {
-            if entries.len() >= opts.limit {
-                break;
-            }
-            let oid = oid?;
-            let commit = repo.find_commit(oid)?;
-            let touched = if let Some(path) = &mut follow {
-                // git's --follow prunes nothing; it shows the commits whose
-                // own diff touches the file, which leaves merges out.
-                commit.parent_count() < 2 && follow_path(&repo, &commit, path)
-            } else if opts.paths.is_empty() {
-                true
-            } else {
-                if seen.contains(&oid) && !kept.contains(&oid) {
-                    seen.extend(commit.parent_ids());
-                    continue;
-                }
-                let (touched, parents) =
-                    simplify_parents(&repo, &commit, &opts.paths, opts.first_parent);
-                seen.extend(commit.parent_ids());
-                if !touched {
-                    skipped.insert(oid, parents.first().copied());
-                }
-                kept.extend(parents);
-                touched
-            };
-            if !touched {
-                continue;
-            }
-            let when = commit.time().seconds();
-            if opts.since.map(|s| when < s).unwrap_or(false)
-                || opts.until.map(|u| when > u).unwrap_or(false)
-            {
-                continue;
-            }
-            if opts
-                .merges
-                .is_some_and(|m| m != (commit.parent_count() > 1))
-            {
-                continue;
-            }
-            if let Some(re) = &grep
-                && !re.is_match(&String::from_utf8_lossy(commit.message_bytes()))
-            {
-                continue;
-            }
-            let author = commit.author();
-            let author_name = author.name().unwrap_or("?").to_owned();
-            if let Some(needle) = &author_needle {
-                let email = author.email().unwrap_or("");
-                if !author_name.to_lowercase().contains(needle)
-                    && !email.to_lowercase().contains(needle)
-                {
-                    continue;
-                }
-            }
-            if let Some(needle) = &committer_needle {
-                let who = commit.committer();
-                let name = who.name().unwrap_or("").to_lowercase();
-                let email = who.email().unwrap_or("").to_lowercase();
-                if !name.contains(needle) && !email.contains(needle) {
-                    continue;
-                }
-            }
-            if (opts.occurrences.is_some() || changes.is_some())
-                && !pickaxe(&repo, &commit, opts, changes.as_ref())?
-            {
-                continue;
-            }
-            // Skip the first `offset` matches for pagination, after filtering.
-            passed += 1;
-            if passed <= opts.offset {
-                continue;
-            }
+        let mut entries = Vec::with_capacity(walked.len());
+        for w in walked {
+            let commit = repo.find_commit(w.id)?;
             entries.push(crate::LogEntry {
                 short_id: commit
                     .as_object()
@@ -621,35 +482,15 @@ impl GitBackend for Git2Backend {
                     .flatten()
                     .unwrap_or_default()
                     .to_owned(),
-                author: author_name,
+                author: commit.author().name().unwrap_or("?").to_owned(),
                 when: relative_age(commit.time().seconds(), now),
-                oid: commit.id().to_string(),
-                parents: commit.parent_ids().map(|id| id.to_string()).collect(),
-                refs: decorations.get(&commit.id()).cloned().unwrap_or_default(),
-                unpushed: unpushed.contains(&commit.id()),
+                oid: w.id.to_string(),
+                parents: w.parents.iter().map(Oid::to_string).collect(),
+                refs: decorations.get(&w.id).cloned().unwrap_or_default(),
+                unpushed: unpushed.contains(&w.id),
+                mark: w.mark,
+                source: w.source,
             });
-        }
-        if opts.rewrite_parents && !skipped.is_empty() {
-            for e in &mut entries {
-                let mut parents: Vec<String> = Vec::new();
-                for p in &e.parents {
-                    let mut p = Oid::from_str(p)?;
-                    let kept = loop {
-                        match skipped.get(&p) {
-                            Some(Some(next)) => p = *next,
-                            Some(None) => break None,
-                            None => break Some(p.to_string()),
-                        }
-                    };
-                    if let Some(p) = kept.filter(|p| !parents.contains(p)) {
-                        parents.push(p);
-                    }
-                }
-                e.parents = parents;
-            }
-        }
-        if opts.reverse {
-            entries.reverse();
         }
         Ok(entries)
     }
@@ -981,45 +822,25 @@ impl GitBackend for Git2Backend {
     }
 
     fn blame(&self, path: &str) -> Result<Vec<crate::BlameLine>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
-        let content = std::fs::read_to_string(self.workdir.join(path))?;
-        // libgit2 blames committed history only, so a file that exists solely in
-        // the index or working tree (newly added, never committed) has nothing to
-        // blame and errors with "path does not exist". Match `git blame` and mark
-        // every line not-yet-committed rather than failing.
-        let blame = repo.blame_file(Path::new(path), None).ok();
-        // Lines changed in the working tree blame to no commit, as in git;
-        // the rest to the line they are in HEAD.
-        let head = repo
-            .head()
-            .and_then(|h| h.peel_to_tree())
-            .and_then(|t| t.get_path(Path::new(path)))
-            .and_then(|e| e.to_object(&repo))
-            .and_then(|o| o.peel_to_blob());
-        let map = match &head {
-            Ok(blob) => Some(line_map(blob.content(), content.as_bytes())?),
-            Err(_) => None,
-        };
-        Ok(blame_lines(blame.as_ref(), &content, path, map.as_deref()))
+        self.blame_with(&crate::BlameOptions {
+            path: path.to_owned(),
+            ..Default::default()
+        })
+        .map(|b| b.lines)
     }
 
     fn blame_at(&self, rev: &str, path: &str) -> Result<Vec<crate::BlameLine>, GitError> {
+        self.blame_with(&crate::BlameOptions {
+            path: path.to_owned(),
+            revs: vec![rev.to_owned()],
+            ..Default::default()
+        })
+        .map(|b| b.lines)
+    }
+
+    fn blame_with(&self, opts: &crate::BlameOptions) -> Result<crate::Blame, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
-        let commit = repo.revparse_single(rev)?.peel_to_commit()?;
-        let blob = commit
-            .tree()?
-            .get_path(Path::new(path))?
-            .to_object(&repo)?
-            .peel_to_blob()?;
-        let mut opts = git2::BlameOptions::new();
-        opts.newest_commit(commit.id());
-        let blame = repo.blame_file(Path::new(path), Some(&mut opts))?;
-        Ok(blame_lines(
-            Some(&blame),
-            &String::from_utf8_lossy(blob.content()),
-            path,
-            None,
-        ))
+        crate::blame::blame(&repo, &self.workdir, opts)
     }
 
     fn index_second(&self) -> Option<i64> {
@@ -2493,6 +2314,56 @@ impl GitBackend for Git2Backend {
         crate::range_diff::range_diff(&self.repo.lock().expect("repo mutex"), opts)
     }
 
+    fn combined_diff(
+        &self,
+        commit: &str,
+        paths: &[String],
+        dense: bool,
+    ) -> Result<Vec<crate::CombinedFile>, GitError> {
+        crate::combine::combined(&self.repo.lock().expect("repo mutex"), commit, paths, dense)
+    }
+
+    fn line_log(
+        &self,
+        tip: &str,
+        order: &[String],
+        specs: &[String],
+        first_parent: bool,
+    ) -> Result<Vec<Option<Vec<crate::FileDiff>>>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        crate::line_log::line_log(&repo, tip, order, specs, first_parent)
+    }
+
+    fn remerge_diff(
+        &self,
+        commit: &str,
+        paths: &[String],
+    ) -> Result<Vec<crate::FileDiff>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let commit = repo.revparse_single(commit)?.peel_to_commit()?;
+        let Some((tree, notes)) = crate::combine::remerge_tree(&repo, &commit)? else {
+            return Ok(Vec::new());
+        };
+        let mut opts = DiffOptions::new();
+        for p in paths.iter().filter(|p| *p != ".") {
+            opts.pathspec(p);
+        }
+        opts.indent_heuristic(true);
+        let diff = repo.diff_tree_to_tree(
+            Some(&repo.find_tree(tree)?),
+            Some(&commit.tree()?),
+            Some(&mut opts),
+        )?;
+        let mut files = extract_with_renames(&repo, diff)?;
+        for f in &mut files {
+            if let Some((_, note)) = notes.iter().find(|(p, _)| *p == f.path) {
+                let at = f.header.find('\n').map_or(f.header.len(), |i| i + 1);
+                f.header.insert_str(at, &format!("{note}\n"));
+            }
+        }
+        Ok(files)
+    }
+
     fn cherry(
         &self,
         upstream: &str,
@@ -2817,50 +2688,8 @@ impl GitBackend for Git2Backend {
         }
     }
 
-    fn describe(
-        &self,
-        rev: &str,
-        tags: bool,
-        dirty: bool,
-        long: bool,
-        abbrev: Option<u32>,
-        pattern: Option<&str>,
-    ) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
-        let mut opts = git2::DescribeOptions::new();
-        if tags {
-            opts.describe_tags();
-        }
-        if let Some(p) = pattern {
-            opts.pattern(p);
-        }
-        opts.show_commit_oid_as_fallback(true);
-        // git2's Object::describe never sets the dirty flag; only the workdir
-        // describe does. So when the target is HEAD (the only case --dirty is
-        // meaningful for), describe the workdir; otherwise describe the object.
-        let head_oid = repo.head().ok().and_then(|h| h.target());
-        let obj = repo.revparse_single(rev)?;
-        let is_head = rev == "HEAD"
-            || obj
-                .peel_to_commit()
-                .map(|c| Some(c.id()) == head_oid)
-                .unwrap_or(false);
-        let describe = if is_head {
-            repo.describe(&opts)?
-        } else {
-            obj.describe(&opts)?
-        };
-        let mut fmt = git2::DescribeFormatOptions::new();
-        if dirty {
-            fmt.dirty_suffix("-dirty");
-        }
-        if long {
-            fmt.always_use_long_format(true);
-        }
-        if let Some(n) = abbrev {
-            fmt.abbreviated_size(n);
-        }
-        Ok(describe.format(Some(&fmt))?)
+    fn describe(&self, rev: &str, opts: &crate::DescribeOptions) -> Result<String, GitError> {
+        crate::describe::describe(&self.repo.lock().expect("repo mutex"), rev, opts)
     }
 
     fn git(&self, args: &[String]) -> Result<String, GitError> {
@@ -5065,6 +4894,19 @@ impl GitBackend for Git2Backend {
         crate::plumbing::resolve(&self.repo.lock().expect("repo mutex"), rev)
     }
 
+    fn object_disk(&self, id: &str) -> Result<(u64, Option<String>), GitError> {
+        crate::plumbing::object_disk(&self.repo.lock().expect("repo mutex"), id)
+    }
+
+    fn convert_blob(&self, path: &str, data: &[u8], textconv: bool) -> Result<Vec<u8>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        if textconv {
+            crate::plumbing::textconv(&repo, path, data)
+        } else {
+            crate::plumbing::smudge(&repo, path, data)
+        }
+    }
+
     fn abbrev_id(&self, id: &str, min: usize) -> Result<String, GitError> {
         crate::plumbing::abbrev(&self.repo.lock().expect("repo mutex"), id, min)
     }
@@ -5133,8 +4975,16 @@ impl GitBackend for Git2Backend {
         crate::plumbing::ref_details(&self.repo.lock().expect("repo mutex"))
     }
 
-    fn rev_walk(&self, walk: &crate::RevWalk) -> Result<Vec<crate::WalkCommit>, GitError> {
+    fn rev_walk(&self, walk: &crate::LogOptions) -> Result<Vec<crate::WalkCommit>, GitError> {
         crate::plumbing::rev_walk(&self.repo.lock().expect("repo mutex"), walk)
+    }
+
+    fn list_objects(
+        &self,
+        commits: &[String],
+        edges: &[String],
+    ) -> Result<Vec<(String, String, bool)>, GitError> {
+        crate::plumbing::list_objects(&self.repo.lock().expect("repo mutex"), commits, edges)
     }
 
     fn merge_bases(&self, a: &str, b: &str, all: bool) -> Result<Vec<String>, GitError> {
@@ -10049,143 +9899,9 @@ fn octopus(
     )
 }
 
-/// A short relative age (`5s`, `12m`, `3h`, `9d`) from a commit time to now.
-/// Whether `commit`'s diff against its first parent touched `path`, matched as an
-/// exact path or a directory prefix. A root commit is compared to the empty tree.
-/// Each line of `content` with the commit that last touched it; lines the
-/// blame does not cover (not yet committed) get an empty id.
-/// `map` gives each line's number in the blamed version, if it has one.
-fn blame_lines(
-    blame: Option<&git2::Blame>,
-    content: &str,
-    path: &str,
-    map: Option<&[Option<usize>]>,
-) -> Vec<crate::BlameLine> {
-    content
-        .lines()
-        .enumerate()
-        .map(|(i, text)| {
-            let line = match map {
-                Some(map) => map.get(i).copied().flatten(),
-                None => Some(i + 1),
-            };
-            (i, line, text, line.and_then(|l| blame?.get_line(l)))
-        })
-        .map(|(n, line, text, hunk)| match hunk {
-            Some(hunk) => {
-                let i = line.expect("a blamed line") - 1;
-                let sig = hunk.final_signature();
-                let id = hunk.final_commit_id().to_string();
-                crate::BlameLine {
-                    short_id: id.chars().take(7).collect(),
-                    author: sig
-                        .as_ref()
-                        .and_then(|s| s.name().ok().map(str::to_owned))
-                        .unwrap_or_else(|| "?".to_owned()),
-                    line: text.to_owned(),
-                    email: sig
-                        .as_ref()
-                        .and_then(|s| s.email().ok().map(str::to_owned))
-                        .unwrap_or_default(),
-                    id,
-                    orig_line: hunk.orig_start_line() + i + 1 - hunk.final_start_line(),
-                    orig_path: hunk
-                        .path()
-                        .map_or_else(|| path.to_owned(), |p| p.to_string_lossy().into_owned()),
-                    boundary: hunk.is_boundary(),
-                }
-            }
-            None => crate::BlameLine {
-                short_id: String::new(),
-                author: String::new(),
-                line: text.to_owned(),
-                id: String::new(),
-                email: String::new(),
-                orig_line: n + 1,
-                orig_path: path.to_owned(),
-                boundary: false,
-            },
-        })
-        .collect()
-}
-
-/// For each line of `new`, its line number in `old`, or None where it was
-/// added.
-fn line_map(old: &[u8], new: &[u8]) -> Result<Vec<Option<usize>>, GitError> {
-    let mut opts = DiffOptions::new();
-    opts.context_lines(0);
-    let patch = Patch::from_buffers(old, None, new, None, Some(&mut opts))?;
-    let (mut added, mut deleted) = (
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-    );
-    for h in 0..patch.num_hunks() {
-        for l in 0..patch.num_lines_in_hunk(h)? {
-            let line = patch.line_in_hunk(h, l)?;
-            match line.origin() {
-                '+' => added.extend(line.new_lineno()),
-                '-' => deleted.extend(line.old_lineno()),
-                _ => {}
-            }
-        }
-    }
-    let total = String::from_utf8_lossy(new).lines().count();
-    let mut old_line = 1;
-    let mut map = Vec::with_capacity(total);
-    for n in 1..=total as u32 {
-        if added.contains(&n) {
-            map.push(None);
-            continue;
-        }
-        while deleted.contains(&old_line) {
-            old_line += 1;
-        }
-        map.push(Some(old_line as usize));
-        old_line += 1;
-    }
-    Ok(map)
-}
-
-/// Whether `commit` changed `paths`, and the parents the walk follows past it,
-/// as in git's default history simplification: when it matches a parent there,
-/// it is left out and only the first such parent is followed.
-pub(crate) fn simplify_parents(
-    repo: &Repository,
-    commit: &git2::Commit<'_>,
-    paths: &[String],
-    first_parent: bool,
-) -> (bool, Vec<Oid>) {
-    let Ok(tree) = commit.tree() else {
-        return (false, Vec::new());
-    };
-    let mut opts = DiffOptions::new();
-    for p in paths.iter().filter(|p| *p != ".") {
-        opts.pathspec(p);
-    }
-    let mut differs = |old: Option<&git2::Tree>| {
-        repo.diff_tree_to_tree(old, Some(&tree), Some(&mut opts))
-            .is_ok_and(|d| d.deltas().len() > 0)
-    };
-    let parents = if first_parent {
-        commit.parent_count().min(1)
-    } else {
-        commit.parent_count()
-    };
-    if parents == 0 {
-        return (differs(None), Vec::new());
-    }
-    for i in 0..parents {
-        let old = commit.parent(i).ok().and_then(|p| p.tree().ok());
-        if !differs(old.as_ref()) {
-            return (false, vec![commit.parent_id(i).expect("parent in range")]);
-        }
-    }
-    (true, commit.parent_ids().take(parents).collect())
-}
-
 /// Whether `commit` touched `path`; when it renamed the file, `path` moves to
 /// the old name for older commits, as `git log --follow` does.
-fn follow_path(repo: &Repository, commit: &git2::Commit<'_>, path: &mut String) -> bool {
+pub(crate) fn follow_path(repo: &Repository, commit: &git2::Commit<'_>, path: &mut String) -> bool {
     let Ok(tree) = commit.tree() else {
         return false;
     };
@@ -10216,7 +9932,7 @@ fn follow_path(repo: &Repository, commit: &git2::Commit<'_>, path: &mut String) 
 /// git's pickaxe: whether `commit`'s own diff (merges have none) changes how
 /// often `opts.occurrences` appears in a file (-S), or adds or removes a line
 /// matching `changes` (-G).
-fn pickaxe(
+pub(crate) fn pickaxe(
     repo: &Repository,
     commit: &git2::Commit<'_>,
     opts: &crate::LogOptions,
@@ -10261,138 +9977,6 @@ fn pickaxe(
         }
     }
     Ok(false)
-}
-
-/// The commits a log starts from, in the order git queues them: every ref
-/// then HEAD for `--all`, then each revision as given.
-fn log_tips(repo: &Repository, opts: &crate::LogOptions) -> Result<Vec<Oid>, GitError> {
-    let mut tips = Vec::new();
-    if opts.all {
-        let mut refs: Vec<(String, Oid)> = repo
-            .references()?
-            .flatten()
-            .filter_map(|r| {
-                let id = r.peel_to_commit().ok()?.id();
-                Some((String::from_utf8_lossy(r.name_bytes()).into_owned(), id))
-            })
-            .collect();
-        refs.sort();
-        tips.extend(refs.into_iter().map(|(_, id)| id));
-    }
-    for rev in opts.revs.iter().filter(|r| !r.starts_with('^')) {
-        let spec = repo.revparse(rev)?;
-        let side =
-            |o: Option<&git2::Object>| o.and_then(|o| o.peel_to_commit().ok()).map(|c| c.id());
-        if spec.mode().contains(git2::RevparseMode::MERGE_BASE) {
-            tips.extend(side(spec.from()));
-        }
-        tips.extend(side(spec.to()).or(side(spec.from())));
-    }
-    if opts.all || opts.revs.is_empty() {
-        tips.extend(
-            repo.head()
-                .ok()
-                .and_then(|h| h.peel_to_commit().ok())
-                .map(|c| c.id()),
-        );
-    }
-    Ok(tips)
-}
-
-/// Commits in git's default log order: newest committer date first, ties in
-/// the order they were queued, and a commit's parents queued once it is
-/// shown. With `allowed`, only those commits are walked.
-struct DateWalk<'r> {
-    repo: &'r Repository,
-    queue: std::collections::BinaryHeap<(i64, std::cmp::Reverse<u64>, Oid)>,
-    seen: std::collections::HashSet<Oid>,
-    allowed: Option<std::collections::HashSet<Oid>>,
-    first_parent: bool,
-    queued: u64,
-}
-
-impl<'r> DateWalk<'r> {
-    fn new(
-        repo: &'r Repository,
-        tips: &[Oid],
-        allowed: Option<std::collections::HashSet<Oid>>,
-        first_parent: bool,
-    ) -> Self {
-        let mut walk = DateWalk {
-            repo,
-            queue: Default::default(),
-            seen: Default::default(),
-            allowed,
-            first_parent,
-            queued: 0,
-        };
-        for &tip in tips {
-            walk.push(tip);
-        }
-        walk
-    }
-
-    fn push(&mut self, id: Oid) {
-        if !self.seen.insert(id) || self.allowed.as_ref().is_some_and(|a| !a.contains(&id)) {
-            return;
-        }
-        let Ok(commit) = self.repo.find_commit(id) else {
-            return;
-        };
-        self.queue
-            .push((commit.time().seconds(), std::cmp::Reverse(self.queued), id));
-        self.queued += 1;
-    }
-}
-
-impl Iterator for DateWalk<'_> {
-    type Item = Result<Oid, GitError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let (_, _, id) = self.queue.pop()?;
-        let parents: Vec<Oid> = match self.repo.find_commit(id) {
-            Ok(c) => c.parent_ids().collect(),
-            Err(e) => return Some(Err(e.into())),
-        };
-        let take = if self.first_parent { 1 } else { parents.len() };
-        for p in parents.into_iter().take(take) {
-            self.push(p);
-        }
-        Some(Ok(id))
-    }
-}
-
-/// Add one `git log` revision to a walk: `rev`, `^rev`, `A..B` or `A...B`.
-/// Returns whether it added a starting point (not only an exclusion).
-fn push_rev(repo: &Repository, walk: &mut git2::Revwalk, rev: &str) -> Result<bool, GitError> {
-    if let Some(neg) = rev.strip_prefix('^') {
-        walk.hide(repo.revparse_single(neg)?.peel_to_commit()?.id())?;
-        return Ok(false);
-    }
-    let spec = repo.revparse(rev)?;
-    let oid = |o: Option<&git2::Object>| -> Result<Oid, GitError> {
-        Ok(
-            o.ok_or_else(|| GitError::Other(format!("bad revision '{rev}'")))?
-                .peel_to_commit()?
-                .id(),
-        )
-    };
-    let from = oid(spec.from())?;
-    if spec.mode().contains(git2::RevparseMode::SINGLE) {
-        walk.push(from)?;
-        return Ok(true);
-    }
-    let to = oid(spec.to())?;
-    walk.push(to)?;
-    if spec.mode().contains(git2::RevparseMode::MERGE_BASE) {
-        walk.push(from)?;
-        if let Ok(base) = repo.merge_base(from, to) {
-            walk.hide(base)?;
-        }
-    } else {
-        walk.hide(from)?;
-    }
-    Ok(true)
 }
 
 /// The two trees a `A..B` or `A...B` diff compares (merge base for `...`).

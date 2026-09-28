@@ -15,10 +15,11 @@ use rgit_git::{Git2Backend, GitBackend, GrepQuery};
 use serde_json::{Map, Value, json};
 
 use crate::cli::{
-    AmArgs, ApplyArgs, ArchiveArgs, BisectCmd, BlameFormat, BranchCmd, BranchOpts, BundleCmd,
-    CliError, Command, ConfigArgs, DiffFormat, FlowCmd, FormatPatchArgs, HashObjectArgs, IndexCmd,
-    LanesCmd, MaintenanceCmd, NoteMessage, NotesCmd, PickFlags, Plumbing, PrettyArgs, RebaseFlags,
-    RemoteCmd, StackCmd, StashCmd, StashPush, SubmoduleCmd, TagOpts, WorkspaceCmd, WorktreeCmd,
+    AmArgs, ApplyArgs, ArchiveArgs, BisectCmd, BlameArgs, BlameFormat, BranchCmd, BranchOpts,
+    BundleCmd, CliError, Command, ConfigArgs, DiffFormat, FlowCmd, FormatPatchArgs, HashObjectArgs,
+    IndexCmd, LanesCmd, MaintenanceCmd, MergeDiffArgs, NoteMessage, NotesCmd, PickFlags, Plumbing,
+    PrettyArgs, RebaseFlags, RemoteCmd, StackCmd, StashCmd, StashPush, SubmoduleCmd, TagOpts,
+    WalkArgs, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::toon::{Node, Obj};
@@ -630,8 +631,12 @@ fn tools() -> Vec<Tool> {
              `A..B`, `A...B`) or all picks the start; first_parent, reverse, follow (one path \
              across renames). patch, stat, name_only, name_status or numstat add each commit's \
              changes as text. format (git pretty format: oneline, medium, `format:%h %s`...), \
-             date (date style) and graph print git's own text. Extra fields: oid, parents, refs, \
-             unpushed.",
+             date (date style) and graph print git's own text; diff_merges (off, first-parent, \
+             separate, combined, dense-combined, remerge) picks how merges diff; line_range \
+             (`START,END:FILE` or `:FUNC:FILE`, git -L) traces lines with their diffs. For \
+             `A...B`: left_right marks each commit's side, cherry_pick drops commits both sides \
+             have, cherry_mark marks them; boundary adds the excluded parents; topo_order keeps \
+             branches together. Extra fields: oid, parents, refs, unpushed.",
             &[
                 ("limit", "integer", false),
                 ("skip", "integer", false),
@@ -651,6 +656,11 @@ fn tools() -> Vec<Tool> {
                 ("no_merges", "boolean", false),
                 ("reverse", "boolean", false),
                 ("follow", "boolean", false),
+                ("left_right", "boolean", false),
+                ("cherry_pick", "boolean", false),
+                ("cherry_mark", "boolean", false),
+                ("boundary", "boolean", false),
+                ("topo_order", "boolean", false),
                 ("patch", "boolean", false),
                 ("stat", "boolean", false),
                 ("name_only", "boolean", false),
@@ -659,6 +669,8 @@ fn tools() -> Vec<Tool> {
                 ("format", "string", false),
                 ("date", "string", false),
                 ("graph", "boolean", false),
+                ("diff_merges", "string", false),
+                ("line_range", "paths", false),
                 FIELDS,
             ],
         ),
@@ -694,7 +706,9 @@ fn tools() -> Vec<Tool> {
              changed-files table (paths limits it; no_patch drops it). patch=true returns its \
              patch instead (truncated unless full); name_only/name_status/numstat list files. \
              rev `<rev>:<path>` prints a file (or folder) at a revision, `:<path>` the staged \
-             file; several revs print each. format (a git pretty format) prints git's show text.",
+             file; several revs print each. format (a git pretty format) prints git's show text, \
+             a merge's diff as diff_merges says (default dense-combined; first_parent for \
+             first-parent).",
             &[
                 ("rev", "paths", false),
                 ("paths", "paths", false),
@@ -704,6 +718,8 @@ fn tools() -> Vec<Tool> {
                 ("numstat", "boolean", false),
                 ("no_patch", "boolean", false),
                 ("format", "string", false),
+                ("diff_merges", "string", false),
+                ("first_parent", "boolean", false),
                 FIELDS,
                 FULL,
             ],
@@ -711,12 +727,17 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_blame",
             "Blame a file (working tree, or as of `rev`): a table of line, id, author, text. Shows \
-             the first 200 lines; `lines` takes START,END or START,+COUNT, and help names the \
-             next range.",
+             the first 200 lines; `lines` takes START,END, START,+COUNT, /regex/ or :funcname, \
+             and help names the next range. `ignore_whitespace`, `moves`, `copies` and \
+             `ignore_rev` follow lines as blame's -w, -M, -C and --ignore-rev do.",
             &[
                 ("path", "string", true),
                 ("rev", "string", false),
                 ("lines", "string", false),
+                ("ignore_whitespace", "boolean", false),
+                ("moves", "boolean", false),
+                ("copies", "boolean", false),
+                ("ignore_rev", "paths", false),
                 FIELDS,
             ],
         ),
@@ -842,12 +863,16 @@ fn tools() -> Vec<Tool> {
             "git_describe",
             "Describe a revision relative to the nearest tag (default HEAD). `tags` uses \
              lightweight tags too, `dirty` appends -dirty, `long` forces long format, `abbrev` \
-             sets the oid length (0: the tag only), `match` limits tags to a glob, `exact_match` \
-             fails unless a tag points at the revision, `contains` names it from the oldest tag \
-             that contains it (`v1~2`).",
+             sets the oid length (0: the tag only), `match` limits tags to globs and `exclude` \
+             drops some, `all` uses any ref, `first_parent` follows first parents only, \
+             `exact_match` fails unless a tag points at the revision, `contains` names it from \
+             the oldest tag that contains it (`v1~2`).",
             &[
                 ("rev", "string", false),
                 ("tags", "boolean", false),
+                ("all", "boolean", false),
+                ("first_parent", "boolean", false),
+                ("exclude", "paths", false),
                 ("dirty", "boolean", false),
                 ("long", "boolean", false),
                 ("abbrev", "integer", false),
@@ -2101,12 +2126,15 @@ fn tools() -> Vec<Tool> {
             "git_cat_file",
             "An object's content like git cat-file -p (`object` is `HEAD`, `HEAD:path`, an id), \
              truncated unless full. `kind` gives only its type, `size` only its size, `exists` \
-             only whether it exists.",
+             only whether it exists. `textconv` runs a `HEAD:path` blob through its diff \
+             driver's textconv; `filters` shows it as checked out.",
             &[
                 ("object", "string", true),
                 ("kind", "boolean", false),
                 ("size", "boolean", false),
                 ("exists", "boolean", false),
+                ("textconv", "boolean", false),
+                ("filters", "boolean", false),
                 FULL,
             ],
         ),
@@ -2145,7 +2173,9 @@ fn tools() -> Vec<Tool> {
             "git_rev_list",
             "Commit ids reachable from `revs` (`HEAD`, `^A`, `A..B`, `A...B`) like git rev-list, \
              newest first. `count` returns only the number; `all` walks every ref; `paths` keeps \
-             commits that change them, simplified as git does.",
+             commits that change them, simplified as git does. since/until (dates like \
+             `2 weeks ago`), author and grep filter; left_right marks the sides of `A...B` and \
+             with count gives `left<TAB>right`.",
             &[
                 ("revs", "string[]", false),
                 ("all", "boolean", false),
@@ -2157,6 +2187,11 @@ fn tools() -> Vec<Tool> {
                 ("no_merges", "boolean", false),
                 ("skip", "integer", false),
                 ("paths", "string[]", false),
+                ("since", "string", false),
+                ("until", "string", false),
+                ("author", "string", false),
+                ("grep", "string[]", false),
+                ("left_right", "boolean", false),
             ],
         ),
         tool(
@@ -2195,7 +2230,8 @@ fn tools() -> Vec<Tool> {
             "git_grep_tracked",
             "Search tracked files like git grep (regexes, case-sensitive): a table of path, \
              line, text. `rev` searches a revision, `cached` the index; `fixed` takes literal \
-             strings; `ignore_case`, `word`, `invert` as in git; `paths` limit; `max_count` caps matches per file.",
+             strings; `ignore_case`, `word`, `invert` as in git; `paths` limit; `max_count` caps matches per file; `all_match` keeps files matching every pattern; \
+             `untracked` searches untracked files too.",
             &[
                 ("patterns", "string[]", true),
                 ("rev", "string", false),
@@ -2206,6 +2242,8 @@ fn tools() -> Vec<Tool> {
                 ("invert", "boolean", false),
                 ("paths", "string[]", false),
                 ("max_count", "integer", false),
+                ("all_match", "boolean", false),
+                ("untracked", "boolean", false),
                 FIELDS,
             ],
         ),
@@ -2663,7 +2701,22 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             no_merges: a.flag("no_merges"),
             reverse: a.flag("reverse"),
             follow: a.flag("follow"),
+            line_ranges: a.strs("line_range").unwrap_or_default(),
+            walk_reflogs: false,
+            parents: false,
+            walk: WalkArgs {
+                left_right: a.flag("left_right"),
+                cherry_pick: a.flag("cherry_pick"),
+                cherry_mark: a.flag("cherry_mark"),
+                boundary: a.flag("boundary"),
+                topo_order: a.flag("topo_order"),
+                ..WalkArgs::default()
+            },
             format: format(),
+            merge_diff: MergeDiffArgs {
+                diff_merges: a.str("diff_merges"),
+                ..MergeDiffArgs::default()
+            },
             revs: a.strs("rev").unwrap_or_default(),
             paths: a.strs("path").unwrap_or_default(),
         },
@@ -2690,11 +2743,23 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                 ..PrettyArgs::default()
             },
             no_patch: a.flag("no_patch"),
+            merge_diff: MergeDiffArgs {
+                diff_merges: a.str("diff_merges"),
+                ..MergeDiffArgs::default()
+            },
+            first_parent: a.flag("first_parent"),
         },
         "git_blame" => Command::Blame {
             args: a.str("rev").into_iter().chain([a.req("path")?]).collect(),
-            lines: a.str("lines"),
+            lines: a.str("lines").into_iter().collect(),
             format: BlameFormat::default(),
+            opts: BlameArgs {
+                ignore_whitespace: a.flag("ignore_whitespace"),
+                moves: a.flag("moves"),
+                copies: u8::from(a.flag("copies")),
+                ignore_rev: a.strs("ignore_rev").unwrap_or_default(),
+                ..BlameArgs::default()
+            },
         },
         "git_refs" => Command::Refs,
         "git_branches" => Command::Branch {
@@ -2737,11 +2802,16 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         "git_describe" => Command::Describe {
             rev: a.str("rev"),
             tags: a.flag("tags"),
-            dirty: a.flag("dirty"),
+            all: a.flag("all"),
+            dirty: a.flag("dirty").then(|| "-dirty".to_owned()),
+            broken: None,
             long: a.flag("long"),
             abbrev: a.num("abbrev")?.map(|n| n as u32),
-            always: false,
-            pattern: a.str("match"),
+            always: true,
+            first_parent: a.flag("first_parent"),
+            candidates: None,
+            pattern: a.strs("match").unwrap_or_default(),
+            exclude: a.strs("exclude").unwrap_or_default(),
             exact_match: a.flag("exact_match"),
             contains: a.flag("contains"),
         },
@@ -3756,15 +3826,23 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         }),
         "git_cat_file" => {
             let (kind, size, exists) = (a.flag("kind"), a.flag("size"), a.flag("exists"));
+            let (textconv, filters) = (a.flag("textconv"), a.flag("filters"));
             Command::Plumbing(Plumbing::CatFile {
                 kind,
                 size,
-                pretty: !(kind || size || exists),
+                pretty: !(kind || size || exists || textconv || filters),
                 exists,
                 batch: None,
                 batch_check: None,
                 batch_all_objects: false,
+                batch_command: None,
                 buffer: false,
+                nul: false,
+                nul_input: false,
+                follow_symlinks: false,
+                textconv,
+                filters,
+                path: None,
                 args: vec![a.req("object")?],
             })
         }
@@ -3806,9 +3884,20 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             branches: None,
             tags: None,
             remotes: None,
-            topo_order: false,
-            date_order: false,
             abbrev_commit: false,
+            since: a.str("since"),
+            until: a.str("until"),
+            author: a.str("author"),
+            committer: None,
+            grep: a.strings("grep")?,
+            ignore_case: false,
+            objects: false,
+            objects_edge: false,
+            missing: None,
+            walk: WalkArgs {
+                left_right: a.flag("left_right"),
+                ..WalkArgs::default()
+            },
             revs: a.strings("revs")?,
             paths: a.strings("paths")?,
         }),
@@ -3856,7 +3945,16 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             extended: true,
             perl: false,
             patterns: a.req_strings("patterns")?,
+            all_match: a.flag("all_match"),
+            show_function: false,
+            function_context: false,
             cached: a.flag("cached"),
+            untracked: a.flag("untracked"),
+            no_index: false,
+            exclude_standard: false,
+            no_exclude_standard: false,
+            recurse_submodules: false,
+            threads: None,
             args: a.str("rev").into_iter().collect(),
             paths: a.strings("paths")?,
         }),
@@ -4295,14 +4393,14 @@ mod tests {
         git(&dir, &["commit", "-qm", "c2"]);
 
         let log = call(&backend, "git_log", json!({ "rev": "HEAD~1..HEAD" })).unwrap();
-        assert!(log.contains("c2") && !log.contains("c1"), "{log}");
+        assert!(log.contains(",c2,") && !log.contains(",c1,"), "{log}");
         let log = call(
             &backend,
             "git_log",
             json!({ "path": ["f.txt"], "grep": "1$" }),
         )
         .unwrap();
-        assert!(log.contains("c1") && !log.contains("c0"), "{log}");
+        assert!(log.contains(",c1,") && !log.contains(",c0,"), "{log}");
         let diff = call(
             &backend,
             "git_diff",
