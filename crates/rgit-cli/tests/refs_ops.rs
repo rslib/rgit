@@ -146,6 +146,156 @@ fn stash_takes_git_flags_and_stash_refs() {
     assert!(out.contains("rgit stash push -m"), "{out}");
 }
 
+/// Two identical repos with `a` staged and `b` and `dir/c` changed, one for
+/// git and one for rgit.
+fn twins(tag: &str) -> (PathBuf, PathBuf) {
+    let make = |t: &str| {
+        let dir = repo(t);
+        std::fs::write(dir.join("a"), "a2\n").unwrap();
+        git(&dir, &["add", "a"]);
+        std::fs::write(dir.join("b"), "b2\n").unwrap();
+        std::fs::write(dir.join("dir/c"), "c2\n").unwrap();
+        dir
+    };
+    (make(&format!("{tag}-git")), make(&format!("{tag}-rgit")))
+}
+
+fn stash_state(dir: &Path) -> (String, String, String) {
+    (
+        short(dir),
+        git(dir, &["stash", "list", "--format=%gs"]),
+        git(dir, &["stash", "show", "-p", "--format="]),
+    )
+}
+
+#[test]
+fn stash_push_takes_staged_pathspec_files_and_parts() {
+    let (g, r) = twins("stash-staged");
+    git(&g, &["stash", "push", "--staged", "-m", "only staged"]);
+    ok(&r, &["stash", "push", "--staged", "-m", "only staged"]);
+    assert_eq!(stash_state(&r), stash_state(&g));
+    let out = fails(&r, &["stash", "-S"]);
+    assert!(out.contains("no staged changes"), "{out}");
+
+    let (g, r) = twins("stash-from-file");
+    for d in [&g, &r] {
+        std::fs::write(d.join("list"), "b\ndir/c\n").unwrap();
+    }
+    git(&g, &["stash", "push", "--pathspec-from-file=list"]);
+    ok(&r, &["stash", "push", "--pathspec-from-file", "list"]);
+    assert_eq!(stash_state(&r), stash_state(&g));
+
+    let out = fails(&r, &["stash", "push", "-p"]);
+    assert!(out.contains("terminal"), "{out}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn stash_push_patch_picks_hunks_on_a_terminal() {
+    let dir = repo("stash-patch");
+    let lines: String = (1..=30).map(|n| format!("{n}\n")).collect();
+    std::fs::write(dir.join("a"), &lines).unwrap();
+    git(&dir, &["commit", "-qam", "thirty"]);
+    std::fs::write(
+        dir.join("a"),
+        lines
+            .replace("\n2\n", "\ntwo\n")
+            .replace("25\n", "twentyfive\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("b"), "b2\n").unwrap();
+    let out = Command::new("script")
+        .args(["-q", "/dev/null", env!("CARGO_BIN_EXE_rgit")])
+        .args(["stash", "push", "-p", "-m", "picked"])
+        .current_dir(&dir)
+        .env("RGIT_OPLOG", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            let mut stdin = c.stdin.take().unwrap();
+            for answer in ["y", "n", "y"] {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                writeln!(stdin, "{answer}")?;
+            }
+            c.wait_with_output()
+        })
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(short(&dir), " M a\n");
+    assert!(git(&dir, &["diff"]).contains("+twentyfive"));
+    assert_eq!(
+        git(&dir, &["stash", "show", "--name-only", "--format="]),
+        "a\nb\n"
+    );
+    assert!(git(&dir, &["stash", "show", "-p"]).contains("+two"));
+    assert_eq!(
+        git(&dir, &["stash", "list", "--format=%gs"]),
+        "On main: picked\n"
+    );
+}
+
+#[test]
+fn stash_creates_stores_and_shows_untracked_like_git() {
+    let (g, r) = twins("stash-create");
+    let made = ok(&r, &["--human", "stash", "create", "my", "msg"]);
+    let theirs = git(&g, &["stash", "create", "my msg"]);
+    let tree = |d: &Path, id: &str| {
+        [
+            rev(d, &format!("{}^{{tree}}", id.trim())),
+            rev(d, &format!("{}^2^{{tree}}", id.trim())),
+            git(d, &["log", "-1", "--format=%s", id.trim()]),
+        ]
+    };
+    assert_eq!(tree(&r, &made), tree(&g, &theirs));
+    assert_eq!(short(&r), short(&g));
+
+    ok(&r, &["stash", "store", made.trim()]);
+    git(&g, &["stash", "store", theirs.trim()]);
+    assert_eq!(stash_state(&r), stash_state(&g));
+    std::fs::write(r.join("b"), "b4\n").unwrap();
+    let made = ok(&r, &["--human", "stash", "create"]);
+    ok(&r, &["stash", "store", "-m", "named", made.trim()]);
+    assert_eq!(
+        git(&r, &["stash", "list", "--format=%gs"]).lines().next(),
+        Some("named")
+    );
+    fails(&r, &["stash", "store", "HEAD"]);
+    git(&r, &["stash", "clear"]);
+    git(&r, &["reset", "-q", "--hard"]);
+    assert_eq!(ok(&r, &["--human", "stash", "create"]).trim(), "");
+
+    std::fs::write(r.join("b"), "b3\n").unwrap();
+    std::fs::write(r.join("new"), "n\n").unwrap();
+    git(&r, &["stash", "push", "-u", "-m", "with untracked"]);
+    std::fs::write(r.join("a"), "a3\n").unwrap();
+    git(&r, &["stash", "push", "-m", "plain"]);
+    for args in [
+        &["stash", "show", "-u", "--name-only", "stash@{1}"][..],
+        &[
+            "stash",
+            "show",
+            "--only-untracked",
+            "--name-only",
+            "stash@{1}",
+        ],
+        &["stash", "show", "-u", "--name-only"],
+        &["stash", "list", "--format=%gd %gs %h %s %an", "-n", "1"],
+        &["stash", "list", "--format=%gd%n%H"],
+        &["stash", "list", "-n", "1"],
+        &["stash", "show", "--name-status", "stash@{1}"],
+        &["stash", "show", "--numstat"],
+    ] {
+        same(&r, args);
+    }
+}
+
 #[test]
 fn tag_delete_removes_every_named_tag() {
     let dir = repo("tag-delete");
@@ -216,6 +366,72 @@ fn tag_creates_at_a_rev_lists_patterns_and_filters() {
     );
 }
 
+#[test]
+fn tag_lists_sorts_formats_and_annotates_like_git() {
+    let dir = repo("tag-list");
+    git(&dir, &["tag", "-a", "v1.10", "-m", "ten\n\nbody\nmore"]);
+    git(&dir, &["tag", "V1.9"]);
+    commit(&dir, "a", "second\n\nsecond body");
+    git(&dir, &["tag", "v1.2"]);
+    git(&dir, &["tag", "-a", "v1.1", "-m", "one"]);
+    git(&dir, &["tag", "alpha"]);
+    for args in [
+        &["tag"][..],
+        &["tag", "-l", "v*"],
+        &["tag", "-i", "-l", "v*"],
+        &["tag", "--sort=version:refname"],
+        &["tag", "--sort=-v:refname", "-i"],
+        &["tag", "--sort=-creatordate", "--sort=refname"],
+        &["tag", "-n3"],
+        &["tag", "-n2", "-l", "v1.1*"],
+        &["tag", "--format=%(refname:short) %(objecttype) %(subject)"],
+        &["tag", "--merged", "HEAD~1"],
+        &["tag", "--no-merged", "HEAD~1"],
+        &["tag", "--no-contains", "HEAD"],
+        &["tag", "--points-at", "HEAD"],
+        &["tag", "--column", "--no-column"],
+    ] {
+        same(&dir, args);
+    }
+    let out = ok(&dir, &["--human", "tag", "-n", "3", "-l", "v1.10"]);
+    assert_eq!(
+        out.trim_end(),
+        git(&dir, &["tag", "-n3", "-l", "v1.10"]).trim_end()
+    );
+
+    let body = |t: &str| {
+        let raw = git(&dir, &["cat-file", "-p", t]);
+        raw.split_once("\n\n").unwrap().1.to_owned()
+    };
+    std::fs::write(dir.join("msg"), "from file\n# dropped\n\n\nend  \n").unwrap();
+    ok(&dir, &["tag", "-F", "msg", "f1"]);
+    git(&dir, &["tag", "-F", "msg", "f2"]);
+    assert_eq!(body("f1"), body("f2"));
+    ok(&dir, &["tag", "-F", "msg", "--cleanup=whitespace", "f3"]);
+    git(&dir, &["tag", "-F", "msg", "--cleanup=whitespace", "f4"]);
+    assert_eq!(body("f3"), body("f4"));
+    ok(
+        &dir,
+        &["tag", "-m", " keep\n# this ", "--cleanup=verbatim", "f5"],
+    );
+    git(
+        &dir,
+        &["tag", "-m", " keep\n# this ", "--cleanup=verbatim", "f6"],
+    );
+    assert_eq!(body("f5"), body("f6"));
+
+    let out = fails(&dir, &["tag", "-v", "v1.1"]);
+    assert!(out.contains("no signature found"), "{out}");
+    git(&dir, &["config", "gpg.program", "false"]);
+    let out = fails(&dir, &["tag", "-s", "-m", "signed", "s1"]);
+    assert!(out.contains("gpg failed to sign"), "{out}");
+    git(&dir, &["config", "tag.gpgSign", "true"]);
+    fails(&dir, &["tag", "-m", "signed", "s2"]);
+    ok(&dir, &["tag", "--no-sign", "-m", "unsigned", "s3"]);
+    ok(&dir, &["tag", "light"]);
+    assert_eq!(git(&dir, &["cat-file", "-t", "light"]), "commit\n");
+}
+
 /// Branch names from `rgit --human branch ...` (dropping the `* ` mark).
 fn branch_names(dir: &Path, args: &[&str]) -> Vec<String> {
     let mut all = vec!["--human", "branch"];
@@ -226,17 +442,9 @@ fn branch_names(dir: &Path, args: &[&str]) -> Vec<String> {
 }
 
 fn git_branches(dir: &Path, args: &[&str]) -> Vec<String> {
-    // rgit, like `git branch -a`'s default view, leaves out `origin/HEAD`.
-    let mut all = vec![
-        "branch",
-        "--format=%(if)%(symref)%(then)%(else)%(refname:short)%(end)",
-    ];
+    let mut all = vec!["branch"];
     all.extend(args);
-    let mut v: Vec<String> = git(dir, &all)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(str::to_owned)
-        .collect();
+    let mut v: Vec<String> = git(dir, &all).lines().map(|l| l[2..].to_owned()).collect();
     v.sort_unstable();
     v
 }
@@ -331,6 +539,89 @@ fn branch_takes_git_forms() {
     ok(&dir, &["branch", "delete", "trunk", "--force"]);
 }
 
+/// `rgit --human <args>` and `git <args>` print the same text.
+fn same(dir: &Path, args: &[&str]) {
+    let mut all = vec!["--human"];
+    all.extend(args);
+    assert_eq!(
+        ok(dir, &all).trim_end(),
+        git(dir, args).trim_end(),
+        "{args:?}"
+    );
+}
+
+#[test]
+fn branch_lists_sorts_formats_and_copies_like_git() {
+    let dir = repo("branch-list");
+    commit(&dir, "a", "second");
+    with_origin(&dir);
+    git(&dir, &["remote", "set-head", "origin", "main"]);
+    git(&dir, &["branch", "Zeta", "HEAD~1"]);
+    git(&dir, &["branch", "alpha"]);
+    git(&dir, &["branch", "v1.10"]);
+    git(&dir, &["branch", "v1.9", "HEAD~1"]);
+    for args in [
+        &["branch"][..],
+        &["branch", "-a"],
+        &["branch", "-r"],
+        &["branch", "-av"],
+        &["branch", "-rv"],
+        &["branch", "-i"],
+        &["branch", "--sort=-refname"],
+        &["branch", "--sort=version:refname", "-l", "v*"],
+        &["branch", "--sort=-committerdate", "--sort=refname"],
+        &[
+            "branch",
+            "--format=%(refname:short) %(objectname:short) %(HEAD)",
+        ],
+        &["branch", "-a", "--format=%(refname) %(symref)"],
+        &["branch", "--points-at", "HEAD~1"],
+        &["branch", "--no-contains", "HEAD"],
+        &["branch", "--list", "-i", "z*"],
+        &["branch", "--column", "--no-column"],
+    ] {
+        same(&dir, args);
+    }
+
+    git(&dir, &["branch", "-u", "origin/main", "alpha"]);
+    git(&dir, &["config", "branch.alpha.description", "about it"]);
+    ok(&dir, &["branch", "-c", "alpha", "beta"]);
+    assert_eq!(
+        git(&dir, &["config", "--get-regexp", "^branch[.]beta[.]"]),
+        git(&dir, &["config", "--get-regexp", "^branch[.]alpha[.]"]).replace("alpha", "beta")
+    );
+    let log = git(&dir, &["reflog", "show", "--format=%gs", "beta"]);
+    assert_eq!(
+        log,
+        format!(
+            "Branch: copied refs/heads/alpha to refs/heads/beta\n{}",
+            git(&dir, &["reflog", "show", "--format=%gs", "alpha"])
+        )
+    );
+    ok(&dir, &["branch", "-m", "beta", "gamma"]);
+    assert_eq!(
+        git(&dir, &["config", "branch.gamma.merge"]).trim(),
+        "refs/heads/main"
+    );
+    assert_eq!(
+        git(&dir, &["reflog", "show", "--format=%gs", "gamma"])
+            .lines()
+            .count(),
+        log.lines().count() + 1
+    );
+
+    ok(&dir, &["branch", "--track", "t1", "main"]);
+    assert_eq!(git(&dir, &["config", "branch.t1.remote"]).trim(), ".");
+    ok(&dir, &["branch", "--track=inherit", "t2", "alpha"]);
+    assert_eq!(git(&dir, &["config", "branch.t2.remote"]).trim(), "origin");
+    ok(&dir, &["branch", "--no-track", "t3", "origin/main"]);
+    assert!(!git(&dir, &["config", "--list"]).contains("branch.t3."));
+    ok(&dir, &["branch", "-r", "-d", "origin/main"]);
+    assert!(!git(&dir, &["branch", "-r"]).contains("origin/main\n"));
+    let out = fails(&dir, &["branch", "--edit-description"]);
+    assert!(out.contains("terminal"), "{out}");
+}
+
 #[test]
 fn remote_takes_git_forms() {
     let dir = repo("remote-forms");
@@ -396,6 +687,268 @@ fn remote_takes_git_forms() {
 
     ok(&dir, &["remote", "rm", "origin"]);
     assert_eq!(git(&dir, &["remote"]), "");
+}
+
+#[test]
+fn remote_shows_updates_and_edits_like_git() {
+    let dir = repo("remote-show");
+    with_origin(&dir);
+    let origin = dir.with_extension("origin.git");
+    git(&origin, &["branch", "gone", "main"]);
+    git(&origin, &["branch", "feature-long-name", "main"]);
+    git(&dir, &["fetch", "-q", "origin"]);
+    git(&origin, &["branch", "-D", "gone"]);
+    git(&origin, &["branch", "newone", "main"]);
+    git(
+        &dir,
+        &["branch", "-q", "--set-upstream-to=origin/main", "main"],
+    );
+    git(
+        &dir,
+        &[
+            "branch",
+            "-q",
+            "--track",
+            "feat",
+            "origin/feature-long-name",
+        ],
+    );
+    git(&dir, &["config", "branch.feat.rebase", "true"]);
+    git(&dir, &["branch", "other"]);
+    same(&dir, &["remote", "show", "origin"]);
+    same(&dir, &["remote", "show", "-n", "origin"]);
+    commit(&dir, "a", "ahead");
+    same(&dir, &["remote", "show", "origin"]);
+
+    let out = ok(&dir, &["--human", "remote", "prune", "--dry-run", "origin"]);
+    assert_eq!(out.trim(), "would prune origin/gone");
+    assert!(git(&dir, &["branch", "-r"]).contains("origin/gone"));
+
+    // A second URL: fetch reads the first, push writes to each, as in git.
+    let second = dir.with_extension("second.git");
+    let _ = std::fs::remove_dir_all(&second);
+    git(&dir, &["init", "-q", "--bare", second.to_str().unwrap()]);
+    ok(
+        &dir,
+        &[
+            "remote",
+            "set-url",
+            "--add",
+            "origin",
+            second.to_str().unwrap(),
+        ],
+    );
+    same(&dir, &["remote", "-v"]);
+    same(&dir, &["remote", "show", "origin"]);
+    ok(&dir, &["push", "origin", "main"]);
+    assert_eq!(rev(&origin, "main"), rev(&dir, "main"));
+    assert_eq!(rev(&second, "main"), rev(&dir, "main"));
+    ok(&dir, &["fetch", "origin"]);
+    assert!(git(&dir, &["branch", "-r"]).contains("origin/newone"));
+    let out = fails(&dir, &["remote", "set-url", "--delete", "origin", "."]);
+    assert!(out.contains("Will not delete all non-push URLs"), "{out}");
+    ok(&dir, &["remote", "set-url", "--delete", "origin", "second"]);
+    same(&dir, &["remote", "get-url", "--all", "origin"]);
+    let out = fails(&dir, &["remote", "set-url", "origin", "x", "nomatch"]);
+    assert!(out.contains("No such URL"), "{out}");
+
+    ok(&dir, &["remote", "set-head", "origin", "feature-long-name"]);
+    assert_eq!(
+        git(&dir, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+        "refs/remotes/origin/feature-long-name"
+    );
+    ok(&dir, &["remote", "set-head", "origin", "-a"]);
+    assert_eq!(
+        git(&dir, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+        "refs/remotes/origin/main"
+    );
+    ok(&dir, &["remote", "set-head", "origin", "-d"]);
+    assert!(!git(&dir, &["branch", "-r"]).contains("HEAD"));
+    fails(&dir, &["remote", "set-head", "origin", "nope"]);
+
+    ok(&dir, &["remote", "set-branches", "origin", "main"]);
+    ok(
+        &dir,
+        &["remote", "set-branches", "--add", "origin", "newone"],
+    );
+    assert_eq!(
+        git(&dir, &["config", "--get-all", "remote.origin.fetch"]),
+        "+refs/heads/main:refs/remotes/origin/main\n+refs/heads/newone:refs/remotes/origin/newone\n"
+    );
+
+    let url = origin.to_str().unwrap();
+    ok(
+        &dir,
+        &["remote", "add", "-f", "-t", "main", "-m", "main", "up", url],
+    );
+    assert_eq!(
+        git(&dir, &["config", "--get-all", "remote.up.fetch"]).trim(),
+        "+refs/heads/main:refs/remotes/up/main"
+    );
+    assert_eq!(rev(&dir, "up/HEAD"), rev(&origin, "main"));
+    assert!(!git(&dir, &["branch", "-r"]).contains("up/newone"));
+    ok(
+        &dir,
+        &[
+            "remote",
+            "add",
+            "--mirror=fetch",
+            "--no-tags",
+            "mirror",
+            url,
+        ],
+    );
+    assert_eq!(
+        git(&dir, &["config", "remote.mirror.fetch"]).trim(),
+        "+refs/*:refs/*"
+    );
+    assert_eq!(
+        git(&dir, &["config", "remote.mirror.tagOpt"]).trim(),
+        "--no-tags"
+    );
+    ok(&dir, &["remote", "add", "--mirror=push", "pushm", url]);
+    assert_eq!(git(&dir, &["config", "remote.pushm.mirror"]).trim(), "true");
+    ok(&dir, &["remote", "rm", "mirror"]);
+    assert!(git(&dir, &["branch"]).contains("other"));
+
+    git(&dir, &["config", "remotes.pair", "up origin"]);
+    git(&origin, &["branch", "later", "main"]);
+    ok(&dir, &["remote", "update", "pair"]);
+    ok(
+        &dir,
+        &["remote", "set-branches", "--add", "origin", "later"],
+    );
+    ok(&dir, &["remote", "update", "-p", "origin"]);
+    assert!(git(&dir, &["branch", "-r"]).contains("origin/later"));
+    fails(&dir, &["remote", "update", "nosuch"]);
+
+    ok(&dir, &["remote", "rename", "up", "upstream"]);
+    git(
+        &dir,
+        &["branch", "-q", "--set-upstream-to=upstream/main", "other"],
+    );
+    ok(&dir, &["remote", "rename", "upstream", "up2"]);
+    assert_eq!(git(&dir, &["config", "branch.other.remote"]).trim(), "up2");
+    assert!(git(&dir, &["branch", "-r"]).contains("up2/main"));
+    git(&dir, &["config", "branch.other.pushRemote", "up2"]);
+    git(&dir, &["config", "remote.pushDefault", "up2"]);
+    ok(&dir, &["remote", "rename", "up2", "up3"]);
+    assert_eq!(
+        git(&dir, &["config", "branch.other.pushRemote"]).trim(),
+        "up3"
+    );
+    assert_eq!(git(&dir, &["config", "remote.pushDefault"]).trim(), "up3");
+    assert_eq!(
+        git(&dir, &["config", "remote.up3.fetch"]).trim(),
+        "+refs/heads/main:refs/remotes/up3/main"
+    );
+}
+
+#[test]
+fn worktree_add_modes_list_formats_and_repair_like_git() {
+    let dir = repo("worktree-modes");
+    commit(&dir, "a", "second");
+    with_origin(&dir);
+    let base = std::env::temp_dir().join(format!("rgit-wtm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let wt = |n: &str| base.join(n).to_string_lossy().into_owned();
+
+    ok(
+        &dir,
+        &[
+            "worktree",
+            "add",
+            "--lock",
+            "--reason",
+            "busy now",
+            &wt("a-long"),
+        ],
+    );
+    ok(&dir, &["worktree", "add", "--lock", &wt("b"), "HEAD~1"]);
+    assert_eq!(rev(&base.join("b"), "HEAD"), rev(&dir, "main~1"));
+    ok(
+        &dir,
+        &["worktree", "add", "--orphan", "-b", "orph", &wt("c")],
+    );
+    assert_eq!(git(&base.join("c"), &["status", "--short"]), "");
+    assert_eq!(
+        git(&base.join("c"), &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/orph"
+    );
+    ok(&dir, &["worktree", "add", "--no-checkout", &wt("d")]);
+    assert!(!base.join("d/a").exists() && base.join("d/.git").is_file());
+    ok(&dir, &["worktree", "add", &wt("e")]);
+    std::fs::remove_dir_all(base.join("e")).unwrap();
+    for args in [
+        &["worktree", "list"][..],
+        &["worktree", "list", "-v"],
+        &["worktree", "list", "--porcelain"],
+        &["worktree", "list", "--porcelain", "-z"],
+    ] {
+        same(&dir, args);
+    }
+    let out = ok(&dir, &["--human", "worktree", "prune", "-n"]);
+    assert_eq!(out.trim(), "would prune e");
+    ok(&dir, &["worktree", "prune"]);
+    assert!(!git(&dir, &["worktree", "list"]).contains("prunable"));
+
+    let out = fails(&dir, &["worktree", "add", &wt("f"), "main"]);
+    assert!(out.contains("already used by worktree"), "{out}");
+    ok(&dir, &["worktree", "add", "-f", &wt("f"), "main"]);
+    assert_eq!(
+        git(&base.join("f"), &["branch", "--show-current"]),
+        "main\n"
+    );
+    git(&dir, &["branch", "moved", "main"]);
+    ok(
+        &dir,
+        &["worktree", "add", "-B", "moved", &wt("g"), "HEAD~1"],
+    );
+    assert_eq!(rev(&dir, "moved"), rev(&dir, "main~1"));
+    fails(&dir, &["worktree", "add", "-b", "moved", &wt("h")]);
+    ok(
+        &dir,
+        &["worktree", "add", "--track", "-b", "t1", &wt("t1"), "main"],
+    );
+    assert_eq!(
+        git(&dir, &["config", "branch.t1.merge"]).trim(),
+        "refs/heads/main"
+    );
+    ok(
+        &dir,
+        &[
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            "t2",
+            &wt("t2"),
+            "origin/main",
+        ],
+    );
+    assert!(!git(&dir, &["config", "--list"]).contains("branch.t2."));
+    std::fs::create_dir_all(base.join("full")).unwrap();
+    std::fs::write(base.join("full/x"), "x").unwrap();
+    fails(&dir, &["worktree", "add", &wt("full")]);
+
+    // Moved by hand: the admin folder still points at the old place.
+    std::fs::rename(base.join("g"), base.join("g2")).unwrap();
+    assert!(git(&dir, &["worktree", "list"]).contains("prunable"));
+    let out = ok(&dir, &["--human", "worktree", "repair", &wt("g2")]);
+    assert!(out.contains("gitdir incorrect"), "{out}");
+    assert!(!git(&dir, &["worktree", "list"]).contains("prunable"));
+    assert_eq!(
+        git(&base.join("g2"), &["branch", "--show-current"]),
+        "moved\n"
+    );
+    std::fs::write(base.join("f/.git"), "gitdir: /nowhere\n").unwrap();
+    let out = ok(&dir, &["--human", "worktree", "repair"]);
+    assert!(out.contains(".git file broken"), "{out}");
+    assert_eq!(
+        git(&base.join("f"), &["branch", "--show-current"]),
+        "main\n"
+    );
 }
 
 #[test]

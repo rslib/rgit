@@ -331,3 +331,56 @@ fn origin(o: rgit_git::LineOrigin) -> char {
 pub fn confirm(prompt: &str) -> anyhow::Result<bool> {
     prompt::confirm(prompt, false).map_err(err)
 }
+
+/// Ask about each hunk of `files` as git's `-p` modes do (y, n, q, a, d),
+/// showing it on stderr; returns the chosen hunks as (path, new-side start).
+pub fn pick_hunks(files: &[rgit_git::FileDiff], verb: &str) -> anyhow::Result<Vec<(String, u32)>> {
+    use rgit_git::LineOrigin;
+    let files: Vec<_> = files.iter().filter(|f| !f.binary).collect();
+    let total: usize = files.iter().map(|f| f.hunks.len()).sum();
+    let mut picked = Vec::new();
+    let mut n = 0;
+    'files: for f in files {
+        eprintln!("diff --git a/{0} b/{0}", f.path);
+        for (i, h) in f.hunks.iter().enumerate() {
+            n += 1;
+            eprintln!("{}", h.header);
+            for l in &h.lines {
+                let mark = match l.origin {
+                    LineOrigin::Added => '+',
+                    LineOrigin::Removed => '-',
+                    LineOrigin::Context => ' ',
+                    LineOrigin::Meta => '\\',
+                };
+                eprintln!("{mark}{}", l.text.trim_end_matches('\n'));
+            }
+            let answer = prompt::line(
+                &format!("({n}/{total}) {verb} this hunk [y,n,q,a,d,?]"),
+                |v| match v.trim() {
+                    "y" | "n" | "q" | "a" | "d" => Ok(()),
+                    _ => Err(format!(
+                        "y: {verb} this hunk, n: skip it, q: quit, a: this and the rest \
+                         of the file, d: none of the rest of the file"
+                    )),
+                },
+            )
+            .map_err(err)?;
+            let rest = f.hunks[i..].iter().map(|h| (f.path.clone(), h.new_start));
+            match answer.trim() {
+                "y" => picked.push((f.path.clone(), h.new_start)),
+                "a" => {
+                    n += f.hunks.len() - i - 1;
+                    picked.extend(rest);
+                    continue 'files;
+                }
+                "d" => {
+                    n += f.hunks.len() - i - 1;
+                    continue 'files;
+                }
+                "q" => break 'files,
+                _ => {}
+            }
+        }
+    }
+    Ok(picked)
+}

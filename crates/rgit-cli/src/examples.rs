@@ -46,7 +46,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit rev-parse HEAD",
             "rgit rev-parse --short HEAD",
             "rgit rev-parse --abbrev-ref HEAD",
-            "rgit rev-parse --show-toplevel",
+            "rgit rev-parse --show-toplevel --show-prefix",
+            "rgit rev-parse --symbolic-full-name @{u}",
         ],
     ),
     (
@@ -67,6 +68,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit cat-file -p HEAD",
             "rgit cat-file -p HEAD:src/lib.rs",
             "rgit cat-file -t <rev>",
+            "rgit cat-file --batch-check < ids.txt",
         ],
     ),
     (
@@ -81,6 +83,7 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit for-each-ref refs/heads",
             "rgit for-each-ref --sort=-committerdate --format='%(refname:short) %(subject)'",
+            "rgit for-each-ref --merged main refs/heads",
         ],
     ),
     (
@@ -89,6 +92,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit rev-list --count HEAD",
             "rgit rev-list main..HEAD",
             "rgit rev-list -n 1 --all",
+            "rgit rev-list HEAD -- src/lib.rs",
         ],
     ),
     (
@@ -109,13 +113,31 @@ const EXAMPLES: &[Entry] = &[
             "rgit grep -n TODO",
             "rgit grep -i -e foo -e bar -- src",
             "rgit grep pattern HEAD~5",
+            "rgit grep -n -C2 --heading TODO",
         ],
     ),
-    ("check-ignore", &["rgit check-ignore -v target/out.o"]),
-    ("var", &["rgit var GIT_AUTHOR_IDENT", "rgit var GIT_EDITOR"]),
+    (
+        "check-ignore",
+        &[
+            "rgit check-ignore -v target/out.o",
+            "rgit check-ignore --stdin < paths.txt",
+        ],
+    ),
+    (
+        "var",
+        &[
+            "rgit var GIT_AUTHOR_IDENT",
+            "rgit var GIT_EDITOR",
+            "rgit var -l",
+        ],
+    ),
     (
         "symbolic-ref",
-        &["rgit symbolic-ref HEAD", "rgit symbolic-ref --short HEAD"],
+        &[
+            "rgit symbolic-ref HEAD",
+            "rgit symbolic-ref --short HEAD",
+            "rgit symbolic-ref HEAD refs/heads/main",
+        ],
     ),
     ("count-objects", &["rgit count-objects -v"]),
     (
@@ -224,6 +246,9 @@ const EXAMPLES: &[Entry] = &[
             "rgit fetch --remote origin --prune",
             "rgit fetch origin main --depth 1",
             "rgit fetch --dry-run",
+            "rgit fetch --unshallow",
+            "rgit fetch --prune --prune-tags",
+            "rgit fetch --multiple origin upstream",
         ],
     ),
     (
@@ -233,6 +258,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit pull --rebase",
             "rgit pull --ff-only",
             "rgit pull origin main",
+            "rgit pull --autostash --rebase",
+            "rgit pull --squash origin feature",
         ],
     ),
     ("sync", &["rgit sync"]),
@@ -246,7 +273,20 @@ const EXAMPLES: &[Entry] = &[
             "rgit push origin feature",
             "rgit push origin local:remote",
             "rgit push origin --delete feature",
+            "rgit push origin :v1",
             "rgit push --all --dry-run",
+            "rgit push --follow-tags",
+            "rgit push --atomic origin main v1",
+            "rgit push --porcelain origin main",
+        ],
+    ),
+    (
+        "ls-remote",
+        &[
+            "rgit ls-remote",
+            "rgit ls-remote --heads origin",
+            "rgit ls-remote --tags https://github.com/example/repo.git 'v1.*'",
+            "rgit ls-remote --symref origin HEAD",
         ],
     ),
     (
@@ -396,6 +436,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit tag v1.0.0 -m \"<message>\"",
             "rgit tag v1.0.0 <rev>",
             "rgit tag -l \"v1.*\" -n",
+            "rgit tag --sort=-v:refname --format='%(refname:short) %(creatordate:short)'",
+            "rgit tag -s v1.0.0 -F notes.txt",
             "rgit tag --contains <rev>",
             "rgit tag -d v1.0.0 v1.0.1",
         ],
@@ -494,7 +536,15 @@ const EXAMPLES: &[Entry] = &[
             "rgit describe --tags --abbrev=0",
         ],
     ),
-    ("init", &["rgit init", "rgit init <path> -b main"]),
+    (
+        "init",
+        &[
+            "rgit init",
+            "rgit init <path> -b main",
+            "rgit init --bare --shared=group <path>.git",
+            "rgit init --separate-git-dir ../<path>.git",
+        ],
+    ),
     (
         "clone",
         &[
@@ -502,9 +552,56 @@ const EXAMPLES: &[Entry] = &[
             "rgit clone https://github.com/example/repo.git repo-dir --depth 1",
             "rgit clone --bare https://github.com/example/repo.git",
             "rgit clone --recurse-submodules -o upstream https://github.com/example/repo.git",
+            "rgit clone --single-branch -b main https://github.com/example/repo.git",
+            "rgit clone --mirror https://github.com/example/repo.git",
+            "rgit clone --filter=blob:none https://github.com/example/repo.git",
         ],
     ),
-    ("submodule", &["rgit submodule update --init"]),
+    (
+        "submodule",
+        &["rgit submodule", "rgit submodule update --init --recursive"],
+    ),
+    ("submodule status", &["rgit submodule status --recursive"]),
+    (
+        "submodule add",
+        &[
+            "rgit submodule add https://github.com/example/lib.git vendor/lib",
+            "rgit submodule add -b main https://github.com/example/lib.git",
+        ],
+    ),
+    ("submodule init", &["rgit submodule init"]),
+    (
+        "submodule update",
+        &[
+            "rgit submodule update --init --recursive",
+            "rgit submodule update --remote vendor/lib",
+        ],
+    ),
+    ("submodule sync", &["rgit submodule sync --recursive"]),
+    (
+        "submodule deinit",
+        &[
+            "rgit submodule deinit vendor/lib",
+            "rgit submodule deinit -f --all",
+        ],
+    ),
+    (
+        "submodule foreach",
+        &["rgit submodule foreach 'echo $sm_path $sha1'"],
+    ),
+    ("submodule summary", &["rgit submodule summary"]),
+    (
+        "submodule set-url",
+        &["rgit submodule set-url vendor/lib https://github.com/fork/lib.git"],
+    ),
+    (
+        "submodule set-branch",
+        &[
+            "rgit submodule set-branch -b main vendor/lib",
+            "rgit submodule set-branch -d vendor/lib",
+        ],
+    ),
+    ("submodule absorbgitdirs", &["rgit submodule absorbgitdirs"]),
     ("git", &["rgit git status", "rgit git log --oneline -5"]),
     ("mcp", &["rgit mcp"]),
     (
@@ -521,7 +618,9 @@ const EXAMPLES: &[Entry] = &[
             "rgit branch",
             "rgit branch -vv",
             "rgit branch --merged main",
+            "rgit branch --sort=-committerdate --format='%(refname:short) %(upstream:short)'",
             "rgit branch <branch> <start>",
+            "rgit branch -c <branch> <new_branch>",
             "rgit branch -d <branch> <branch>",
             "rgit branch -u origin/<branch>",
         ],
@@ -559,7 +658,17 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit stash push -m \"<message>\" --include-untracked",
             "rgit stash push -- src/lib.rs",
+            "rgit stash push --staged -m \"<message>\"",
+            "rgit stash push -p",
         ],
+    ),
+    (
+        "stash create",
+        &["rgit stash create", "rgit stash create \"<message>\""],
+    ),
+    (
+        "stash store",
+        &["rgit stash store -m \"<message>\" <commit>"],
     ),
     (
         "stash pop",
@@ -567,10 +676,20 @@ const EXAMPLES: &[Entry] = &[
     ),
     ("stash apply", &["rgit stash apply"]),
     ("stash drop", &["rgit stash drop 0"]),
-    ("stash list", &["rgit stash list"]),
+    (
+        "stash list",
+        &[
+            "rgit stash list",
+            "rgit stash list --format=\"%gd %cr %gs\" -n 5",
+        ],
+    ),
     (
         "stash show",
-        &["rgit stash show", "rgit stash show -p stash@{1}"],
+        &[
+            "rgit stash show",
+            "rgit stash show -p stash@{1}",
+            "rgit stash show -u --name-only",
+        ],
     ),
     ("stash branch", &["rgit stash branch <branch>"]),
     ("stash clear", &["rgit stash clear"]),
@@ -584,7 +703,10 @@ const EXAMPLES: &[Entry] = &[
     ),
     (
         "remote add",
-        &["rgit remote add origin https://github.com/example/repo.git"],
+        &[
+            "rgit remote add origin https://github.com/example/repo.git",
+            "rgit remote add -f -t main upstream https://github.com/example/repo.git",
+        ],
     ),
     ("remote remove", &["rgit remote remove origin"]),
     (
@@ -592,11 +714,34 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit remote set-url origin https://github.com/example/repo.git",
             "rgit remote set-url --push origin https://github.com/fork/repo.git",
+            "rgit remote set-url --add --push origin https://github.com/mirror/repo.git",
         ],
     ),
     ("remote get-url", &["rgit remote get-url origin"]),
     ("remote rename", &["rgit remote rename origin upstream"]),
-    ("remote prune", &["rgit remote prune origin"]),
+    (
+        "remote prune",
+        &["rgit remote prune origin", "rgit remote prune -n origin"],
+    ),
+    (
+        "remote show",
+        &["rgit remote show origin", "rgit remote show -n"],
+    ),
+    (
+        "remote update",
+        &["rgit remote update", "rgit remote update -p <group>"],
+    ),
+    (
+        "remote set-head",
+        &[
+            "rgit remote set-head origin -a",
+            "rgit remote set-head origin main",
+        ],
+    ),
+    (
+        "remote set-branches",
+        &["rgit remote set-branches --add origin <branch>"],
+    ),
     ("worktree", &["rgit worktree"]),
     (
         "worktree add",
@@ -604,9 +749,14 @@ const EXAMPLES: &[Entry] = &[
             "rgit worktree add ../<path> <branch>",
             "rgit worktree add -b <new_branch> ../<path> origin/main",
             "rgit worktree add --detach ../<path> <rev>",
+            "rgit worktree add -B <branch> --lock --reason \"<reason>\" ../<path>",
+            "rgit worktree add --orphan -b <new_branch> ../<path>",
         ],
     ),
-    ("worktree list", &["rgit worktree list"]),
+    (
+        "worktree list",
+        &["rgit worktree list -v", "rgit worktree list --porcelain"],
+    ),
     (
         "worktree remove",
         &[
@@ -624,6 +774,10 @@ const EXAMPLES: &[Entry] = &[
         &["rgit worktree move ../<path> ../<new_path>"],
     ),
     ("worktree prune", &["rgit worktree prune"]),
+    (
+        "worktree repair",
+        &["rgit worktree repair", "rgit worktree repair ../<path>"],
+    ),
     ("workspace", &["rgit workspace"]),
     ("workspace new", &["rgit workspace new <name>"]),
     ("workspace list", &["rgit workspace list"]),

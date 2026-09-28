@@ -101,6 +101,16 @@ pub struct RevWalk {
     pub merges: bool,
     pub no_merges: bool,
     pub max: Option<usize>,
+    /// Leave out the first N commits (`--skip`).
+    pub skip: usize,
+    /// Ref globs to walk too (`refs/heads/*` for `--branches`).
+    pub globs: Vec<String>,
+    /// Never show a parent before all its children (`--topo-order`).
+    pub topo: bool,
+    /// Only commits that change these paths, with git's default history
+    /// simplification: a merge that matches one parent on the paths follows
+    /// only that parent.
+    pub paths: Vec<String>,
 }
 
 /// A commit from `rev_walk`.
@@ -139,14 +149,29 @@ pub struct GitGrep {
     pub cached: bool,
     pub rev: Option<String>,
     pub paths: Vec<String>,
+    /// Context lines before and after each match (`-B`, `-A`).
+    pub before: usize,
+    pub after: usize,
+    /// Stop a file after this many matching lines (`-m`).
+    pub max_count: Option<u64>,
+    /// Fill `GrepHit::parts` with each match (`-o`).
+    pub only_matching: bool,
+    /// Return one `line` 0 hit per file with no match instead (`-L`).
+    pub files_without_match: bool,
+    /// Skip binary files (`-I`).
+    pub skip_binary: bool,
 }
 
-/// A matching line, or a whole binary file that matches (`line` 0).
+/// A matching line, a context line, or a whole file (`line` 0): a binary file
+/// that matches, or with `files_without_match` a file that does not.
 pub struct GrepHit {
     pub path: String,
     pub line: u64,
     pub text: String,
     pub binary: bool,
+    pub context: bool,
+    /// The matching parts of the line, with `only_matching`.
+    pub parts: Vec<String>,
 }
 
 /// The ignore rule that excludes a path (`git check-ignore -v`).
@@ -180,17 +205,51 @@ pub(crate) fn resolve(repo: &Repository, rev: &str) -> Result<String, GitError> 
     Ok(repo.revparse_single(rev)?.id().to_string())
 }
 
+/// git's abbreviation length when none is asked for: core.abbrev, or with
+/// `auto` (the default) half the bits of the packed object count, at least 7.
+// ponytail: reads the pack index headers on every call; cache per repo if
+// long listings get slow.
+fn default_abbrev(repo: &Repository) -> usize {
+    if let Ok(v) = repo.config().and_then(|c| c.get_string("core.abbrev"))
+        && !v.eq_ignore_ascii_case("auto")
+    {
+        return match v.to_ascii_lowercase().as_str() {
+            "false" | "no" | "off" => 40,
+            n => n.parse().unwrap_or(7),
+        };
+    }
+    let count: u64 = std::fs::read_dir(repo.commondir().join("objects/pack"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "idx"))
+        .filter_map(|e| {
+            let mut head = [0u8; 1032];
+            std::io::Read::read_exact(&mut std::fs::File::open(e.path()).ok()?, &mut head).ok()?;
+            Some(u64::from(u32::from_be_bytes(head[1028..].try_into().ok()?)))
+        })
+        .sum();
+    let bits = 64 - count.leading_zeros() as usize;
+    bits.div_ceil(2).max(7)
+}
+
+/// The shortest unique prefix of `id` of at least `min` digits; `min` 0 is
+/// git's default length.
 pub(crate) fn abbrev(repo: &Repository, id: &str, min: usize) -> Result<String, GitError> {
-    let short = repo
-        .find_object(Oid::from_str(id)?, None)
-        .ok()
-        .and_then(|obj| obj.short_id().ok()?.as_str().ok().map(str::to_owned))
-        .unwrap_or_else(|| id[..7.min(id.len())].to_owned());
-    Ok(if min > short.len() {
-        id[..min.min(id.len())].to_owned()
+    let mut len = if min == 0 {
+        default_abbrev(repo)
     } else {
-        short
-    })
+        min.max(4)
+    }
+    .min(id.len());
+    let odb = repo.odb()?;
+    while len < id.len() {
+        match odb.exists_prefix(Oid::from_str(&id[..len])?, len) {
+            Err(e) if e.code() == git2::ErrorCode::Ambiguous => len += 1,
+            _ => break,
+        }
+    }
+    Ok(id[..len].to_owned())
 }
 
 pub(crate) fn full_ref_name(repo: &Repository, rev: &str) -> Result<Option<String>, GitError> {
@@ -387,13 +446,33 @@ fn commit_id(repo: &Repository, rev: &str) -> Result<Oid, GitError> {
 
 pub(crate) fn rev_walk(repo: &Repository, opts: &RevWalk) -> Result<Vec<WalkCommit>, GitError> {
     let mut walk = repo.revwalk()?;
-    walk.set_sorting(git2::Sort::TIME)?;
+    // Path limiting marks parents from children, so children must come first.
+    walk.set_sorting(if opts.topo || !opts.paths.is_empty() {
+        git2::Sort::TOPOLOGICAL | git2::Sort::TIME
+    } else {
+        git2::Sort::TIME
+    })?;
     if opts.first_parent {
         walk.simplify_first_parent()?;
     }
+    let mut tips: std::collections::HashSet<Oid> = std::collections::HashSet::new();
+    let mut push = |walk: &mut git2::Revwalk, id: Oid| -> Result<(), GitError> {
+        tips.insert(id);
+        Ok(walk.push(id)?)
+    };
+    let mut globs = opts.globs.clone();
     if opts.all {
-        walk.push_glob("*")?;
-        let _ = walk.push_head();
+        globs.push("refs/*".to_owned());
+        if let Ok(id) = commit_id(repo, "HEAD") {
+            push(&mut walk, id)?;
+        }
+    }
+    for glob in &globs {
+        for r in repo.references_glob(glob)? {
+            if let Ok(commit) = r?.peel_to_commit() {
+                push(&mut walk, commit.id())?;
+            }
+        }
     }
     let or_head = |s: &str| {
         if s.is_empty() {
@@ -407,8 +486,8 @@ pub(crate) fn rev_walk(repo: &Repository, opts: &RevWalk) -> Result<Vec<WalkComm
             walk.hide(commit_id(repo, hidden)?)?;
         } else if let Some((a, b)) = rev.split_once("...") {
             let (a, b) = (commit_id(repo, &or_head(a))?, commit_id(repo, &or_head(b))?);
-            walk.push(a)?;
-            walk.push(b)?;
+            push(&mut walk, a)?;
+            push(&mut walk, b)?;
             if let Ok(bases) = repo.merge_bases(a, b) {
                 for base in bases.iter() {
                     walk.hide(*base)?;
@@ -416,19 +495,66 @@ pub(crate) fn rev_walk(repo: &Repository, opts: &RevWalk) -> Result<Vec<WalkComm
             }
         } else if let Some((a, b)) = rev.split_once("..") {
             walk.hide(commit_id(repo, &or_head(a))?)?;
-            walk.push(commit_id(repo, &or_head(b))?)?;
+            push(&mut walk, commit_id(repo, &or_head(b))?)?;
         } else {
-            walk.push(commit_id(repo, rev)?)?;
+            push(&mut walk, commit_id(repo, rev)?)?;
         }
     }
-    let mut out = Vec::new();
+    let mut diff_opts = git2::DiffOptions::new();
+    for p in &opts.paths {
+        diff_opts.pathspec(p);
+    }
+    // Whether `commit` matches its parent `n` (or the empty tree) on the paths.
+    let mut same_as = |commit: &git2::Commit, n: Option<usize>| -> Result<bool, GitError> {
+        let old = n.map(|n| commit.parent(n)?.tree()).transpose()?;
+        let diff =
+            repo.diff_tree_to_tree(old.as_ref(), Some(&commit.tree()?), Some(&mut diff_opts))?;
+        Ok(diff.deltas().len() == 0)
+    };
+    // With paths, a commit is walked only from a starting commit or through
+    // a parent its child follows.
+    let mut wanted = tips;
+    let (mut out, mut skipped) = (Vec::new(), 0);
     for oid in walk {
         if opts.max.is_some_and(|m| out.len() >= m) {
             break;
         }
         let commit = repo.find_commit(oid?)?;
         let merge = commit.parent_count() > 1;
+        if !opts.paths.is_empty() {
+            if !wanted.contains(&commit.id()) {
+                continue;
+            }
+            let parents = if opts.first_parent {
+                commit.parent_count().min(1)
+            } else {
+                commit.parent_count()
+            };
+            let same = (0..parents)
+                .map(|n| same_as(&commit, Some(n)).map(|same| same.then_some(n)))
+                .find_map(Result::transpose)
+                .transpose()?;
+            let show = match same {
+                // A commit that matches a parent follows only that parent.
+                Some(n) => {
+                    wanted.insert(commit.parent_id(n)?);
+                    false
+                }
+                None if parents == 0 => !same_as(&commit, None)?,
+                None => {
+                    wanted.extend(commit.parent_ids().take(parents));
+                    true
+                }
+            };
+            if !show {
+                continue;
+            }
+        }
         if opts.merges && !merge || opts.no_merges && merge {
+            continue;
+        }
+        if skipped < opts.skip {
+            skipped += 1;
             continue;
         }
         out.push(WalkCommit {
@@ -517,7 +643,7 @@ pub(crate) fn grep(
     q: &GitGrep,
 ) -> Result<Vec<GrepHit>, GitError> {
     use grep::regex::RegexMatcherBuilder;
-    use grep::searcher::{BinaryDetection, SearcherBuilder, sinks::Lossy};
+    use grep::searcher::{BinaryDetection, SearcherBuilder};
     use rayon::prelude::*;
 
     let patterns: Vec<String> = q
@@ -587,36 +713,101 @@ pub(crate) fn grep(
     Ok(files
         .par_iter()
         .flat_map_iter(|(path, data)| {
-            let mut hits = Vec::new();
-            let _ = SearcherBuilder::new()
-                .line_number(true)
-                .invert_match(q.invert)
-                .binary_detection(BinaryDetection::none())
-                .build()
-                .search_slice(
-                    &matcher,
-                    data,
-                    Lossy(|line, text| {
-                        hits.push(GrepHit {
-                            path: path.clone(),
-                            line,
-                            text: text.trim_end_matches(['\n', '\r']).to_owned(),
-                            binary: false,
-                        });
-                        Ok(true)
-                    }),
-                );
-            if !hits.is_empty() && data[..data.len().min(8000)].contains(&0) {
-                hits = vec![GrepHit {
-                    path: path.clone(),
-                    line: 0,
-                    text: String::new(),
-                    binary: true,
-                }];
+            let binary = data[..data.len().min(8000)].contains(&0);
+            let mut sink = Hits {
+                path,
+                matcher: &matcher,
+                only: q.only_matching,
+                hits: Vec::new(),
+            };
+            if !(binary && q.skip_binary) {
+                let _ = SearcherBuilder::new()
+                    .line_number(true)
+                    .invert_match(q.invert)
+                    .before_context(q.before)
+                    .after_context(q.after)
+                    .max_matches(q.max_count)
+                    .binary_detection(BinaryDetection::none())
+                    .build()
+                    .search_slice(&matcher, data, &mut sink);
+            }
+            let mut hits = sink.hits;
+            let matched = hits.iter().any(|h| !h.context);
+            let whole = |binary| GrepHit {
+                path: path.clone(),
+                line: 0,
+                text: String::new(),
+                binary,
+                context: false,
+                parts: Vec::new(),
+            };
+            if q.files_without_match {
+                hits = if matched || binary && q.skip_binary {
+                    Vec::new()
+                } else {
+                    vec![whole(false)]
+                };
+            } else if matched && binary {
+                hits = vec![whole(true)];
             }
             hits.into_iter()
         })
         .collect())
+}
+
+/// Collects a file's matching and context lines for `grep`.
+struct Hits<'a> {
+    path: &'a str,
+    matcher: &'a grep::regex::RegexMatcher,
+    only: bool,
+    hits: Vec<GrepHit>,
+}
+
+impl Hits<'_> {
+    fn push(&mut self, line: Option<u64>, bytes: &[u8], context: bool) {
+        use grep::matcher::Matcher;
+        let mut parts = Vec::new();
+        if self.only && !context {
+            let _ = self.matcher.find_iter(bytes, |m| {
+                if !m.is_empty() {
+                    parts.push(String::from_utf8_lossy(&bytes[m]).into_owned());
+                }
+                true
+            });
+        }
+        self.hits.push(GrepHit {
+            path: self.path.to_owned(),
+            line: line.unwrap_or(0),
+            text: String::from_utf8_lossy(bytes)
+                .trim_end_matches(['\n', '\r'])
+                .to_owned(),
+            binary: false,
+            context,
+            parts,
+        });
+    }
+}
+
+impl grep::searcher::Sink for &mut Hits<'_> {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _: &grep::searcher::Searcher,
+        m: &grep::searcher::SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        self.push(m.line_number(), m.bytes(), false);
+        Ok(true)
+    }
+
+    fn context(
+        &mut self,
+        _: &grep::searcher::Searcher,
+        c: &grep::searcher::SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        self.push(c.line_number(), c.bytes(), true);
+        Ok(true)
+    }
 }
 
 pub(crate) fn check_ignore(
@@ -703,15 +894,131 @@ pub(crate) fn ident(repo: &Repository, committer: bool) -> Result<String, GitErr
             if committer { "committer" } else { "author" }
         )));
     };
-    let when = git2::Signature::now(&name, &email)?.when();
-    let offset = when.offset_minutes();
+    let now = git2::Signature::now(&name, &email)?.when();
+    let (seconds, offset) = std::env::var(format!("GIT_{role}_DATE"))
+        .ok()
+        .and_then(|d| parse_git_date(&d, now.offset_minutes()))
+        .unwrap_or((now.seconds(), now.offset_minutes()));
     let sign = if offset < 0 { '-' } else { '+' };
     Ok(format!(
-        "{name} <{email}> {} {sign}{:02}{:02}",
-        when.seconds(),
+        "{name} <{email}> {seconds} {sign}{:02}{:02}",
         offset.abs() / 60,
         offset.abs() % 60
     ))
+}
+
+/// A `+HHMM` / `-HHMM` zone (or `Z`) as minutes east of UTC.
+fn parse_zone(s: &str) -> Option<i32> {
+    if matches!(s, "Z" | "UTC" | "GMT") {
+        return Some(0);
+    }
+    let (sign, digits) = match s.as_bytes().first()? {
+        b'+' => (1, &s[1..]),
+        b'-' => (-1, &s[1..]),
+        _ => return None,
+    };
+    let digits = digits.replace(':', "");
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: i32 = digits.parse().ok()?;
+    Some(sign * (n / 100 * 60 + n % 100))
+}
+
+/// A date as git reads GIT_AUTHOR_DATE: `@<unix> [<zone>]`, `<unix> <zone>`,
+/// ISO 8601 (`2024-01-02T10:00:00+0200`) or RFC 2822
+/// (`Mon, 3 Jul 2006 17:18:43 +0200`), with the time and zone (minutes east
+/// of UTC); `local` is the zone when none is given.
+pub(crate) fn parse_git_date(s: &str, local: i32) -> Option<(i64, i32)> {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    let s = s.trim();
+    let raw = |r: &str| {
+        let mut it = r.split_whitespace();
+        let t = it.next()?.parse().ok()?;
+        Some((t, it.next().and_then(parse_zone).unwrap_or(local)))
+    };
+    if let Some(r) = s.strip_prefix('@') {
+        return raw(r);
+    }
+    if s.split_whitespace()
+        .next()
+        .is_some_and(|t| t.len() >= 9 && t.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return raw(s);
+    }
+    let (mut date, mut time, mut zone) = (None, (0, 0, 0), None);
+    let (mut day, mut month, mut year) = (None, None, None);
+    let mut tokens: Vec<String> = Vec::new();
+    for tok in s.split([' ', ',']).filter(|t| !t.is_empty()) {
+        match tok.split_once('T') {
+            Some((d, t)) if d.contains('-') => tokens.extend([d.to_owned(), t.to_owned()]),
+            _ => tokens.push(tok.to_owned()),
+        }
+    }
+    for tok in &tokens {
+        if let Some(z) = parse_zone(tok) {
+            zone = Some(z);
+        } else if tok.contains(':') {
+            let cut = tok.find(['+', '-', 'Z']).unwrap_or(tok.len());
+            zone = parse_zone(&tok[cut..]).or(zone);
+            let mut parts = tok[..cut].split(':').map(|p| p.parse::<i64>().ok());
+            time = (
+                parts.next()??,
+                parts.next()??,
+                parts.next().flatten().unwrap_or(0),
+            );
+        } else if let [y, m, d] = tok.split('-').collect::<Vec<_>>()[..] {
+            date = Some((y.parse().ok()?, m.parse().ok()?, d.parse().ok()?));
+        } else if let Some(m) = MONTHS
+            .iter()
+            .position(|m| tok.to_ascii_lowercase().starts_with(m))
+        {
+            month = Some(m as i64 + 1);
+        } else if let Ok(n) = tok.parse::<i64>() {
+            if n > 31 {
+                year = Some(n)
+            } else {
+                day = Some(n)
+            }
+        }
+    }
+    let (y, m, d) = date.or_else(|| Some((year?, month?, day?)))?;
+    // days_from_civil (Howard Hinnant, public domain).
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+    let secs = days * 86400 + time.0 * 3600 + time.1 * 60 + time.2;
+    let zone = zone.unwrap_or(local);
+    Some((secs - i64::from(zone) * 60, zone))
+}
+
+#[cfg(test)]
+#[test]
+fn dates_parse_like_git() {
+    assert_eq!(
+        parse_git_date("2024-01-02T10:00:00+0200", 0),
+        Some((1704182400, 120))
+    );
+    assert_eq!(
+        parse_git_date("@1700000000 +0100", 0),
+        Some((1700000000, 60))
+    );
+    assert_eq!(
+        parse_git_date("1700000000 -0130", 0),
+        Some((1700000000, -90))
+    );
+    assert_eq!(
+        parse_git_date("Mon, 3 Jul 2006 17:18:43 +0200", 0),
+        Some((1151939923, 120))
+    );
+    assert_eq!(
+        parse_git_date("2024-01-02 10:00:00", 60),
+        Some((1704182400 + 3600, 60))
+    );
 }
 
 pub(crate) fn count_objects(repo: &Repository) -> Result<ObjectCounts, GitError> {

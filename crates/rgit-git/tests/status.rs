@@ -799,7 +799,9 @@ fn push_fetch_and_pull_over_a_local_remote() {
     assert_eq!(backend_b.status().unwrap().head.behind, 1);
 
     // B pulls: fast-forwards and gains the second file.
-    backend_b.pull(None, None, None, false, &|_| {}).unwrap();
+    backend_b
+        .pull(None, None, &Default::default(), &|_| {})
+        .unwrap();
     let st = backend_b.status().unwrap();
     assert_eq!(st.head.behind, 0);
     assert_eq!(st.recent.len(), 2);

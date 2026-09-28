@@ -87,12 +87,38 @@ fn main() -> ! {
             path,
             initial_branch,
             bare,
+            template,
+            shared,
+            separate_git_dir,
+            object_format,
+            quiet,
         }) => {
+            if object_format.as_deref().is_some_and(|f| f != "sha1") {
+                die(
+                    CliError::usage("only --object-format=sha1 is supported"),
+                    &emit,
+                );
+            }
             let path = path.unwrap_or_else(|| ".".to_owned());
+            let args = rgit_git::InitArgs {
+                initial_branch,
+                bare,
+                template,
+                shared,
+                separate_git_dir,
+            };
             finish(
-                rgit_git::init(std::path::Path::new(&path), initial_branch.as_deref(), bare)
-                    .map(|()| "ok".to_owned())
+                rgit_git::init(std::path::Path::new(&path), &args)
+                    .map(|msg| if quiet { String::new() } else { msg })
                     .map_err(anyhow::Error::from),
+                &emit,
+            );
+        }
+        // ls-remote works outside a repository too, given a URL.
+        Some(command @ Command::LsRemote { .. }) => {
+            let cwd = std::env::current_dir().ok();
+            finish(
+                plumbing::ls_remote(cwd.as_deref(), command, emit.mode == OutputMode::Text),
                 &emit,
             );
         }
@@ -104,6 +130,23 @@ fn main() -> ! {
             bare,
             origin,
             recurse_submodules,
+            single_branch,
+            no_single_branch: _,
+            no_checkout,
+            mirror,
+            no_tags,
+            reference,
+            dissociate,
+            shared,
+            filter,
+            sparse,
+            template,
+            shallow_since,
+            separate_git_dir,
+            config,
+            quiet,
+            verbose: _,
+            jobs: _,
         }) => {
             // Default the target directory to the repo name, as git does.
             let dir = dir.unwrap_or_else(|| {
@@ -113,14 +156,44 @@ fn main() -> ! {
                     .unwrap_or("repo")
                     .trim_end_matches(".git")
                     .to_owned()
-                    + if bare { ".git" } else { "" }
+                    + if bare || mirror { ".git" } else { "" }
             });
+            // What libgit2 cannot clone with goes to git as given.
+            let mut git_flags: Vec<String> = reference
+                .iter()
+                .map(|r| format!("--reference={r}"))
+                .collect();
+            for (on, flag) in [
+                (dissociate, "--dissociate"),
+                (shared, "--shared"),
+                (sparse, "--sparse"),
+            ] {
+                if on {
+                    git_flags.push(flag.to_owned());
+                }
+            }
+            for (flag, value) in [
+                ("--filter", filter),
+                ("--template", template),
+                ("--shallow-since", shallow_since),
+                ("--separate-git-dir", separate_git_dir),
+            ] {
+                if let Some(v) = value {
+                    git_flags.push(format!("{flag}={v}"));
+                }
+            }
             let args = rgit_git::CloneArgs {
                 branch,
                 depth,
                 bare,
                 origin,
                 recurse_submodules,
+                single_branch,
+                no_checkout,
+                mirror,
+                no_tags,
+                config,
+                git_flags,
             };
             let result = rgit_git::clone(&url, std::path::Path::new(&dir), &args, &|p| {
                 if let rgit_git::OpProgress::Line(l) = p
@@ -131,7 +204,13 @@ fn main() -> ! {
             });
             finish(
                 result
-                    .map(|()| format!("cloned into {dir}"))
+                    .map(|()| {
+                        if quiet {
+                            String::new()
+                        } else {
+                            format!("cloned into {dir}")
+                        }
+                    })
                     .map_err(anyhow::Error::from),
                 &emit,
             );
@@ -400,6 +479,13 @@ fn die(error: anyhow::Error, emit: &Emit) -> ! {
 fn fail(message: String, help: Vec<String>, code: i32, mode: OutputMode) -> ! {
     match mode {
         OutputMode::Text if message.is_empty() => {}
+        // A multi-line message is a report in git's own words (a refused push).
+        OutputMode::Text if message.contains('\n') => {
+            eprintln!("{message}");
+            for h in &help {
+                eprintln!("hint: {h}");
+            }
+        }
         OutputMode::Text => {
             eprintln!("rgit: {message}");
             for h in &help {
@@ -824,7 +910,7 @@ fn discover_or_init(can_prompt: bool) -> anyhow::Result<Arc<dyn GitBackend>> {
             ))? {
                 anyhow::bail!("cancelled");
             }
-            rgit_git::init(&cwd, None, false)?;
+            rgit_git::init(&cwd, &Default::default())?;
             Ok(Arc::new(Git2Backend::discover(&cwd)?))
         }
         Err(rgit_git::GitError::NotARepository(_)) => Err(CliError::not_a_repo()),

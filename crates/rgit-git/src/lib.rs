@@ -34,14 +34,15 @@ pub use backend::GitBackend;
 pub use creds::CredentialPrompt;
 pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 pub use error::GitError;
-pub use git_repo::{Git2Backend, clone, config_value, init, pathspec_matches};
+pub use git_repo::{Git2Backend, clone, config_value, init, ls_remote, pathspec_matches};
 pub use model::{
     BlameLine, Blob, CheckoutMode, CloneArgs, Commit, CommitDetails, CommitFile, CommitOptions,
     CommitOverview, CommitRef, ConfigScope, Deco, DiffSpec, EmptyCommit, FetchArgs, FileActivity,
-    GrepMatch, GrepQuery, Head, HunkRef, Lane, LanesState, LastCommit, LogEntry, LogOptions,
-    MergeOptions, OpLogEntry, OpProgress, PickOptions, PushArgs, RebaseOptions, RebaseProgress,
-    RefEntry, RefKind, Remote, RepoState, RepoStatus, ResetMode, RestackOutcome, RmOptions,
-    SmartlogEntry, Stash, StatusCode, StatusEntry, TagInfo, TreeEntry, Worktree, activity_weights,
+    GrepMatch, GrepQuery, Head, HunkRef, InitArgs, Lane, LanesState, LastCommit, LogEntry,
+    LogOptions, MergeOptions, OpLogEntry, OpProgress, PickOptions, PullArgs, PushArgs,
+    RebaseOptions, RebaseProgress, RefEntry, RefKind, Remote, RepoState, RepoStatus, ResetMode,
+    RestackOutcome, RmOptions, SmartlogEntry, Stash, StatusCode, StatusEntry, SubmoduleInfo,
+    SubmoduleOp, TagInfo, TreeEntry, Worktree, WorktreeAddArgs, activity_weights,
     group_decorations,
 };
 pub use plumbing::{

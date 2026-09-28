@@ -548,6 +548,43 @@ pub enum Command {
         /// Show what would be fetched without changing any ref.
         #[arg(long)]
         dry_run: bool,
+        /// Take every positional as a remote to fetch (git's --multiple).
+        #[arg(long)]
+        multiple: bool,
+        /// Fetch the whole history of a shallow clone.
+        #[arg(long)]
+        unshallow: bool,
+        /// Deepen a shallow history by N commits.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        deepen: i32,
+        /// Deepen a shallow history to the commits after DATE.
+        #[arg(long, value_name = "DATE")]
+        shallow_since: Option<String>,
+        /// Fetch every tag and, with --prune, delete local tags gone upstream.
+        #[arg(short = 'P', long)]
+        prune_tags: bool,
+        /// Follow no tags.
+        #[arg(short = 'n', long, conflicts_with = "tags")]
+        no_tags: bool,
+        /// Update refs even when that is not a fast-forward.
+        #[arg(short = 'f', long)]
+        force: bool,
+        /// Map the refspecs given through REFSPEC instead of the configured
+        /// ones; `--refmap=` updates no remote-tracking ref.
+        #[arg(long, value_name = "REFSPEC")]
+        refmap: Vec<String>,
+        /// Record the fetched branch as the current branch's upstream.
+        #[arg(long)]
+        set_upstream: bool,
+        /// Print nothing unless an error occurs.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Report more (accepted for git compatibility).
+        #[arg(short, long)]
+        verbose: bool,
+        /// Parallel fetches (accepted; remotes are fetched in turn).
+        #[arg(short = 'j', long, value_name = "N")]
+        jobs: Option<usize>,
     },
     /// Fetch and integrate the current branch's upstream (merges when it has
     /// diverged, unless `pull.rebase` says otherwise).
@@ -565,6 +602,37 @@ pub enum Command {
         /// Refuse unless the upstream fast-forwards the branch (git's --ff-only).
         #[arg(long)]
         ff_only: bool,
+        /// Always make a merge commit, even for a fast-forward.
+        #[arg(long, conflicts_with = "ff_only")]
+        no_ff: bool,
+        /// Stage the upstream's changes without committing or recording a merge.
+        #[arg(long)]
+        squash: bool,
+        /// Merge but stop before making the merge commit.
+        #[arg(long)]
+        no_commit: bool,
+        /// Stash local changes before the pull and restore them after
+        /// (default: `rebase.autoStash` / `merge.autoStash`).
+        #[arg(long, overrides_with = "no_autostash")]
+        autostash: bool,
+        /// Do not stash local changes around the pull.
+        #[arg(long)]
+        no_autostash: bool,
+        /// On conflicting hunks take `ours` or `theirs` (merge only).
+        #[arg(short = 'X', long = "strategy-option", value_name = "OPTION")]
+        strategy_option: Option<String>,
+        /// Fetch every remote first.
+        #[arg(long)]
+        all: bool,
+        /// Limit the fetched history to N commits.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        depth: i32,
+        /// Print nothing unless an error occurs.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Report more (accepted for git compatibility).
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Fetch, fast-forward branches to their upstreams, and restack the stack.
     Sync,
@@ -601,6 +669,38 @@ pub enum Command {
         /// Show what would be pushed without sending anything.
         #[arg(short = 'n', long)]
         dry_run: bool,
+        /// Also push annotated tags that point into the pushed history
+        /// (default: `push.followTags`).
+        #[arg(long)]
+        follow_tags: bool,
+        /// Push every ref or none.
+        #[arg(long)]
+        atomic: bool,
+        /// With --all or --tags, delete remote refs no local ref maps to.
+        #[arg(long)]
+        prune: bool,
+        /// Make every remote ref match the local one: force-updates and deletes.
+        #[arg(long, conflicts_with_all = ["all", "tags", "delete"])]
+        mirror: bool,
+        /// Pass OPTION to the server's hooks (repeatable).
+        #[arg(short = 'o', long = "push-option", value_name = "OPTION")]
+        push_option: Vec<String>,
+        /// Skip the pre-push hook.
+        #[arg(long)]
+        no_verify: bool,
+        /// Report in git's machine-readable format.
+        #[arg(long)]
+        porcelain: bool,
+        /// Submodule check: check, on-demand, only or no (accepted; submodules
+        /// are not pushed or checked).
+        #[arg(long, value_name = "MODE", require_equals = true)]
+        recurse_submodules: Option<String>,
+        /// Print nothing unless an error occurs.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Also list refs that are already up to date.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Check out a branch or, for any other revision, a detached HEAD; or
     /// restore paths from a revision or the index.
@@ -1005,42 +1105,11 @@ pub enum Command {
     /// <name>...` deletes, `tag -l <pattern>...` lists matching tags.
     Tag {
         /// The tag to create, then the revision to tag (default HEAD); with -d,
-        /// the tags to delete; with -l, patterns to list.
+        /// the tags to delete; with -v, the tags to verify; with -l, patterns
+        /// to list.
         names: Vec<String>,
-        /// Annotation message (implies an annotated tag).
-        #[arg(short, long)]
-        message: Option<String>,
-        /// Make an annotated tag (needs -m, or a prompt on a terminal).
-        #[arg(short, long)]
-        annotate: bool,
-        /// Replace an existing tag of the same name (git's -f).
-        #[arg(short, long)]
-        force: bool,
-        /// Delete the named tags (git's -d).
-        #[arg(short = 'd', long)]
-        delete: bool,
-        /// List tags, only those matching the given patterns (git's -l).
-        #[arg(short, long)]
-        list: bool,
-        /// List tags with up to N lines of their message (git's -n, default 1).
-        #[arg(
-            short = 'n',
-            value_name = "N",
-            num_args = 0..=1,
-            default_missing_value = "1"
-        )]
-        lines: Option<usize>,
-        /// List only tags that contain this commit (default HEAD).
-        #[arg(long, value_name = "REV", num_args = 0..=1, default_missing_value = "HEAD")]
-        contains: Option<String>,
-        /// List only tags that point at this commit (default HEAD).
-        #[arg(
-            long = "points-at",
-            value_name = "REV",
-            num_args = 0..=1,
-            default_missing_value = "HEAD"
-        )]
-        points_at: Option<String>,
+        #[command(flatten)]
+        opts: TagOpts,
     },
     /// Remote management (no subcommand lists remotes).
     #[command(args_conflicts_with_subcommands = true)]
@@ -1380,6 +1449,55 @@ pub enum Command {
         /// Create a bare repository (git's --bare).
         #[arg(long)]
         bare: bool,
+        /// Copy hooks and other files from DIR into the new repository.
+        #[arg(long, value_name = "DIR")]
+        template: Option<String>,
+        /// Share the repository: group (default), all, umask or an octal mode.
+        #[arg(
+            long,
+            value_name = "PERMISSIONS",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "group"
+        )]
+        shared: Option<String>,
+        /// Put the repository in GIT_DIR and link it from the working tree.
+        #[arg(long, value_name = "GIT_DIR")]
+        separate_git_dir: Option<String>,
+        /// The object id hash: only sha1 is supported.
+        #[arg(long, value_name = "FORMAT")]
+        object_format: Option<String>,
+        /// Print nothing unless an error occurs.
+        #[arg(short, long)]
+        quiet: bool,
+    },
+    /// List the refs in a remote repository, like `git ls-remote`.
+    LsRemote {
+        /// The remote name or URL (defaults to the current branch's remote).
+        repository: Option<String>,
+        /// Only refs whose name ends in one of these (globs allowed: `v1.*`).
+        patterns: Vec<String>,
+        /// Only branches (refs/heads).
+        #[arg(short = 'b', long, visible_alias = "branches")]
+        heads: bool,
+        /// Only tags (refs/tags).
+        #[arg(short = 't', long)]
+        tags: bool,
+        /// Leave out peeled tags (`^{}`) and HEAD.
+        #[arg(long)]
+        refs: bool,
+        /// Also show what symbolic refs point at.
+        #[arg(long)]
+        symref: bool,
+        /// Do not print the remote's URL.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Exit with status 2 when no ref matches.
+        #[arg(long)]
+        exit_code: bool,
+        /// Print the remote's URL instead of listing refs.
+        #[arg(long)]
+        get_url: bool,
     },
     /// Clone a repository into a new directory.
     Clone {
@@ -1402,12 +1520,63 @@ pub enum Command {
         /// Clone the submodules too (git's --recurse-submodules).
         #[arg(long)]
         recurse_submodules: bool,
+        /// Fetch only the branch checked out (-b, else the remote's HEAD).
+        #[arg(long, overrides_with = "no_single_branch")]
+        single_branch: bool,
+        /// Fetch every branch (the default).
+        #[arg(long)]
+        no_single_branch: bool,
+        /// Leave the working tree empty.
+        #[arg(short = 'n', long)]
+        no_checkout: bool,
+        /// A bare copy of every ref that `fetch` keeps in step with the remote.
+        #[arg(long)]
+        mirror: bool,
+        /// Follow no tags, now or on later fetches.
+        #[arg(long)]
+        no_tags: bool,
+        /// Borrow objects from this local repository (git's alternates).
+        #[arg(long, value_name = "REPO")]
+        reference: Vec<String>,
+        /// With --reference, copy the borrowed objects and drop the link.
+        #[arg(long)]
+        dissociate: bool,
+        /// Share the source's objects instead of copying them (local only).
+        #[arg(short = 's', long)]
+        shared: bool,
+        /// A partial clone, e.g. `blob:none` or `tree:0`.
+        #[arg(long, value_name = "SPEC")]
+        filter: Option<String>,
+        /// Start with a sparse checkout of the top-level files only.
+        #[arg(long)]
+        sparse: bool,
+        /// Copy hooks and other files from DIR into the new repository.
+        #[arg(long, value_name = "DIR")]
+        template: Option<String>,
+        /// Shallow-clone the commits after DATE.
+        #[arg(long, value_name = "DATE")]
+        shallow_since: Option<String>,
+        /// Put the repository in GIT_DIR and link it from the working tree.
+        #[arg(long, value_name = "GIT_DIR")]
+        separate_git_dir: Option<String>,
+        /// Set KEY=VALUE in the new repository's config (repeatable).
+        #[arg(short = 'c', long = "config", value_name = "KEY=VALUE")]
+        config: Vec<String>,
+        /// Print nothing unless an error occurs.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Report more (accepted for git compatibility).
+        #[arg(short, long)]
+        verbose: bool,
+        /// Parallel submodule fetches (accepted; fetched in turn).
+        #[arg(short = 'j', long, value_name = "N")]
+        jobs: Option<usize>,
     },
-    /// Submodule management: forwards to `git submodule <args>`.
+    /// Submodules: status (the default), add, init, update, sync, deinit,
+    /// foreach, summary, set-url, set-branch and absorbgitdirs.
     Submodule {
-        /// Arguments passed to `git submodule`.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        #[command(subcommand)]
+        cmd: Option<SubmoduleCmd>,
     },
     /// Escape hatch: run any `git` subcommand and print its output.
     Git {
@@ -1455,55 +1624,23 @@ pub enum Command {
 #[derive(Subcommand)]
 pub enum Plumbing {
     /// Resolve revisions to object ids, or print repository paths, like
-    /// `git rev-parse`.
+    /// `git rev-parse`. Answers print in the order the options and revisions
+    /// are given.
     RevParse {
-        /// Abbreviate ids to a unique prefix of at least N digits (default 7).
+        /// Revisions (`HEAD`, `main~2`, `v1^{commit}`, `HEAD:path`, `^A`,
+        /// `A..B`, `A...B`) and options: `--verify`, `-q`, `--short[=N]`,
+        /// `--abbrev-ref`, `--symbolic`, `--symbolic-full-name`, `--not`,
+        /// `--all`, `--branches`, `--tags`, `--remotes`, `--default REV`,
+        /// `--show-toplevel`, `--show-prefix`, `--show-cdup`, `--git-dir`,
+        /// `--absolute-git-dir`, `--git-common-dir`, `--is-inside-work-tree`, `--is-inside-git-dir`, `--is-bare-repository`,
+        /// `--is-shallow-repository`, `--show-object-format`, `--local-env-vars`,
+        /// `--sq-quote ARGS...`.
         #[arg(
-            long,
-            value_name = "N",
-            num_args = 0..=1,
-            require_equals = true,
-            default_missing_value = "7"
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
         )]
-        short: Option<usize>,
-        /// Print each revision's ref name, shortened (`main`; `HEAD` when detached).
-        #[arg(long = "abbrev-ref")]
-        abbrev_ref: bool,
-        /// Print each revision's full ref name (`refs/heads/main`).
-        #[arg(long = "symbolic-full-name")]
-        symbolic_full_name: bool,
-        /// Resolve exactly one revision, failing if it does not exist.
-        #[arg(long)]
-        verify: bool,
-        /// With --verify, fail without a message.
-        #[arg(short, long)]
-        quiet: bool,
-        /// Print the working tree's top-level folder.
-        #[arg(long = "show-toplevel")]
-        show_toplevel: bool,
-        /// Print the .git folder (relative when run at the top level).
-        #[arg(long = "git-dir")]
-        git_dir: bool,
-        /// Print the .git folder as an absolute path.
-        #[arg(long = "absolute-git-dir")]
-        absolute_git_dir: bool,
-        /// Print the current folder relative to the top level (`src/`).
-        #[arg(long = "show-prefix")]
-        show_prefix: bool,
-        /// Print the path from the current folder up to the top level (`../`).
-        #[arg(long = "show-cdup")]
-        show_cdup: bool,
-        /// Print `true` (rgit runs only inside a working tree).
-        #[arg(long = "is-inside-work-tree")]
-        inside_work_tree: bool,
-        /// Print `false` (rgit runs only inside a working tree).
-        #[arg(long = "is-inside-git-dir")]
-        inside_git_dir: bool,
-        /// Print `false` (rgit needs a working tree).
-        #[arg(long = "is-bare-repository")]
-        bare: bool,
-        /// Revisions: `HEAD`, `main~2`, `v1^{commit}`, `HEAD:path`, `^A`, `A..B`, `A...B`.
-        revs: Vec<String>,
+        args: Vec<String>,
     },
     /// List files in the index and the working tree, like `git ls-files`.
     LsFiles {
@@ -1516,7 +1653,7 @@ pub enum Plumbing {
         /// Show untracked files (with ignored ones unless --exclude-standard).
         #[arg(short = 'o', long)]
         others: bool,
-        /// With -o and --exclude-standard, show only ignored files.
+        /// With -o or -c and --exclude-standard, show only ignored files.
         #[arg(short = 'i', long)]
         ignored: bool,
         /// Honor .gitignore, .git/info/exclude and core.excludesFile.
@@ -1534,10 +1671,14 @@ pub enum Plumbing {
         /// End each entry with NUL instead of a newline.
         #[arg(short = 'z')]
         z: bool,
-        /// Accepted for git compatibility: paths are always from the top level.
-        #[arg(long = "full-name", hide = true)]
+        /// Print paths from the top level, not from the current folder.
+        #[arg(long = "full-name")]
         full_name: bool,
-        /// Limit to these paths: files, folders or globs.
+        /// Fail if a path matches no file.
+        #[arg(long = "error-unmatch")]
+        error_unmatch: bool,
+        /// Limit to these paths: files, folders or globs (default: the
+        /// current folder).
         paths: Vec<String>,
     },
     /// List a tree's entries, like `git ls-tree`.
@@ -1560,24 +1701,28 @@ pub enum Plumbing {
         /// Show only object ids.
         #[arg(long = "object-only")]
         object_only: bool,
-        /// Abbreviate object ids to at least N digits.
+        /// Abbreviate object ids to a unique prefix of at least N digits.
         #[arg(
             long,
             value_name = "N",
             num_args = 0..=1,
             require_equals = true,
-            default_missing_value = "7"
+            default_missing_value = "0"
         )]
         abbrev: Option<usize>,
         /// End each entry with NUL instead of a newline.
         #[arg(short = 'z')]
         z: bool,
-        /// Accepted for git compatibility: paths are always from the top level.
-        #[arg(long = "full-name", hide = true)]
+        /// Print paths from the top level, not from the current folder.
+        #[arg(long = "full-name")]
         full_name: bool,
-        /// Accepted for git compatibility: paths are always from the top level.
-        #[arg(long = "full-tree", hide = true)]
+        /// List from the top level, not the current folder; implies --full-name.
+        #[arg(long = "full-tree")]
         full_tree: bool,
+        /// The line format: `%(objectmode)`, `%(objecttype)`, `%(objectname)`,
+        /// `%(objectsize)`, `%(objectsize:padded)`, `%(path)`.
+        #[arg(long)]
+        format: Option<String>,
         /// The commit, tag or tree to list.
         rev: String,
         /// Limit to these paths; `dir/` lists inside dir.
@@ -1597,9 +1742,23 @@ pub enum Plumbing {
         /// Exit 0 if the object exists, 1 if not, printing nothing.
         #[arg(short = 'e')]
         exists: bool,
+        /// Read object names from stdin; print each one's id, type, size and
+        /// content, or the given format (`%(objectname)`, `%(objecttype)`,
+        /// `%(objectsize)`, `%(rest)`).
+        #[arg(long, value_name = "FORMAT", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+        batch: Option<String>,
+        /// Like --batch, without the content.
+        #[arg(long = "batch-check", value_name = "FORMAT", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+        batch_check: Option<String>,
+        /// With --batch or --batch-check, answer for every object instead of stdin.
+        #[arg(long = "batch-all-objects")]
+        batch_all_objects: bool,
+        /// With --batch or --batch-check, do not flush after each object.
+        #[arg(long)]
+        buffer: bool,
         /// The object (`HEAD`, `HEAD:src/lib.rs`, an id), optionally after its
         /// type (`blob HEAD:a.txt`).
-        #[arg(required = true, num_args = 1..=2, value_name = "[TYPE] OBJECT")]
+        #[arg(num_args = 0..=2, value_name = "[TYPE] OBJECT")]
         args: Vec<String>,
     },
     /// List refs with their object ids, like `git show-ref`.
@@ -1626,6 +1785,18 @@ pub enum Plumbing {
             default_missing_value = "0"
         )]
         hash: Option<usize>,
+        /// Abbreviate object ids to a unique prefix of at least N digits.
+        #[arg(
+            long,
+            value_name = "N",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "0"
+        )]
+        abbrev: Option<usize>,
+        /// Exit 0 if the one ref given exists, 2 if not.
+        #[arg(long, conflicts_with = "verify")]
+        exists: bool,
         /// Also show HEAD.
         #[arg(long)]
         head: bool,
@@ -1640,17 +1811,42 @@ pub enum Plumbing {
         /// The line format: `%(refname)`, `%(refname:short)`, `%(objectname)`,
         /// `%(objectname:short)`, `%(objecttype)`, `%(subject)`, `%(body)`,
         /// `%(authorname)`, `%(authoremail)`, `%(authordate[:short|iso|unix|relative])`,
-        /// `%(committer*)`, `%(tagger*)`, `%(creatordate)`, `%(upstream[:short])`,
-        /// `%(HEAD)`, `%(symref)`, `%(*objectname)`.
+        /// `%(committer*)`, `%(tagger*)`, `%(creatordate)`, `%(contents[:signature])`,
+        /// `%(upstream[:short|track|trackshort])`, `%(HEAD)`, `%(symref)`,
+        /// `%(objectsize)`, `%(tree)`, `%(parent)`, `%(*objectname)`,
+        /// `%(align:N[,middle|right])...%(end)`,
+        /// `%(if[:equals=X])...%(then)...[%(else)...]%(end)`.
         #[arg(long)]
         format: Option<String>,
-        /// Sort by this field; `-` in front reverses (`-committerdate`). The
+        /// Sort by this field; `-` in front reverses (`-committerdate`);
+        /// `version:` compares numbers by value (`version:refname`). The
         /// last --sort is the main key.
         #[arg(long, value_name = "KEY")]
         sort: Vec<String>,
         /// Show at most N refs.
         #[arg(long, value_name = "N")]
         count: Option<usize>,
+        /// Only refs reachable from this commit (default HEAD).
+        #[arg(long, value_name = "COMMIT", num_args = 0..=1, default_missing_value = "HEAD")]
+        merged: Vec<String>,
+        /// Only refs not reachable from this commit (default HEAD).
+        #[arg(long = "no-merged", value_name = "COMMIT", num_args = 0..=1, default_missing_value = "HEAD")]
+        no_merged: Vec<String>,
+        /// Only refs that contain this commit (default HEAD).
+        #[arg(long, value_name = "COMMIT", num_args = 0..=1, default_missing_value = "HEAD")]
+        contains: Vec<String>,
+        /// Only refs that do not contain this commit (default HEAD).
+        #[arg(long = "no-contains", value_name = "COMMIT", num_args = 0..=1, default_missing_value = "HEAD")]
+        no_contains: Vec<String>,
+        /// Only refs that point at this object.
+        #[arg(long = "points-at", value_name = "OBJECT")]
+        points_at: Vec<String>,
+        /// Leave out refs matching this pattern.
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+        /// Print nothing for a ref whose format expands to nothing.
+        #[arg(long = "omit-empty")]
+        omit_empty: bool,
         /// Show refs that start with one of these (`refs/heads`) or match a glob.
         patterns: Vec<String>,
     },
@@ -1680,8 +1876,33 @@ pub enum Plumbing {
         /// Print each commit's parents after it.
         #[arg(long)]
         parents: bool,
+        /// Leave out the first N commits.
+        #[arg(long, value_name = "N")]
+        skip: Option<usize>,
+        /// Walk every branch, or those matching the pattern.
+        #[arg(long, value_name = "PATTERN", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+        branches: Option<String>,
+        /// Walk every tag, or those matching the pattern.
+        #[arg(long, value_name = "PATTERN", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+        tags: Option<String>,
+        /// Walk every remote-tracking branch, or those matching the pattern.
+        #[arg(long, value_name = "PATTERN", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+        remotes: Option<String>,
+        /// Never show a parent before all of its children.
+        #[arg(long = "topo-order")]
+        topo_order: bool,
+        /// Show commits by date (the default).
+        #[arg(long = "date-order")]
+        date_order: bool,
+        /// Abbreviate commit ids.
+        #[arg(long = "abbrev-commit")]
+        abbrev_commit: bool,
         /// Revisions: `HEAD`, `^A` (exclude), `A..B`, `A...B`.
         revs: Vec<String>,
+        /// Only commits that change these paths (after `--`), simplified as
+        /// git does.
+        #[arg(last = true, value_name = "PATH")]
+        paths: Vec<String>,
     },
     /// Find the common ancestor of two commits, like `git merge-base`.
     MergeBase {
@@ -1725,8 +1946,52 @@ pub enum Plumbing {
         /// Revisions or ranges (default HEAD).
         revs: Vec<String>,
     },
-    /// Search tracked files, the index or a revision, like `git grep`.
+    /// Search tracked files, the index or a revision, like `git grep`. Paths
+    /// print from the current folder, which limits the search by default.
+    #[command(disable_help_flag = true)]
     Grep {
+        /// Print help.
+        #[arg(long, action = clap::ArgAction::Help)]
+        help: Option<bool>,
+        /// Show this many lines of context after each match.
+        #[arg(short = 'A', long = "after-context", value_name = "N")]
+        after: Option<usize>,
+        /// Show this many lines of context before each match.
+        #[arg(short = 'B', long = "before-context", value_name = "N")]
+        before: Option<usize>,
+        /// Show this many lines of context around each match.
+        #[arg(short = 'C', long = "context", value_name = "N")]
+        context: Option<usize>,
+        /// Show only the matching part of each line.
+        #[arg(short = 'o', long = "only-matching")]
+        only_matching: bool,
+        /// Show only the names of files without a match.
+        #[arg(short = 'L', long = "files-without-match")]
+        files_without_match: bool,
+        /// Show each file's name once, above its matches.
+        #[arg(long)]
+        heading: bool,
+        /// Print an empty line between files.
+        #[arg(long = "break")]
+        break_: bool,
+        /// Leave file names out of match lines.
+        #[arg(short = 'h', conflicts_with = "with_filename")]
+        no_filename: bool,
+        /// Show file names on match lines (the default).
+        #[arg(short = 'H')]
+        with_filename: bool,
+        /// Stop each file after N matching lines.
+        #[arg(short = 'm', long = "max-count", value_name = "N")]
+        max_count: Option<u64>,
+        /// Skip binary files.
+        #[arg(short = 'I')]
+        skip_binary: bool,
+        /// Print NUL after file names instead of `:`.
+        #[arg(short = 'z', long = "null")]
+        null: bool,
+        /// Print paths from the top level, not from the current folder.
+        #[arg(long = "full-name")]
+        full_name: bool,
         /// Match regardless of case.
         #[arg(short = 'i', long = "ignore-case")]
         ignore_case: bool,
@@ -1784,18 +2049,28 @@ pub enum Plumbing {
         /// Check tracked paths too.
         #[arg(long = "no-index")]
         no_index: bool,
+        /// Read the paths from stdin, one per line.
+        #[arg(long)]
+        stdin: bool,
+        /// Separate input and output fields with NUL.
+        #[arg(short = 'z')]
+        z: bool,
         /// The paths to check.
-        #[arg(required = true)]
         paths: Vec<String>,
     },
     /// Print a git variable: GIT_AUTHOR_IDENT, GIT_COMMITTER_IDENT, GIT_EDITOR,
-    /// GIT_SEQUENCE_EDITOR, GIT_PAGER or GIT_DEFAULT_BRANCH, like `git var`.
+    /// GIT_SEQUENCE_EDITOR, GIT_PAGER, GIT_DEFAULT_BRANCH, GIT_SHELL_PATH, GIT_ATTR_SYSTEM,
+    /// GIT_ATTR_GLOBAL, GIT_CONFIG_SYSTEM or GIT_CONFIG_GLOBAL, like `git var`.
     Var {
+        /// Print the config, then every variable as `NAME=value`.
+        #[arg(short = 'l', conflicts_with = "name")]
+        list: bool,
         /// The variable.
-        name: String,
+        #[arg(required_unless_present = "list")]
+        name: Option<String>,
     },
-    /// Print where a symbolic ref points (`HEAD` -> `refs/heads/main`), like
-    /// `git symbolic-ref`.
+    /// Print where a symbolic ref points (`HEAD` -> `refs/heads/main`), point
+    /// it elsewhere, or delete it, like `git symbolic-ref`.
     SymbolicRef {
         /// Shorten the ref name (`main`).
         #[arg(long)]
@@ -1803,10 +2078,15 @@ pub enum Plumbing {
         /// Fail without a message when the ref is not symbolic (detached HEAD).
         #[arg(short, long)]
         quiet: bool,
+        /// Delete the symbolic ref.
+        #[arg(short = 'd', long, conflicts_with = "target")]
+        delete: bool,
+        /// The reflog message for the change.
+        #[arg(short = 'm', value_name = "REASON")]
+        message: Option<String>,
         /// The symbolic ref, usually HEAD.
         name: String,
-        /// Not supported: rgit only reads symbolic refs.
-        #[arg(hide = true)]
+        /// Point it at this ref (`refs/heads/main`).
         target: Option<String>,
     },
     /// Count loose and packed objects, like `git count-objects`.
@@ -1944,6 +2224,58 @@ pub struct BranchOpts {
     /// List only branches that contain this commit (default HEAD).
     #[arg(long, value_name = "REV", num_args = 0..=1, default_missing_value = "HEAD")]
     pub contains: Option<String>,
+    /// List only branches that do not contain this commit (default HEAD).
+    #[arg(
+        long = "no-contains",
+        value_name = "REV",
+        num_args = 0..=1,
+        default_missing_value = "HEAD"
+    )]
+    pub no_contains: Option<String>,
+    /// List only branches that point at this commit (default HEAD).
+    #[arg(
+        long = "points-at",
+        value_name = "REV",
+        num_args = 0..=1,
+        default_missing_value = "HEAD"
+    )]
+    pub points_at: Option<String>,
+    /// Sort by a for-each-ref key (`-committerdate`, `version:refname`); the
+    /// last --sort is the main key (default refname, or `branch.sort`).
+    #[arg(long, value_name = "KEY")]
+    pub sort: Vec<String>,
+    /// Print each branch in a for-each-ref format, e.g. `%(refname:short)`.
+    #[arg(long, value_name = "FORMAT")]
+    pub format: Option<String>,
+    /// Match patterns and sort case-insensitively (git's -i).
+    #[arg(short = 'i', long = "ignore-case")]
+    pub ignore_case: bool,
+    /// Accepted for git compatibility; branches list one per line.
+    #[arg(long, value_name = "STYLE", num_args = 0..=1, require_equals = true, default_missing_value = "always")]
+    pub column: Option<String>,
+    /// Accepted for git compatibility.
+    #[arg(long = "no-column")]
+    pub no_column: bool,
+    /// A new branch tracks its start point, or with `=inherit` the start
+    /// point's own upstream (git's -t).
+    #[arg(
+        short = 't',
+        long,
+        value_name = "direct|inherit",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "direct"
+    )]
+    pub track: Option<String>,
+    /// A new branch tracks nothing, even when started from a remote branch.
+    #[arg(long = "no-track", conflicts_with = "track")]
+    pub no_track: bool,
+    /// Edit `[<branch>]`'s (default current) description in the editor.
+    #[arg(long = "edit-description", group = "branch_action")]
+    pub edit_description: bool,
+    /// Accepted for git compatibility.
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
     /// Print the current branch's name (nothing when detached).
     #[arg(long = "show-current", group = "branch_action")]
     pub show_current: bool,
@@ -1995,13 +2327,125 @@ impl BranchOpts {
             || self.copy
             || self.force_copy
             || self.set_upstream_to.is_some()
-            || self.unset_upstream;
+            || self.unset_upstream
+            || self.edit_description;
         !acts
             && (self.args.is_empty()
                 || self.list
                 || self.merged.is_some()
                 || self.no_merged.is_some()
-                || self.contains.is_some())
+                || self.contains.is_some()
+                || self.no_contains.is_some()
+                || self.points_at.is_some())
+    }
+}
+
+/// `rgit tag`'s git flags.
+#[derive(clap::Args, Default)]
+pub struct TagOpts {
+    /// Annotation message (implies an annotated tag).
+    #[arg(short, long)]
+    pub message: Option<String>,
+    /// Read the annotation message from a file, `-` for stdin (git's -F).
+    #[arg(short = 'F', long, value_name = "FILE", conflicts_with = "message")]
+    pub file: Option<String>,
+    /// Edit the message in the editor (terminal only; git's -e).
+    #[arg(short, long)]
+    pub edit: bool,
+    /// Make an annotated tag (needs -m, or a prompt on a terminal).
+    #[arg(short, long)]
+    pub annotate: bool,
+    /// Make a GPG-signed annotated tag (git's -s).
+    #[arg(short, long)]
+    pub sign: bool,
+    /// Do not sign, even with `tag.gpgSign` set.
+    #[arg(long = "no-sign", conflicts_with = "sign")]
+    pub no_sign: bool,
+    /// Sign with this key (git's -u).
+    #[arg(short = 'u', long = "local-user", value_name = "KEY-ID")]
+    pub local_user: Option<String>,
+    /// How to clean the message: strip (default; drops `#` lines),
+    /// whitespace or verbatim.
+    #[arg(long, value_name = "MODE")]
+    pub cleanup: Option<String>,
+    /// Replace an existing tag of the same name (git's -f).
+    #[arg(short, long)]
+    pub force: bool,
+    /// Delete the named tags (git's -d).
+    #[arg(short = 'd', long)]
+    pub delete: bool,
+    /// Verify the named tags' GPG signatures (git's -v).
+    #[arg(short = 'v', long)]
+    pub verify: bool,
+    /// List tags, only those matching the given patterns (git's -l).
+    #[arg(short, long)]
+    pub list: bool,
+    /// List tags with up to N lines of their message (git's -n, default 1).
+    #[arg(
+        short = 'n',
+        value_name = "N",
+        num_args = 0..=1,
+        default_missing_value = "1"
+    )]
+    pub lines: Option<usize>,
+    /// List only tags that contain this commit (default HEAD).
+    #[arg(long, value_name = "REV", num_args = 0..=1, default_missing_value = "HEAD")]
+    pub contains: Option<String>,
+    /// List only tags that do not contain this commit (default HEAD).
+    #[arg(
+        long = "no-contains",
+        value_name = "REV",
+        num_args = 0..=1,
+        default_missing_value = "HEAD"
+    )]
+    pub no_contains: Option<String>,
+    /// List only tags merged into this commit (default HEAD).
+    #[arg(long, value_name = "REV", num_args = 0..=1, default_missing_value = "HEAD")]
+    pub merged: Option<String>,
+    /// List only tags not merged into this commit (default HEAD).
+    #[arg(
+        long = "no-merged",
+        value_name = "REV",
+        num_args = 0..=1,
+        default_missing_value = "HEAD"
+    )]
+    pub no_merged: Option<String>,
+    /// List only tags that point at this commit (default HEAD).
+    #[arg(
+        long = "points-at",
+        value_name = "REV",
+        num_args = 0..=1,
+        default_missing_value = "HEAD"
+    )]
+    pub points_at: Option<String>,
+    /// Sort by a for-each-ref key (`-creatordate`, `version:refname` or
+    /// `-v:refname`); the last --sort is the main key (default refname, or
+    /// `tag.sort`).
+    #[arg(long, value_name = "KEY")]
+    pub sort: Vec<String>,
+    /// Print each tag in a for-each-ref format, e.g. `%(refname:short)`.
+    #[arg(long, value_name = "FORMAT")]
+    pub format: Option<String>,
+    /// Match patterns and sort case-insensitively (git's -i).
+    #[arg(short = 'i', long = "ignore-case")]
+    pub ignore_case: bool,
+    /// Accepted for git compatibility; tags list one per line.
+    #[arg(long, value_name = "STYLE", num_args = 0..=1, require_equals = true, default_missing_value = "always")]
+    pub column: Option<String>,
+    /// Accepted for git compatibility.
+    #[arg(long = "no-column")]
+    pub no_column: bool,
+}
+
+impl TagOpts {
+    /// Whether these flags, with `names`, list tags rather than change them.
+    pub fn is_listing(&self, names: &[String]) -> bool {
+        !self.delete && !self.verify && (names.is_empty() || self.list || self.lines.is_some())
+            || self.contains.is_some()
+            || self.no_contains.is_some()
+            || self.merged.is_some()
+            || self.no_merged.is_some()
+            || self.points_at.is_some()
     }
 }
 
@@ -2076,7 +2520,15 @@ pub enum StashCmd {
         index: Option<usize>,
     },
     /// List the stashes.
-    List,
+    List {
+        /// Print each stash in a log format: `%gd` (stash@{N}), `%gs` (its
+        /// message), `%H`, `%h`, `%s`, `%an`, `%ae`, `%ar`, `%ad`, `%cr`, `%n`.
+        #[arg(long, alias = "pretty", value_name = "FORMAT")]
+        format: Option<String>,
+        /// Show at most N stashes.
+        #[arg(short = 'n', long = "max-count", value_name = "N")]
+        max_count: Option<usize>,
+    },
     /// Show the changes a stash records, as a diffstat (-p for the patch).
     Show {
         /// The stash: `N` or `stash@{N}` (defaults to the most recent).
@@ -2088,9 +2540,38 @@ pub enum StashCmd {
         /// List only the names of changed files.
         #[arg(long = "name-only")]
         name_only: bool,
+        /// List the changed files with their status letter.
+        #[arg(long = "name-status")]
+        name_status: bool,
+        /// Show added and deleted line counts per file.
+        #[arg(long)]
+        numstat: bool,
         /// Show a diffstat (the default).
         #[arg(long)]
         stat: bool,
+        /// Show the stashed untracked files too (git's -u).
+        #[arg(short = 'u', long = "include-untracked")]
+        include_untracked: bool,
+        /// Show only the stashed untracked files.
+        #[arg(long = "only-untracked", conflicts_with = "include_untracked")]
+        only_untracked: bool,
+    },
+    /// Make a stash commit of the local changes and print its id, without
+    /// storing it or touching the working tree (git's `stash create`).
+    Create {
+        /// The stash message.
+        message: Vec<String>,
+    },
+    /// Put a stash commit (from `stash create`) on the stash list.
+    Store {
+        /// The stash commit.
+        commit: String,
+        /// The message for the stash list.
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Accepted for git compatibility.
+        #[arg(short = 'q', long)]
+        quiet: bool,
     },
     /// Create and check out a branch at the stash's base commit, apply the
     /// stash there and drop it.
@@ -2114,9 +2595,31 @@ pub struct StashPush {
     /// Also stash untracked files (git's -u).
     #[arg(short = 'u', long = "include-untracked")]
     pub include_untracked: bool,
+    /// Also stash ignored and untracked files (git's -a).
+    #[arg(short = 'a', long, conflicts_with = "include_untracked")]
+    pub all: bool,
     /// Leave the staged changes in the index as well (git's -k).
     #[arg(short = 'k', long = "keep-index")]
     pub keep_index: bool,
+    /// With -p, reset the index too.
+    #[arg(long = "no-keep-index", conflicts_with = "keep_index")]
+    pub no_keep_index: bool,
+    /// Stash only the staged changes, taking them out of the index and
+    /// working tree (git's -S).
+    #[arg(short = 'S', long, conflicts_with_all = ["patch", "include_untracked", "all"])]
+    pub staged: bool,
+    /// Pick the hunks to stash, one by one (needs a terminal; git's -p).
+    #[arg(short = 'p', long, conflicts_with_all = ["include_untracked", "all"])]
+    pub patch: bool,
+    /// Read the paths to stash from this file, one per line (`-` for stdin).
+    #[arg(long = "pathspec-from-file", value_name = "FILE")]
+    pub pathspec_from_file: Option<String>,
+    /// With --pathspec-from-file, paths are NUL-separated.
+    #[arg(long = "pathspec-file-nul", requires = "pathspec_from_file")]
+    pub pathspec_file_nul: bool,
+    /// Accepted for git compatibility.
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
 }
 
 /// `bisect` subcommands.
@@ -2384,6 +2887,31 @@ pub enum RemoteCmd {
         name: String,
         /// The remote URL.
         url: String,
+        /// Fetch the remote right after adding it (git's -f).
+        #[arg(short = 'f', long)]
+        fetch: bool,
+        /// Track only this branch; repeat for more (git's -t).
+        #[arg(short = 't', long = "track", value_name = "BRANCH")]
+        track: Vec<String>,
+        /// Point `<name>/HEAD` at this branch (git's -m).
+        #[arg(short = 'm', long = "master", value_name = "BRANCH")]
+        master: Option<String>,
+        /// Mirror the remote: `fetch` copies every ref as is, `push` pushes
+        /// every ref; both without a value.
+        #[arg(
+            long,
+            value_name = "fetch|push",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "both"
+        )]
+        mirror: Option<String>,
+        /// Fetch every tag from it.
+        #[arg(long)]
+        tags: bool,
+        /// Fetch no tags from it.
+        #[arg(long = "no-tags", conflicts_with = "tags")]
+        no_tags: bool,
     },
     /// Remove a remote.
     #[command(alias = "rm")]
@@ -2391,15 +2919,25 @@ pub enum RemoteCmd {
         /// The remote name.
         name: String,
     },
-    /// Change a remote's URL.
+    /// Change a remote's URL, add one (--add) or delete those matching a
+    /// regex (--delete).
     SetUrl {
         /// The remote name.
         name: String,
-        /// The new URL.
+        /// The new URL; with --delete, a regex of the URLs to delete.
         url: String,
+        /// Replace only the URL matching this regex.
+        #[arg(conflicts_with_all = ["add", "delete"])]
+        old: Option<String>,
         /// Set the push URL instead (git's --push).
         #[arg(long)]
         push: bool,
+        /// Add the URL, keeping the others.
+        #[arg(long, conflicts_with = "delete")]
+        add: bool,
+        /// Delete the URLs matching the regex.
+        #[arg(long)]
+        delete: bool,
     },
     /// Print a remote's URL.
     GetUrl {
@@ -2412,7 +2950,7 @@ pub enum RemoteCmd {
         #[arg(long)]
         all: bool,
     },
-    /// Rename a remote.
+    /// Rename a remote, its tracking refs and the branches that track it.
     Rename {
         /// The current remote name.
         old: String,
@@ -2424,6 +2962,185 @@ pub enum RemoteCmd {
         /// The remotes to prune.
         #[arg(required = true)]
         names: Vec<String>,
+        /// Only list what would be pruned (git's -n).
+        #[arg(short = 'n', long = "dry-run")]
+        dry_run: bool,
+    },
+    /// Describe remotes as `git remote show` does: URLs, HEAD branch, remote
+    /// branches, and the local branches that pull from and push to them.
+    Show {
+        /// The remotes (all when none).
+        names: Vec<String>,
+        /// Do not query the remotes (git's -n).
+        #[arg(short = 'n')]
+        no_query: bool,
+    },
+    /// Fetch remotes: all by default, or the named remotes and groups
+    /// (`remotes.<group>`).
+    Update {
+        /// Remotes or groups to fetch.
+        names: Vec<String>,
+        /// Prune stale remote-tracking branches too (git's -p).
+        #[arg(short = 'p', long)]
+        prune: bool,
+    },
+    /// Set `<name>/HEAD`: to a branch, from the remote (-a), or delete it (-d).
+    SetHead {
+        /// The remote name.
+        name: String,
+        /// The remote branch HEAD should name.
+        #[arg(required_unless_present_any = ["auto", "delete"])]
+        branch: Option<String>,
+        /// Ask the remote which branch its HEAD names (git's -a).
+        #[arg(short = 'a', long, conflicts_with_all = ["branch", "delete"])]
+        auto: bool,
+        /// Delete `<name>/HEAD` (git's -d).
+        #[arg(short = 'd', long, conflicts_with = "branch")]
+        delete: bool,
+    },
+    /// Fetch only these branches from a remote (with --add, these too).
+    SetBranches {
+        /// The remote name.
+        name: String,
+        /// The branches to fetch.
+        #[arg(required = true)]
+        branches: Vec<String>,
+        /// Add to the branches fetched instead of replacing them.
+        #[arg(long)]
+        add: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SubmoduleCmd {
+    /// Show each submodule's commit, path and name for it: ` ` in step,
+    /// `-` not initialized, `+` another commit checked out, `U` conflicts.
+    Status {
+        /// Show the commit the superproject records instead of the checked-out one.
+        #[arg(long)]
+        cached: bool,
+        /// Include nested submodules.
+        #[arg(long)]
+        recursive: bool,
+        /// Print nothing unless an error occurs.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Only these submodule paths.
+        paths: Vec<String>,
+    },
+    /// Clone URL into PATH (default: the URL's name) and add it as a submodule.
+    Add {
+        /// The repository to add.
+        url: String,
+        /// Where to put it.
+        path: Option<String>,
+        /// Check out and track this branch.
+        #[arg(short = 'b', long)]
+        branch: Option<String>,
+        /// Name the submodule this instead of its path.
+        #[arg(long)]
+        name: Option<String>,
+        /// Print nothing unless an error occurs.
+        #[arg(short, long)]
+        quiet: bool,
+    },
+    /// Register submodules in .git/config from .gitmodules.
+    Init {
+        /// Print nothing unless an error occurs.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Only these submodule paths.
+        paths: Vec<String>,
+    },
+    /// Clone missing submodules and check out the commits the superproject records.
+    Update {
+        /// Initialize submodules that are not yet.
+        #[arg(long)]
+        init: bool,
+        /// Update nested submodules too.
+        #[arg(long)]
+        recursive: bool,
+        /// Check out the submodule's remote-tracking branch instead.
+        #[arg(long)]
+        remote: bool,
+        /// Check out detached (the default; accepted for git compatibility).
+        #[arg(long)]
+        checkout: bool,
+        /// Print nothing unless an error occurs.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Parallel clones (accepted; cloned in turn).
+        #[arg(short = 'j', long, value_name = "N")]
+        jobs: Option<usize>,
+        /// Only these submodule paths.
+        paths: Vec<String>,
+    },
+    /// Copy submodule URLs from .gitmodules into the config and the submodules.
+    Sync {
+        /// Sync nested submodules too.
+        #[arg(long)]
+        recursive: bool,
+        /// Print nothing unless an error occurs.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Only these submodule paths.
+        paths: Vec<String>,
+    },
+    /// Unregister submodules and empty their folders.
+    Deinit {
+        /// Discard local changes in them.
+        #[arg(short = 'f', long)]
+        force: bool,
+        /// Every submodule (required when no path is given).
+        #[arg(long)]
+        all: bool,
+        /// Print nothing unless an error occurs.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Only these submodule paths.
+        paths: Vec<String>,
+    },
+    /// Run a shell command in each checked-out submodule ($name, $sm_path,
+    /// $displaypath, $sha1 and $toplevel are set).
+    Foreach {
+        /// Include nested submodules.
+        #[arg(long)]
+        recursive: bool,
+        /// Do not print `Entering '<path>'`.
+        #[arg(short, long)]
+        quiet: bool,
+        /// The command.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Summarize the commits between recorded and checked-out submodule commits.
+    Summary {
+        /// git's `submodule summary` arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Change a submodule's URL in .gitmodules and sync it.
+    SetUrl {
+        /// The submodule's path.
+        path: String,
+        /// The new URL.
+        url: String,
+    },
+    /// Set (or with -d, clear) the branch `update --remote` follows.
+    SetBranch {
+        /// The branch to follow.
+        #[arg(short = 'b', long, required_unless_present = "default")]
+        branch: Option<String>,
+        /// Follow the remote's default branch again.
+        #[arg(short = 'd', long, conflicts_with = "branch")]
+        default: bool,
+        /// The submodule's path.
+        path: String,
+    },
+    /// Move submodules' repositories into the superproject's .git/modules.
+    Absorbgitdirs {
+        /// Only these submodule paths.
+        paths: Vec<String>,
     },
 }
 
@@ -2439,14 +3156,61 @@ pub enum WorktreeCmd {
         #[arg(value_name = "BRANCH")]
         commitish: Option<String>,
         /// Create this branch at BRANCH (default HEAD) and check it out there.
-        #[arg(short = 'b', value_name = "NEW_BRANCH")]
+        #[arg(
+            short = 'b',
+            value_name = "NEW_BRANCH",
+            conflicts_with = "reset_branch"
+        )]
         new_branch: Option<String>,
+        /// Like -b, but reset the branch to BRANCH if it exists.
+        #[arg(short = 'B', value_name = "NEW_BRANCH")]
+        reset_branch: Option<String>,
         /// Check out a detached HEAD (git's --detach).
-        #[arg(short = 'd', long, conflicts_with = "new_branch")]
+        #[arg(short = 'd', long, conflicts_with_all = ["new_branch", "reset_branch", "orphan"])]
         detach: bool,
+        /// Start an empty, unborn branch (-b's, or named after PATH).
+        #[arg(long)]
+        orphan: bool,
+        /// Check out the branch even if another worktree has it.
+        #[arg(short, long)]
+        force: bool,
+        /// Leave the new worktree's files and index empty.
+        #[arg(long = "no-checkout")]
+        no_checkout: bool,
+        /// Lock the new worktree (see `worktree lock`).
+        #[arg(long)]
+        lock: bool,
+        /// Why it is locked (with --lock).
+        #[arg(long, requires = "lock")]
+        reason: Option<String>,
+        /// A new branch tracks BRANCH.
+        #[arg(long, conflicts_with = "no_track")]
+        track: bool,
+        /// A new branch tracks nothing, even when BRANCH is remote.
+        #[arg(long = "no-track")]
+        no_track: bool,
+        /// Accepted for git compatibility.
+        #[arg(short, long)]
+        quiet: bool,
     },
-    /// List the worktrees.
-    List,
+    /// List the worktrees, as `git worktree list` prints them.
+    List {
+        /// git's stable format, one `key value` line per field.
+        #[arg(long)]
+        porcelain: bool,
+        /// With --porcelain, end lines with NUL.
+        #[arg(short = 'z', requires = "porcelain")]
+        z: bool,
+        /// Show lock and prune reasons.
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Fix the links between worktrees and the repository after moving
+    /// either; name worktrees moved by hand.
+    Repair {
+        /// Worktrees now at these paths.
+        paths: Vec<String>,
+    },
     /// Remove a linked worktree (by name or path) and its folder.
     Remove {
         /// The worktree's name or path.
@@ -2476,7 +3240,14 @@ pub enum WorktreeCmd {
         new_path: String,
     },
     /// Prune worktree entries whose working tree is gone (git's `worktree prune`).
-    Prune,
+    Prune {
+        /// Only list what would be pruned (git's -n).
+        #[arg(short = 'n', long = "dry-run")]
+        dry_run: bool,
+        /// Accepted for git compatibility; the pruned names are printed.
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 /// Subcommands for stacked branches.
@@ -3248,7 +4019,7 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Remotes and forge (GitHub/GitLab)",
-        &["fetch", "pull", "push", "remote", "forge"],
+        &["fetch", "pull", "push", "ls-remote", "remote", "forge"],
     ),
     (
         "Patches, notes, config and maintenance",
@@ -3909,18 +4680,50 @@ pub fn run(
             tags,
             depth,
             dry_run,
+            multiple,
+            unshallow,
+            deepen,
+            shallow_since,
+            prune_tags,
+            no_tags,
+            force,
+            refmap,
+            set_upstream,
+            quiet,
+            verbose: _,
+            jobs: _,
         } => {
-            let (remote, refspecs) = remote_and_refspecs(remote, repository, refspecs);
             let args = rgit_git::FetchArgs {
                 all,
                 prune,
                 tags,
                 depth,
                 dry_run,
+                unshallow,
+                deepen,
+                shallow_since,
+                prune_tags,
+                no_tags,
+                force,
+                refmap: (!refmap.is_empty())
+                    .then(|| refmap.into_iter().filter(|m| !m.is_empty()).collect()),
+                set_upstream,
             };
-            net(interactive, "fetch", |r| {
-                backend.fetch(remote.as_deref(), &refspecs, &args, r)
-            })?
+            let out = if multiple {
+                let mut out = Vec::new();
+                for name in remote.into_iter().chain(repository).chain(refspecs) {
+                    out.push(net(interactive, "fetch", |r| {
+                        backend.fetch(Some(&name), &[], &args, r)
+                    })?);
+                }
+                out.join("\n")
+            } else {
+                let (remote, refspecs) = remote_and_refspecs(remote, repository, refspecs);
+                net(interactive, "fetch", |r| {
+                    backend.fetch(remote.as_deref(), &refspecs, &args, r)
+                })?
+            };
+            if quiet { String::new() } else { out }
         }
         Command::Pull {
             repository,
@@ -3928,11 +4731,32 @@ pub fn run(
             rebase,
             no_rebase,
             ff_only,
+            no_ff,
+            squash,
+            no_commit,
+            autostash,
+            no_autostash,
+            strategy_option,
+            all,
+            depth,
+            quiet,
+            verbose: _,
         } => {
-            let rebase = (rebase || no_rebase).then_some(rebase);
-            net(interactive, "pull", |r| {
-                backend.pull(repository.as_deref(), branch.as_deref(), rebase, ff_only, r)
-            })?
+            let args = rgit_git::PullArgs {
+                rebase: (rebase || no_rebase).then_some(rebase),
+                ff_only,
+                no_ff,
+                squash,
+                no_commit,
+                autostash: (autostash || no_autostash).then_some(autostash),
+                strategy_option,
+                all,
+                depth,
+            };
+            let out = net(interactive, "pull", |r| {
+                backend.pull(repository.as_deref(), branch.as_deref(), &args, r)
+            })?;
+            if quiet { String::new() } else { out }
         }
         Command::Submit => backend.submit_stack(&|_| {})?.join("\n"),
         Command::Sync => {
@@ -3957,6 +4781,16 @@ pub fn run(
             all,
             delete,
             dry_run,
+            follow_tags,
+            atomic,
+            prune,
+            mirror,
+            push_option,
+            no_verify,
+            porcelain,
+            recurse_submodules: _,
+            quiet,
+            verbose,
         } => {
             // `push --delete <branch>` (no remote named) deletes on the upstream.
             let (remote, mut refspecs) = match repository {
@@ -3983,10 +4817,19 @@ pub fn run(
                 all,
                 tags,
                 dry_run,
+                follow_tags,
+                atomic,
+                prune,
+                mirror,
+                push_options: push_option,
+                no_verify,
+                porcelain,
+                verbose,
             };
-            net(interactive, "push", |r| {
+            let out = net(interactive, "push", |r| {
                 backend.push_to(remote.as_deref(), &refspecs, &args, r)
-            })?
+            })?;
+            if quiet { String::new() } else { out }
         }
         Command::Checkout {
             rev,
@@ -4375,16 +5218,9 @@ pub fn run(
         }
         Command::Branch { cmd, opts } => match cmd {
             None if opts.is_listing() => {
-                let rows = branch_rows(backend, &opts)?;
-                if opts.verbose == 0 {
-                    let names: Vec<String> = rows.iter().map(|r| r.name.clone()).collect();
-                    let current = rows.iter().find(|r| r.current).map(|r| r.name.as_str());
-                    render::branches(&names, current)
-                } else {
-                    render_branch_rows(&rows, opts.verbose)
-                }
+                render_branch_rows(backend, &branch_rows(backend, &opts)?, &opts)?
             }
-            None => branch_change(backend, opts)?,
+            None => branch_change(backend, opts, interactive)?,
             Some(BranchCmd::Create { name, start: None }) => ok(backend.create_branch(&name))?,
             Some(BranchCmd::Create {
                 name,
@@ -4424,16 +5260,45 @@ pub fn run(
         },
         Command::Stash { cmd, push, paths } => match cmd {
             None | Some(StashCmd::Push { .. }) => {
-                let (p, paths) = match cmd {
+                let (p, mut paths) = match cmd {
                     Some(StashCmd::Push { push, paths }) => (push, paths),
                     _ => (push, paths),
                 };
-                ok_msg(backend.stash_push_opts(
-                    p.message.as_deref(),
-                    p.include_untracked,
-                    p.keep_index,
-                    &paths,
-                ))?
+                if let Some(file) = &p.pathspec_from_file {
+                    paths.extend(pathspec_from_file(file, p.pathspec_file_nul)?);
+                }
+                if p.staged {
+                    ok_msg(backend.stash_push_part(p.message.as_deref(), None, true, &paths))?
+                } else if p.patch {
+                    if !interactive {
+                        return Err(CliError::usage(
+                            "stash -p picks hunks on a terminal; stash whole files with `rgit stash push -- <path>`",
+                        ));
+                    }
+                    let files = backend.diff(&rgit_git::DiffSpec {
+                        from: Some("HEAD".to_owned()),
+                        paths: paths.clone(),
+                        ..rgit_git::DiffSpec::default()
+                    })?;
+                    let hunks = crate::interactive::pick_hunks(&files, "Stash")?;
+                    if hunks.is_empty() {
+                        return Ok("No changes selected".to_owned());
+                    }
+                    ok_msg(backend.stash_push_part(
+                        p.message.as_deref(),
+                        Some(&hunks),
+                        !p.no_keep_index,
+                        &paths,
+                    ))?
+                } else {
+                    ok_msg(backend.stash_push_opts(
+                        p.message.as_deref(),
+                        p.include_untracked,
+                        p.all,
+                        p.keep_index,
+                        &paths,
+                    ))?
+                }
             }
             Some(StashCmd::Pop {
                 index,
@@ -4457,21 +5322,47 @@ pub fn run(
                 interactive,
                 "Drop which stash?",
             )?))?,
-            Some(StashCmd::List) => render::stashes(&backend.status()?.stashes),
+            Some(StashCmd::List {
+                format: Some(format),
+                max_count,
+            }) => stash_log(backend, &format, max_count)?,
+            Some(StashCmd::List { max_count, .. }) => {
+                let mut stashes = backend.status()?.stashes;
+                stashes.truncate(max_count.unwrap_or(usize::MAX));
+                render::stashes(&stashes)
+            }
             Some(StashCmd::Show {
                 index,
                 patch,
                 name_only,
+                name_status,
+                numstat,
                 stat,
+                include_untracked,
+                only_untracked,
             }) => diff_out(
-                &stash_diff(backend, index.unwrap_or(0))?,
+                &stash_diff(
+                    backend,
+                    index.unwrap_or(0),
+                    (!only_untracked, include_untracked || only_untracked),
+                )?,
                 DiffFormat {
                     patch,
                     name_only,
+                    name_status,
+                    numstat,
                     stat,
-                    ..DiffFormat::default()
                 },
             ),
+            Some(StashCmd::Create { message }) => {
+                let message = message.join(" ");
+                backend
+                    .stash_create((!message.is_empty()).then_some(message.as_str()))?
+                    .unwrap_or_default()
+            }
+            Some(StashCmd::Store {
+                commit, message, ..
+            }) => ok(backend.stash_store(&commit, message.as_deref()))?,
             Some(StashCmd::Branch { name, index }) => {
                 let i = index.unwrap_or(0);
                 backend.create_branch_at(&name, &format!("stash@{{{i}}}^1"), false)?;
@@ -4486,34 +5377,20 @@ pub fn run(
                 "ok".to_owned()
             }
         },
-        Command::Tag {
-            names,
-            message,
-            annotate,
-            force,
-            delete,
-            list,
-            lines,
-            contains,
-            points_at,
-        } => {
-            if !delete && (names.is_empty() || list || lines.is_some())
-                || contains.is_some()
-                || points_at.is_some()
-            {
-                let tags = tag_list(backend, &names, contains.as_deref(), points_at.as_deref())?;
-                if tags.is_empty() {
+        Command::Tag { names, opts } => {
+            if opts.is_listing(&names) {
+                let tags = tag_list(backend, &names, &opts)?;
+                if let Some(fmt) = &opts.format {
+                    crate::plumbing::format_refs(backend, &tags, fmt)?
+                } else if tags.is_empty() {
                     "no tags".to_owned()
                 } else {
                     tags.iter()
-                        .map(|t| match lines {
-                            Some(n) => tag_with_message(t, n),
-                            None => t.name.clone(),
-                        })
+                        .map(|t| tag_with_message(t, opts.lines))
                         .collect::<Vec<_>>()
                         .join("\n")
                 }
-            } else if delete {
+            } else if opts.delete {
                 if names.is_empty() {
                     return Err(CliError::usage("tag -d needs a tag name"));
                 }
@@ -4525,24 +5402,13 @@ pub fn run(
                     anyhow::bail!("could not delete {}", failed.join("; "));
                 }
                 "ok".to_owned()
+            } else if opts.verify {
+                if names.is_empty() {
+                    return Err(CliError::usage("tag -v needs a tag name"));
+                }
+                backend.verify_tags(&names)?
             } else {
-                let (name, rev) = match names.as_slice() {
-                    [name] => (name, "HEAD"),
-                    [name, rev] => (name, rev.as_str()),
-                    _ => {
-                        return Err(CliError::usage(format!(
-                            "tag takes a name and an optional revision, got {}",
-                            names.join(" ")
-                        )));
-                    }
-                };
-                let message = match message {
-                    None if annotate => resolve(None, "an annotation message (-m)", &|| {
-                        crate::interactive::input("Tag message")
-                    })?,
-                    m => m.unwrap_or_default(),
-                };
-                ok(backend.create_tag_at(name, rev, &message, force))?
+                create_tag(backend, &names, opts, interactive)?
             }
         }
         Command::Remote { cmd, verbose } => match cmd {
@@ -4562,13 +5428,62 @@ pub fn run(
                 }
             }
             None => render::remotes(&backend.remotes()?),
-            Some(RemoteCmd::Add { name, url }) => ok(backend.add_remote(&name, &url))?,
+            Some(RemoteCmd::Add {
+                name,
+                url,
+                fetch,
+                track,
+                master,
+                mirror,
+                tags,
+                no_tags,
+            }) => {
+                use rgit_git::ConfigScope::Local;
+                let specs: Vec<String> = match mirror.as_deref() {
+                    Some("fetch" | "both") => vec!["+refs/*:refs/*".to_owned()],
+                    Some("push") => Vec::new(),
+                    Some(other) => {
+                        return Err(CliError::usage(format!(
+                            "unknown --mirror value {other}; use fetch or push"
+                        )));
+                    }
+                    None => track
+                        .iter()
+                        .map(|b| format!("+refs/heads/{b}:refs/remotes/{name}/{b}"))
+                        .collect(),
+                };
+                backend.add_remote(&name, &url)?;
+                if !specs.is_empty() {
+                    set_fetch_specs(backend, &name, &specs, false)?;
+                }
+                if matches!(mirror.as_deref(), Some("push" | "both")) {
+                    backend.config_write(Local, &format!("remote.{name}.mirror"), "true", false)?;
+                }
+                if tags || no_tags {
+                    let opt = if tags { "--tags" } else { "--no-tags" };
+                    backend.config_write(Local, &format!("remote.{name}.tagOpt"), opt, false)?;
+                }
+                if fetch {
+                    backend.fetch(Some(&name), &[], &rgit_git::FetchArgs::default(), &|_| {})?;
+                }
+                if let Some(m) = master {
+                    backend.set_symbolic_ref(
+                        &format!("refs/remotes/{name}/HEAD"),
+                        &format!("refs/remotes/{name}/{m}"),
+                        Some("remote add"),
+                    )?;
+                }
+                "ok".to_owned()
+            }
             Some(RemoteCmd::Remove { name }) => ok(backend.remove_remote(&name))?,
-            Some(RemoteCmd::SetUrl { name, url, push }) => ok(if push {
-                backend.set_remote_push_url(&name, &url)
-            } else {
-                backend.set_remote_url(&name, &url)
-            })?,
+            Some(RemoteCmd::SetUrl {
+                name,
+                url,
+                old,
+                push,
+                add,
+                delete,
+            }) => ok(backend.edit_remote_urls(&name, &url, old.as_deref(), push, add, delete))?,
             Some(RemoteCmd::GetUrl { name, push, all }) => {
                 let urls = backend.remote_urls(&name, push)?;
                 if all {
@@ -4578,16 +5493,114 @@ pub fn run(
                 }
             }
             Some(RemoteCmd::Rename { old, new }) => ok(backend.rename_remote(&old, &new))?,
-            Some(RemoteCmd::Prune { names }) => {
+            Some(RemoteCmd::Prune { names, dry_run }) => {
                 let mut pruned = Vec::new();
                 for name in &names {
-                    pruned.extend(backend.prune_remote(name)?);
+                    if dry_run {
+                        let (heads, _) = backend.remote_heads(name)?;
+                        let stale = remote_branches(backend, name, &heads)?.stale;
+                        pruned.extend(stale.into_iter().map(|r| {
+                            r.strip_prefix("refs/remotes/")
+                                .map_or(r.clone(), str::to_owned)
+                        }));
+                    } else {
+                        pruned.extend(backend.prune_remote(name)?);
+                    }
                 }
-                if pruned.is_empty() {
-                    "nothing to prune".to_owned()
+                match (pruned.is_empty(), dry_run) {
+                    (true, _) => "nothing to prune".to_owned(),
+                    (false, true) => format!("would prune {}", pruned.join(", ")),
+                    (false, false) => format!("pruned {}", pruned.join(", ")),
+                }
+            }
+            Some(RemoteCmd::Show { names, no_query }) => {
+                let names = if names.is_empty() {
+                    backend.remotes()?.into_iter().map(|r| r.name).collect()
                 } else {
-                    format!("pruned {}", pruned.join(", "))
+                    names
+                };
+                let mut out = Vec::new();
+                for name in &names {
+                    out.push(remote_show(backend, name, !no_query)?);
                 }
+                out.join("\n")
+            }
+            Some(RemoteCmd::Update { names, prune }) => {
+                let group = |g: &str| -> anyhow::Result<Option<Vec<String>>> {
+                    Ok(backend
+                        .config_get(&format!("remotes.{g}"))?
+                        .map(|v| v.split_whitespace().map(str::to_owned).collect()))
+                };
+                let remotes: Vec<String> = backend.remotes()?.into_iter().map(|r| r.name).collect();
+                let mut targets = Vec::new();
+                if names.is_empty() {
+                    match group("default")? {
+                        Some(g) => targets = g,
+                        None => {
+                            for r in &remotes {
+                                let key = format!("remote.{r}.skipDefaultUpdate");
+                                if backend.config_get(&key)?.as_deref() != Some("true") {
+                                    targets.push(r.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                for n in names {
+                    match group(&n)? {
+                        Some(g) => targets.extend(g),
+                        None if remotes.contains(&n) => targets.push(n),
+                        None => anyhow::bail!("no such remote or remote group: {n}"),
+                    }
+                }
+                let args = rgit_git::FetchArgs {
+                    prune,
+                    ..rgit_git::FetchArgs::default()
+                };
+                let mut out = Vec::new();
+                for t in targets {
+                    backend.fetch(Some(&t), &[], &args, &|_| {})?;
+                    out.push(format!("Fetching {t}"));
+                }
+                out.join("\n")
+            }
+            Some(RemoteCmd::SetHead {
+                name,
+                branch,
+                auto: _,
+                delete,
+            }) => {
+                let head = format!("refs/remotes/{name}/HEAD");
+                if delete {
+                    backend.update_ref(&head, None, None, true, None)?;
+                    return Ok(format!("deleted {name}/HEAD"));
+                }
+                let branch = match branch {
+                    Some(b) => b,
+                    None => backend
+                        .remote_heads(&name)?
+                        .1
+                        .ok_or_else(|| anyhow::anyhow!("Cannot determine remote HEAD"))?,
+                };
+                let target = format!("refs/remotes/{name}/{branch}");
+                if backend.rev_parse(&target).is_err() {
+                    anyhow::bail!("Not a valid ref: {target}");
+                }
+                backend.set_symbolic_ref(&head, &target, Some("remote set-head"))?;
+                format!("{name}/HEAD set to {branch}")
+            }
+            Some(RemoteCmd::SetBranches {
+                name,
+                branches,
+                add,
+            }) => {
+                backend.remote_urls(&name, false)?;
+                let specs: Vec<String> = branches
+                    .iter()
+                    .map(|b| format!("+refs/heads/{b}:refs/remotes/{name}/{b}"))
+                    .collect();
+                set_fetch_specs(backend, &name, &specs, add)?;
+                "ok".to_owned()
             }
         },
         Command::Flow { cmd } => match cmd {
@@ -4629,18 +5642,41 @@ pub fn run(
             WorkspaceCmd::Remove { name } => rgit_git::workspace::remove(backend.as_ref(), &name)?,
         },
         Command::Worktree { cmd } => match cmd {
-            None | Some(WorktreeCmd::List) => render::worktrees(&backend.worktrees()?),
+            None => worktree_list(backend, false, false, false)?,
+            Some(WorktreeCmd::List {
+                porcelain,
+                z,
+                verbose,
+            }) => worktree_list(backend, porcelain, z, verbose)?,
             Some(WorktreeCmd::Add {
                 path,
                 commitish,
                 new_branch,
+                reset_branch,
                 detach,
-            }) => ok(backend.worktree_add(
-                &path,
-                commitish.as_deref(),
-                new_branch.as_deref(),
-                detach,
-            ))?,
+                orphan,
+                force,
+                no_checkout,
+                lock,
+                reason,
+                track,
+                no_track,
+                quiet: _,
+            }) => {
+                let args = rgit_git::WorktreeAddArgs {
+                    reset: reset_branch.is_some(),
+                    new_branch: new_branch.or(reset_branch),
+                    detach,
+                    orphan,
+                    force,
+                    no_checkout,
+                    lock,
+                    reason,
+                    track: (track || no_track).then_some(track),
+                };
+                ok(backend.worktree_add(&path, commitish.as_deref(), &args))?
+            }
+            Some(WorktreeCmd::Repair { paths }) => backend.repair_worktrees(&paths)?.join("\n"),
             Some(WorktreeCmd::Remove { name, force }) => ok(backend.remove_worktree(&name, force))?,
             Some(WorktreeCmd::Lock { name, reason }) => {
                 ok(backend.worktree_lock(&name, reason.as_deref()))?
@@ -4649,12 +5685,19 @@ pub fn run(
             Some(WorktreeCmd::Move { name, new_path }) => {
                 ok(backend.worktree_move(&name, &new_path))?
             }
-            Some(WorktreeCmd::Prune) => {
-                let pruned = backend.prune_worktrees()?;
-                if pruned.is_empty() {
-                    "nothing to prune".to_owned()
+            Some(WorktreeCmd::Prune { dry_run, .. }) => {
+                let pruned: Vec<String> = if dry_run {
+                    let list = backend.worktrees()?.into_iter();
+                    list.filter(|w| w.prunable.is_some() && !w.locked)
+                        .map(|w| w.name)
+                        .collect()
                 } else {
-                    format!("pruned {}", pruned.join(", "))
+                    backend.prune_worktrees()?
+                };
+                match (pruned.is_empty(), dry_run) {
+                    (true, _) => "nothing to prune".to_owned(),
+                    (false, true) => format!("would prune {}", pruned.join(", ")),
+                    (false, false) => format!("pruned {}", pruned.join(", ")),
                 }
             }
         },
@@ -5074,9 +6117,9 @@ pub fn run(
                 backend.describe(rev, tags, dirty, long, abbrev, pattern.as_deref())?
             }
         }
-        Command::Submodule { mut args } => {
-            args.insert(0, "submodule".to_owned());
-            backend.git(&args)?
+        Command::Submodule { cmd } => submodule(backend, cmd, interactive)?,
+        command @ Command::LsRemote { .. } => {
+            crate::plumbing::ls_remote(Some(backend.workdir()), command, true)?.text
         }
         Command::Git { args } => backend.git(&args)?,
         Command::Init { .. }
@@ -5085,6 +6128,180 @@ pub fn run(
         | Command::Serve { .. }
         | Command::Forge { .. } => unreachable!("handled before dispatch"),
     })
+}
+
+/// `git submodule status` lines for `list`: the recorded commit with
+/// `cached`, else the checked-out one.
+pub fn submodule_status(list: &[rgit_git::SubmoduleInfo], cached: bool) -> String {
+    list.iter()
+        .map(|s| {
+            let commit = match cached {
+                true => s.recorded.as_ref(),
+                false => s.checked_out.as_ref().or(s.recorded.as_ref()),
+            };
+            let name = match (&s.describe, s.state) {
+                (Some(d), s) if s != '-' => format!(" ({d})"),
+                _ => String::new(),
+            };
+            format!(
+                "{}{} {}{name}",
+                s.state,
+                commit.map_or("0".repeat(40), String::clone),
+                s.path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The submodules under `paths` (all when empty).
+pub fn chosen_submodules(
+    backend: &Arc<dyn GitBackend>,
+    recursive: bool,
+    paths: &[String],
+) -> anyhow::Result<Vec<rgit_git::SubmoduleInfo>> {
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|p| p.trim_end_matches('/').to_owned())
+        .collect();
+    Ok(backend
+        .submodules(recursive)?
+        .into_iter()
+        .filter(|s| paths.is_empty() || rgit_git::pathspec_matches(&paths, &s.path))
+        .collect())
+}
+
+fn submodule(
+    backend: &Arc<dyn GitBackend>,
+    cmd: Option<SubmoduleCmd>,
+    interactive: bool,
+) -> anyhow::Result<String> {
+    use rgit_git::SubmoduleOp as Op;
+    let (op, quiet) = match cmd {
+        None => return Ok(submodule_status(&backend.submodules(false)?, false)),
+        Some(SubmoduleCmd::Status {
+            cached,
+            recursive,
+            quiet,
+            paths,
+        }) => {
+            let text = submodule_status(&chosen_submodules(backend, recursive, &paths)?, cached);
+            return Ok(if quiet { String::new() } else { text });
+        }
+        Some(SubmoduleCmd::Foreach {
+            recursive,
+            quiet,
+            command,
+        }) => return submodule_foreach(backend, recursive, quiet, &command),
+        Some(SubmoduleCmd::Add {
+            url,
+            path,
+            branch,
+            name,
+            quiet,
+        }) => (
+            Op::Add {
+                url,
+                path,
+                branch,
+                name,
+            },
+            quiet,
+        ),
+        Some(SubmoduleCmd::Init { quiet, paths }) => (Op::Init { paths }, quiet),
+        Some(SubmoduleCmd::Update {
+            init,
+            recursive,
+            remote,
+            quiet,
+            paths,
+            ..
+        }) => (
+            Op::Update {
+                paths,
+                init,
+                recursive,
+                remote,
+            },
+            quiet,
+        ),
+        Some(SubmoduleCmd::Sync {
+            recursive,
+            quiet,
+            paths,
+        }) => (Op::Sync { paths, recursive }, quiet),
+        Some(SubmoduleCmd::Deinit {
+            force,
+            all,
+            quiet,
+            paths,
+        }) => (Op::Deinit { paths, force, all }, quiet),
+        Some(SubmoduleCmd::Summary { args }) => (Op::Summary { args }, false),
+        Some(SubmoduleCmd::SetUrl { path, url }) => (Op::SetUrl { path, url }, false),
+        Some(SubmoduleCmd::SetBranch { branch, path, .. }) => {
+            (Op::SetBranch { path, branch }, false)
+        }
+        Some(SubmoduleCmd::Absorbgitdirs { paths }) => (Op::AbsorbGitDirs { paths }, false),
+    };
+    let out = net(interactive, "submodule", |r| backend.submodule(&op, r))?;
+    Ok(if quiet { String::new() } else { out })
+}
+
+/// `submodule foreach`: run `command` in each checked-out submodule with
+/// git's variables set, printing `Entering '<path>'` before its output.
+fn submodule_foreach(
+    backend: &Arc<dyn GitBackend>,
+    recursive: bool,
+    quiet: bool,
+    command: &[String],
+) -> anyhow::Result<String> {
+    let top = backend.workdir().to_path_buf();
+    let mut out = String::new();
+    for s in backend.submodules(recursive)? {
+        if s.state == '-' {
+            continue;
+        }
+        if !quiet {
+            out.push_str(&format!("Entering '{}'\n", s.path));
+        }
+        // ponytail: nested submodules get the top-level $toplevel and a
+        // top-relative $sm_path; git gives their immediate superproject's.
+        let mut cmd = match command {
+            [one] => {
+                let mut sh = std::process::Command::new("sh");
+                sh.args(["-c", one]);
+                sh
+            }
+            [program, args @ ..] => {
+                let mut c = std::process::Command::new(program);
+                c.args(args);
+                c
+            }
+            [] => anyhow::bail!("foreach needs a command"),
+        };
+        let result = cmd
+            .current_dir(top.join(&s.path))
+            .env("name", &s.name)
+            .env("sm_path", &s.path)
+            .env("displaypath", &s.path)
+            .env("sha1", s.checked_out.as_deref().unwrap_or_default())
+            .env("toplevel", &top)
+            .output()?;
+        out.push_str(&String::from_utf8_lossy(&result.stdout));
+        if !result.status.success() {
+            return Err(CliError {
+                message: format!(
+                    "{}run_command returned non-zero status for {}",
+                    String::from_utf8_lossy(&result.stderr),
+                    s.path
+                ),
+                help: None,
+                code: result.status.code().unwrap_or(1),
+            }
+            .into());
+        }
+    }
+    Ok(out.trim_end().to_owned())
 }
 
 /// git's `<repository> [<refspec>...]`: the first positional names the remote,
@@ -5395,54 +6612,111 @@ pub(crate) struct BranchRow {
     pub id: String,
     pub summary: String,
     pub upstream: Option<(String, usize, usize)>,
+    /// A remote-tracking branch.
+    pub remote: bool,
+    /// Where a symbolic ref (`origin/HEAD`) points, shortened.
+    pub symref: Option<String>,
+    pub detail: rgit_git::RefDetail,
 }
 
-/// The branches `rgit branch` lists under `opts`' filters.
+impl BranchRow {
+    /// The name as `git branch` prints it: `remotes/` in front of a remote
+    /// branch with -a, and `-> <target>` after a symbolic one.
+    fn label(&self, all: bool) -> String {
+        let mut s = if self.remote && all {
+            format!("remotes/{}", self.name)
+        } else {
+            self.name.clone()
+        };
+        if let Some(t) = &self.symref {
+            s.push_str(&format!(" -> {t}"));
+        }
+        s
+    }
+}
+
+/// The branches `rgit branch` lists under `opts`' filters, in `--sort` order.
 pub(crate) fn branch_rows(
     backend: &Arc<dyn GitBackend>,
     opts: &BranchOpts,
 ) -> anyhow::Result<Vec<BranchRow>> {
-    let current = backend.status().ok().and_then(|s| s.head.branch);
-    let mut names = if opts.remotes {
-        Vec::new()
-    } else {
-        backend.local_branches()?
-    };
-    let local = names.len();
-    if opts.all || opts.remotes {
-        names.extend(backend.remote_branches()?);
+    let head = backend.symbolic_ref("HEAD").ok().flatten();
+    let mut sort = opts.sort.clone();
+    if sort.is_empty() {
+        sort.extend(backend.config_get("branch.sort").ok().flatten());
     }
+    if sort.is_empty() && opts.ignore_case {
+        sort.push("refname".to_owned());
+    }
+    let refs =
+        crate::plumbing::sort_refs(backend, backend.ref_details()?, &sort, opts.ignore_case)?;
+    let fold = |s: &str| {
+        if opts.ignore_case {
+            s.to_lowercase()
+        } else {
+            s.to_owned()
+        }
+    };
+    let patterns: Vec<String> = opts.args.iter().map(|p| fold(p)).collect();
+    let at = opts
+        .points_at
+        .as_ref()
+        .map(|r| backend.rev_parse(r))
+        .transpose()?;
     let mut rows = Vec::new();
-    for (i, name) in names.into_iter().enumerate() {
-        let keep =
-            (!opts.list || opts.args.is_empty() || rgit_git::pathspec_matches(&opts.args, &name))
-                && opts
-                    .merged
-                    .as_ref()
-                    .map_or(Ok(true), |r| backend.is_ancestor(&name, r))?
-                && opts
-                    .no_merged
-                    .as_ref()
-                    .map_or(Ok(true), |r| backend.is_ancestor(&name, r).map(|m| !m))?
-                && opts
-                    .contains
-                    .as_ref()
-                    .map_or(Ok(true), |r| backend.is_ancestor(r, &name))?;
+    for detail in refs {
+        let (name, remote) = if let Some(n) = detail.name.strip_prefix("refs/heads/") {
+            (n.to_owned(), false)
+        } else if let Some(n) = detail.name.strip_prefix("refs/remotes/") {
+            (n.to_owned(), true)
+        } else {
+            continue;
+        };
+        let full = detail.name.as_str();
+        let keep = if remote {
+            opts.all || opts.remotes
+        } else {
+            !opts.remotes
+        } && (patterns.is_empty()
+            || rgit_git::pathspec_matches(&patterns, &fold(&name)))
+            && at.as_ref().is_none_or(|at| *at == detail.id)
+            && opts
+                .merged
+                .as_ref()
+                .map_or(Ok(true), |r| backend.is_ancestor(full, r))?
+            && opts
+                .no_merged
+                .as_ref()
+                .map_or(Ok(true), |r| backend.is_ancestor(full, r).map(|m| !m))?
+            && opts
+                .contains
+                .as_ref()
+                .map_or(Ok(true), |r| backend.is_ancestor(r, full))?
+            && opts
+                .no_contains
+                .as_ref()
+                .map_or(Ok(true), |r| backend.is_ancestor(r, full).map(|c| !c))?;
         if !keep {
             continue;
         }
         let mut row = BranchRow {
-            current: i < local && current.as_ref() == Some(&name),
+            current: head.as_deref() == Some(full),
             name,
             id: String::new(),
             summary: String::new(),
             upstream: None,
+            remote,
+            symref: detail
+                .symref
+                .as_deref()
+                .map(|s| s.strip_prefix("refs/remotes/").unwrap_or(s).to_owned()),
+            detail,
         };
-        if opts.verbose > 0 {
+        if opts.verbose > 0 && row.symref.is_none() {
             if let Some(tip) = backend
                 .log(&LogOptions {
                     limit: 1,
-                    revs: vec![row.name.clone()],
+                    revs: vec![row.detail.name.clone()],
                     ..LogOptions::default()
                 })?
                 .into_iter()
@@ -5451,7 +6725,7 @@ pub(crate) fn branch_rows(
                 row.id = tip.short_id;
                 row.summary = tip.summary;
             }
-            if i < local {
+            if !remote {
                 row.upstream = backend.branch_upstream(&row.name)?;
             }
         }
@@ -5460,14 +6734,38 @@ pub(crate) fn branch_rows(
     Ok(rows)
 }
 
-/// Branches as `git branch -v` / `-vv` prints them.
-fn render_branch_rows(rows: &[BranchRow], verbose: u8) -> String {
-    if rows.is_empty() {
-        return "no branches".to_owned();
+/// Branches as `git branch` prints them: plainly, with -v / -vv, or in a
+/// for-each-ref `--format`.
+fn render_branch_rows(
+    backend: &Arc<dyn GitBackend>,
+    rows: &[BranchRow],
+    opts: &BranchOpts,
+) -> anyhow::Result<String> {
+    let all = opts.all && !opts.remotes;
+    if let Some(fmt) = &opts.format {
+        return crate::plumbing::format_refs(backend, rows.iter().map(|r| &r.detail), fmt);
     }
-    let width = rows.iter().map(|r| r.name.len()).max().unwrap_or(0);
-    rows.iter()
+    if opts.verbose == 0 {
+        let labels: Vec<String> = rows.iter().map(|r| r.label(all)).collect();
+        let current = rows.iter().find(|r| r.current).map(|r| r.name.as_str());
+        return Ok(render::branches(&labels, current));
+    }
+    if rows.is_empty() {
+        return Ok("no branches".to_owned());
+    }
+    let width = rows
+        .iter()
+        .filter(|r| r.symref.is_none())
+        .map(|r| r.label(all).len())
+        .max()
+        .unwrap_or(0);
+    Ok(rows
+        .iter()
         .map(|r| {
+            let mark = if r.current { "*" } else { " " };
+            if r.symref.is_some() {
+                return format!("{mark} {}", r.label(all));
+            }
             let track = match &r.upstream {
                 Some((up, ahead, behind)) => {
                     let mut counts = Vec::new();
@@ -5478,7 +6776,7 @@ fn render_branch_rows(rows: &[BranchRow], verbose: u8) -> String {
                         counts.push(format!("behind {behind}"));
                     }
                     let counts = counts.join(", ");
-                    match (verbose > 1, counts.is_empty()) {
+                    match (opts.verbose > 1, counts.is_empty()) {
                         (true, true) => format!("[{up}] "),
                         (true, false) => format!("[{up}: {counts}] "),
                         (false, false) => format!("[{counts}] "),
@@ -5487,11 +6785,15 @@ fn render_branch_rows(rows: &[BranchRow], verbose: u8) -> String {
                 }
                 None => String::new(),
             };
-            let mark = if r.current { "*" } else { " " };
-            format!("{mark} {:<width$} {} {track}{}", r.name, r.id, r.summary)
+            format!(
+                "{mark} {:<width$} {} {track}{}",
+                r.label(all),
+                r.id,
+                r.summary
+            )
         })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n"))
 }
 
 /// Delete each of `names`, reporting every failure rather than stopping at
@@ -5518,7 +6820,11 @@ fn delete_branches(
 
 /// `rgit branch` with git's flags that change branches: create, delete,
 /// rename, copy, set or unset the upstream, or print the current branch.
-fn branch_change(backend: &Arc<dyn GitBackend>, o: BranchOpts) -> anyhow::Result<String> {
+fn branch_change(
+    backend: &Arc<dyn GitBackend>,
+    o: BranchOpts,
+    interactive: bool,
+) -> anyhow::Result<String> {
     let current = || {
         backend
             .status()?
@@ -5534,6 +6840,15 @@ fn branch_change(backend: &Arc<dyn GitBackend>, o: BranchOpts) -> anyhow::Result
     if o.show_current {
         return Ok(backend.status()?.head.branch.unwrap_or_default());
     }
+    if o.edit_description {
+        let name = target("--edit-description")?;
+        if !interactive {
+            return Err(CliError::usage(format!(
+                "--edit-description opens an editor and needs a terminal; set it with `rgit config branch.{name}.description <text>`"
+            )));
+        }
+        return edit_description(backend, &name);
+    }
     if let Some(up) = &o.set_upstream_to {
         let name = target("--set-upstream-to")?;
         backend.set_upstream(&name, Some(up))?;
@@ -5548,6 +6863,18 @@ fn branch_change(backend: &Arc<dyn GitBackend>, o: BranchOpts) -> anyhow::Result
         if o.args.is_empty() {
             return Err(CliError::usage("branch -d needs a branch name"));
         }
+        if o.remotes {
+            for name in &o.args {
+                let full = format!("refs/remotes/{name}");
+                backend
+                    .update_ref(&full, None, None, true, None)
+                    .map_err(|_| anyhow::anyhow!("remote-tracking branch '{name}' not found"))?;
+            }
+            return Ok(format!(
+                "deleted remote-tracking branch {}",
+                o.args.join(", ")
+            ));
+        }
         return delete_branches(backend, &o.args, o.force_delete || o.force);
     }
     if o.rename || o.force_rename || o.copy || o.force_copy {
@@ -5558,7 +6885,7 @@ fn branch_change(backend: &Arc<dyn GitBackend>, o: BranchOpts) -> anyhow::Result
         };
         let force = o.force_rename || o.force_copy || o.force;
         if o.copy || o.force_copy {
-            backend.create_branch_at(&new, &old, force)?;
+            backend.copy_branch(&old, &new, force)?;
             return Ok(format!("copied branch {old} to {new}"));
         }
         if force && old != new && backend.local_branches()?.contains(&new) {
@@ -5577,25 +6904,425 @@ fn branch_change(backend: &Arc<dyn GitBackend>, o: BranchOpts) -> anyhow::Result
         }
     };
     backend.create_branch_at(name, start, o.force)?;
+    let upstream = match o.track.as_deref() {
+        Some("inherit") => backend.branch_upstream(start)?.map(|(up, ..)| up),
+        Some("direct") => Some(start.to_owned()),
+        Some(other) => {
+            return Err(CliError::usage(format!(
+                "--track takes direct or inherit, got {other}"
+            )));
+        }
+        None => None,
+    };
+    if o.no_track {
+        backend.set_upstream(name, None)?;
+    } else if let Some(up) = upstream {
+        backend.set_upstream(name, Some(&up))?;
+        return Ok(format!("branch {name} set up to track {up}"));
+    }
     Ok(format!("created branch {name} at {start}"))
 }
 
-/// Tags matching any of `patterns` (all when none), keeping only those that
-/// contain `contains` and point at `points_at` when given.
+/// `git branch --edit-description`: edit `branch.<name>.description` in the
+/// editor, dropping `#` lines; an empty text removes it.
+fn edit_description(backend: &Arc<dyn GitBackend>, name: &str) -> anyhow::Result<String> {
+    use rgit_git::ConfigScope;
+    let key = format!("branch.{name}.description");
+    let old = backend.config_get(&key)?.unwrap_or_default();
+    let text = edit_file(
+        backend,
+        "EDIT_DESCRIPTION",
+        &format!(
+            "{old}# Please edit the description for the branch\n#   {name}\n# Lines starting with '#' will be stripped.\n"
+        ),
+    )?;
+    let text = strip_comments(&text);
+    let text = text.trim();
+    if text.is_empty() {
+        let _ = backend.config_unset(ConfigScope::Local, &key, false);
+    } else {
+        backend.config_write(ConfigScope::Local, &key, &format!("{text}\n"), false)?;
+    }
+    Ok(format!("edited the description of {name}"))
+}
+
+/// Worktrees as `git worktree list` prints them: aligned, with lock and
+/// prune reasons under each with `verbose`, or in `porcelain` form
+/// (NUL-ended with `z`).
+fn worktree_list(
+    backend: &Arc<dyn GitBackend>,
+    porcelain: bool,
+    z: bool,
+    verbose: bool,
+) -> anyhow::Result<String> {
+    let list = backend.worktrees()?;
+    let path = |w: &rgit_git::Worktree| w.path.trim_end_matches('/').to_owned();
+    let mut out = String::new();
+    if porcelain {
+        let end = if z { '\0' } else { '\n' };
+        for w in &list {
+            let zero = "0".repeat(40);
+            let mut lines = vec![
+                format!("worktree {}", path(w)),
+                format!("HEAD {}", w.oid.as_deref().unwrap_or(&zero)),
+                match &w.branch {
+                    Some(b) => format!("branch refs/heads/{b}"),
+                    None => "detached".to_owned(),
+                },
+            ];
+            if w.locked {
+                lines.push(match &w.lock_reason {
+                    Some(r) => format!("locked {r}"),
+                    None => "locked".to_owned(),
+                });
+            }
+            lines.extend(w.prunable.as_ref().map(|p| format!("prunable {p}")));
+            for line in lines {
+                out.push_str(&line);
+                out.push(end);
+            }
+            out.push(end);
+        }
+        return Ok(out);
+    }
+    let width = list.iter().map(|w| path(w).len()).max().unwrap_or(0) + 1;
+    let mut lines = Vec::new();
+    for w in &list {
+        let head = w.head.clone().unwrap_or_else(|| "0000000".to_owned());
+        let on = match &w.branch {
+            Some(b) => format!("[{b}]"),
+            None => "(detached HEAD)".to_owned(),
+        };
+        let mut line = format!("{:<width$} {head} {on}", path(w));
+        let reason = |what: &str, why: &Option<String>| match why {
+            Some(r) => format!("\t{what}: {r}"),
+            None => format!("\t{what}"),
+        };
+        if verbose {
+            if w.locked {
+                line.push('\n');
+                line.push_str(&reason("locked", &w.lock_reason));
+            }
+            if w.prunable.is_some() {
+                line.push('\n');
+                line.push_str(&reason("prunable", &w.prunable));
+            }
+        } else {
+            if w.locked {
+                line.push_str(" locked");
+            }
+            if w.prunable.is_some() {
+                line.push_str(" prunable");
+            }
+        }
+        lines.push(line);
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Set remote `name`'s fetch refspecs to `specs`, or add them with `add`.
+fn set_fetch_specs(
+    backend: &Arc<dyn GitBackend>,
+    name: &str,
+    specs: &[String],
+    add: bool,
+) -> anyhow::Result<()> {
+    use rgit_git::ConfigScope::Local;
+    let key = format!("remote.{name}.fetch");
+    if !add {
+        let _ = backend.config_unset(Local, &key, true);
+    }
+    for spec in specs {
+        backend.config_write(Local, &key, spec, true)?;
+    }
+    Ok(())
+}
+
+/// A remote's branches against our tracking refs, as full tracking ref
+/// names: fetched, not fetched yet, and gone from the remote.
+#[derive(Default)]
+struct RemoteBranches {
+    tracked: Vec<String>,
+    new: Vec<String>,
+    stale: Vec<String>,
+}
+
+/// Sort `heads` (a remote's refs) against remote `name`'s tracking refs
+/// through its fetch refspecs.
+fn remote_branches(
+    backend: &Arc<dyn GitBackend>,
+    name: &str,
+    heads: &[(String, String)],
+) -> anyhow::Result<RemoteBranches> {
+    let specs: Vec<(String, String)> = backend
+        .config_entries(
+            rgit_git::ConfigScope::Any,
+            Some(&format!("remote.{name}.fetch")),
+        )?
+        .into_iter()
+        .filter_map(|(_, v)| {
+            let (src, dst) = v.trim_start_matches('+').split_once(':')?;
+            Some((src.to_owned(), dst.to_owned()))
+        })
+        .collect();
+    // `from` through a refspec side with at most one `*`, onto the other.
+    let through = |from: &str, pat: &str, onto: &str| match pat.split_once('*') {
+        Some((pre, suf)) => from
+            .strip_prefix(pre)
+            .and_then(|r| r.strip_suffix(suf))
+            .map(|mid| onto.replacen('*', mid, 1)),
+        None => (from == pat).then(|| onto.to_owned()),
+    };
+    let tracking: Vec<String> = backend
+        .ref_details()?
+        .into_iter()
+        .filter(|r| r.symref.is_none())
+        .map(|r| r.name)
+        .filter(|n| specs.iter().any(|(s, d)| through(n, d, s).is_some()))
+        .collect();
+    let mut out = RemoteBranches::default();
+    let mut fetched = Vec::new();
+    for (head, _) in heads.iter().filter(|(h, _)| h.starts_with("refs/heads/")) {
+        let Some(dst) = specs.iter().find_map(|(s, d)| through(head, s, d)) else {
+            continue;
+        };
+        if tracking.contains(&dst) {
+            out.tracked.push(dst.clone());
+        } else {
+            out.new.push(dst.clone());
+        }
+        fetched.push(dst);
+    }
+    out.stale = tracking
+        .into_iter()
+        .filter(|t| !fetched.contains(t))
+        .collect();
+    Ok(out)
+}
+
+/// `git remote show <name>`, querying the remote unless `query` is false.
+fn remote_show(backend: &Arc<dyn GitBackend>, name: &str, query: bool) -> anyhow::Result<String> {
+    let plural = |n: usize, one: &str, many: &str| if n == 1 { one } else { many }.to_owned();
+    let not_queried = if query { "" } else { " (status not queried)" };
+    let fetch_urls = backend.remote_urls(name, false)?;
+    let mut out = vec![
+        format!("* remote {name}"),
+        format!(
+            "  Fetch URL: {}",
+            fetch_urls.first().map_or("(no URL)", String::as_str)
+        ),
+    ];
+    for url in backend.remote_urls(name, true)? {
+        out.push(format!("  Push  URL: {url}"));
+    }
+    let (heads, head) = if query {
+        backend.remote_heads(name)?
+    } else {
+        (Vec::new(), None)
+    };
+    out.push(format!(
+        "  HEAD branch: {}",
+        match (query, &head) {
+            (false, _) => "(not queried)",
+            (true, Some(h)) => h,
+            (true, None) => "(unknown)",
+        }
+    ));
+
+    let prefix = format!("refs/remotes/{name}/");
+    let branches = remote_branches(backend, name, &heads)?;
+    let mut rows: Vec<(String, String)> = Vec::new();
+    if query {
+        let short = |r: &String| r.strip_prefix(&prefix).unwrap_or(r).to_owned();
+        rows.extend(
+            branches
+                .tracked
+                .iter()
+                .map(|r| (short(r), "tracked".to_owned())),
+        );
+        rows.extend(branches.new.iter().map(|r| {
+            (
+                short(r),
+                format!("new (next fetch will store in remotes/{name})"),
+            )
+        }));
+        rows.extend(branches.stale.iter().map(|r| {
+            (
+                r.clone(),
+                "stale (use 'git remote prune' to remove)".to_owned(),
+            )
+        }));
+    } else {
+        rows.extend(branches.stale.iter().map(|r| {
+            (
+                r.strip_prefix(&prefix).unwrap_or(r).to_owned(),
+                String::new(),
+            )
+        }));
+    }
+    rows.sort();
+    if !rows.is_empty() {
+        out.push(format!(
+            "  {}:{not_queried}",
+            plural(rows.len(), "Remote branch", "Remote branches")
+        ));
+        let w = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+        for (n, state) in &rows {
+            out.push(if state.is_empty() {
+                format!("    {n}")
+            } else {
+                format!("    {n:<w$} {state}")
+            });
+        }
+    }
+
+    let config = backend.config_entries(rgit_git::ConfigScope::Any, None)?;
+    let get = |key: &str| {
+        config
+            .iter()
+            .rev()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.as_str())
+    };
+    let mut pulls = Vec::new();
+    for b in backend.local_branches()? {
+        if get(&format!("branch.{b}.remote")) != Some(name) {
+            continue;
+        }
+        let Some(merge) = get(&format!("branch.{b}.merge")) else {
+            continue;
+        };
+        let merge = merge
+            .strip_prefix("refs/heads/")
+            .unwrap_or(merge)
+            .to_owned();
+        let how = match get(&format!("branch.{b}.rebase")) {
+            Some("interactive" | "i") => "rebases interactively onto remote",
+            Some(v) if !matches!(v, "false" | "no" | "off" | "0") => "rebases onto remote",
+            _ => " merges with remote",
+        };
+        pulls.push((b, how, merge));
+    }
+    if !pulls.is_empty() {
+        out.push(format!(
+            "  {} configured for 'git pull':",
+            plural(pulls.len(), "Local branch", "Local branches")
+        ));
+        let w = pulls.iter().map(|(b, ..)| b.len()).max().unwrap_or(0);
+        for (b, how, merge) in &pulls {
+            out.push(format!("    {b:<w$} {how} {merge}"));
+        }
+    }
+
+    if get(&format!("remote.{name}.mirror")) == Some("true") {
+        out.push("  Local refs will be mirrored by 'git push'".to_owned());
+        return Ok(out.join("\n"));
+    }
+    let specs: Vec<&str> = config
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(&format!("remote.{name}.push")))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    let mut pushes: Vec<(String, String, bool)> = Vec::new();
+    if specs.is_empty() && query {
+        for b in backend.local_branches()? {
+            if heads.iter().any(|(h, _)| *h == format!("refs/heads/{b}")) {
+                pushes.push((b.clone(), b, false));
+            }
+        }
+    } else if specs.is_empty() {
+        pushes.push(("(matching)".to_owned(), "(matching)".to_owned(), false));
+    }
+    for spec in specs {
+        let forced = spec.starts_with('+');
+        let (src, dst) = spec
+            .trim_start_matches('+')
+            .split_once(':')
+            .unwrap_or((spec, spec));
+        let short = |s: &str| {
+            s.strip_prefix("refs/heads/")
+                .unwrap_or(s)
+                .trim_start_matches('+')
+                .to_owned()
+        };
+        pushes.push((short(src), short(dst), forced));
+    }
+    if !pushes.is_empty() {
+        out.push(format!(
+            "  {} configured for 'git push'{not_queried}:",
+            plural(pushes.len(), "Local ref", "Local refs")
+        ));
+        let w1 = pushes.iter().map(|(s, ..)| s.len()).max().unwrap_or(0);
+        let w2 = pushes.iter().map(|(_, d, _)| d.len()).max().unwrap_or(0);
+        for (src, dst, forced) in &pushes {
+            let verb = if *forced { "forces to" } else { "pushes to" };
+            if !query {
+                out.push(format!("    {src:<w1$} {verb} {dst}"));
+                continue;
+            }
+            let theirs = heads
+                .iter()
+                .find(|(h, _)| *h == format!("refs/heads/{dst}"))
+                .map(|(_, id)| id.as_str());
+            let ours = backend.rev_parse(&format!("refs/heads/{src}")).ok();
+            let status = match (theirs, ours) {
+                (None, _) => "create",
+                (Some(t), Some(o)) if t == o => "up to date",
+                (Some(t), Some(o)) if backend.is_ancestor(t, &o).unwrap_or(false) => {
+                    "fast-forwardable"
+                }
+                _ => "local out of date",
+            };
+            out.push(format!("    {src:<w1$} {verb} {dst:<w2$} ({status})"));
+        }
+    }
+    Ok(out.join("\n"))
+}
+
+/// Tags matching any of `patterns` (all when none) and `o`'s filters, in its
+/// `--sort` order.
 pub(crate) fn tag_list(
     backend: &Arc<dyn GitBackend>,
     patterns: &[String],
-    contains: Option<&str>,
-    points_at: Option<&str>,
-) -> anyhow::Result<Vec<rgit_git::TagInfo>> {
-    let at = points_at.map(|r| backend.rev_parse(r)).transpose()?;
+    o: &TagOpts,
+) -> anyhow::Result<Vec<rgit_git::RefDetail>> {
+    let mut sort = o.sort.clone();
+    if sort.is_empty() {
+        sort.extend(backend.config_get("tag.sort").ok().flatten());
+    }
+    if sort.is_empty() && o.ignore_case {
+        sort.push("refname".to_owned());
+    }
+    let refs = crate::plumbing::sort_refs(backend, backend.ref_details()?, &sort, o.ignore_case)?;
+    let fold = |s: &str| {
+        if o.ignore_case {
+            s.to_lowercase()
+        } else {
+            s.to_owned()
+        }
+    };
+    let patterns: Vec<String> = patterns.iter().map(|p| fold(p)).collect();
+    let at = o
+        .points_at
+        .as_ref()
+        .map(|r| backend.rev_parse(r))
+        .transpose()?;
+    // Tags of non-commits never pass a commit filter, as in git.
+    let reach = |a: &str, b: &str, want: bool| backend.is_ancestor(a, b).is_ok_and(|r| r == want);
     let mut out = Vec::new();
-    for t in backend.all_tags()? {
-        if (patterns.is_empty() || rgit_git::pathspec_matches(patterns, &t.name))
-            && contains.map_or(Ok(true), |c| backend.is_ancestor(c, &t.name))?
+    for t in refs {
+        let Some(name) = t.name.strip_prefix("refs/tags/") else {
+            continue;
+        };
+        let full = t.name.as_str();
+        if (patterns.is_empty() || rgit_git::pathspec_matches(&patterns, &fold(name)))
             && at
                 .as_ref()
-                .is_none_or(|oid| backend.rev_parse(&t.name).ok().as_ref() == Some(oid))
+                .is_none_or(|at| *at == t.id || t.peeled.as_ref() == Some(at))
+            && o.contains.as_ref().is_none_or(|c| reach(c, full, true))
+            && o.no_contains.as_ref().is_none_or(|c| reach(c, full, false))
+            && o.merged.as_ref().is_none_or(|m| reach(full, m, true))
+            && o.no_merged.as_ref().is_none_or(|m| reach(full, m, false))
         {
             out.push(t);
         }
@@ -5603,19 +7330,218 @@ pub(crate) fn tag_list(
     Ok(out)
 }
 
-/// A tag and up to `n` lines of its message, laid out like `git tag -n`.
-fn tag_with_message(t: &rgit_git::TagInfo, n: usize) -> String {
-    let body: Vec<&str> = t.message.lines().take(n).collect();
-    format!("{:<15} {}", t.name, body.join("\n    "))
+/// A tag, with up to `n` lines of its message laid out like `git tag -n`.
+fn tag_with_message(t: &rgit_git::RefDetail, n: Option<usize>) -> String {
+    let name = t.name.strip_prefix("refs/tags/").unwrap_or(&t.name);
+    let Some(n) = n else {
+        return name.to_owned();
+    };
+    // A signed tag's signature is not part of its message.
+    let message = t.message.split("-----BEGIN ").next().unwrap_or_default();
+    let body: Vec<&str> = message.lines().take(n).collect();
+    format!("{name:<15} {}", body.join("\n    "))
 }
 
-/// The changes stash `index` records: its base commit against its tree.
+/// `git tag <name> [<rev>]`: a lightweight tag, or an annotated one with a
+/// message from -m, -F, the editor (-e) or a prompt, signed with -s / -u or
+/// `tag.gpgSign`.
+fn create_tag(
+    backend: &Arc<dyn GitBackend>,
+    names: &[String],
+    o: TagOpts,
+    interactive: bool,
+) -> anyhow::Result<String> {
+    let (name, rev) = match names {
+        [name] => (name, "HEAD"),
+        [name, rev] => (name, rev.as_str()),
+        _ => {
+            return Err(CliError::usage(format!(
+                "tag takes a name and an optional revision, got {}",
+                names.join(" ")
+            )));
+        }
+    };
+    let mut message = match o.file.as_deref() {
+        Some("-") => Some(std::io::read_to_string(std::io::stdin())?),
+        Some(f) => Some(
+            std::fs::read_to_string(f).map_err(|e| anyhow::anyhow!("could not read {f}: {e}"))?,
+        ),
+        None => o.message,
+    };
+    let signed = o.sign || o.local_user.is_some();
+    let annotated = message.is_some() || o.annotate || signed;
+    if o.edit || message.is_none() && annotated {
+        if !interactive {
+            let what = if o.edit {
+                "-e"
+            } else {
+                "an annotation message (-m)"
+            };
+            return Err(CliError::usage(format!("{what} needs a terminal")));
+        }
+        let template = format!(
+            "{}\n#\n# Write a message for tag:\n#   {name}\n# Lines starting with '#' will be ignored.\n",
+            message.as_deref().unwrap_or_default()
+        );
+        let text = edit_file(backend, "TAG_EDITMSG", &template)?;
+        let text = strip_comments(&text);
+        if text.trim().is_empty() {
+            anyhow::bail!("no tag message?");
+        }
+        message = Some(text);
+    }
+    let gpg_sign = backend
+        .config_get("tag.gpgSign")?
+        .is_some_and(|v| matches!(v.to_lowercase().as_str(), "true" | "yes" | "on" | "1"));
+    let key = match o.local_user {
+        Some(k) => Some(k),
+        None if o.sign || annotated && gpg_sign && !o.no_sign => Some(String::new()),
+        None => None,
+    };
+    ok(backend.tag_with(
+        name,
+        rev,
+        message.as_deref(),
+        o.cleanup.as_deref().unwrap_or("strip"),
+        key.as_deref(),
+        o.force,
+    ))
+}
+
+/// `text` without its `#` lines.
+fn strip_comments(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Write `text` to `<git dir>/<file>`, open it in git's editor on the
+/// terminal and return what was saved.
+fn edit_file(backend: &Arc<dyn GitBackend>, file: &str, text: &str) -> anyhow::Result<String> {
+    let path = backend.git_dir().join(file);
+    std::fs::write(&path, text)?;
+    let editor = std::env::var("GIT_EDITOR")
+        .ok()
+        .or_else(|| backend.config_get("core.editor").ok().flatten())
+        .or_else(|| std::env::var("VISUAL").ok())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| "vi".to_owned());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("sh")
+        .arg(&path)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("the editor {editor} failed");
+    }
+    Ok(std::fs::read_to_string(&path)?)
+}
+
+/// The changes stash `index` records, `(tracked, untracked)`: its base
+/// commit against its tree, and the untracked files it saved.
 pub(crate) fn stash_diff(
     backend: &Arc<dyn GitBackend>,
     index: usize,
+    (tracked, untracked): (bool, bool),
 ) -> anyhow::Result<Vec<rgit_git::FileDiff>> {
     let stash = format!("stash@{{{index}}}");
-    Ok(backend.diff_refs(&format!("{stash}^1"), &stash)?)
+    let mut files = if tracked {
+        backend.diff_refs(&format!("{stash}^1"), &stash)?
+    } else {
+        Vec::new()
+    };
+    let saved = format!("{stash}^3");
+    if untracked && backend.rev_parse(&saved).is_ok() {
+        files.extend(backend.diff(&rgit_git::DiffSpec {
+            to: Some(saved),
+            ..rgit_git::DiffSpec::default()
+        })?);
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+    }
+    Ok(files)
+}
+
+/// Paths listed in `file` (`-` for stdin), one per line or NUL-separated.
+fn pathspec_from_file(file: &str, nul: bool) -> anyhow::Result<Vec<String>> {
+    let text = if file == "-" {
+        std::io::read_to_string(std::io::stdin())?
+    } else {
+        std::fs::read_to_string(file).map_err(|e| anyhow::anyhow!("could not read {file}: {e}"))?
+    };
+    Ok(text
+        .split(if nul { '\0' } else { '\n' })
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// `git stash list --format`: each stash in a log format.
+fn stash_log(
+    backend: &Arc<dyn GitBackend>,
+    format: &str,
+    max: Option<usize>,
+) -> anyhow::Result<String> {
+    if backend.status()?.stashes.is_empty() {
+        return Ok(String::new());
+    }
+    let mut out = Vec::new();
+    for (i, item) in backend
+        .reflog("refs/stash")?
+        .into_iter()
+        .enumerate()
+        .take(max.unwrap_or(usize::MAX))
+    {
+        let Some(c) = backend
+            .rev_walk(&rgit_git::RevWalk {
+                revs: vec![item.id.clone()],
+                max: Some(1),
+                ..rgit_git::RevWalk::default()
+            })?
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        let mut line = String::new();
+        let mut chars = format.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '%' {
+                line.push(ch);
+                continue;
+            }
+            let date = crate::plumbing::format_date;
+            let a = &c.author;
+            let cm = &c.committer;
+            let code: String = match chars.next() {
+                Some(c2 @ ('a' | 'c' | 'g')) => [c2].into_iter().chain(chars.next()).collect(),
+                Some(c2) => c2.to_string(),
+                None => String::new(),
+            };
+            line.push_str(&match code.as_str() {
+                "gd" => format!("stash@{{{i}}}"),
+                "gs" => item.message.clone(),
+                "H" => c.id.clone(),
+                "h" => backend.abbrev_id(&c.id, 7)?,
+                "s" => c.summary.clone(),
+                "an" => a.name.clone(),
+                "ae" => a.email.clone(),
+                "ad" => date(a.time, a.offset, "default"),
+                "ar" => date(a.time, a.offset, "relative"),
+                "cn" => cm.name.clone(),
+                "ce" => cm.email.clone(),
+                "cd" => date(cm.time, cm.offset, "default"),
+                "cr" => date(cm.time, cm.offset, "relative"),
+                "n" => "\n".to_owned(),
+                "%" => "%".to_owned(),
+                other => format!("%{other}"),
+            });
+        }
+        out.push(line);
+    }
+    Ok(out.join("\n"))
 }
 
 /// Status limited to `paths`, with untracked files per git's `-u` mode and
@@ -5726,9 +7652,13 @@ pub fn from_cwd(mut command: Command, backend: &Arc<dyn GitBackend>) -> Command 
         // A trailing `/` means "inside this folder" to ls-tree and pathspecs.
         Command::Plumbing(
             Plumbing::LsFiles { paths, .. }
-            | Plumbing::LsTree { paths, .. }
+            | Plumbing::LsTree {
+                paths,
+                full_tree: false,
+                ..
+            }
             | Plumbing::Grep { paths, .. }
-            | Plumbing::CheckIgnore { paths, .. },
+            | Plumbing::RevList { paths, .. },
         ) => {
             for p in paths {
                 let dir = p.ends_with('/');
@@ -5745,7 +7675,7 @@ pub fn from_cwd(mut command: Command, backend: &Arc<dyn GitBackend>) -> Command 
 
 /// `p` typed in the repo subfolder `prefix`, as a path from the repo `root`.
 /// `:/x` names `x` at the root, as in git.
-fn repo_path(root: &Path, prefix: &Path, p: &str) -> String {
+pub(crate) fn repo_path(root: &Path, prefix: &Path, p: &str) -> String {
     if let Some(top) = p.strip_prefix(":/") {
         return top.to_owned();
     }

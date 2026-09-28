@@ -48,6 +48,33 @@ fn same(dir: &Path, cases: &[&[&str]]) {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
+/// rgit and git print the same bytes for `args` with `input` on stdin.
+fn same_input(dir: &Path, args: &[&str], input: &[u8]) {
+    let feed = |bin: &str, args: &[&str]| {
+        use std::io::Write;
+        let mut child = Command::new(bin)
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("RGIT_OPLOG", "0")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap().stdout
+    };
+    let mut human = vec!["--human"];
+    human.extend(args);
+    let (want, got) = (feed("git", args), feed(env!("CARGO_BIN_EXE_rgit"), &human));
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        String::from_utf8_lossy(&want),
+        "{args:?}"
+    );
+}
+
 fn commit(dir: &Path, n: u32, message: &str, author: &str) {
     let date = format!("2024-01-0{n}T10:00:00+0200");
     let email = format!("{}@example.com", author.to_lowercase());
@@ -159,8 +186,28 @@ fn rev_parse_matches_git() {
             &["rev-parse", "--show-cdup"],
             &["rev-parse", "--git-dir"],
             &["rev-parse", "--show-toplevel"],
+            &["rev-parse", "HEAD", "--abbrev-ref", "HEAD", "--show-prefix"],
+            &["rev-parse", "--short", "HEAD", "--show-cdup"],
+            &["rev-parse", "--short=4", "HEAD"],
+            &["rev-parse", "--short", "HEAD", "side"],
+            &["rev-parse", "--git-common-dir", "--absolute-git-dir"],
+            &["rev-parse", "--sq-quote", "a b", "it's", "x!"],
+            &["rev-parse", "--local-env-vars"],
+            &["rev-parse", "--symbolic", "HEAD", "side~1"],
+            &["rev-parse", "--symbolic-full-name", "HEAD", "side", "lw"],
+            &["rev-parse", "--not", "main", "^side", "--branches"],
+            &["rev-parse", "--all", "--tags"],
+            &["rev-parse", "--default", "side"],
+            &["rev-parse", "--verify", "--symbolic-full-name", "side"],
+            &["rev-parse", "HEAD", "--", "a"],
+            &[
+                "rev-parse",
+                "--is-shallow-repository",
+                "--show-object-format",
+            ],
         ],
     );
+    same(&dir, &[&["rev-parse", "--git-common-dir", "--show-cdup"]]);
     git(&dir, &["checkout", "-q", "--detach"], &[]);
     same(&dir, &[&["rev-parse", "--abbrev-ref", "HEAD"]]);
     let _ = std::fs::remove_dir_all(&dir);
@@ -192,6 +239,43 @@ fn ls_files_and_ls_tree_match_git() {
             &["ls-tree", "HEAD", "dir/"],
             &["ls-tree", "HEAD", "dir/sub/b"],
             &["ls-tree", "--abbrev=8", "v1"],
+            &["ls-tree", "--abbrev", "HEAD"],
+            &[
+                "ls-tree",
+                "-r",
+                "--format=%(objectmode)|%(objectsize:padded)|%(path)",
+                "HEAD",
+            ],
+            &["ls-files", "-c", "-i", "--exclude-standard"],
+            &["ls-files", "--error-unmatch", "c.txt"],
+            &["ls-files", "--error-unmatch", "c.txt", "nope"],
+            &["ls-files", "-s", "-z", "dir"],
+        ],
+    );
+    // git limits these to the current folder and prints paths from it.
+    same(
+        &dir.join("dir"),
+        &[
+            &["ls-files"][..],
+            &["ls-files", ".."],
+            &["ls-files", "--full-name"],
+            &["ls-files", "-s", "sub"],
+            &["ls-files", "-o"],
+            &["ls-files", "-m", "-d"],
+            &["ls-files", "-o", "-i", "--exclude-standard"],
+            &["ls-tree", "HEAD"],
+            &["ls-tree", "HEAD", ".."],
+            &["ls-tree", "-r", "HEAD", "sub"],
+            &["ls-tree", "--full-name", "HEAD"],
+            &["ls-tree", "--full-tree", "HEAD"],
+            &["ls-tree", "--full-tree", "HEAD", "dir"],
+            &["grep", "a"],
+            &["grep", "-n", "e", "--", ".."],
+            &["grep", "a", "HEAD", "--", ".."],
+            &["grep", "--full-name", "a", "HEAD"],
+            &["grep", "-l", "e", "../c.txt", "a"],
+            &["check-ignore", "y.tmp", "./y.tmp", "../x.log", "a"],
+            &["check-ignore", "-v", "-n", "y.tmp", "../x.log", "a"],
         ],
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -240,6 +324,10 @@ fn refs_match_git() {
             &["show-ref", "-s", "v1"],
             &["show-ref", "--head", "--heads"],
             &["show-ref", "nosuch"],
+            &["show-ref", "--abbrev", "--tags"],
+            &["show-ref", "--abbrev=10", "-d"],
+            &["show-ref", "--exists", "refs/heads/main"],
+            &["show-ref", "--exists", "main"],
             &["for-each-ref"],
             &["for-each-ref", "refs/heads"],
             &["for-each-ref", "refs/tags/*"],
@@ -250,6 +338,31 @@ fn refs_match_git() {
                 "--format=%(refname:short) %(committerdate:unix)",
             ],
             &["for-each-ref", "--sort=-refname", "--count=2"],
+            &[
+                "for-each-ref",
+                "--format=%(if)%(*objectname)%(then)A%(else)L%(end)|\
+                 %(if:equals=main)%(refname:short)%(then)M%(end)|\
+                 %(align:10)%(refname:short)%(end)|%(align:8,right)%(objecttype)%(end)|\
+                 %(align:width=9,position=middle)x%(end)|%(contents:subject)|%(contents:body)|\
+                 %(objectsize)|%(numparent)|%(parent)|%(tree)|%(*objecttype)",
+            ],
+            &["for-each-ref", "--merged"],
+            &["for-each-ref", "--merged=side"],
+            &["for-each-ref", "--no-merged", "side"],
+            &["for-each-ref", "--contains", "side"],
+            &["for-each-ref", "--no-contains", "HEAD~1"],
+            &["for-each-ref", "--points-at", "side"],
+            &["for-each-ref", "--sort=objecttype", "--sort=-refname"],
+            &[
+                "for-each-ref",
+                "--sort=-version:refname",
+                "--exclude=refs/tags/lw",
+            ],
+            &[
+                "for-each-ref",
+                "--omit-empty",
+                "--format=%(if)%(*objectname)%(then)%(refname)%(end)",
+            ],
             &["symbolic-ref", "HEAD"],
             &["symbolic-ref", "--short", "HEAD"],
         ],
@@ -317,6 +430,22 @@ fn grep_matches_git() {
             &["grep", "a\\+b"],
             &["grep", "-q", "foo"],
             &["grep", "zzz"],
+            &["grep", "-C1", "-n", "o"],
+            &["grep", "-A1", "a"],
+            &["grep", "-B2", "two"],
+            &["grep", "--heading", "-n", "a"],
+            &["grep", "--heading", "--break", "-C1", "o"],
+            &["grep", "--break", "a"],
+            &["grep", "-o", "-n", "a."],
+            &["grep", "-h", "-o", "[a-z]*oo"],
+            &["grep", "-L", "a"],
+            &["grep", "-c", "-h", "a"],
+            &["grep", "-z", "-n", "-C1", "bar"],
+            &["grep", "-z", "-l", "a"],
+            &["grep", "-z", "-c", "a"],
+            &["grep", "-m1", "o"],
+            &["grep", "-I", "binary"],
+            &["grep", "binary"],
             &["check-ignore", "x.log"],
             &["check-ignore", "-v", "x.log", "dir/y.tmp", "build/out.o"],
             &["check-ignore", "-v", "-n", "c.txt", "x.log"],
@@ -324,6 +453,16 @@ fn grep_matches_git() {
             &["count-objects"],
             &["count-objects", "-v"],
         ],
+    );
+    same_input(
+        &dir,
+        &["check-ignore", "--stdin"],
+        b"x.log\nc.txt\ndir/y.tmp\n",
+    );
+    same_input(
+        &dir,
+        &["check-ignore", "--stdin", "-z", "-v", "-n"],
+        b"x.log\0c.txt\0",
     );
     git(&dir, &["repack", "-a", "-d", "-q"], &[]);
     same(&dir, &[&["count-objects", "-v"]]);
@@ -343,6 +482,86 @@ fn var_reads_identity_and_editor() {
         &[("GIT_EDITOR", "nano -w")],
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "nano -w\n");
+    let env = [
+        ("GIT_AUTHOR_DATE", "2024-01-02T10:00:00+0200"),
+        ("GIT_COMMITTER_DATE", "@1700000000 -0130"),
+        ("GIT_ATTR_NOSYSTEM", "1"),
+        ("GIT_EDITOR", "vi"),
+    ];
+    for args in [
+        &["var", "-l"][..],
+        &["var", "GIT_AUTHOR_IDENT"],
+        &["var", "GIT_COMMITTER_IDENT"],
+        &["var", "GIT_CONFIG_GLOBAL"],
+        &["var", "GIT_SHELL_PATH"],
+    ] {
+        let want = run("git", &dir, args, &env);
+        let mut human = vec!["--human"];
+        human.extend(args);
+        let got = run(env!("CARGO_BIN_EXE_rgit"), &dir, &human, &env);
+        assert_eq!(
+            String::from_utf8_lossy(&got.stdout),
+            String::from_utf8_lossy(&want.stdout),
+            "{args:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_symbolic_ref_and_path_limits_match_git() {
+    let dir = repo("batch");
+    let input = b"HEAD\nv1\nnope\nHEAD:c.txt\nHEAD^{tree}\n";
+    same_input(&dir, &["cat-file", "--batch-check"], input);
+    same_input(&dir, &["cat-file", "--batch"], input);
+    same_input(
+        &dir,
+        &[
+            "cat-file",
+            "--batch-check=%(objecttype) %(rest)|%(objectname)",
+        ],
+        b"HEAD some rest\nside\n",
+    );
+    same(
+        &dir,
+        &[
+            &["cat-file", "--batch-check", "--batch-all-objects"][..],
+            &["rev-list", "HEAD", "--", "s.txt"],
+            &["rev-list", "HEAD", "--", "c.txt"],
+            &["rev-list", "--all", "--", "dir", "e.txt"],
+            &["rev-list", "--count", "HEAD", "--", "c.txt"],
+            &["rev-list", "--first-parent", "HEAD", "--", "s.txt"],
+            &["rev-list", "--skip=1", "--branches"],
+            &["rev-list", "--tags", "--abbrev-commit"],
+            &["rev-list", "--topo-order", "--parents", "HEAD"],
+        ],
+    );
+    same(&dir.join("dir"), &[&["rev-list", "HEAD", "--", "../s.txt"]]);
+    let ok = |args: &[&str]| assert!(rgit(&dir, args).status.success(), "{args:?}");
+    ok(&["symbolic-ref", "refs/heads/alias", "refs/heads/side"]);
+    assert_eq!(
+        git(&dir, &["symbolic-ref", "refs/heads/alias"], &[]),
+        "refs/heads/side\n"
+    );
+    ok(&["symbolic-ref", "-d", "refs/heads/alias"]);
+    assert!(
+        !run("git", &dir, &["symbolic-ref", "refs/heads/alias"], &[])
+            .status
+            .success()
+    );
+    ok(&["symbolic-ref", "-m", "move", "HEAD", "refs/heads/side"]);
+    assert_eq!(
+        git(&dir, &["symbolic-ref", "HEAD"], &[]),
+        "refs/heads/side\n"
+    );
+    same(
+        &dir,
+        &[
+            &["symbolic-ref", "HEAD", "side"][..],
+            &["symbolic-ref", "-d", "HEAD"],
+            &["symbolic-ref", "-d", "-q", "refs/heads/main"],
+        ],
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

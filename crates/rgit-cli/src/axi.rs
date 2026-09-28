@@ -11,7 +11,7 @@ use rgit_git::{
 
 use crate::cli::{
     BranchCmd, Command, FlowCmd, IndexCmd, LanesCmd, NotesCmd, RemoteCmd, StackCmd, StashCmd,
-    WorkspaceCmd, WorktreeCmd,
+    SubmoduleCmd, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::render;
@@ -142,6 +142,49 @@ pub fn run(
             blame(&all, &path, start, end)
         }
         Command::Plumbing(c) => crate::plumbing::run(backend, c, false)?,
+        command @ Command::LsRemote { .. } => {
+            crate::plumbing::ls_remote(Some(backend.workdir()), command, false)?
+        }
+        Command::Submodule {
+            cmd: cmd @ (None | Some(SubmoduleCmd::Status { quiet: false, .. })),
+        } => {
+            let (cached, recursive, paths) = match cmd {
+                Some(SubmoduleCmd::Status {
+                    cached,
+                    recursive,
+                    paths,
+                    ..
+                }) => (cached, recursive, paths),
+                _ => (false, false, Vec::new()),
+            };
+            let list = crate::cli::chosen_submodules(backend, recursive, &paths)?;
+            let rows = list
+                .iter()
+                .map(|s| {
+                    let commit = match cached {
+                        true => s.recorded.as_deref(),
+                        false => s.checked_out.as_deref().or(s.recorded.as_deref()),
+                    };
+                    crate::obj! {
+                        "path" => s.path,
+                        "commit" => commit.unwrap_or(""),
+                        "state" => s.state.to_string(),
+                        "name" => s.name,
+                        "url" => s.url.as_deref().unwrap_or(""),
+                        "branch" => s.branch.as_deref().unwrap_or(""),
+                        "describe" => s.describe.as_deref().unwrap_or(""),
+                    }
+                })
+                .collect();
+            Output::new(crate::cli::submodule_status(&list, cached))
+                .list(
+                    "submodules",
+                    rows,
+                    &["path", "commit", "state"],
+                    "0 submodules",
+                )
+                .help("Run `rgit submodule update --init --recursive` to check them out")
+        }
         Command::Refs => {
             let refs = backend.refs()?;
             let rows = refs
@@ -161,7 +204,7 @@ pub fn run(
                 "0 refs in this repository",
             )
         }
-        Command::Branch { cmd: None, opts } if opts.is_listing() => {
+        Command::Branch { cmd: None, opts } if opts.is_listing() && opts.format.is_none() => {
             let list = crate::cli::branch_rows(backend, &opts)?;
             let names: Vec<String> = list.iter().map(|r| r.name.clone()).collect();
             let current = list.iter().find(|r| r.current).map(|r| r.name.as_str());
@@ -239,6 +282,7 @@ pub fn run(
         )),
         Command::Branch { cmd: None, opts }
             if (opts.delete || opts.force_delete)
+                && !opts.remotes
                 && !opts.args.is_empty()
                 && !any_branch_exists(backend, &opts.args)? =>
         {
@@ -247,39 +291,38 @@ pub fn run(
                 opts.args.join(", ")
             ))
         }
-        Command::Tag {
-            names,
-            delete: false,
-            list,
-            lines,
-            contains,
-            points_at,
-            ..
-        } if names.is_empty()
-            || list
-            || lines.is_some()
-            || contains.is_some()
-            || points_at.is_some() =>
-        {
-            let tags =
-                crate::cli::tag_list(backend, &names, contains.as_deref(), points_at.as_deref())?;
-            let text = if tags.is_empty() {
+        Command::Tag { names, opts } if opts.is_listing(&names) && opts.format.is_none() => {
+            let tags = crate::cli::tag_list(backend, &names, &opts)?;
+            let info: std::collections::HashMap<String, rgit_git::TagInfo> = backend
+                .all_tags()?
+                .into_iter()
+                .map(|t| (t.name.clone(), t))
+                .collect();
+            let names: Vec<&str> = tags
+                .iter()
+                .map(|t| t.name.strip_prefix("refs/tags/").unwrap_or(&t.name))
+                .collect();
+            let text = if names.is_empty() {
                 "no tags".to_owned()
             } else {
-                tags.iter()
-                    .map(|t| t.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                names.join("\n")
             };
-            let rows = tags
+            let rows = names
                 .iter()
-                .map(|t| crate::obj! { "name" => t.name, "when" => t.when, "message" => t.message })
+                .map(|n| {
+                    let t = info.get(*n);
+                    crate::obj! {
+                        "name" => n,
+                        "when" => t.map(|t| t.when.as_str()).unwrap_or_default(),
+                        "message" => t.map(|t| t.message.as_str()).unwrap_or_default(),
+                    }
+                })
                 .collect();
             Output::new(text)
                 .list(
                     "tags",
                     rows,
-                    if lines.is_some() {
+                    if opts.lines.is_some() {
                         &["name", "when", "message"]
                     } else {
                         &["name", "when"]
@@ -288,19 +331,18 @@ pub fn run(
                 )
                 .help("Run `rgit tag <name> -m \"<message>\"` to create a tag")
         }
-        Command::Tag {
-            names,
-            force: false,
-            delete: false,
-            ..
-        } if names.len() == 1 && tag_exists(backend, &names[0])? => {
+        Command::Tag { names, opts }
+            if !opts.force
+                && !opts.delete
+                && !opts.verify
+                && names.len() == 1
+                && tag_exists(backend, &names[0])? =>
+        {
             Output::message(format!("tag {} already exists (no-op)", names[0]))
         }
-        Command::Tag {
-            names,
-            delete: true,
-            ..
-        } if !names.is_empty() && !any_tag_exists(backend, &names)? => {
+        Command::Tag { names, opts }
+            if opts.delete && !names.is_empty() && !any_tag_exists(backend, &names)? =>
+        {
             Output::message(format!("tag {} does not exist (no-op)", names.join(", ")))
         }
         Command::Stash {
@@ -309,20 +351,33 @@ pub fn run(
                     index,
                     patch,
                     name_only,
+                    include_untracked,
+                    only_untracked,
+                    name_status: false,
+                    numstat: false,
                     ..
                 }),
             ..
         } => {
             let i = index.unwrap_or(0);
-            let files = crate::cli::stash_diff(backend, i)?;
+            let files = crate::cli::stash_diff(
+                backend,
+                i,
+                (!only_untracked, include_untracked || only_untracked),
+            )?;
             let base = format!("rgit stash show stash@{{{i}}}");
             diff(&files, &format!("stash@{{{i}}}"), &base, patch, name_only)
         }
         Command::Stash {
-            cmd: Some(StashCmd::List),
+            cmd:
+                Some(StashCmd::List {
+                    format: None,
+                    max_count,
+                }),
             ..
         } => {
-            let stashes = backend.status()?.stashes;
+            let mut stashes = backend.status()?.stashes;
+            stashes.truncate(max_count.unwrap_or(usize::MAX));
             let rows = stashes
                 .iter()
                 .map(|s| crate::obj! { "index" => s.index, "message" => s.message })
@@ -348,7 +403,7 @@ pub fn run(
                 .help("Run `rgit remote add <name> <url>` to add a remote")
         }
         Command::Remote {
-            cmd: Some(RemoteCmd::Add { name, url }),
+            cmd: Some(RemoteCmd::Add { name, url, .. }),
             ..
         } if backend.remotes()?.iter().any(|r| r.name == name) => {
             let existing = backend
@@ -375,7 +430,11 @@ pub fn run(
             Output::message(format!("remote {name} does not exist (no-op)"))
         }
         Command::Worktree {
-            cmd: None | Some(WorktreeCmd::List),
+            cmd:
+                None
+                | Some(WorktreeCmd::List {
+                    porcelain: false, ..
+                }),
         } => {
             let list = backend.worktrees()?;
             let rows = list
@@ -1274,16 +1333,15 @@ fn done_message(c: &Command) -> Option<String> {
                 format!("{} onto new branch {name}", stash("popped", index))
             }
             StashCmd::Clear => "dropped every stash".to_owned(),
+            StashCmd::Store { commit, .. } => format!("stored {commit} as stash@{{0}}"),
             _ => return None,
         },
-        Command::Tag {
-            names,
-            delete: true,
-            ..
-        } => format!("deleted tag {}", names.join(", ")),
+        Command::Tag { names, opts } if opts.delete => {
+            format!("deleted tag {}", names.join(", "))
+        }
         Command::Tag { names, .. } if !names.is_empty() => format!("created tag {}", names[0]),
         Command::Remote { cmd: Some(cmd), .. } => match cmd {
-            RemoteCmd::Add { name, url } => format!("added remote {name} -> {url}"),
+            RemoteCmd::Add { name, url, .. } => format!("added remote {name} -> {url}"),
             RemoteCmd::Remove { name } => format!("removed remote {name}"),
             RemoteCmd::SetUrl { name, url, .. } => format!("set remote {name} -> {url}"),
             RemoteCmd::Rename { old, new } => format!("renamed remote {old} to {new}"),
@@ -1368,11 +1426,9 @@ fn next_steps(c: &Command) -> Vec<String> {
         } => vec![format!(
             "Run `rgit push --set-upstream` to publish {name}"
         )],
-        Command::Tag {
-            names,
-            delete: false,
-            ..
-        } if !names.is_empty() => vec!["Run `rgit push --tags` to publish tags".into()],
+        Command::Tag { names, opts } if !opts.delete && !opts.is_listing(names) => {
+            vec!["Run `rgit push --tags` to publish tags".into()]
+        }
         Command::Stash {
             cmd: None | Some(StashCmd::Push { .. }),
             ..

@@ -691,6 +691,15 @@ fn input_rich(prompt: &str, validate: &dyn Fn(&str) -> Result<(), String>) -> Re
     }
 }
 
+/// A plain one-line answer on stderr/stdin, even on a rich terminal, for
+/// prompts that follow printed text (git's `-p` hunk questions).
+pub fn line(
+    prompt: &str,
+    validate: impl Fn(&str) -> Result<(), String>,
+) -> Result<String, Cancelled> {
+    input_line(prompt, &validate)
+}
+
 fn input_line(
     prompt: &str,
     validate: &dyn Fn(&str) -> Result<(), String>,

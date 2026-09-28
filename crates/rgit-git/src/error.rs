@@ -33,6 +33,10 @@ pub enum GitError {
     #[error("push rejected; the remote has changes you do not - fetch and integrate, or force")]
     PushRejected,
 
+    /// A push that left refs unpushed, with git's report and advice.
+    #[error("{0}")]
+    PushFailed(String),
+
     /// A `git` CLI invocation failed (used only for the operations libgit2
     /// cannot do: undo, rebase continue/skip, bisect).
     #[error("{0}")]

@@ -407,6 +407,35 @@ pub struct Worktree {
     pub locked: bool,
     /// The primary worktree (the repository's own working directory).
     pub is_main: bool,
+    /// The full HEAD commit id, `None` when unborn.
+    pub oid: Option<String>,
+    /// Why it is locked, when a reason was given.
+    pub lock_reason: Option<String>,
+    /// Why `worktree prune` would remove it, as git words it.
+    pub prunable: Option<String>,
+}
+
+/// `git worktree add`'s flags beyond the path and commit-ish.
+#[derive(Debug, Clone, Default)]
+pub struct WorktreeAddArgs {
+    /// Create this branch at the commit-ish (git's -b), or with `reset`
+    /// create or reset it (-B).
+    pub new_branch: Option<String>,
+    pub reset: bool,
+    /// Check out a detached HEAD.
+    pub detach: bool,
+    /// Start an unborn branch with an empty index.
+    pub orphan: bool,
+    /// Check out a branch even when another worktree has it.
+    pub force: bool,
+    /// Leave the working tree and index empty.
+    pub no_checkout: bool,
+    /// Lock the new worktree, with an optional reason.
+    pub lock: bool,
+    pub reason: Option<String>,
+    /// Set a new branch's upstream to the start point (`Some(true)`), never
+    /// (`Some(false)`), or when it is a remote-tracking branch (`None`).
+    pub track: Option<bool>,
 }
 
 /// Filters for the commit log view.
@@ -886,6 +915,48 @@ pub struct FetchArgs {
     pub depth: i32,
     /// Report what would change without updating any ref (`--dry-run`).
     pub dry_run: bool,
+    /// Fetch the whole history of a shallow repository (`--unshallow`).
+    pub unshallow: bool,
+    /// Deepen a shallow history by this many commits (`--deepen`).
+    pub deepen: i32,
+    /// Limit history to commits after this date (`--shallow-since`).
+    pub shallow_since: Option<String>,
+    /// Also fetch every tag and, with `prune`, drop local tags gone from the
+    /// remote (`--prune-tags`).
+    pub prune_tags: bool,
+    /// Follow no tags (`--no-tags`).
+    pub no_tags: bool,
+    /// Update refs even when not a fast-forward (`--force`).
+    pub force: bool,
+    /// Map command-line refspecs through these instead of the configured
+    /// ones (`--refmap`); an empty list updates no remote-tracking ref.
+    pub refmap: Option<Vec<String>>,
+    /// Record the fetched branch as the current branch's upstream (`--set-upstream`).
+    pub set_upstream: bool,
+}
+
+/// `git pull` flags beyond the remote and branch.
+#[derive(Debug, Clone, Default)]
+pub struct PullArgs {
+    /// Rebase (`Some(true)`) or merge (`Some(false)`); `None` follows `pull.rebase`.
+    pub rebase: Option<bool>,
+    /// Refuse anything but a fast-forward (`--ff-only`).
+    pub ff_only: bool,
+    /// Always make a merge commit (`--no-ff`).
+    pub no_ff: bool,
+    /// Stage the result without committing or recording a merge (`--squash`).
+    pub squash: bool,
+    /// Merge but stop before committing (`--no-commit`).
+    pub no_commit: bool,
+    /// Stash local changes around the pull (`--autostash`); `None` follows
+    /// `rebase.autoStash` / `merge.autoStash`.
+    pub autostash: Option<bool>,
+    /// `ours` or `theirs` for conflicting hunks (`-X`).
+    pub strategy_option: Option<String>,
+    /// Fetch every remote first (`--all`).
+    pub all: bool,
+    /// Limit fetched history to this many commits (`--depth`).
+    pub depth: i32,
 }
 
 /// `git push` flags beyond the remote and refspecs.
@@ -903,6 +974,102 @@ pub struct PushArgs {
     pub tags: bool,
     /// Report what would be pushed without sending it (`--dry-run`).
     pub dry_run: bool,
+    /// Also push annotated tags that point into the pushed history (`--follow-tags`).
+    pub follow_tags: bool,
+    /// Push nothing unless every ref can be updated (`--atomic`).
+    pub atomic: bool,
+    /// Delete remote refs that no local ref maps to (`--prune`).
+    pub prune: bool,
+    /// Make the remote's refs match every local ref (`--mirror`).
+    pub mirror: bool,
+    /// Strings passed to the server's hooks (`-o`/`--push-option`).
+    pub push_options: Vec<String>,
+    /// Skip the pre-push hook (`--no-verify`).
+    pub no_verify: bool,
+    /// Report in git's machine-readable format (`--porcelain`).
+    pub porcelain: bool,
+    /// Also report refs that are already up to date (`--verbose`).
+    pub verbose: bool,
+}
+
+/// A submodule as `git submodule status` reports it.
+#[derive(Debug, Clone)]
+pub struct SubmoduleInfo {
+    pub name: String,
+    /// Path from the top of the superproject (nested ones include their parents).
+    pub path: String,
+    pub url: Option<String>,
+    /// The branch `.gitmodules` names, if any.
+    pub branch: Option<String>,
+    /// The commit the superproject records.
+    pub recorded: Option<String>,
+    /// The commit checked out in the submodule, when it is.
+    pub checked_out: Option<String>,
+    /// git's status column: ` ` in sync, `-` not initialized, `+` another commit
+    /// checked out, `U` merge conflicts.
+    pub state: char,
+    /// The checked-out commit as `git describe` names it.
+    pub describe: Option<String>,
+}
+
+/// A `git submodule` subcommand that changes something.
+#[derive(Debug, Clone)]
+pub enum SubmoduleOp {
+    Add {
+        url: String,
+        path: Option<String>,
+        branch: Option<String>,
+        name: Option<String>,
+    },
+    Init {
+        paths: Vec<String>,
+    },
+    Update {
+        paths: Vec<String>,
+        init: bool,
+        recursive: bool,
+        remote: bool,
+    },
+    Sync {
+        paths: Vec<String>,
+        recursive: bool,
+    },
+    Deinit {
+        paths: Vec<String>,
+        force: bool,
+        all: bool,
+    },
+    SetUrl {
+        path: String,
+        url: String,
+    },
+    /// `branch: None` goes back to the remote's default branch.
+    SetBranch {
+        path: String,
+        branch: Option<String>,
+    },
+    AbsorbGitDirs {
+        paths: Vec<String>,
+    },
+    /// git's own `submodule summary` arguments.
+    Summary {
+        args: Vec<String>,
+    },
+}
+
+/// `git init` options beyond the path.
+#[derive(Debug, Clone, Default)]
+pub struct InitArgs {
+    /// Name of the first branch (`-b`).
+    pub initial_branch: Option<String>,
+    /// Make a bare repository (`--bare`).
+    pub bare: bool,
+    /// Copy hooks and other files from this folder (`--template`).
+    pub template: Option<String>,
+    /// `group`, `all`/`world`/`everybody`, `umask`/`false` or an octal mode (`--shared`).
+    pub shared: Option<String>,
+    /// Put the repository here and link it from the working tree (`--separate-git-dir`).
+    pub separate_git_dir: Option<String>,
 }
 
 /// `git clone` options beyond the URL and target directory.
@@ -918,4 +1085,17 @@ pub struct CloneArgs {
     pub origin: Option<String>,
     /// Clone submodules too (`--recurse-submodules`).
     pub recurse_submodules: bool,
+    /// Fetch only the checked-out branch (`--single-branch`).
+    pub single_branch: bool,
+    /// Leave the working tree empty (`--no-checkout`).
+    pub no_checkout: bool,
+    /// A bare copy of every ref, kept as a mirror (`--mirror`).
+    pub mirror: bool,
+    /// Follow no tags (`--no-tags`).
+    pub no_tags: bool,
+    /// `key=value` settings written to the new repository (`-c`).
+    pub config: Vec<String>,
+    /// Flags only git's own clone implements (`--reference`, `--shared`,
+    /// `--filter`, `--sparse`, `--template`, ...), handed to it as given.
+    pub git_flags: Vec<String>,
 }

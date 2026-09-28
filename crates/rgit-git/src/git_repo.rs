@@ -93,6 +93,12 @@ impl Git2Backend {
             Some(r) => r.to_owned(),
             None => upstream_remote(&repo)?.0,
         };
+        if multi_url(&repo, &remote_name, true) {
+            let mut cmd = vec!["push", remote_name.as_str()];
+            cmd.extend(refspecs.iter().map(String::as_str));
+            self.run_git(&cmd, &[])?;
+            return Ok(());
+        }
         let mut remote = repo.find_remote(&remote_name)?;
         if let Ok(url) = remote.url() {
             report(OpProgress::Line(format!("To {url}")));
@@ -195,6 +201,63 @@ impl Git2Backend {
             other => other,
         }
     }
+
+    /// Fetch one remote natively, or through git for what libgit2 cannot do:
+    /// deepening by a count or a date, and shallow fetches over its local
+    /// transport.
+    fn fetch_remote(
+        &self,
+        repo: &Repository,
+        name: &str,
+        refspecs: &[String],
+        args: &crate::FetchArgs,
+        report: &dyn Fn(OpProgress),
+        cred: Option<&dyn crate::CredentialPrompt>,
+    ) -> Result<(), GitError> {
+        if args.dry_run {
+            return fetch_dry_run(repo, name, refspecs, args, report, cred);
+        }
+        let local = repo.find_remote(name)?.url().is_ok_and(is_local_url);
+        if !(args.deepen > 0
+            || args.shallow_since.is_some()
+            || (local && (args.depth > 0 || args.unshallow))
+            || multi_url(repo, name, false))
+        {
+            return do_fetch(repo, name, refspecs, args, report, cred);
+        }
+        let mut cmd = vec!["fetch".to_owned()];
+        if args.depth > 0 {
+            cmd.push(format!("--depth={}", args.depth));
+        }
+        if args.deepen > 0 {
+            cmd.push(format!("--deepen={}", args.deepen));
+        }
+        if let Some(date) = &args.shallow_since {
+            cmd.push(format!("--shallow-since={date}"));
+        }
+        for (on, flag) in [
+            (args.unshallow, "--unshallow"),
+            (args.prune, "--prune"),
+            (args.prune_tags, "--prune-tags"),
+            (args.tags, "--tags"),
+            (args.no_tags, "--no-tags"),
+            (args.force, "--force"),
+        ] {
+            if on {
+                cmd.push(flag.to_owned());
+            }
+        }
+        match &args.refmap {
+            Some(map) if map.is_empty() => cmd.push("--refmap=".to_owned()),
+            Some(map) => cmd.extend(map.iter().map(|m| format!("--refmap={m}"))),
+            None => {}
+        }
+        cmd.push(name.to_owned());
+        cmd.extend(refspecs.iter().cloned());
+        let argv: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        self.run_git(&argv, &[])?;
+        Ok(())
+    }
 }
 
 /// Reload libgit2's cached index from disk. libgit2 keeps one index instance per
@@ -286,6 +349,7 @@ impl GitBackend for Git2Backend {
         &self,
         message: Option<&str>,
         include_untracked: bool,
+        all: bool,
         keep_index: bool,
         paths: &[String],
     ) -> Result<String, GitError> {
@@ -293,7 +357,8 @@ impl GitBackend for Git2Backend {
             if paths.is_empty() {
                 let mut repo = self.repo.lock().expect("repo mutex");
                 let sig = repo.signature()?;
-                let mut flags = stash_flags(include_untracked).unwrap_or_default();
+                let mut flags = stash_flags(include_untracked || all).unwrap_or_default();
+                flags.set(git2::StashFlags::INCLUDE_IGNORED, all);
                 flags.set(git2::StashFlags::KEEP_INDEX, keep_index);
                 repo.stash_save2(&sig, message, Some(flags))?;
                 return Ok(stash_saved_line(&repo));
@@ -301,6 +366,7 @@ impl GitBackend for Git2Backend {
             // libgit2 can stash a pathspec, but git2 cannot name such a stash.
             let mut args = vec!["stash", "push"];
             args.extend(include_untracked.then_some("-u"));
+            args.extend(all.then_some("-a"));
             args.extend(keep_index.then_some("-k"));
             if let Some(m) = message {
                 args.extend(["-m", m]);
@@ -355,6 +421,109 @@ impl GitBackend for Git2Backend {
             let mut repo = self.repo.lock().expect("repo mutex");
             repo.stash_drop(index)?;
             Ok(())
+        })
+    }
+
+    fn stash_push_part(
+        &self,
+        message: Option<&str>,
+        hunks: Option<&[(String, u32)]>,
+        keep_index: bool,
+        paths: &[String],
+    ) -> Result<String, GitError> {
+        self.logged("stash", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            let head = repo.head()?.peel_to_commit()?;
+            let head_tree = head.tree()?;
+            let index_tree = repo.find_tree(repo.index()?.write_tree()?)?;
+            let tree = match hunks {
+                None => index_tree,
+                Some(hunks) => {
+                    let mut opts = DiffOptions::new();
+                    for p in paths {
+                        opts.pathspec(p);
+                    }
+                    let diff =
+                        repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut opts))?;
+                    let path = std::cell::RefCell::new(String::new());
+                    let mut apply = ApplyOptions::new();
+                    apply.delta_callback(|d| {
+                        let p = d.and_then(|d| d.new_file().path().or(d.old_file().path()));
+                        *path.borrow_mut() = p
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        hunks.iter().any(|(h, _)| *h == *path.borrow())
+                    });
+                    apply.hunk_callback(|h| {
+                        h.is_some_and(|h| {
+                            hunks
+                                .iter()
+                                .any(|(p, start)| *p == *path.borrow() && *start == h.new_start())
+                        })
+                    });
+                    let mut picked = repo.apply_to_tree(&head_tree, &diff, Some(&mut apply))?;
+                    repo.find_tree(picked.write_tree_to(&repo)?)?
+                }
+            };
+            if tree.id() == head_tree.id() {
+                return Err(GitError::Other(
+                    match hunks {
+                        None => "no staged changes to stash",
+                        Some(_) => "no changes selected",
+                    }
+                    .to_owned(),
+                ));
+            }
+            let stash = stash_commit(&repo, message, &tree)?;
+            let line = stash
+                .summary()
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+                .to_owned();
+            store_stash(&repo, stash.id(), &line)?;
+            let undo = repo.diff_tree_to_tree(Some(&tree), Some(&head_tree), None)?;
+            if hunks.is_none() {
+                repo.apply(&undo, ApplyLocation::Both, None)?;
+            } else {
+                repo.apply(&undo, ApplyLocation::WorkDir, None)?;
+                if !keep_index {
+                    let all = [".".to_owned()];
+                    let paths = if paths.is_empty() { &all[..] } else { paths };
+                    repo.reset_default(Some(head.as_object()), paths)?;
+                }
+            }
+            Ok(format!("Saved working directory and index state {line}"))
+        })
+    }
+
+    fn stash_create(&self, message: Option<&str>) -> Result<Option<String>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        let head_tree = repo.head()?.peel_to_tree()?;
+        let index_tree = repo.find_tree(repo.index()?.write_tree()?)?;
+        let diff = repo.diff_index_to_workdir(None, None)?;
+        let mut worktree = repo.apply_to_tree(&index_tree, &diff, None)?;
+        let tree = repo.find_tree(worktree.write_tree_to(&repo)?)?;
+        if tree.id() == head_tree.id() && index_tree.id() == head_tree.id() {
+            return Ok(None);
+        }
+        Ok(Some(stash_commit(&repo, message, &tree)?.id().to_string()))
+    }
+
+    fn stash_store(&self, rev: &str, message: Option<&str>) -> Result<(), GitError> {
+        self.logged("stash store", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let commit = repo.revparse_single(rev)?.peel_to_commit()?;
+            if commit.parent_count() < 2 {
+                return Err(GitError::Other(format!("{rev} is not a stash-like commit")));
+            }
+            store_stash(
+                &repo,
+                commit.id(),
+                message.unwrap_or("Created via \"git stash store\"."),
+            )
         })
     }
 
@@ -2809,6 +2978,73 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
+    fn tag_with(
+        &self,
+        name: &str,
+        rev: &str,
+        message: Option<&str>,
+        cleanup: &str,
+        sign: Option<&str>,
+        force: bool,
+    ) -> Result<(), GitError> {
+        let message = match message {
+            None => None,
+            Some(m) => Some(match cleanup {
+                "verbatim" => m.to_owned(),
+                "whitespace" => git2::message_prettify(m, None)?,
+                "strip" => git2::message_prettify(m, Some(b'#'))?,
+                other => {
+                    return Err(GitError::Other(format!(
+                        "invalid cleanup mode {other}; use strip, whitespace or verbatim"
+                    )));
+                }
+            }),
+        };
+        if let Some(key) = sign {
+            // libgit2 cannot sign; git runs gpg (or ssh, per gpg.format).
+            let message = message.unwrap_or_default();
+            let mut args = vec!["tag", "--cleanup=verbatim", "-m", &message];
+            if key.is_empty() {
+                args.push("-s");
+            } else {
+                args.extend(["-u", key]);
+            }
+            if force {
+                args.push("-f");
+            }
+            args.extend([name, rev]);
+            self.run_git(&args, &[])?;
+            return Ok(());
+        }
+        let repo = self.repo.lock().expect("repo mutex");
+        let target = repo.revparse_single(rev)?;
+        match message {
+            None => repo.tag_lightweight(name, &target, force)?,
+            Some(m) => repo.tag(name, &target, &repo.signature()?, &m, force)?,
+        };
+        Ok(())
+    }
+
+    fn verify_tags(&self, names: &[String]) -> Result<String, GitError> {
+        // libgit2 cannot check signatures; git runs gpg, reporting on stderr.
+        let out = std::process::Command::new("git")
+            .args(["tag", "-v"])
+            .args(names)
+            .current_dir(&self.workdir)
+            .output()
+            .map_err(|e| GitError::Cli(format!("could not run git: {e}")))?;
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if out.status.success() {
+            Ok(text.trim_end().to_owned())
+        } else {
+            Err(GitError::Cli(text.trim_end().to_owned()))
+        }
+    }
+
     fn is_ancestor(&self, ancestor: &str, rev: &str) -> Result<bool, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let a = repo.revparse_single(ancestor)?.peel_to_commit()?.id();
@@ -2853,8 +3089,10 @@ impl GitBackend for Git2Backend {
         let mut remotes = Vec::new();
         let names = repo.remotes()?;
         for name in names.iter().filter_map(|n| n.ok().flatten()) {
-            let remote = repo.find_remote(name)?;
-            let url = remote.url().unwrap_or_default().to_owned();
+            let url = remote_urls(&repo, name, false)?
+                .into_iter()
+                .next()
+                .unwrap_or_default();
             remotes.push(crate::Remote {
                 name: name.to_owned(),
                 url,
@@ -2872,6 +3110,21 @@ impl GitBackend for Git2Backend {
 
     fn remove_remote(&self, name: &str) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
+        // libgit2 deletes every ref a fetch refspec writes; git only those
+        // under refs/remotes, so a mirror's `refs/*:refs/*` must not reach it.
+        let key = format!("remote.{name}.fetch");
+        let specs = config_values(&repo, &key)?;
+        let tracking = |s: &&String| {
+            s.split_once(':')
+                .is_some_and(|(_, d)| d.starts_with("refs/remotes/"))
+        };
+        if !specs.iter().all(|s| tracking(&s)) {
+            let mut config = open_config(&repo, ConfigScope::Local, true)?;
+            config.remove_multivar(&key, ".*")?;
+            for spec in specs.iter().filter(tracking) {
+                config.set_multivar(&key, "$^", spec)?;
+            }
+        }
         repo.remote_delete(name)?;
         Ok(())
     }
@@ -2885,21 +3138,7 @@ impl GitBackend for Git2Backend {
     fn remote_urls(&self, name: &str, push: bool) -> Result<Vec<String>, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         repo.find_remote(name)?;
-        let config = repo.config()?;
-        let values = |key: &str| -> Result<Vec<String>, GitError> {
-            let mut out = Vec::new();
-            let mut entries = config.multivar(&format!("remote.{name}.{key}"), None)?;
-            while let Some(entry) = entries.next() {
-                out.extend(entry?.value().map(str::to_owned));
-            }
-            Ok(out)
-        };
-        let push_urls = if push { values("pushurl")? } else { Vec::new() };
-        if push_urls.is_empty() {
-            values("url")
-        } else {
-            Ok(push_urls)
-        }
+        remote_urls(&repo, name, push)
     }
 
     fn set_remote_push_url(&self, name: &str, url: &str) -> Result<(), GitError> {
@@ -2924,16 +3163,19 @@ impl GitBackend for Git2Backend {
                 Ok(out)
             };
             let before = tracking(&repo)?;
-            let rejected = std::sync::atomic::AtomicBool::new(false);
-            let mut remote = repo.find_remote(name)?;
-            let mut conn = remote.connect_auth(
-                git2::Direction::Fetch,
-                Some(remote_callbacks(&|_| {}, &rejected, cred)),
-                None,
-            )?;
-            conn.remote()
-                .prune(Some(remote_callbacks(&|_| {}, &rejected, cred)))?;
-            drop(conn);
+            if multi_url(&repo, name, false) {
+                self.run_git(&["remote", "prune", name], &[])?;
+            } else {
+                let rejected = std::sync::atomic::AtomicBool::new(false);
+                let mut remote = repo.find_remote(name)?;
+                let mut conn = remote.connect_auth(
+                    git2::Direction::Fetch,
+                    Some(remote_callbacks(&|_| {}, &rejected, cred)),
+                    None,
+                )?;
+                conn.remote()
+                    .prune(Some(remote_callbacks(&|_| {}, &rejected, cred)))?;
+            }
             let after = tracking(&repo)?;
             Ok(before.into_iter().filter(|b| !after.contains(b)).collect())
         })
@@ -2941,9 +3183,105 @@ impl GitBackend for Git2Backend {
 
     fn rename_remote(&self, old: &str, new: &str) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
-        // Returns the list of non-default refspecs it could not rename; ignore it.
-        repo.remote_rename(old, new)?;
+        // libgit2 leaves non-default refspecs and push remotes alone; git
+        // moves their `refs/remotes/<old>/` and names too.
+        let odd = repo.remote_rename(old, new)?;
+        let mut config = open_config(&repo, ConfigScope::Local, true)?;
+        if !odd.is_empty() {
+            let key = format!("remote.{new}.fetch");
+            let specs = config_values(&repo, &key)?;
+            config.remove_multivar(&key, ".*")?;
+            let (from, to) = (
+                format!(":refs/remotes/{old}/"),
+                format!(":refs/remotes/{new}/"),
+            );
+            for spec in specs {
+                config.set_multivar(&key, "$^", &spec.replace(&from, &to))?;
+            }
+        }
+        let mut renamed = Vec::new();
+        config.entries(None)?.for_each(|e| {
+            let key = String::from_utf8_lossy(e.name_bytes()).into_owned();
+            let push_remote = key == "remote.pushdefault"
+                || key.starts_with("branch.") && key.ends_with(".pushremote");
+            if push_remote && e.value_bytes() == old.as_bytes() {
+                renamed.push(key);
+            }
+        })?;
+        for key in renamed {
+            config.set_str(&key, new)?;
+        }
         Ok(())
+    }
+
+    fn edit_remote_urls(
+        &self,
+        name: &str,
+        url: &str,
+        old: Option<&str>,
+        push: bool,
+        add: bool,
+        delete: bool,
+    ) -> Result<(), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        repo.find_remote(name)?;
+        let key = format!("remote.{name}.{}", if push { "pushurl" } else { "url" });
+        let mut config = open_config(&repo, ConfigScope::Local, true)?;
+        let matching = |re: &str| -> Result<usize, GitError> {
+            let mut n = 0;
+            if let Ok(mut entries) = config.multivar(&key, Some(re)) {
+                while let Some(e) = entries.next() {
+                    e?;
+                    n += 1;
+                }
+            }
+            Ok(n)
+        };
+        if add {
+            config.set_multivar(&key, "$^", url)?;
+        } else if delete {
+            let found = matching(url)?;
+            if found == 0 {
+                return Err(GitError::Other(format!("No such URL found: {url}")));
+            }
+            if !push && found == config_values(&repo, &key)?.len() {
+                return Err(GitError::Other(
+                    "Will not delete all non-push URLs".to_owned(),
+                ));
+            }
+            config.remove_multivar(&key, url)?;
+        } else if let Some(old) = old {
+            if matching(old)? == 0 {
+                return Err(GitError::Other(format!("No such URL found: {old}")));
+            }
+            config.set_multivar(&key, old, url)?;
+        } else {
+            config.set_str(&key, url)?;
+        }
+        Ok(())
+    }
+
+    fn remote_heads(&self, name: &str) -> Result<crate::backend::RemoteHeads, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        let url = remote_urls(&repo, name, false)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| GitError::Other(format!("remote {name} has no URL")))?;
+        let mut remote = repo.remote_anonymous(&url)?;
+        let rejected = std::sync::atomic::AtomicBool::new(false);
+        let callbacks = remote_callbacks(&|_| {}, &rejected, cred_guard.as_deref());
+        let conn = remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None)?;
+        let heads = conn
+            .list()?
+            .iter()
+            .map(|h| (h.name().to_owned(), h.oid().to_string()))
+            .collect();
+        let head = conn
+            .default_branch()
+            .ok()
+            .and_then(|b| b.as_str().ok().map(|s| short_ref(s).to_owned()));
+        Ok((heads, head))
     }
 
     fn worktrees(&self) -> Result<Vec<crate::Worktree>, GitError> {
@@ -2961,23 +3299,52 @@ impl GitBackend for Git2Backend {
                 dirty: repo_is_dirty(&repo),
                 locked: false,
                 is_main: true,
+                oid: head_oid(&repo),
+                lock_reason: None,
+                prunable: None,
             });
         }
 
-        // Each linked worktree, opened on its own path for branch/HEAD/dirty.
+        // Each linked worktree, opened on its own admin folder for
+        // branch/HEAD/dirty, so one whose folder is gone still reads.
         let names = repo.worktrees()?;
         for name in names.iter().filter_map(|n| n.ok().flatten()) {
             let Ok(wt) = repo.find_worktree(name) else {
                 continue;
             };
             let path = wt.path().to_path_buf();
-            let locked = !matches!(wt.is_locked(), Ok(git2::WorktreeLockStatus::Unlocked));
-            let (branch, head, dirty) = match Repository::open(&path) {
+            let (locked, lock_reason) = match wt.is_locked() {
+                Ok(git2::WorktreeLockStatus::Locked(reason)) => (
+                    true,
+                    reason
+                        .map(|r| r.trim_end().to_owned())
+                        .filter(|r| !r.is_empty()),
+                ),
+                _ => (false, None),
+            };
+            let (branch, head, dirty, oid) = match Repository::open_from_worktree(&wt) {
                 Ok(wtr) => {
                     let (b, h) = worktree_head(&wtr);
-                    (b, h, repo_is_dirty(&wtr))
+                    (b, h, path.exists() && repo_is_dirty(&wtr), head_oid(&wtr))
                 }
-                Err(_) => (None, None, false),
+                // libgit2 will not open a worktree whose folder is gone; its
+                // HEAD is still in the admin folder.
+                Err(_) => {
+                    let head = std::fs::read_to_string(
+                        repo.commondir().join("worktrees").join(name).join("HEAD"),
+                    )
+                    .unwrap_or_default();
+                    let head = head.trim();
+                    let (branch, id) = match head.strip_prefix("ref: ") {
+                        Some(r) => (Some(short_ref(r).to_owned()), repo.refname_to_id(r).ok()),
+                        None => (None, Oid::from_str(head).ok()),
+                    };
+                    let short = id
+                        .and_then(|id| repo.find_object(id, None).ok())
+                        .and_then(|o| o.short_id().ok())
+                        .and_then(|b| b.as_str().ok().map(str::to_owned));
+                    (branch, short, false, id.map(|id| id.to_string()))
+                }
             };
             out.push(crate::Worktree {
                 name: name.to_owned(),
@@ -2987,13 +3354,16 @@ impl GitBackend for Git2Backend {
                 dirty,
                 locked,
                 is_main: false,
+                oid,
+                lock_reason,
+                prunable: (!path.exists())
+                    .then(|| "gitdir file points to non-existent location".to_owned()),
             });
         }
 
         out.sort_by(|a, b| b.is_main.cmp(&a.is_main).then(a.name.cmp(&b.name)));
         Ok(out)
     }
-
     fn add_worktree(&self, name: &str, path: &str) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         repo.worktree(name, Path::new(path), None)?;
@@ -3004,63 +3374,151 @@ impl GitBackend for Git2Backend {
         &self,
         path: &str,
         commitish: Option<&str>,
-        new_branch: Option<&str>,
-        detach: bool,
+        a: &crate::WorktreeAddArgs,
     ) -> Result<(), GitError> {
         let abs = std::path::absolute(path)?;
+        if abs.read_dir().is_ok_and(|mut d| d.next().is_some()) || abs.is_file() {
+            return Err(GitError::Other(format!("'{path}' already exists")));
+        }
         let repo = self.repo.lock().expect("repo mutex");
-        let local = |b: &str| repo.find_branch(b, BranchType::Local).ok();
+        let local = |b: &str| repo.find_branch(b, BranchType::Local).is_ok();
+        let branch = |name: &str, start: &str, reset: bool| {
+            new_worktree_branch(&repo, name, start, reset, a.track).map(|()| name.to_owned())
+        };
         // The branch to check out there, creating it (and tracking a remote
         // branch it starts from) when needed; None to detach.
-        let branch = match (new_branch, commitish) {
-            _ if detach => None,
-            (Some(b), start) => Some(new_worktree_branch(&repo, b, start.unwrap_or("HEAD"))?),
-            (None, Some(c)) => match local(c) {
-                Some(b) => Some(b),
-                None => {
-                    // As git does, track the one remote branch of that name.
-                    let mut remote = Vec::new();
-                    for b in repo.branches(Some(BranchType::Remote))? {
-                        if let Some(n) = b?.0.name()?
-                            && n.ends_with(&format!("/{c}"))
-                        {
-                            remote.push(n.to_owned());
-                        }
-                    }
-                    match remote.as_slice() {
-                        [one] => Some(new_worktree_branch(&repo, c, one)?),
-                        _ => None,
+        let head = match (&a.new_branch, commitish) {
+            _ if a.orphan => {
+                if commitish.is_some() {
+                    return Err(GitError::Other(
+                        "--orphan starts an empty branch and takes no commit-ish".to_owned(),
+                    ));
+                }
+                let name = a
+                    .new_branch
+                    .clone()
+                    .unwrap_or_else(|| worktree_base_name(&abs));
+                if local(&name) && !a.reset {
+                    return Err(GitError::Other(format!(
+                        "a branch named '{name}' already exists"
+                    )));
+                }
+                Some(name)
+            }
+            _ if a.detach => None,
+            (Some(b), start) => Some(branch(b, start.unwrap_or("HEAD"), a.reset)?),
+            (None, Some(c)) if local(c) => Some(c.to_owned()),
+            (None, Some(c)) => {
+                // As git does, track the one remote branch of that name.
+                let mut remote = Vec::new();
+                for b in repo.branches(Some(BranchType::Remote))? {
+                    if let Some(n) = b?.0.name()?
+                        && n.ends_with(&format!("/{c}"))
+                    {
+                        remote.push(n.to_owned());
                     }
                 }
-            },
+                match remote.as_slice() {
+                    [one] => Some(branch(c, one, false)?),
+                    _ => None,
+                }
+            }
             (None, None) => {
                 let name = worktree_base_name(&abs);
-                match local(&name) {
-                    Some(b) => Some(b),
-                    None => Some(new_worktree_branch(&repo, &name, "HEAD")?),
+                if local(&name) {
+                    Some(name)
+                } else {
+                    Some(branch(&name, "HEAD", false)?)
                 }
             }
         };
-        if let Some(branch) = branch {
-            let base = worktree_base_name(&abs);
-            let mut name = base.clone();
-            for n in 1.. {
-                if repo.find_worktree(&name).is_err() {
-                    break;
-                }
-                name = format!("{base}{n}");
-            }
-            let mut opts = git2::WorktreeAddOptions::new();
-            opts.reference(Some(branch.get()));
-            repo.worktree(&name, &abs, Some(&opts))?;
-            return Ok(());
+        let refname = head.as_ref().map(|b| format!("refs/heads/{b}"));
+        if let Some(refname) = refname.as_ref().filter(|_| !a.force)
+            && let Some(other) = checked_out_at(&repo, refname)?
+        {
+            return Err(GitError::Other(format!(
+                "'{}' is already used by worktree at '{other}'",
+                short_ref(refname)
+            )));
         }
-        // libgit2 cannot add a worktree on a detached HEAD.
-        let abs = abs.to_string_lossy();
-        let mut args = vec!["worktree", "add", "--detach", &abs];
-        args.extend(commitish);
-        self.run_git(&args, &[])?;
+        let head_line = match &refname {
+            Some(r) => format!("ref: {r}\n"),
+            None => {
+                let commit = repo
+                    .revparse_single(commitish.unwrap_or("HEAD"))?
+                    .peel_to_commit()?;
+                format!("{}\n", commit.id())
+            }
+        };
+        let base = worktree_base_name(&abs);
+        let mut name = base.clone();
+        for n in 1.. {
+            if !repo.commondir().join("worktrees").join(&name).exists() {
+                break;
+            }
+            name = format!("{base}{n}");
+        }
+        // A linked worktree is a `.git` file pointing at an admin folder
+        // under the common git dir, which points back; write both as git does.
+        std::fs::create_dir_all(&abs)?;
+        let abs = std::fs::canonicalize(&abs)?;
+        let admin = std::fs::canonicalize(repo.commondir())?
+            .join("worktrees")
+            .join(&name);
+        std::fs::create_dir_all(&admin)?;
+        std::fs::write(admin.join("commondir"), "../..\n")?;
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", abs.join(".git").display()),
+        )?;
+        std::fs::write(admin.join("HEAD"), head_line)?;
+        if a.lock {
+            let reason = a.reason.as_deref().unwrap_or("added with --lock");
+            std::fs::write(admin.join("locked"), format!("{reason}\n"))?;
+        }
+        std::fs::write(abs.join(".git"), format!("gitdir: {}\n", admin.display()))?;
+        if !a.orphan && !a.no_checkout {
+            let wt = Repository::open(&abs)?;
+            wt.checkout_head(Some(CheckoutBuilder::new().force()))?;
+        }
         Ok(())
+    }
+
+    fn repair_worktrees(&self, paths: &[String]) -> Result<Vec<String>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let mut fixed = Vec::new();
+        let admin_root = std::fs::canonicalize(repo.commondir())?.join("worktrees");
+        // A worktree at a new path: its `.git` file still names its admin
+        // folder, which must now point here.
+        for p in paths {
+            let dotgit = std::fs::canonicalize(p)?.join(".git");
+            let text = std::fs::read_to_string(&dotgit)
+                .map_err(|_| GitError::Other(format!("{p}: not a linked worktree")))?;
+            let admin = PathBuf::from(text.trim().trim_start_matches("gitdir: "));
+            let gitdir = admin.join("gitdir");
+            let want = format!("{}\n", dotgit.display());
+            if std::fs::read_to_string(&gitdir).ok().as_deref() != Some(want.as_str()) {
+                std::fs::write(&gitdir, want)?;
+                fixed.push(format!("repair: gitdir incorrect: {}", gitdir.display()));
+            }
+        }
+        // Each worktree's `.git` file must name its admin folder, which may
+        // have moved with the repository.
+        for name in repo.worktrees()?.iter().filter_map(|n| n.ok().flatten()) {
+            let admin = admin_root.join(name);
+            let Ok(text) = std::fs::read_to_string(admin.join("gitdir")) else {
+                continue;
+            };
+            let dotgit = PathBuf::from(text.trim());
+            let want = format!("gitdir: {}\n", admin.display());
+            if dotgit.is_file()
+                && std::fs::read_to_string(&dotgit).ok().as_deref() != Some(want.as_str())
+            {
+                std::fs::write(&dotgit, want)?;
+                fixed.push(format!("repair: .git file broken: {}", dotgit.display()));
+            }
+        }
+        Ok(fixed)
     }
 
     fn worktree_lock(&self, worktree: &str, reason: Option<&str>) -> Result<(), GitError> {
@@ -3076,20 +3534,34 @@ impl GitBackend for Git2Backend {
     }
 
     fn worktree_move(&self, worktree: &str, new_path: &str) -> Result<(), GitError> {
-        let from = {
-            let repo = self.repo.lock().expect("repo mutex");
-            find_worktree(&repo, worktree)?.path().to_path_buf()
-        };
-        let to = std::path::absolute(new_path)?;
-        // libgit2 has no worktree move.
-        self.run_git(
-            &[
-                "worktree",
-                "move",
-                &from.to_string_lossy(),
-                &to.to_string_lossy(),
-            ],
-            &[],
+        let repo = self.repo.lock().expect("repo mutex");
+        let wt = find_worktree(&repo, worktree)?;
+        if let Ok(git2::WorktreeLockStatus::Locked(_)) = wt.is_locked() {
+            return Err(GitError::Other(format!(
+                "cannot move a locked working tree; run `rgit worktree unlock {worktree}` first"
+            )));
+        }
+        let from = wt.path().to_path_buf();
+        let mut to = std::path::absolute(new_path)?;
+        if to.is_dir() {
+            to = to.join(from.file_name().unwrap_or_default());
+        }
+        if to.exists() {
+            return Err(GitError::Other(format!(
+                "'{}' already exists",
+                to.display()
+            )));
+        }
+        // A move is a rename plus the admin folder's pointer back to it.
+        std::fs::rename(&from, &to)?;
+        let to = std::fs::canonicalize(&to)?;
+        let admin = repo
+            .commondir()
+            .join("worktrees")
+            .join(wt.name()?.unwrap_or_default());
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", to.join(".git").display()),
         )?;
         Ok(())
     }
@@ -3137,7 +3609,7 @@ impl GitBackend for Git2Backend {
 
     fn config_get(&self, key: &str) -> Result<Option<String>, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
-        let cfg = repo.config()?;
+        let cfg = open_config(&repo, ConfigScope::Any, false)?;
         match cfg.get_string(key) {
             Ok(v) => Ok(Some(v)),
             Err(e) if e.code() == ErrorCode::NotFound => Ok(None),
@@ -3273,6 +3745,44 @@ impl GitBackend for Git2Backend {
             let repo = self.repo.lock().expect("repo mutex");
             repo.find_branch(old, BranchType::Local)?
                 .rename(new, false)?;
+            Ok(())
+        })
+    }
+
+    fn copy_branch(&self, old: &str, new: &str, force: bool) -> Result<(), GitError> {
+        self.logged("copy branch", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let (from, to) = (format!("refs/heads/{old}"), format!("refs/heads/{new}"));
+            let commit = repo.find_reference(&from)?.peel_to_commit()?;
+            repo.branch(new, &commit, force)?;
+            let src = repo.reflog(&from)?;
+            let mut log = repo.reflog(&to)?;
+            while !log.is_empty() {
+                log.remove(0, false)?;
+            }
+            for e in src.iter().rev() {
+                log.append(e.id_new(), &e.committer(), e.message()?)?;
+            }
+            let msg = format!("Branch: copied {from} to {to}");
+            log.append(commit.id(), &repo.signature()?, Some(&msg))?;
+            log.write()?;
+            let mut config = open_config(&repo, ConfigScope::Local, true)?;
+            let mut copied = Vec::new();
+            config.entries(None)?.for_each(|e| {
+                let name = String::from_utf8_lossy(e.name_bytes());
+                if let Some(key) = name.strip_prefix(&format!("branch.{old}.")) {
+                    copied.push((
+                        format!("branch.{new}.{key}"),
+                        String::from_utf8_lossy(e.value_bytes()).into_owned(),
+                    ));
+                }
+            })?;
+            for (name, _) in &copied {
+                let _ = config.remove_multivar(name, ".*");
+            }
+            for (name, value) in copied {
+                config.set_multivar(&name, "$^", &value)?;
+            }
             Ok(())
         })
     }
@@ -3934,25 +4444,31 @@ impl GitBackend for Git2Backend {
             }]
         };
         for name in &names {
-            let local = repo.find_remote(name)?.url().is_ok_and(is_local_url);
-            if args.dry_run {
-                fetch_dry_run(&repo, name, refspecs, args.tags, report, cred)?;
-            } else if args.depth > 0 && local {
-                // libgit2's local transport cannot fetch shallow; git can.
-                let depth = args.depth.to_string();
-                let mut cmd = vec!["fetch", "--depth", depth.as_str()];
-                if args.prune {
-                    cmd.push("--prune");
+            self.fetch_remote(&repo, name, refspecs, args, report, cred)?;
+        }
+        if args.set_upstream && !args.dry_run {
+            let name = &names[0];
+            let merge = match refspecs.first() {
+                Some(s) => {
+                    let src = s.trim_start_matches('+').split(':').next().unwrap_or("");
+                    match src.starts_with("refs/") {
+                        true => src.to_owned(),
+                        false => format!("refs/heads/{src}"),
+                    }
                 }
-                if args.tags {
-                    cmd.push("--tags");
-                }
-                cmd.push(name);
-                cmd.extend(refspecs.iter().map(String::as_str));
-                self.run_git(&cmd, &[])?;
-            } else {
-                do_fetch(&repo, name, refspecs, args, report, cred)?;
-            }
+                None => repo
+                    .find_reference(&format!("refs/remotes/{name}/HEAD"))
+                    .ok()
+                    .and_then(|r| r.symbolic_target().ok().flatten().map(str::to_owned))
+                    .and_then(|t| map_glob(&format!("refs/remotes/{name}/*"), "refs/heads/*", &t))
+                    .ok_or_else(|| {
+                        GitError::Other(format!("no branch to track: {name}/HEAD is not set"))
+                    })?,
+            };
+            let branch = current_branch(&repo)?;
+            let mut config = repo.config()?;
+            config.set_str(&format!("branch.{branch}.remote"), name)?;
+            config.set_str(&format!("branch.{branch}.merge"), &merge)?;
         }
         Ok(())
     }
@@ -3961,17 +4477,17 @@ impl GitBackend for Git2Backend {
         &self,
         remote: Option<&str>,
         branch: Option<&str>,
-        rebase: Option<bool>,
-        ff_only: bool,
+        args: &crate::PullArgs,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
-        let (remote, branch, rebase, ff_only, chosen) = {
+        let (remote, branch, rebase, ff_only, chosen, autostash) = {
             let repo = self.repo.lock().expect("repo mutex");
             let (upstream, current) = upstream_remote(&repo)?;
             let config = repo.config()?;
             // git refuses a diverged pull until a flag or config picks merge or rebase.
-            let chosen = rebase.is_some()
-                || ff_only
+            let chosen = args.rebase.is_some()
+                || args.ff_only
+                || args.squash
                 || config_rebase(&config, &format!("branch.{current}.rebase")).is_some()
                 || config_rebase(&config, "pull.rebase").is_some()
                 || config.get_string("pull.ff").is_ok();
@@ -3979,13 +4495,21 @@ impl GitBackend for Git2Backend {
                 .branch_upstream_merge(&format!("refs/heads/{current}"))
                 .ok()
                 .and_then(|b| b.as_str().ok().map(|s| short_ref(s).to_owned()));
-            let rebase = !ff_only
-                && rebase.unwrap_or_else(|| {
+            let rebase = !args.ff_only
+                && args.rebase.unwrap_or_else(|| {
                     config_rebase(&config, &format!("branch.{current}.rebase"))
                         .or_else(|| config_rebase(&config, "pull.rebase"))
                         .unwrap_or(false)
                 });
-            let ff_only = ff_only || config.get_string("pull.ff").is_ok_and(|v| v == "only");
+            let ff_only = args.ff_only || config.get_string("pull.ff").is_ok_and(|v| v == "only");
+            let key = if rebase {
+                "rebase.autoStash"
+            } else {
+                "merge.autoStash"
+            };
+            let autostash = args
+                .autostash
+                .unwrap_or_else(|| config.get_bool(key).unwrap_or(false));
             (
                 remote.map_or(upstream, str::to_owned),
                 branch
@@ -3995,52 +4519,99 @@ impl GitBackend for Git2Backend {
                 rebase,
                 ff_only,
                 chosen,
+                autostash,
             )
         };
+        if rebase && args.strategy_option.is_some() {
+            return Err(GitError::Other(
+                "-X applies to a merge only; add --no-rebase".to_owned(),
+            ));
+        }
         self.logged(if rebase { "pull --rebase" } else { "pull" }, || {
-            let repo = self.repo.lock().expect("repo mutex");
-            let cred_guard = self.cred_prompt.lock().expect("cred mutex");
-            let cred = cred_guard.as_deref();
-            do_fetch(
-                &repo,
-                &remote,
-                &[],
-                &crate::FetchArgs::default(),
-                report,
-                cred,
-            )?;
+            let mut repo = self.repo.lock().expect("repo mutex");
+            {
+                let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+                let cred = cred_guard.as_deref();
+                let fetch = crate::FetchArgs {
+                    depth: args.depth,
+                    ..Default::default()
+                };
+                let names: Vec<String> = match args.all {
+                    true => repo
+                        .remotes()?
+                        .iter()
+                        .flatten()
+                        .flatten()
+                        .map(str::to_owned)
+                        .collect(),
+                    false => vec![remote.clone()],
+                };
+                for name in &names {
+                    self.fetch_remote(&repo, name, &[], &fetch, report, cred)?;
+                }
+            }
             let target = repo.refname_to_id(&format!("refs/remotes/{remote}/{branch}"))?;
-            if rebase {
+            let mut status = StatusOptions::new();
+            status.include_untracked(false);
+            let dirty = autostash
+                && repo
+                    .statuses(Some(&mut status))?
+                    .iter()
+                    .any(|e| e.status() != Status::CURRENT);
+            if dirty {
+                let sig = repo.signature()?;
+                let id = repo.stash_save2(&sig, Some("autostash"), None)?;
+                report(OpProgress::Line(format!(
+                    "Created autostash: {}",
+                    short7(id)
+                )));
+            }
+            let result = if rebase {
                 let upstream = repo.find_annotated_commit(target)?;
                 run_rebase(&repo, &upstream, None, report)
             } else {
-                let url = repo
-                    .find_remote(&remote)?
-                    .url()
-                    .unwrap_or(&remote)
-                    .to_owned();
+                let url = remote_urls(&repo, &remote, false)?
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| remote.clone());
                 let source = repo.find_commit(target)?;
                 let (analysis, _) = repo.merge_analysis(&[&repo.find_annotated_commit(target)?])?;
                 if !chosen && !analysis.is_up_to_date() && !analysis.is_fast_forward() {
-                    return Err(GitError::Other(
+                    Err(GitError::Other(
                         "you have divergent branches and need to specify how to reconcile \
                          them: pass --rebase, --no-rebase or --ff-only, or set pull.rebase"
                             .to_owned(),
+                    ))
+                } else {
+                    let name = format!("branch '{branch}' of {url}");
+                    merge_commit(
+                        &repo,
+                        &source,
+                        &name,
+                        &crate::MergeOptions {
+                            ff_only,
+                            message: Some(format!("Merge {name}")),
+                            squash: args.squash,
+                            no_ff: args.no_ff,
+                            no_commit: args.no_commit,
+                            strategy_option: args.strategy_option.clone(),
+                            ..Default::default()
+                        },
+                        report,
+                    )
+                }
+            };
+            if dirty {
+                if result.is_ok() && repo.stash_pop(0, None).is_ok() {
+                    report(OpProgress::Line("Applied autostash.".to_owned()));
+                } else {
+                    report(OpProgress::Line(
+                        "Your changes are safe in the stash; run `rgit stash pop` when ready."
+                            .to_owned(),
                     ));
                 }
-                let name = format!("branch '{branch}' of {url}");
-                merge_commit(
-                    &repo,
-                    &source,
-                    &name,
-                    &crate::MergeOptions {
-                        ff_only,
-                        message: Some(format!("Merge {name}")),
-                        ..Default::default()
-                    },
-                    report,
-                )
             }
+            result
         })
     }
 
@@ -4068,11 +4639,15 @@ impl GitBackend for Git2Backend {
         args: &crate::PushArgs,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
         let repo = self.repo.lock().expect("repo mutex");
         let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        let cred = cred_guard.as_deref();
         let remote_name = match remote {
             Some(r) => r.to_owned(),
-            None if refspecs.is_empty() && !args.all && !args.tags => upstream_remote(&repo)?.0,
+            None if refspecs.is_empty() && !args.all && !args.tags && !args.mirror => {
+                upstream_remote(&repo)?.0
+            }
             None => upstream_remote(&repo)
                 .map(|(r, _)| r)
                 .or_else(|_| default_remote(&repo))?,
@@ -4080,16 +4655,23 @@ impl GitBackend for Git2Backend {
         // (force, source ref, destination ref); an empty source deletes.
         let mut specs = refspecs
             .iter()
-            .map(|s| expand_push_refspec(&repo, s))
+            .map(|s| expand_push_refspec(&repo, &remote_name, s))
             .collect::<Result<Vec<_>, _>>()?;
-        if args.all {
+        if args.mirror {
+            for r in repo.references()? {
+                let r = r?;
+                if let (Ok(name), Some(_)) = (r.name(), r.target()) {
+                    specs.push((true, name.to_owned(), name.to_owned()));
+                }
+            }
+        } else if args.all {
             for b in repo.branches(Some(BranchType::Local))? {
                 if let Ok(name) = b?.0.get().name() {
                     specs.push((false, name.to_owned(), name.to_owned()));
                 }
             }
         }
-        if args.tags {
+        if args.tags && !args.mirror {
             for t in repo.tag_names(None)?.iter().flatten().flatten() {
                 let name = format!("refs/tags/{t}");
                 specs.push((false, name.clone(), name));
@@ -4097,20 +4679,88 @@ impl GitBackend for Git2Backend {
         }
         if specs.is_empty() {
             if args.tags {
-                report(OpProgress::Line("no tags to push".to_owned()));
+                report(OpProgress::Line("Everything up-to-date".to_owned()));
                 return Ok(());
             }
-            let head = format!("refs/heads/{}", current_branch(&repo)?);
-            specs.push((false, head.clone(), head));
+            specs = default_push_specs(&repo, &remote_name)?;
         }
-        let force = args.force || args.force_with_lease;
-        let refspecs: Vec<String> = specs
-            .iter()
-            .map(|(f, src, dst)| {
-                let lead = if force || *f { "+" } else { "" };
+        // --follow-tags: annotated tags on the pushed history; one the remote
+        // already has with another value is left alone, as in git.
+        let mut followed = Vec::new();
+        if args.follow_tags || repo.config()?.get_bool("push.followTags").unwrap_or(false) {
+            let tips: Vec<Oid> = specs
+                .iter()
+                .filter_map(|(_, src, _)| {
+                    Some(repo.revparse_single(src).ok()?.peel_to_commit().ok()?.id())
+                })
+                .collect();
+            for t in repo.tag_names(None)?.iter().flatten().flatten() {
+                let name = format!("refs/tags/{t}");
+                let Ok(obj) = repo.revparse_single(&name) else {
+                    continue;
+                };
+                let Ok(target) = obj.peel_to_commit() else {
+                    continue;
+                };
+                if obj.kind() == Some(ObjectType::Tag)
+                    && !specs.iter().any(|(_, _, d)| *d == name)
+                    && tips.iter().any(|&tip| {
+                        tip == target.id()
+                            || repo.graph_descendant_of(tip, target.id()).unwrap_or(false)
+                    })
+                {
+                    specs.push((false, name.clone(), name.clone()));
+                    followed.push(name);
+                }
+            }
+        }
+        if multi_url(&repo, &remote_name, true) {
+            let mut cmd = vec!["push".to_owned()];
+            for (on, flag) in [
+                (args.force_with_lease, "--force-with-lease"),
+                (args.dry_run, "--dry-run"),
+                (args.set_upstream, "--set-upstream"),
+            ] {
+                if on {
+                    cmd.push(flag.to_owned());
+                }
+            }
+            cmd.push(remote_name);
+            cmd.extend(specs.iter().map(|(f, src, dst)| {
+                let lead = if args.force || *f { "+" } else { "" };
                 format!("{lead}{src}:{dst}")
-            })
-            .collect();
+            }));
+            let cmd: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            self.run_git(&cmd, &[])?;
+            return Ok(());
+        }
+
+        let mut remote = repo.find_remote(&remote_name)?;
+        let url = remote.url().unwrap_or(&remote_name).to_owned();
+        let prune: &[&str] = match (args.mirror, args.prune, args.all, args.tags) {
+            (true, ..) => &["refs/"],
+            (_, true, true, true) => &["refs/heads/", "refs/tags/"],
+            (_, true, true, _) => &["refs/heads/"],
+            (_, true, _, true) => &["refs/tags/"],
+            _ => &[],
+        };
+        if !prune.is_empty() {
+            let ignored = AtomicBool::new(false);
+            let callbacks = remote_callbacks(report, &ignored, cred);
+            let conn = remote.connect_auth(git2::Direction::Push, Some(callbacks), None)?;
+            let theirs: Vec<String> = conn.list()?.iter().map(|h| h.name().to_owned()).collect();
+            drop(conn);
+            for name in theirs {
+                if prune.iter().any(|p| name.starts_with(p))
+                    && !name.ends_with("^{}")
+                    && !specs.iter().any(|(_, _, d)| *d == name)
+                {
+                    specs.push((false, String::new(), name));
+                }
+            }
+        }
+
+        let forced_all = args.force || args.force_with_lease || args.mirror;
         // Force-with-lease: each remote branch must still match the ref we
         // last fetched for it.
         let leases: std::collections::HashMap<String, Oid> = specs
@@ -4124,73 +4774,157 @@ impl GitBackend for Git2Backend {
                 Some((dst.clone(), id))
             })
             .collect();
-
-        let mut remote = repo.find_remote(&remote_name)?;
-        if let Ok(url) = remote.url() {
-            report(OpProgress::Line(format!("To {url}")));
-        }
-        let forced: Vec<String> = specs
-            .iter()
-            .filter(|(f, _, _)| force || *f)
-            .map(|(_, _, dst)| dst.clone())
-            .collect();
-        let rejected = std::sync::atomic::AtomicBool::new(false);
-        let dry_run_hit = std::sync::atomic::AtomicBool::new(false);
-        let mut callbacks = remote_callbacks(report, &rejected, cred_guard.as_deref());
-        let (dry_run, repo_ref) = (args.dry_run, &*repo);
-        let (dry_run_flag, rejected_flag) = (&dry_run_hit, &rejected);
-        // The negotiation callback sees every update before anything is sent:
-        // it enforces the leases, and a dry run reports the updates and stops.
-        callbacks.push_negotiation(move |updates| {
-            for update in updates {
-                if let Ok(dst) = update.dst_refname()
-                    && let Some(lease) = leases.get(dst)
-                    && update.src() != *lease
+        let push_options: Vec<&str> = args.push_options.iter().map(String::as_str).collect();
+        let repo_ref = &*repo;
+        let rows: Mutex<Vec<PushRow>> = Mutex::new(Vec::new());
+        let hook_failed: Mutex<Option<String>> = Mutex::new(None);
+        let mut failed: Vec<PushRow> = Vec::new();
+        let mut todo = specs.clone();
+        // A rejected ref (checked here, before anything is sent) aborts the
+        // push; unless atomic, the rest are pushed again without it, as git
+        // pushes every ref it can.
+        loop {
+            let (retry, stop) = (AtomicBool::new(false), AtomicBool::new(false));
+            let forced: std::collections::HashMap<String, bool> = todo
+                .iter()
+                .map(|(f, _, d)| (d.clone(), forced_all || *f))
+                .collect();
+            let ignored = AtomicBool::new(false);
+            let mut callbacks = remote_callbacks(report, &ignored, cred);
+            callbacks.update_tips(|_, _, _| true);
+            callbacks.push_update_reference(|refname, status| {
+                if let Some(msg) = status
+                    && let Some(row) = rows
+                        .lock()
+                        .expect("rows mutex")
+                        .iter_mut()
+                        .find(|r| r.dst == refname)
                 {
-                    return Err(git2::Error::from_str(
-                        "stale info: the remote branch moved; force-with-lease aborted",
-                    ));
+                    row.flag = '!';
+                    row.summary = "[remote rejected]".to_owned();
+                    row.reason = Some(msg.to_owned());
                 }
-            }
-            if dry_run {
-                for update in updates {
-                    let forced = update
-                        .dst_refname()
-                        .is_ok_and(|d| forced.iter().any(|f| f == d));
-                    let line = push_update_line(repo_ref, update, forced);
-                    if line.starts_with(" ! ") {
-                        rejected_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            });
+            callbacks.push_negotiation(|updates| {
+                let mut out: Vec<PushRow> = updates
+                    .iter()
+                    .map(|u| {
+                        let dst = u.dst_refname().unwrap_or_default();
+                        push_row(
+                            repo_ref,
+                            u,
+                            forced.get(dst).copied().unwrap_or(forced_all),
+                            leases.get(dst).copied(),
+                        )
+                    })
+                    .collect();
+                let rejected = out.iter().any(|r| r.flag == '!');
+                if rejected && args.atomic {
+                    for r in out.iter_mut().filter(|r| !matches!(r.flag, '!' | '=')) {
+                        r.flag = '!';
+                        r.summary = "[rejected]".to_owned();
+                        r.reason = Some("atomic push failed".to_owned());
                     }
-                    report(OpProgress::Line(line));
                 }
-                dry_run_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                return Err(git2::Error::from_str("dry run"));
+                if rejected && !args.dry_run && !args.atomic {
+                    *rows.lock().expect("rows mutex") = out;
+                    retry.store(true, Relaxed);
+                    return Err(git2::Error::from_str("rejected"));
+                }
+                if !rejected && !args.no_verify {
+                    let refs: Vec<git2_hooks::PrePushRef> = out
+                        .iter()
+                        .filter(|r| r.flag != '=')
+                        .map(|r| {
+                            let (local, new) = match r.flag {
+                                '-' => ("(delete)", None),
+                                _ => (r.src.as_str(), Some(r.new)),
+                            };
+                            let old = (!r.old.is_zero()).then_some(r.old);
+                            git2_hooks::PrePushRef::new(local, new, r.dst.as_str(), old)
+                        })
+                        .collect();
+                    let hook =
+                        git2_hooks::hooks_pre_push(repo_ref, None, Some(&remote_name), &url, &refs);
+                    if let Err(e) = run_hook("pre-push", hook) {
+                        *hook_failed.lock().expect("hook mutex") = Some(e.to_string());
+                        stop.store(true, Relaxed);
+                        return Err(git2::Error::from_str("pre-push hook failed"));
+                    }
+                }
+                *rows.lock().expect("rows mutex") = out;
+                if args.dry_run || rejected {
+                    stop.store(true, Relaxed);
+                    return Err(git2::Error::from_str("not pushed"));
+                }
+                Ok(())
+            });
+            let mut opts = PushOptions::new();
+            opts.remote_callbacks(callbacks);
+            if !push_options.is_empty() {
+                opts.remote_push_options(&push_options);
             }
-            Ok(())
-        });
-
-        let mut opts = PushOptions::new();
-        opts.remote_callbacks(callbacks);
-        let pushed = remote.push(&refspecs, Some(&mut opts));
-        if dry_run_hit.load(std::sync::atomic::Ordering::Relaxed) {
-            if rejected.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(GitError::PushRejected);
+            let wire: Vec<String> = todo
+                .iter()
+                .map(|(f, src, dst)| {
+                    let lead = if forced_all || *f { "+" } else { "" };
+                    format!("{lead}{src}:{dst}")
+                })
+                .collect();
+            let pushed = remote.push(&wire, Some(&mut opts));
+            if retry.load(Relaxed) {
+                let out = std::mem::take(&mut *rows.lock().expect("rows mutex"));
+                let (bad, _): (Vec<PushRow>, Vec<PushRow>) =
+                    out.into_iter().partition(|r| r.flag == '!');
+                todo.retain(|(_, _, d)| !bad.iter().any(|r| r.dst == *d));
+                failed.extend(bad);
+                if todo.is_empty() {
+                    break;
+                }
+                continue;
             }
-            return Ok(());
+            if !stop.load(Relaxed) {
+                pushed?;
+            }
+            break;
         }
-        pushed?;
-        if args.dry_run {
-            report(OpProgress::Line("Everything up-to-date".to_owned()));
-            return Ok(());
-        }
-        // libgit2 reports a refused ref through the callback but still returns
-        // success, so surface the rejection as an error.
-        if rejected.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(GitError::PushRejected);
+        if let Some(msg) = hook_failed.into_inner().expect("hook mutex") {
+            return Err(GitError::PushFailed(format!(
+                "{msg}\nerror: failed to push some refs to '{url}'"
+            )));
         }
 
-        if args.set_upstream {
-            for (_, src, dst) in &specs {
+        let mut all = failed;
+        all.extend(rows.into_inner().expect("rows mutex"));
+        all.retain(|r| !(r.summary == "[rejected]" && followed.contains(&r.dst)));
+        let at = |d: &str| specs.iter().position(|(_, _, x)| x == d);
+        all.sort_by_key(|r| at(&r.dst));
+        let shown: Vec<String> = all
+            .iter()
+            .filter(|r| args.porcelain || args.verbose || r.flag != '=')
+            .map(|r| r.line(args.porcelain))
+            .collect();
+        let mut text = Vec::new();
+        if shown.is_empty() {
+            text.push("Everything up-to-date".to_owned());
+        } else {
+            text.push(format!("To {url}"));
+            text.extend(shown);
+            if args.porcelain {
+                text.push("Done".to_owned());
+            }
+        }
+        if all.iter().any(|r| r.flag == '!') {
+            text.push(format!("error: failed to push some refs to '{url}'"));
+            text.extend(push_hints(&repo, &all));
+            return Err(GitError::PushFailed(text.join("\n")));
+        }
+        for line in text {
+            report(OpProgress::Line(line));
+        }
+        if args.set_upstream && !args.dry_run {
+            for (_, src, dst) in &todo {
                 if let (Some(local), Some(theirs)) = (
                     src.strip_prefix("refs/heads/"),
                     dst.strip_prefix("refs/heads/"),
@@ -4233,6 +4967,67 @@ impl GitBackend for Git2Backend {
         })
     }
 
+    fn submodules(&self, recursive: bool) -> Result<Vec<crate::SubmoduleInfo>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        let mut out = Vec::new();
+        list_submodules(&repo, "", recursive, &mut out)?;
+        Ok(out)
+    }
+
+    fn submodule(
+        &self,
+        op: &crate::SubmoduleOp,
+        report: &dyn Fn(OpProgress),
+    ) -> Result<(), GitError> {
+        use crate::SubmoduleOp as Op;
+        // libgit2 cannot name a submodule apart from its path, move a
+        // submodule's repository into .git/modules, or summarize one.
+        let mut argv = vec!["submodule".to_owned()];
+        match op {
+            Op::Add {
+                url,
+                path,
+                branch,
+                name: Some(name),
+            } => {
+                argv.push("add".to_owned());
+                if let Some(b) = branch {
+                    argv.extend(["-b".to_owned(), b.clone()]);
+                }
+                argv.extend([
+                    "--name".to_owned(),
+                    name.clone(),
+                    "--".to_owned(),
+                    url.clone(),
+                ]);
+                argv.extend(path.clone());
+            }
+            Op::AbsorbGitDirs { paths } => {
+                argv.push("absorbgitdirs".to_owned());
+                argv.push("--".to_owned());
+                argv.extend(paths.iter().cloned());
+            }
+            Op::Summary { args } => {
+                argv.push("summary".to_owned());
+                argv.extend(args.iter().cloned());
+            }
+            _ => {
+                return self.logged("submodule", || {
+                    let repo = self.repo.lock().expect("repo mutex");
+                    sync_index(&repo)?;
+                    submodule_op(&repo, op, report)
+                });
+            }
+        }
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let out = self.run_git(&args, &[])?;
+        for line in out.lines() {
+            report(OpProgress::Line(line.to_owned()));
+        }
+        sync_index(&self.repo.lock().expect("repo mutex"))
+    }
+
     fn resolve_object(&self, rev: &str) -> Result<String, GitError> {
         crate::plumbing::resolve(&self.repo.lock().expect("repo mutex"), rev)
     }
@@ -4249,12 +5044,35 @@ impl GitBackend for Git2Backend {
         crate::plumbing::symbolic_ref(&self.repo.lock().expect("repo mutex"), name)
     }
 
+    fn set_symbolic_ref(
+        &self,
+        name: &str,
+        target: &str,
+        message: Option<&str>,
+    ) -> Result<(), GitError> {
+        self.logged("symbolic-ref", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            repo.reference_symbolic(name, target, true, message.unwrap_or("symbolic-ref"))?;
+            Ok(())
+        })
+    }
+
     fn git_dir(&self) -> PathBuf {
         self.repo.lock().expect("repo mutex").path().to_path_buf()
     }
 
     fn read_object(&self, rev: &str) -> Result<crate::RawObject, GitError> {
         crate::plumbing::read_object(&self.repo.lock().expect("repo mutex"), rev)
+    }
+
+    fn all_objects(&self) -> Result<Vec<String>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let mut ids = std::collections::BTreeSet::new();
+        repo.odb()?.foreach(|id| {
+            ids.insert(id.to_string());
+            true
+        })?;
+        Ok(ids.into_iter().collect())
     }
 
     fn ls_tree(
@@ -4352,35 +5170,171 @@ fn do_fetch(
     cred: Option<&dyn crate::CredentialPrompt>,
 ) -> Result<(), GitError> {
     let mut remote = repo.find_remote(remote)?;
-    if let Ok(url) = remote.url() {
-        report(OpProgress::Line(format!("From {url}")));
+    let url = remote.url().unwrap_or_default().to_owned();
+    let announced = std::sync::atomic::AtomicBool::new(false);
+    let mut specs: Vec<String> = refspecs
+        .iter()
+        .map(|s| match args.force && !s.starts_with('+') {
+            true => format!("+{s}"),
+            false => s.clone(),
+        })
+        .collect();
+    if let Some(map) = &args.refmap {
+        // An anonymous remote has no configured refspecs to update through.
+        specs = specs.iter().map(|s| refmap_spec(s, map)).collect();
+        remote = repo.remote_anonymous(&url)?;
     }
+    if args.prune_tags {
+        if specs.is_empty() {
+            specs = remote
+                .fetch_refspecs()?
+                .iter()
+                .flatten()
+                .flatten()
+                .map(str::to_owned)
+                .collect();
+        }
+        specs.push("refs/tags/*:refs/tags/*".to_owned());
+    }
+    let tracking = tracking_specs(&remote, &specs)?;
     let ignored = std::sync::atomic::AtomicBool::new(false);
+    let mut callbacks = remote_callbacks(report, &ignored, cred);
+    callbacks.update_tips(|dst, old, new| {
+        let src = tracking
+            .iter()
+            .find_map(|(s, d)| map_glob(d, s, dst))
+            .unwrap_or_else(|| dst.to_owned());
+        if let Some(line) = fetch_line(repo, &src, dst, Some(old), new, true) {
+            // Like git, "From" only heads a fetch that changed something.
+            if !announced.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                report(OpProgress::Line(format!("From {url}")));
+            }
+            report(OpProgress::Line(line));
+        }
+        true
+    });
     let mut opts = FetchOptions::new();
-    opts.remote_callbacks(remote_callbacks(report, &ignored, cred));
+    opts.remote_callbacks(callbacks);
     if args.prune {
         opts.prune(git2::FetchPrune::On);
     }
-    if args.tags {
+    if args.no_tags {
+        opts.download_tags(git2::AutotagOption::None);
+    } else if args.tags {
         opts.download_tags(git2::AutotagOption::All);
     } else if !refspecs.is_empty() {
         // git follows no tags when the refs to fetch are named.
         opts.download_tags(git2::AutotagOption::None);
     }
-    if args.depth > 0 {
+    if args.unshallow {
+        // libgit2's GIT_FETCH_DEPTH_UNSHALLOW.
+        opts.depth(i32::MAX);
+    } else if args.depth > 0 {
         opts.depth(args.depth);
     }
-    remote.fetch(refspecs, Some(&mut opts), None)?;
+    remote.fetch(&specs, Some(&mut opts), None)?;
     Ok(())
 }
 
-/// `git fetch --dry-run`: list the remote's refs and report the tracking-ref
-/// updates a fetch would make, without downloading or writing anything.
+/// The (source, destination) patterns that name remote-tracking refs: the
+/// `src:dst` refspecs given, then the remote's configured ones.
+fn tracking_specs(
+    remote: &git2::Remote<'_>,
+    specs: &[String],
+) -> Result<Vec<(String, String)>, GitError> {
+    let configured = remote.fetch_refspecs()?;
+    Ok(specs
+        .iter()
+        .map(String::as_str)
+        .chain(configured.iter().flatten().flatten())
+        .filter_map(|s| {
+            let (src, dst) = s.trim_start_matches('+').split_once(':')?;
+            Some((src.to_owned(), dst.to_owned()))
+        })
+        .filter(|(_, d)| !d.is_empty())
+        .collect())
+}
+
+/// `name` matched against the refspec side `from` (one `*` at most) and
+/// rewritten through `to`.
+fn map_glob(from: &str, to: &str, name: &str) -> Option<String> {
+    match from.split_once('*') {
+        None => (from == name).then(|| to.to_owned()),
+        Some((pre, post)) => {
+            let mid = name.strip_prefix(pre)?.strip_suffix(post)?;
+            Some(to.replacen('*', mid, 1))
+        }
+    }
+}
+
+/// A command-line fetch refspec as `--refmap` maps it: a bare ref gets the
+/// destination the first matching refmap entry gives it.
+fn refmap_spec(spec: &str, map: &[String]) -> String {
+    if spec.contains(':') {
+        return spec.to_owned();
+    }
+    let (force, name) = match spec.strip_prefix('+') {
+        Some(n) => ("+", n),
+        None => ("", spec),
+    };
+    let full = match name.starts_with("refs/") {
+        true => name.to_owned(),
+        false => format!("refs/heads/{name}"),
+    };
+    map.iter()
+        .find_map(|m| {
+            let plus = if m.starts_with('+') { "+" } else { force };
+            let (src, dst) = m.trim_start_matches('+').split_once(':')?;
+            Some(format!("{plus}{full}:{}", map_glob(src, dst, &full)?))
+        })
+        .unwrap_or(full)
+}
+
+/// A git-style fetch line for `dst` moving from `old` to `new`; `None` when
+/// nothing changes. `done` says the update happened (else a dry run).
+fn fetch_line(
+    repo: &Repository,
+    src: &str,
+    dst: &str,
+    old: Option<Oid>,
+    new: Oid,
+    done: bool,
+) -> Option<String> {
+    let (src, short) = (short_ref(src), short_ref(dst));
+    let tag = dst.starts_with("refs/tags/");
+    if new.is_zero() {
+        return Some(format!(" - [deleted]         (none)     -> {short}"));
+    }
+    Some(match old.filter(|o| !o.is_zero()) {
+        Some(old) if old == new => return None,
+        None if tag => format!(" * [new tag]         {src} -> {short}"),
+        None if dst.starts_with("refs/heads/") || dst.starts_with("refs/remotes/") => {
+            format!(" * [new branch]      {src} -> {short}")
+        }
+        None => format!(" * [new ref]         {src} -> {short}"),
+        Some(_) if tag && done => format!(" t [tag update]      {src} -> {short}"),
+        Some(_) if tag => {
+            format!(" ! [rejected]        {src} -> {short}  (would clobber existing tag)")
+        }
+        Some(old) if repo.graph_descendant_of(new, old).unwrap_or(false) => {
+            format!("   {}..{}  {src} -> {short}", short7(old), short7(new))
+        }
+        Some(old) => format!(
+            " + {}...{} {src} -> {short}  (forced update)",
+            short7(old),
+            short7(new)
+        ),
+    })
+}
+
+/// `git fetch --dry-run`: download the objects as git does, then report the
+/// ref updates a fetch would make, including auto-followed tags, without
+/// writing any ref.
 fn fetch_dry_run(
     repo: &Repository,
     name: &str,
     refspecs: &[String],
-    tags: bool,
+    args: &crate::FetchArgs,
     report: &dyn Fn(OpProgress),
     cred: Option<&dyn crate::CredentialPrompt>,
 ) -> Result<(), GitError> {
@@ -4388,14 +5342,20 @@ fn fetch_dry_run(
     if let Ok(url) = remote.url() {
         report(OpProgress::Line(format!("From {url}")));
     }
+    let tracking = tracking_specs(&remote, refspecs)?;
     let ignored = std::sync::atomic::AtomicBool::new(false);
     let heads: Vec<(String, Oid)> = {
         let callbacks = remote_callbacks(report, &ignored, cred);
-        let conn = remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None)?;
-        conn.list()?
+        let mut conn = remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None)?;
+        let heads = conn
+            .list()?
             .iter()
             .map(|h| (h.name().to_owned(), h.oid()))
-            .collect()
+            .collect();
+        let mut opts = FetchOptions::new();
+        opts.remote_callbacks(remote_callbacks(report, &ignored, cred));
+        conn.remote().download(refspecs, Some(&mut opts))?;
+        heads
     };
     let wanted = |head: &str| {
         refspecs.is_empty()
@@ -4404,76 +5364,256 @@ fn fetch_dry_run(
                 head == src || short_ref(head) == src
             })
     };
-    for (head, new) in heads {
-        if !wanted(&head) || head.ends_with("^{}") {
+    // A tag is followed when what it points at is now here.
+    let followed = |head: &str, id: Oid| {
+        let peeled = heads
+            .iter()
+            .find(|(h, _)| *h == format!("{head}^{{}}"))
+            .map_or(id, |(_, o)| *o);
+        repo.find_commit(peeled).is_ok()
+    };
+    let all_tags = args.tags || args.prune_tags;
+    for (head, new) in &heads {
+        if head.ends_with("^{}") {
             continue;
         }
         let tag = head.starts_with("refs/tags/");
-        let dst = if tag && tags {
+        let dst = if tag
+            && (all_tags || (!args.no_tags && refspecs.is_empty() && followed(head, *new)))
+        {
             head.clone()
+        } else if !wanted(head) {
+            continue;
         } else {
-            let spec = remote
-                .refspecs()
-                .find(|s| s.direction() == git2::Direction::Fetch && s.src_matches(&head));
-            match spec.and_then(|s| s.transform(&head).ok()) {
-                Some(buf) => buf.as_str().unwrap_or_default().to_owned(),
+            match tracking.iter().find_map(|(s, d)| map_glob(s, d, head)) {
+                Some(dst) => dst,
                 None => continue,
             }
         };
-        let (src, dst_short) = (short_ref(&head), short_ref(&dst));
-        let line = match repo.refname_to_id(&dst).ok() {
-            Some(old) if old == new => continue,
-            None if tag => format!(" * [new tag]         {src} -> {dst_short}"),
-            None => format!(" * [new branch]      {src} -> {dst_short}"),
-            Some(old) if repo.graph_descendant_of(new, old).unwrap_or(true) => {
-                format!("   {}..{}  {src} -> {dst_short}", short7(old), short7(new))
-            }
-            Some(old) => format!(
-                " + {}...{} {src} -> {dst_short}  (forced update)",
-                short7(old),
-                short7(new)
-            ),
+        let old = repo.refname_to_id(&dst).ok();
+        let Some(line) = fetch_line(repo, head, &dst, old, *new, args.force) else {
+            continue;
         };
         report(OpProgress::Line(line));
+    }
+    if args.prune {
+        for (src, dst) in &tracking {
+            let Some((pre, _)) = dst.split_once('*') else {
+                continue;
+            };
+            for r in repo.references_glob(&format!("{pre}*"))? {
+                let r = r?;
+                if r.symbolic_target().is_ok_and(|t| t.is_some()) {
+                    continue;
+                }
+                if let Ok(local) = r.name()
+                    && let Some(theirs) = map_glob(dst, src, local)
+                    && !heads.iter().any(|(h, _)| *h == theirs)
+                {
+                    report(OpProgress::Line(format!(
+                        " - [deleted]         (none)     -> {}",
+                        short_ref(local)
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
 
-/// A git-style `push --dry-run` line for one negotiated ref update.
-fn push_update_line(repo: &Repository, update: &git2::PushUpdate<'_>, force: bool) -> String {
-    let src = short_ref(update.src_refname().unwrap_or_default());
-    let dst = short_ref(update.dst_refname().unwrap_or_default());
-    let (old, new) = (update.src(), update.dst());
-    if new.is_zero() {
-        return format!(" - [deleted]         {dst}");
-    }
-    if old.is_zero() {
-        let kind = if update
-            .dst_refname()
-            .is_ok_and(|d| d.starts_with("refs/tags/"))
-        {
-            "tag"
-        } else {
-            "branch"
-        };
-        return format!(" * [new {kind}]      {src} -> {dst}");
-    }
-    if repo.graph_descendant_of(new, old).unwrap_or(false) {
-        format!("   {}..{}  {src} -> {dst}", short7(old), short7(new))
-    } else if force {
+/// One ref of a push, as git reports it: `flag` is git's status column
+/// (` ` fast-forward, `+` forced, `-` deleted, `*` new, `=` up to date, `!` rejected).
+struct PushRow {
+    flag: char,
+    summary: String,
+    src: String,
+    dst: String,
+    old: Oid,
+    new: Oid,
+    reason: Option<String>,
+}
+
+impl PushRow {
+    fn line(&self, porcelain: bool) -> String {
+        let reason = self
+            .reason
+            .as_ref()
+            .map(|r| format!(" ({r})"))
+            .unwrap_or_default();
+        if porcelain {
+            return format!(
+                "{}\t{}:{}\t{}{reason}",
+                self.flag, self.src, self.dst, self.summary
+            );
+        }
+        if self.flag == '-' {
+            return format!(" - {:<17} {}", self.summary, short_ref(&self.dst));
+        }
         format!(
-            " + {}...{} {src} -> {dst} (forced update)",
-            short7(old),
-            short7(new)
+            " {} {:<17} {} -> {}{reason}",
+            self.flag,
+            self.summary,
+            short_ref(&self.src),
+            short_ref(&self.dst)
         )
-    } else {
-        format!(" ! [rejected]        {src} -> {dst} (non-fast-forward)")
     }
+}
+
+/// Classify one negotiated ref update the way git does before sending.
+fn push_row(
+    repo: &Repository,
+    update: &git2::PushUpdate<'_>,
+    force: bool,
+    lease: Option<Oid>,
+) -> PushRow {
+    let (old, new) = (update.src(), update.dst());
+    let dst = update.dst_refname().unwrap_or_default().to_owned();
+    let tag = dst.starts_with("refs/tags/");
+    let (flag, summary, reason) = if lease.is_some_and(|l| l != old) {
+        ('!', "[rejected]".to_owned(), Some("stale info"))
+    } else if new.is_zero() {
+        ('-', "[deleted]".to_owned(), None)
+    } else if old == new {
+        ('=', "[up to date]".to_owned(), None)
+    } else if old.is_zero() {
+        let kind = match dst.split('/').nth(1) {
+            Some("tags") => "[new tag]",
+            Some("heads") => "[new branch]",
+            _ => "[new reference]",
+        };
+        ('*', kind.to_owned(), None)
+    } else {
+        let have = repo.odb().is_ok_and(|db| db.exists(old));
+        if have && !tag && repo.graph_descendant_of(new, old).unwrap_or(false) {
+            (' ', format!("{}..{}", short7(old), short7(new)), None)
+        } else if force {
+            (
+                '+',
+                format!("{}...{}", short7(old), short7(new)),
+                Some("forced update"),
+            )
+        } else if tag {
+            ('!', "[rejected]".to_owned(), Some("already exists"))
+        } else if !have {
+            ('!', "[rejected]".to_owned(), Some("fetch first"))
+        } else {
+            ('!', "[rejected]".to_owned(), Some("non-fast-forward"))
+        }
+    };
+    PushRow {
+        flag,
+        summary,
+        src: update.src_refname().unwrap_or_default().to_owned(),
+        dst,
+        old,
+        new,
+        reason: reason.map(str::to_owned),
+    }
+}
+
+/// git's advice for the first kind of rejection in `rows`, in git's order.
+fn push_hints(repo: &Repository, rows: &[PushRow]) -> Vec<String> {
+    let head = current_branch(repo).map(|b| format!("refs/heads/{b}")).ok();
+    let why = |reason: &str, on_head: Option<bool>| {
+        rows.iter().any(|r| {
+            r.summary == "[rejected]"
+                && r.reason.as_deref() == Some(reason)
+                && on_head.is_none_or(|h| h == (head.as_deref() == Some(r.dst.as_str())))
+        })
+    };
+    let text = if why("non-fast-forward", Some(true)) {
+        "Updates were rejected because the tip of your current branch is behind\n\
+         its remote counterpart. If you want to integrate the remote changes,\n\
+         use 'git pull' before pushing again.\n\
+         See the 'Note about fast-forwards' in 'git push --help' for details."
+    } else if why("non-fast-forward", None) {
+        "Updates were rejected because a pushed branch tip is behind its remote\n\
+         counterpart. If you want to integrate the remote changes, use 'git pull'\n\
+         before pushing again.\n\
+         See the 'Note about fast-forwards' in 'git push --help' for details."
+    } else if why("already exists", None) {
+        "Updates were rejected because the tag already exists in the remote."
+    } else if why("fetch first", None) {
+        "Updates were rejected because the remote contains work that you do not\n\
+         have locally. This is usually caused by another repository pushing to\n\
+         the same ref. If you want to integrate the remote changes, use\n\
+         'git pull' before pushing again.\n\
+         See the 'Note about fast-forwards' in 'git push --help' for details."
+    } else {
+        return Vec::new();
+    };
+    text.lines().map(|l| format!("hint: {l}")).collect()
+}
+
+/// What a bare `push` sends, per `push.default` (`simple` when unset).
+fn default_push_specs(
+    repo: &Repository,
+    remote: &str,
+) -> Result<Vec<(bool, String, String)>, GitError> {
+    let branch = current_branch(repo)?;
+    let head = format!("refs/heads/{branch}");
+    let upstream = repo
+        .branch_upstream_remote(&head)
+        .ok()
+        .filter(|r| r.as_str().ok() == Some(remote))
+        .and_then(|_| repo.branch_upstream_merge(&head).ok())
+        .and_then(|m| m.as_str().ok().map(str::to_owned));
+    let mode = repo
+        .config()?
+        .get_string("push.default")
+        .unwrap_or_else(|_| "simple".to_owned());
+    Ok(match mode.as_str() {
+        "nothing" => {
+            return Err(GitError::Other(
+                "You didn't specify any refspecs to push, and push.default is \"nothing\"."
+                    .to_owned(),
+            ));
+        }
+        "current" => vec![(false, head.clone(), head)],
+        "upstream" | "tracking" => match upstream {
+            Some(up) => vec![(false, head, up)],
+            None => {
+                return Err(GitError::Other(format!(
+                    "The current branch {branch} has no upstream branch."
+                )));
+            }
+        },
+        "matching" => {
+            let mut specs = Vec::new();
+            for b in repo.branches(Some(BranchType::Local))? {
+                let b = b?.0;
+                if let Ok(name) = b.get().name()
+                    && repo
+                        .refname_to_id(&format!("refs/remotes/{remote}/{}", short_ref(name)))
+                        .is_ok()
+                {
+                    specs.push((false, name.to_owned(), name.to_owned()));
+                }
+            }
+            specs
+        }
+        _ => match upstream {
+            Some(up) if up != head => {
+                return Err(GitError::Other(format!(
+                    "The upstream branch of your current branch does not match the name of \
+                     your current branch. To push to the upstream branch on the remote, use \
+                     `rgit push {remote} HEAD:{}`; to push to the branch of the same name, use \
+                     `rgit push {remote} HEAD`",
+                    short_ref(&up)
+                )));
+            }
+            _ => vec![(false, head.clone(), head)],
+        },
+    })
 }
 
 /// Expand a git push refspec (`branch`, `src:dst`, `:dst`, `+src:dst`) to
 /// (force, full source ref, full destination ref); an empty source deletes.
-fn expand_push_refspec(repo: &Repository, spec: &str) -> Result<(bool, String, String), GitError> {
+fn expand_push_refspec(
+    repo: &Repository,
+    remote: &str,
+    spec: &str,
+) -> Result<(bool, String, String), GitError> {
     let (force, spec) = match spec.strip_prefix('+') {
         Some(s) => (true, s),
         None => (false, spec),
@@ -4486,18 +5626,35 @@ fn expand_push_refspec(repo: &Repository, spec: &str) -> Result<(bool, String, S
         String::new()
     } else if src == "HEAD" {
         format!("refs/heads/{}", current_branch(repo)?)
+    } else if let Some(name) = repo
+        .resolve_reference_from_short_name(src)
+        .ok()
+        .and_then(|r| r.name().ok().map(str::to_owned))
+    {
+        name
+    } else if dst.is_some_and(|d| !d.is_empty()) && repo.revparse_single(src).is_ok() {
+        src.to_owned()
     } else {
-        repo.resolve_reference_from_short_name(src)
-            .ok()
-            .and_then(|r| r.name().ok().map(str::to_owned))
-            .ok_or_else(|| GitError::Other(format!("src refspec {src} does not match any")))?
+        return Err(GitError::Other(format!(
+            "src refspec {src} does not match any"
+        )));
     };
+    let exists = |name: String| repo.find_reference(&name).is_ok();
     let dst = match dst {
         None | Some("") if src.is_empty() => {
             return Err(GitError::Other(format!("invalid refspec '{spec}'")));
         }
         None | Some("") => src.clone(),
         Some(d) if d.starts_with("refs/") => d.to_owned(),
+        // `:name` deletes a tag when name is a tag here and no branch.
+        Some(d)
+            if src.is_empty()
+                && exists(format!("refs/tags/{d}"))
+                && !exists(format!("refs/heads/{d}"))
+                && !exists(format!("refs/remotes/{remote}/{d}")) =>
+        {
+            format!("refs/tags/{d}")
+        }
         Some(d) if src.starts_with("refs/tags/") => format!("refs/tags/{d}"),
         Some(d) => format!("refs/heads/{d}"),
     };
@@ -4758,20 +5915,59 @@ fn run_hook_file(repo: &Repository, name: &str) -> Result<(), GitError> {
     Err(GitError::Hook(format!("{name} hook failed: {detail}")))
 }
 
-/// Create a new repository at `path` (`git init`), via libgit2.
-/// Create a repository at `path`. `initial_branch` names the first branch
-/// (git's `-b`); `bare` makes a bare repository (git's `--bare`).
-pub fn init(path: &Path, initial_branch: Option<&str>, bare: bool) -> Result<(), GitError> {
-    let branch = initial_branch
-        .map(str::to_owned)
-        .or_else(default_initial_branch);
+/// Create a repository at `path` (`git init`), via libgit2, and return git's
+/// report line.
+pub fn init(path: &Path, args: &crate::InitArgs) -> Result<String, GitError> {
+    let branch = args.initial_branch.clone().or_else(default_initial_branch);
     let mut opts = git2::RepositoryInitOptions::new();
-    opts.bare(bare);
+    opts.bare(args.bare);
     if let Some(b) = branch.as_deref() {
         opts.initial_head(b);
     }
-    Repository::init_opts(path, &opts)?;
-    Ok(())
+    if let Some(t) = &args.template {
+        opts.template_path(Path::new(t));
+    }
+    if let Some(shared) = &args.shared {
+        use git2::RepositoryInitMode as Mode;
+        opts.mode(match shared.as_str() {
+            "umask" | "false" | "no" | "off" => Mode::SHARED_UMASK,
+            "group" | "true" | "yes" | "on" => Mode::SHARED_GROUP,
+            "all" | "world" | "everybody" => Mode::SHARED_ALL,
+            octal => Mode::from_bits_retain(
+                u32::from_str_radix(octal, 8)
+                    .map_err(|_| GitError::Other(format!("invalid value for --shared: {octal}")))?,
+            ),
+        });
+    }
+    let at = match &args.separate_git_dir {
+        // The repository lives there; `path` gets a `.git` file pointing at it.
+        Some(dir) => {
+            opts.no_dotgit_dir(true)
+                .workdir_path(&std::path::absolute(path)?);
+            PathBuf::from(dir)
+        }
+        None => path.to_path_buf(),
+    };
+    let existed = Repository::open(&at).is_ok();
+    let repo = Repository::init_opts(&at, &opts)?;
+    let shared = if args
+        .shared
+        .as_deref()
+        .is_some_and(|s| !matches!(s, "umask" | "false" | "no" | "off"))
+    {
+        "shared "
+    } else {
+        ""
+    };
+    let verb = if existed {
+        "Reinitialized existing"
+    } else {
+        "Initialized empty"
+    };
+    Ok(format!(
+        "{verb} {shared}Git repository in {}",
+        repo.path().display()
+    ))
 }
 
 fn default_initial_branch() -> Option<String> {
@@ -4780,6 +5976,52 @@ fn default_initial_branch() -> Option<String> {
         .get_string("init.defaultBranch")
         .ok()
         .filter(|s| !s.trim().is_empty())
+}
+
+/// A ref a remote advertises: name, object id and symbolic target.
+pub type RemoteRef = (String, String, Option<String>);
+
+/// The refs `remote` advertises (`git ls-remote`): its URL, then each ref's
+/// name, object id and symbolic target. `remote` is a remote name or a URL, or
+/// the current branch's remote when `None`; `dir` is where to look for a
+/// repository, if anywhere. With `list` unset only the URL is looked up.
+pub fn ls_remote(
+    dir: Option<&Path>,
+    remote: Option<&str>,
+    list: bool,
+) -> Result<(String, Vec<RemoteRef>), GitError> {
+    let repo = dir.and_then(|d| Repository::discover(d).ok());
+    let mut remote = match (&repo, remote) {
+        (Some(repo), Some(r)) => repo.find_remote(r).or_else(|_| repo.remote_anonymous(r))?,
+        (Some(repo), None) => {
+            let name = upstream_remote(repo)
+                .map(|(r, _)| r)
+                .or_else(|_| default_remote(repo))?;
+            repo.find_remote(&name)?
+        }
+        (None, Some(url)) => git2::Remote::create_detached(url)?,
+        (None, None) => return Err(GitError::NotARepository(PathBuf::from("."))),
+    };
+    let url = remote.url().unwrap_or_default().to_owned();
+    if !list {
+        return Ok((url, Vec::new()));
+    }
+    let ignored = std::sync::atomic::AtomicBool::new(false);
+    let quiet = |_: OpProgress| {};
+    let callbacks = remote_callbacks(&quiet, &ignored, None);
+    let conn = remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None)?;
+    let refs = conn
+        .list()?
+        .iter()
+        .map(|h| {
+            (
+                h.name().to_owned(),
+                h.oid().to_string(),
+                h.symref_target().map(str::to_owned),
+            )
+        })
+        .collect();
+    Ok((url, refs))
 }
 
 /// Clone `url` into `path` (`git clone`), via libgit2, using the same
@@ -4792,10 +6034,10 @@ pub fn clone(
     report: &dyn Fn(OpProgress),
 ) -> Result<(), GitError> {
     let mut depth = args.depth;
+    if !args.git_flags.is_empty() || (depth > 0 && url.starts_with("file://")) {
+        return clone_with_git(url, path, args);
+    }
     if depth > 0 && is_local_url(url) {
-        if url.starts_with("file://") {
-            return clone_with_git(url, path, args);
-        }
         report(OpProgress::Line(
             "warning: --depth is ignored in local clones; use file:// instead.".to_owned(),
         ));
@@ -4807,38 +6049,125 @@ pub fn clone(
     if depth > 0 {
         opts.depth(depth);
     }
+    if args.no_tags {
+        opts.download_tags(git2::AutotagOption::None);
+    }
+    let single = match (&args.branch, args.single_branch && !args.mirror) {
+        (Some(b), true) => Some(b.clone()),
+        (None, true) => {
+            let mut remote = git2::Remote::create_detached(url)?;
+            let callbacks = remote_callbacks(report, &ignored, None);
+            let conn = remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None)?;
+            let head = conn.default_branch()?;
+            Some(short_ref(head.as_str().unwrap_or("main")).to_owned())
+        }
+        _ => None,
+    };
     let mut builder = git2::build::RepoBuilder::new();
-    builder.fetch_options(opts).bare(args.bare);
+    builder.fetch_options(opts).bare(args.bare || args.mirror);
     if let Some(b) = &args.branch {
         builder.branch(b);
     }
-    if let Some(origin) = args.origin.clone() {
-        builder.remote_create(move |repo, _, url| repo.remote(&origin, url));
+    if args.no_checkout {
+        let mut checkout = CheckoutBuilder::new();
+        checkout.dry_run();
+        builder.with_checkout(checkout);
     }
+    let origin = args.origin.clone().unwrap_or_else(|| "origin".to_owned());
+    let (mirror, no_tags) = (args.mirror, args.no_tags);
+    let (name, only) = (origin.clone(), single.clone());
+    builder.remote_create(move |repo, _, url| {
+        let fetch = match &only {
+            _ if mirror => "+refs/*:refs/*".to_owned(),
+            Some(b) => format!("+refs/heads/{b}:refs/remotes/{name}/{b}"),
+            None => format!("+refs/heads/*:refs/remotes/{name}/*"),
+        };
+        let remote = repo.remote_with_fetch(&name, url, &fetch)?;
+        let mut config = repo.config()?;
+        if mirror {
+            config.set_bool(&format!("remote.{name}.mirror"), true)?;
+        }
+        if no_tags {
+            config.set_str(&format!("remote.{name}.tagOpt"), "--no-tags")?;
+        }
+        Ok(remote)
+    });
     let repo = builder.clone(url, path)?;
-    if args.recurse_submodules && !args.bare {
+    if mirror {
+        // A mirror has no remote-tracking refs and no upstreams.
+        if let Ok(mut head) = repo.find_reference(&format!("refs/remotes/{origin}/HEAD")) {
+            head.delete()?;
+        }
+        if let Ok(b) = current_branch(&repo) {
+            let mut config = repo.config()?;
+            let _ = config.remove(&format!("branch.{b}.remote"));
+            let _ = config.remove(&format!("branch.{b}.merge"));
+        }
+    }
+    if let Some(b) = single
+        .as_ref()
+        .filter(|_| !mirror)
+        .or(no_tags.then_some(&origin))
+    {
+        // libgit2's clone takes every tag; git follows only the branch's, or none.
+        let tip = repo
+            .refname_to_id(&format!("refs/remotes/{origin}/{b}"))
+            .ok();
+        for tag in repo.tag_names(None)?.iter().flatten().flatten() {
+            let mut r = repo.find_reference(&format!("refs/tags/{tag}"))?;
+            let on_branch = !no_tags
+                && r.peel_to_commit().is_ok_and(|c| {
+                    tip.is_some_and(|t| {
+                        c.id() == t || repo.graph_descendant_of(t, c.id()).unwrap_or(false)
+                    })
+                });
+            if !on_branch {
+                r.delete()?;
+            }
+        }
+    }
+    let mut config = repo.config()?;
+    for kv in &args.config {
+        let (key, value) = kv.split_once('=').unwrap_or((kv, "true"));
+        config.set_str(key, value)?;
+    }
+    if args.recurse_submodules && !args.bare && !args.mirror {
         update_submodules(&repo, report)?;
     }
     Ok(())
 }
 
-/// A shallow clone over `file://`, which libgit2's local transport cannot do.
+/// A clone through git, for what libgit2 cannot do: shallow over `file://`,
+/// and alternates, partial, sparse and template clones.
 fn clone_with_git(url: &str, path: &Path, args: &crate::CloneArgs) -> Result<(), GitError> {
     let mut cmd = std::process::Command::new("git");
-    cmd.args(["clone", "--quiet", "--depth", &args.depth.to_string()]);
+    cmd.args(["clone", "--quiet"]);
+    if args.depth > 0 {
+        cmd.arg(format!("--depth={}", args.depth));
+    }
     if let Some(b) = &args.branch {
         cmd.args(["--branch", b]);
     }
     if let Some(o) = &args.origin {
         cmd.args(["--origin", o]);
     }
-    if args.bare {
-        cmd.arg("--bare");
+    for (on, flag) in [
+        (args.bare, "--bare"),
+        (args.mirror, "--mirror"),
+        (args.recurse_submodules, "--recurse-submodules"),
+        (args.single_branch, "--single-branch"),
+        (args.no_checkout, "--no-checkout"),
+        (args.no_tags, "--no-tags"),
+    ] {
+        if on {
+            cmd.arg(flag);
+        }
     }
-    if args.recurse_submodules {
-        cmd.arg("--recurse-submodules");
+    for kv in &args.config {
+        cmd.args(["--config", kv]);
     }
     let out = cmd
+        .args(&args.git_flags)
         .arg(url)
         .arg(path)
         .output()
@@ -4864,6 +6193,337 @@ fn update_submodules(repo: &Repository, report: &dyn Fn(OpProgress)) -> Result<(
         update_submodules(&sm.open()?, report)?;
     }
     Ok(())
+}
+
+/// `repo`'s submodules whose paths match `paths` (all when empty).
+fn chosen_submodules<'r>(
+    repo: &'r Repository,
+    paths: &[String],
+) -> Result<Vec<git2::Submodule<'r>>, GitError> {
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|p| p.trim_end_matches('/').to_owned())
+        .collect();
+    Ok(repo
+        .submodules()?
+        .into_iter()
+        .filter(|sm| paths.is_empty() || pathspec_matches(&paths, &sm.path().to_string_lossy()))
+        .collect())
+}
+
+/// Append `repo`'s submodules to `out`, their paths under `prefix`.
+fn list_submodules(
+    repo: &Repository,
+    prefix: &str,
+    recursive: bool,
+    out: &mut Vec<crate::SubmoduleInfo>,
+) -> Result<(), GitError> {
+    let conflicted: Vec<String> = repo
+        .index()?
+        .conflicts()?
+        .flatten()
+        .filter_map(|c| String::from_utf8(c.our.or(c.their)?.path).ok())
+        .collect();
+    for sm in repo.submodules()? {
+        let rel = sm.path().to_string_lossy().into_owned();
+        let path = format!("{prefix}{rel}");
+        let recorded = sm.index_id().or(sm.head_id());
+        let sub = sm.open().ok().filter(|r| r.head().is_ok());
+        let checked_out = sub.as_ref().and_then(|r| r.head().ok()?.target());
+        let state = if conflicted.contains(&rel) {
+            'U'
+        } else if sub.is_none() {
+            '-'
+        } else if checked_out != recorded {
+            '+'
+        } else {
+            ' '
+        };
+        out.push(crate::SubmoduleInfo {
+            name: sm.name().unwrap_or_default().to_owned(),
+            path: path.clone(),
+            url: sm.url().ok().flatten().map(str::to_owned),
+            branch: sm.branch().ok().flatten().map(str::to_owned),
+            recorded: recorded.map(|o| o.to_string()),
+            checked_out: checked_out.map(|o| o.to_string()),
+            state,
+            describe: sub.as_ref().and_then(describe_head),
+        });
+        if recursive && let Some(sub) = &sub {
+            list_submodules(sub, &format!("{path}/"), true, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// HEAD as `git submodule status` names it: a tag, else any ref, else the id.
+fn describe_head(repo: &Repository) -> Option<String> {
+    let name = |opts: &git2::DescribeOptions| repo.describe(opts).ok()?.format(None).ok();
+    name(git2::DescribeOptions::new().describe_tags()).or_else(|| {
+        name(
+            git2::DescribeOptions::new()
+                .describe_all()
+                .show_commit_oid_as_fallback(true),
+        )
+    })
+}
+
+/// Check out `branch` from `origin` in a freshly cloned submodule.
+fn checkout_remote_branch(sub: &Repository, branch: &str) -> Result<(), GitError> {
+    let id = sub.refname_to_id(&format!("refs/remotes/origin/{branch}"))?;
+    let commit = sub.find_commit(id)?;
+    sub.branch(branch, &commit, true)?
+        .set_upstream(Some(&format!("origin/{branch}")))?;
+    sub.checkout_tree(commit.as_object(), Some(CheckoutBuilder::new().force()))?;
+    sub.set_head(&format!("refs/heads/{branch}"))?;
+    Ok(())
+}
+
+/// The superproject's `.gitmodules`, for editing.
+fn gitmodules(repo: &Repository) -> Result<git2::Config, GitError> {
+    let dir = repo
+        .workdir()
+        .ok_or_else(|| GitError::Bare(repo.path().to_path_buf()))?;
+    Ok(git2::Config::open(&dir.join(".gitmodules"))?)
+}
+
+fn submodule_op(
+    repo: &Repository,
+    op: &crate::SubmoduleOp,
+    report: &dyn Fn(OpProgress),
+) -> Result<(), GitError> {
+    use crate::SubmoduleOp as Op;
+    let top = repo
+        .workdir()
+        .ok_or_else(|| GitError::Bare(repo.path().to_path_buf()))?
+        .to_path_buf();
+    let find = |path: &str| {
+        chosen_submodules(repo, &[path.to_owned()])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| GitError::Other(format!("no submodule mapping found for path '{path}'")))
+    };
+    match op {
+        Op::Add {
+            url, path, branch, ..
+        } => {
+            let path = path.clone().unwrap_or_else(|| {
+                let base = url.trim_end_matches('/').rsplit(['/', ':']).next();
+                base.unwrap_or(url).trim_end_matches(".git").to_owned()
+            });
+            report(OpProgress::Line(format!(
+                "Cloning into '{}'...",
+                top.join(&path).display()
+            )));
+            let mut sm = repo.submodule(url, Path::new(&path), true)?;
+            let sub = sm.clone(None)?;
+            if let Some(b) = branch {
+                checkout_remote_branch(&sub, b)?;
+                gitmodules(repo)?.set_str(&format!("submodule.{path}.branch"), b)?;
+            }
+            sm.add_finalize()?;
+        }
+        Op::Init { paths } => {
+            let config = repo.config()?;
+            for mut sm in chosen_submodules(repo, paths)? {
+                let name = sm.name().unwrap_or_default().to_owned();
+                if config.get_string(&format!("submodule.{name}.url")).is_ok() {
+                    continue;
+                }
+                sm.init(false)?;
+                let url = repo
+                    .config()?
+                    .get_string(&format!("submodule.{name}.url"))
+                    .unwrap_or_default();
+                report(OpProgress::Line(format!(
+                    "Submodule '{name}' ({url}) registered for path '{}'",
+                    sm.path().display()
+                )));
+            }
+        }
+        Op::Update {
+            paths,
+            init,
+            recursive,
+            remote,
+        } => update_each(repo, "", paths, *init, *recursive, *remote, report)?,
+        Op::Sync { paths, recursive } => sync_each(repo, "", paths, *recursive, report)?,
+        Op::Deinit { paths, force, all } => {
+            if paths.is_empty() && !all {
+                return Err(GitError::Other(
+                    "Use '--all' if you really want to deinitialize all submodules".to_owned(),
+                ));
+            }
+            for sm in chosen_submodules(repo, paths)? {
+                let name = sm.name().unwrap_or_default().to_owned();
+                let path = sm.path().to_string_lossy().into_owned();
+                let dir = top.join(&path);
+                if dir.join(".git").is_dir() {
+                    return Err(GitError::Other(format!(
+                        "Submodule work tree '{path}' contains a .git directory (use 'rm -rf' if \
+                         you really want to remove it including all of its history)"
+                    )));
+                }
+                let status = repo.submodule_status(&name, git2::SubmoduleIgnore::None)?;
+                let dirty = git2::SubmoduleStatus::WD_INDEX_MODIFIED
+                    | git2::SubmoduleStatus::WD_WD_MODIFIED
+                    | git2::SubmoduleStatus::WD_UNTRACKED;
+                if !force && status.intersects(dirty) {
+                    return Err(GitError::Other(format!(
+                        "Submodule work tree '{path}' contains local modifications; use '-f' to \
+                         discard them"
+                    )));
+                }
+                if dir.read_dir().is_ok_and(|mut d| d.next().is_some()) {
+                    std::fs::remove_dir_all(&dir)?;
+                    std::fs::create_dir_all(&dir)?;
+                    report(OpProgress::Line(format!("Cleared directory '{path}'")));
+                }
+                let mut local = repo.config()?.open_level(git2::ConfigLevel::Local)?;
+                let url = local.get_string(&format!("submodule.{name}.url"));
+                let mut keys = Vec::new();
+                let pattern = format!("^submodule\\.{}\\.", regex_escape(&name));
+                local
+                    .entries(Some(&pattern))?
+                    .for_each(|e| keys.extend(e.name().map(str::to_owned)))?;
+                for key in &keys {
+                    local.remove(key)?;
+                }
+                if let Ok(url) = url {
+                    report(OpProgress::Line(format!(
+                        "Submodule '{name}' ({url}) unregistered for path '{path}'"
+                    )));
+                }
+            }
+        }
+        Op::SetUrl { path, url } => {
+            let name = find(path)?.name().unwrap_or_default().to_owned();
+            gitmodules(repo)?.set_str(&format!("submodule.{name}.url"), url)?;
+            let mut sm = repo.find_submodule(&name)?;
+            sm.sync()?;
+        }
+        Op::SetBranch { path, branch } => {
+            let name = find(path)?.name().unwrap_or_default().to_owned();
+            let key = format!("submodule.{name}.branch");
+            let mut config = gitmodules(repo)?;
+            match branch {
+                Some(b) => config.set_str(&key, b)?,
+                None => {
+                    let _ = config.remove(&key);
+                }
+            }
+        }
+        Op::AbsorbGitDirs { .. } | Op::Summary { .. } => {
+            unreachable!("run through git")
+        }
+    }
+    Ok(())
+}
+
+/// `submodule update` over `repo`'s chosen submodules, reporting paths under `prefix`.
+fn update_each(
+    repo: &Repository,
+    prefix: &str,
+    paths: &[String],
+    init: bool,
+    recursive: bool,
+    remote: bool,
+    report: &dyn Fn(OpProgress),
+) -> Result<(), GitError> {
+    let top = repo.workdir().unwrap_or(repo.path()).to_path_buf();
+    for mut sm in chosen_submodules(repo, paths)? {
+        let name = sm.name().unwrap_or_default().to_owned();
+        let path = format!("{prefix}{}", sm.path().display());
+        let registered = repo
+            .config()?
+            .get_string(&format!("submodule.{name}.url"))
+            .is_ok();
+        if !registered && !init {
+            continue;
+        }
+        if !registered {
+            sm.init(false)?;
+            let url = repo
+                .config()?
+                .get_string(&format!("submodule.{name}.url"))
+                .unwrap_or_default();
+            report(OpProgress::Line(format!(
+                "Submodule '{name}' ({url}) registered for path '{path}'"
+            )));
+        }
+        let before = sm.open().ok().and_then(|r| r.head().ok()?.target());
+        if before.is_none() {
+            report(OpProgress::Line(format!(
+                "Cloning into '{}'...",
+                top.join(sm.path()).display()
+            )));
+        }
+        sm.update(true, None)?;
+        let sub = sm.open()?;
+        let after = if remote {
+            // --remote: the submodule's remote-tracking branch, not the
+            // recorded commit.
+            sub.find_remote("origin")?
+                .fetch(&[] as &[&str], None, None)?;
+            let tracking = match sm.branch().ok().flatten() {
+                Some(b) => format!("refs/remotes/origin/{b}"),
+                None => sub
+                    .find_reference("refs/remotes/origin/HEAD")
+                    .ok()
+                    .and_then(|r| r.symbolic_target().ok().flatten().map(str::to_owned))
+                    .unwrap_or_else(|| "refs/remotes/origin/HEAD".to_owned()),
+            };
+            let id = sub.refname_to_id(&tracking)?;
+            sub.checkout_tree(
+                &sub.find_object(id, None)?,
+                Some(CheckoutBuilder::new().safe()),
+            )?;
+            sub.set_head_detached(id)?;
+            Some(id)
+        } else {
+            sub.head().ok().and_then(|h| h.target())
+        };
+        if let Some(id) = after.filter(|a| Some(*a) != before) {
+            report(OpProgress::Line(format!(
+                "Submodule path '{path}': checked out '{id}'"
+            )));
+        }
+        if recursive {
+            update_each(&sub, &format!("{path}/"), &[], init, true, remote, report)?;
+        }
+    }
+    Ok(())
+}
+
+/// `submodule sync`: copy each chosen submodule's URL from `.gitmodules`.
+fn sync_each(
+    repo: &Repository,
+    prefix: &str,
+    paths: &[String],
+    recursive: bool,
+    report: &dyn Fn(OpProgress),
+) -> Result<(), GitError> {
+    for mut sm in chosen_submodules(repo, paths)? {
+        let path = format!("{prefix}{}", sm.path().display());
+        report(OpProgress::Line(format!(
+            "Synchronizing submodule url for '{path}'"
+        )));
+        sm.sync()?;
+        if recursive && let Ok(sub) = sm.open() {
+            sync_each(&sub, &format!("{path}/"), &[], true, report)?;
+        }
+    }
+    Ok(())
+}
+
+/// `s` with regex metacharacters escaped, for a config-name pattern.
+fn regex_escape(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| {
+            let special = r"\.+*?()|[]{}^$".contains(c);
+            special.then_some('\\').into_iter().chain([c])
+        })
+        .collect()
 }
 
 /// A 7-character short oid, as git prints in ref-update lines.
@@ -5369,6 +7029,95 @@ fn commit_report(repo: &Repository) -> Vec<String> {
 /// The git-style line git prints after `git stash`: `Saved working directory
 /// and index state WIP on <branch>: <short-oid> <subject>`. Stash does not move
 /// HEAD, so the base commit it reports is the current HEAD.
+/// Every value of a multi-valued config key, in file order.
+fn config_values(repo: &Repository, key: &str) -> Result<Vec<String>, GitError> {
+    let config = open_config(repo, ConfigScope::Any, false)?;
+    let mut out = Vec::new();
+    let mut entries = match config.multivar(key, None) {
+        Ok(entries) => entries,
+        Err(e) if e.code() == ErrorCode::NotFound => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    while let Some(entry) = entries.next() {
+        out.extend(entry?.value().map(str::to_owned));
+    }
+    Ok(out)
+}
+
+/// A remote's URLs as git uses them: `pushurl`s, else `url`s, for `push`.
+fn remote_urls(repo: &Repository, name: &str, push: bool) -> Result<Vec<String>, GitError> {
+    let push_urls = if push {
+        config_values(repo, &format!("remote.{name}.pushurl"))?
+    } else {
+        Vec::new()
+    };
+    if push_urls.is_empty() {
+        config_values(repo, &format!("remote.{name}.url"))
+    } else {
+        Ok(push_urls)
+    }
+}
+
+/// Whether remote `name` has several URLs for the direction: libgit2 reads
+/// only the last, while git fetches from the first and pushes to each, so
+/// such remotes go through git.
+fn multi_url(repo: &Repository, name: &str, push: bool) -> bool {
+    remote_urls(repo, name, push).is_ok_and(|u| u.len() > 1)
+}
+
+/// A stash commit of worktree `tree` as git makes one: the index as its
+/// second parent, and git's `WIP on <branch>: ...` or `On <branch>: <msg>`.
+fn stash_commit<'r>(
+    repo: &'r Repository,
+    message: Option<&str>,
+    tree: &git2::Tree,
+) -> Result<git2::Commit<'r>, GitError> {
+    let head = repo.head()?;
+    let commit = head.peel_to_commit()?;
+    let branch = if head.is_branch() {
+        head.shorthand().unwrap_or("HEAD")
+    } else {
+        "(no branch)"
+    };
+    let short = commit.as_object().short_id()?;
+    let base = format!(
+        "{branch}: {} {}",
+        short.as_str().unwrap_or_default(),
+        commit.summary().ok().flatten().unwrap_or_default()
+    );
+    let sig = repo.signature()?;
+    let index_tree = repo.find_tree(repo.index()?.write_tree()?)?;
+    let index = repo.commit(
+        None,
+        &sig,
+        &sig,
+        &format!("index on {base}\n"),
+        &index_tree,
+        &[&commit],
+    )?;
+    let message = match message {
+        Some(m) => format!("On {branch}: {m}\n"),
+        None => format!("WIP on {base}\n"),
+    };
+    let id = repo.commit(
+        None,
+        &sig,
+        &sig,
+        &message,
+        tree,
+        &[&commit, &repo.find_commit(index)?],
+    )?;
+    Ok(repo.find_commit(id)?)
+}
+
+/// Point `refs/stash` at `id`, logging `message` in its reflog.
+fn store_stash(repo: &Repository, id: Oid, message: &str) -> Result<(), GitError> {
+    // libgit2 logs refs/stash only once its reflog exists.
+    repo.reference_ensure_log("refs/stash")?;
+    repo.reference("refs/stash", id, true, message)?;
+    Ok(())
+}
+
 fn stash_saved_line(repo: &Repository) -> String {
     let Ok(head) = repo.head() else {
         return "Saved working directory and index state".to_owned();
@@ -5581,11 +7330,15 @@ fn open_config(
         ConfigScope::Local => Config::open(&local)?,
         ConfigScope::Any if write => Config::open(&local)?,
         ConfigScope::Any if env_global.is_some() => {
-            // libgit2 ignores GIT_CONFIG_GLOBAL, so stack the files as git does.
+            // libgit2 ignores GIT_CONFIG_GLOBAL, so stack the files as git
+            // does: it replaces both ~/.gitconfig and the XDG file.
             let mut config = Config::new()?;
+            let system = std::env::var_os("GIT_CONFIG_SYSTEM")
+                .map(PathBuf::from)
+                .or_else(|| Config::find_system().ok())
+                .filter(|_| std::env::var_os("GIT_CONFIG_NOSYSTEM").is_none());
             for (path, level) in [
-                (Config::find_system().ok(), ConfigLevel::System),
-                (Config::find_xdg().ok(), ConfigLevel::XDG),
+                (system, ConfigLevel::System),
                 (env_global.clone(), ConfigLevel::Global),
                 (Some(local), ConfigLevel::Local),
             ] {
@@ -7433,10 +9186,16 @@ fn collect_recent(repo: &Repository) -> Vec<Commit> {
 }
 
 /// The branch name (only when HEAD points at a branch) and the abbreviated HEAD
-/// commit id for a repository/worktree. Both are `None` on an unborn branch.
+/// commit id for a repository/worktree. The id is `None` on an unborn branch.
 fn worktree_head(repo: &Repository) -> (Option<String>, Option<String>) {
     let Ok(head) = repo.head() else {
-        return (None, None);
+        let unborn = repo.find_reference("HEAD").ok().and_then(|h| {
+            h.symbolic_target()
+                .ok()
+                .flatten()
+                .map(|t| short_ref(t).to_owned())
+        });
+        return (unborn, None);
     };
     let branch = head
         .is_branch()
@@ -7451,21 +9210,50 @@ fn worktree_head(repo: &Repository) -> (Option<String>, Option<String>) {
     (branch, short)
 }
 
+/// The full HEAD commit id, `None` on an unborn branch.
+fn head_oid(repo: &Repository) -> Option<String> {
+    Some(repo.head().ok()?.peel_to_commit().ok()?.id().to_string())
+}
+
 /// Whether a repository/worktree has any uncommitted change: tracked edits,
 /// staged files, or new (untracked) files. Ignored files do not count.
 /// Create branch `name` at `start` for a new worktree, tracking `start` when
 /// it is a remote-tracking branch.
-fn new_worktree_branch<'r>(
-    repo: &'r Repository,
+fn new_worktree_branch(
+    repo: &Repository,
     name: &str,
     start: &str,
-) -> Result<git2::Branch<'r>, GitError> {
+    reset: bool,
+    track: Option<bool>,
+) -> Result<(), GitError> {
     let commit = repo.revparse_single(start)?.peel_to_commit()?;
-    let mut branch = repo.branch(name, &commit, false)?;
-    if repo.find_branch(start, BranchType::Remote).is_ok() {
+    let mut branch = repo.branch(name, &commit, reset)?;
+    if track.unwrap_or_else(|| repo.find_branch(start, BranchType::Remote).is_ok()) {
         branch.set_upstream(Some(start))?;
     }
-    Ok(branch)
+    Ok(())
+}
+
+/// The path of the worktree, main or linked, that has `refname` checked out.
+fn checked_out_at(repo: &Repository, refname: &str) -> Result<Option<String>, GitError> {
+    let on = |r: &Repository| {
+        r.find_reference("HEAD")
+            .ok()
+            .and_then(|h| h.symbolic_target().ok().flatten().map(str::to_owned))
+            .as_deref()
+            == Some(refname)
+    };
+    let main = Repository::open(repo.commondir())?;
+    if let Some(dir) = main.workdir().filter(|_| on(&main)) {
+        return Ok(Some(dir.to_string_lossy().trim_end_matches('/').to_owned()));
+    }
+    for name in main.worktrees()?.iter().filter_map(|n| n.ok().flatten()) {
+        let wt = main.find_worktree(name)?;
+        if Repository::open_from_worktree(&wt).is_ok_and(|r| on(&r)) {
+            return Ok(Some(wt.path().to_string_lossy().into_owned()));
+        }
+    }
+    Ok(None)
 }
 
 /// The last folder of a worktree path, which git names the worktree after.

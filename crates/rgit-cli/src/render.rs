@@ -355,7 +355,7 @@ pub fn stashes(list: &[Stash]) -> String {
     list.iter()
         .map(|s| {
             format!(
-                "{} {}",
+                "{}: {}",
                 paint(&format!("stash@{{{}}}", s.index), YELLOW),
                 s.message
             )
