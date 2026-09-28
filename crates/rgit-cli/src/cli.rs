@@ -1007,7 +1007,8 @@ pub enum Command {
         /// Replay commits after <upstream> onto this new base (git's --onto).
         #[arg(long = "onto", value_name = "NEWBASE")]
         onto_new: Option<String>,
-        /// Interactive rebase: opens the todo editor (needs a terminal).
+        /// Interactive rebase: opens the todo editor (needs a terminal, or
+        /// GIT_SEQUENCE_EDITOR set to a script).
         #[arg(short = 'i', long = "interactive")]
         edit: bool,
         /// Rebase every commit down to the root commit.
@@ -1039,7 +1040,8 @@ pub enum Command {
         /// Stop the rebase, leaving HEAD, the index and the working tree as they are.
         #[arg(long)]
         quit: bool,
-        /// Edit the todo list of the in-progress rebase (needs a terminal).
+        /// Edit the todo list of the in-progress rebase (needs a terminal, or
+        /// GIT_SEQUENCE_EDITOR set to a script).
         #[arg(long = "edit-todo")]
         edit_todo: bool,
         /// Show the commit the rebase stopped at.
@@ -2909,7 +2911,7 @@ impl BisectCmd {
     }
 }
 
-/// `rebase` flags handed as they are to git's sequencer.
+/// `rebase`'s further flags, as git's.
 #[derive(clap::Args, Default)]
 pub struct RebaseFlags {
     /// Keep commits that start out empty.
@@ -2965,37 +2967,28 @@ pub struct RebaseFlags {
 }
 
 impl RebaseFlags {
-    fn git_flags(&self) -> Vec<String> {
-        let mut flags: Vec<String> = [
-            (self.keep_empty, "--keep-empty"),
-            (self.no_autosquash, "--no-autosquash"),
-            (self.force_rebase, "--force-rebase"),
-            (self.fork_point, "--fork-point"),
-            (self.no_fork_point, "--no-fork-point"),
-            (self.keep_base, "--keep-base"),
-            (
-                self.committer_date_is_author_date,
-                "--committer-date-is-author-date",
-            ),
-            (self.reset_author_date, "--reset-author-date"),
-            (self.reapply_cherry_picks, "--reapply-cherry-picks"),
-            (self.signoff, "--signoff"),
-            (self.autostash, "--autostash"),
-            (self.no_verify, "--no-verify"),
-            (self.quiet, "--quiet"),
-            (self.verbose, "--verbose"),
-        ]
-        .into_iter()
-        .filter(|(on, _)| *on)
-        .map(|(_, flag)| flag.to_owned())
-        .collect();
-        flags.extend(
-            self.rebase_merges
-                .iter()
-                .map(|m| format!("--rebase-merges={m}")),
-        );
-        flags.extend(self.empty.iter().map(|e| format!("--empty={e}")));
-        flags
+    fn options(&self) -> rgit_git::RebaseOptions {
+        rgit_git::RebaseOptions {
+            no_autosquash: self.no_autosquash,
+            force: self.force_rebase,
+            fork_point: match (self.fork_point, self.no_fork_point) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
+            keep_base: self.keep_base,
+            committer_date_is_author_date: self.committer_date_is_author_date,
+            reset_author_date: self.reset_author_date,
+            rebase_merges: self.rebase_merges.as_deref().map(|m| m == "rebase-cousins"),
+            empty: self.empty.clone(),
+            reapply_cherry_picks: self.reapply_cherry_picks,
+            signoff: self.signoff,
+            autostash: self.autostash,
+            no_verify: self.no_verify,
+            quiet: self.quiet,
+            verbose: self.verbose,
+            ..Default::default()
+        }
     }
 }
 
@@ -6060,16 +6053,19 @@ pub fn run(
             edit_todo,
             show_current_patch,
         } => {
+            let done = |out: String| if out.is_empty() { "ok".to_owned() } else { out };
+            // A scripted sequence editor stands in for the terminal.
+            let scripted = std::env::var("GIT_SEQUENCE_EDITOR").is_ok_and(|e| !e.is_empty());
             if abort {
-                ok(backend.rebase_abort())?
+                done(backend.rebase_abort()?)
             } else if cont {
-                ok(backend.rebase_continue())?
+                done(backend.rebase_continue()?)
             } else if skip {
-                ok(backend.rebase_skip())?
+                done(backend.rebase_skip()?)
             } else if quit {
                 ok(backend.rebase_quit())?
             } else if edit_todo {
-                if !interactive {
+                if !interactive && !scripted {
                     anyhow::bail!("rebase --edit-todo needs a terminal");
                 }
                 ok(backend.rebase_edit_todo())?
@@ -6079,19 +6075,18 @@ pub fn run(
                 }
                 show_one(backend, "REBASE_HEAD", &[], DiffFormat::default(), false)?
             } else {
-                if edit && !interactive {
+                if edit && !interactive && !scripted {
                     anyhow::bail!("interactive rebase needs a terminal");
                 }
                 // Pick the base (how far back to edit) when it is not given.
                 let onto = match onto {
-                    None if edit && !root => Some(crate::interactive::pick_commit(
+                    None if edit && !root && interactive => Some(crate::interactive::pick_commit(
                         backend,
                         "Rebase onto which commit? (edits the commits after it)",
                     )?),
                     onto => onto,
                 };
-                // git's own sequencer, so a conflict stops for --continue as in
-                // git; no upstream argument means the branch's upstream.
+                // No upstream argument means the branch's upstream.
                 let opts = rgit_git::RebaseOptions {
                     onto: onto_new,
                     interactive: edit,
@@ -6101,13 +6096,13 @@ pub fn run(
                     update_refs,
                     strategy_option,
                     branch,
-                    flags: more.git_flags(),
+                    ..more.options()
                 };
                 let out = backend.rebase_with(onto.as_deref(), &opts)?;
-                if out.is_empty() || more.quiet {
+                if more.quiet {
                     "ok".to_owned()
                 } else {
-                    out
+                    done(out)
                 }
             }
         }

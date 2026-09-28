@@ -20,6 +20,7 @@ mod model;
 mod oplog;
 mod plumbing;
 mod range_diff;
+mod rebase;
 #[cfg(feature = "ssh")]
 mod ssh;
 pub mod workflow;

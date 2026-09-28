@@ -335,9 +335,8 @@ fn rebase_abort_errors_cleanly_with_nothing_to_abort() {
 
 #[test]
 fn rebase_abort_cleans_up_a_cli_started_rebase() {
-    // A git-CLI-started rebase uses git's default "merge" backend, whose state
-    // libgit2's open_rebase cannot drive. rebase_abort now shells out to
-    // `git rebase --abort` so it restores the pre-rebase HEAD regardless.
+    // A git-CLI-started rebase keeps git's `.git/rebase-merge` state, which
+    // rgit's own sequencer reads, so rebase_abort restores the pre-rebase HEAD.
     let dir = init_repo("rebase-abort-cli");
     std::fs::write(dir.join("f.txt"), "base\n").unwrap();
     git(&dir, &["add", "f.txt"]);

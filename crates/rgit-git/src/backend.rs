@@ -457,8 +457,8 @@ pub trait GitBackend: Send + Sync {
     /// working tree of `start`, or empty when `None`.
     fn checkout_orphan(&self, name: &str, start: Option<&str>) -> Result<(), GitError>;
 
-    /// Rebase the current branch onto `rev` in-process; aborts on conflict.
-    /// `report` receives git-style progress lines (`Applying: ...`).
+    /// Rebase the current branch onto `rev`; a conflict undoes the whole
+    /// rebase. `report` receives git's output lines.
     fn rebase_onto(&self, rev: &str, report: &dyn Fn(crate::OpProgress)) -> Result<(), GitError>;
 
     /// Three-point rebase: replay the current branch's commits after `upstream`
@@ -486,31 +486,29 @@ pub trait GitBackend: Send + Sync {
         max_commits: usize,
     ) -> Result<std::collections::HashMap<String, crate::FileActivity>, GitError>;
 
-    /// Abort an in-progress rebase, restoring the pre-rebase HEAD. Shells out to
-    /// `git` so it works for CLI-started (interactive) rebases too, which libgit2
-    /// cannot drive.
-    fn rebase_abort(&self) -> Result<(), GitError>;
+    /// Abort an in-progress rebase (rgit's or git's), restoring the pre-rebase
+    /// branch and HEAD. Returns what restoring an autostash printed.
+    fn rebase_abort(&self) -> Result<String, GitError>;
 
-    /// Continue an in-progress rebase after resolving conflicts. Shells out to
-    /// `git` (libgit2 cannot drive a CLI-started rebase).
-    fn rebase_continue(&self) -> Result<(), GitError>;
+    /// Continue an in-progress rebase after resolving conflicts, committing
+    /// what is staged. Returns the rebase's output.
+    fn rebase_continue(&self) -> Result<String, GitError>;
 
-    /// Skip the current commit of an in-progress rebase. Shells out to `git`.
-    fn rebase_skip(&self) -> Result<(), GitError>;
+    /// Skip the current commit of an in-progress rebase.
+    fn rebase_skip(&self) -> Result<String, GitError>;
 
     /// Stop an in-progress rebase, leaving HEAD, the index and the working tree
-    /// where they are (git's `--quit`). Shells out to `git`.
+    /// where they are (git's `--quit`).
     fn rebase_quit(&self) -> Result<(), GitError>;
 
-    /// Edit the todo list of an in-progress interactive rebase in the editor on
-    /// the terminal (git's `--edit-todo`). Shells out to `git`.
+    /// Edit the todo list of an in-progress rebase in the sequence editor
+    /// (git's `--edit-todo`).
     fn rebase_edit_todo(&self) -> Result<(), GitError>;
 
-    /// Rebase onto `upstream` (the branch's upstream when `None`) with options
-    /// libgit2's rebase lacks (`-i`, `--root`, `--autosquash`, `--exec`,
-    /// `--update-refs`, `-X`), run through git's sequencer. `-i` inherits the
-    /// terminal for the todo editor. A conflict leaves the rebase in progress.
-    /// Returns what git printed on stdout (the `-v` diffstat).
+    /// Rebase onto `upstream` (the branch's upstream when `None`), as git's
+    /// sequencer does, in git's `.git/rebase-merge` state. A conflict, an
+    /// `edit` or a `break` leaves the rebase in progress. Returns the output
+    /// lines (`Successfully rebased and updated refs/heads/x.`).
     fn rebase_with(
         &self,
         upstream: Option<&str>,

@@ -206,7 +206,7 @@ pub struct MergeOptions {
     pub stat: bool,
 }
 
-/// Rebase options that go past libgit2's rebase, run through git's sequencer.
+/// `rebase` options, as git's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RebaseOptions {
     /// Replay onto this base instead of the upstream (git's `--onto`).
@@ -225,8 +225,35 @@ pub struct RebaseOptions {
     pub strategy_option: Option<String>,
     /// Check out this branch first (git's `<upstream> <branch>`).
     pub branch: Option<String>,
-    /// Further git rebase flags the CLI has checked (`--keep-empty`, `-f`, ...).
-    pub flags: Vec<String>,
+    /// Do not autosquash, overriding rebase.autoSquash (git's `--no-autosquash`).
+    pub no_autosquash: bool,
+    /// Replay every commit, even ones that could be kept (git's `-f`).
+    pub force: bool,
+    /// Narrow the upstream with its reflog (git's `--[no-]fork-point`); the
+    /// default is on only when no upstream is given.
+    pub fork_point: Option<bool>,
+    /// Replay onto the merge base of the upstream and the branch (git's `--keep-base`).
+    pub keep_base: bool,
+    /// Give each commit its author date as the committer date.
+    pub committer_date_is_author_date: bool,
+    /// Give each commit the current time as its author date.
+    pub reset_author_date: bool,
+    /// Recreate merges (git's `-r`); `true` rebases cousins too.
+    pub rebase_merges: Option<bool>,
+    /// `drop`, `keep` or `stop`: a commit that becomes empty (git's `--empty`).
+    pub empty: Option<String>,
+    /// Replay commits already upstream too (git's `--reapply-cherry-picks`).
+    pub reapply_cherry_picks: bool,
+    /// Add a Signed-off-by trailer to each commit.
+    pub signoff: bool,
+    /// Stash local changes first and restore them after.
+    pub autostash: bool,
+    /// Skip the pre-rebase hook.
+    pub no_verify: bool,
+    /// Print nothing on success.
+    pub quiet: bool,
+    /// Show a diffstat of what changed upstream.
+    pub verbose: bool,
 }
 
 impl RepoStatus {

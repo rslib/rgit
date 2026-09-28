@@ -339,6 +339,28 @@ fn pull_rebases_with_the_flag_or_config() {
 }
 
 #[test]
+fn pull_rebase_stops_on_a_conflict_for_continue() {
+    let (_, up, clone) = fetch_setup("pull-rebase-stop");
+    commit(&clone, "a", "local\n");
+    commit(&up, "a", "remote\n");
+    git(&up, &["push", "-q", "origin", "main"]);
+    let out = fails(&clone, &["pull", "--rebase"]);
+    assert!(out.contains("CONFLICT"), "{out}");
+    assert!(clone.join(".git/rebase-merge").exists());
+    std::fs::write(clone.join("a"), "both\n").unwrap();
+    git(&clone, &["add", "a"]);
+    ok(&clone, &["rebase", "--continue"]);
+    assert_eq!(
+        git(&clone, &["rev-parse", "HEAD~1"]),
+        git(&up, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        git(&clone, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/main"
+    );
+}
+
+#[test]
 fn pull_takes_a_remote_and_branch() {
     let (_, up, clone) = fetch_setup("pull-branch");
     git(&up, &["checkout", "-qb", "topic"]);

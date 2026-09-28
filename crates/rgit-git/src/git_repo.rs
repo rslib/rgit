@@ -118,7 +118,7 @@ impl Git2Backend {
 
     /// Run a `git` CLI command in the working directory, returning its stdout on
     /// success or its stderr as a `Cli` error. Used only for the few operations
-    /// libgit2 cannot do (rebase continue/skip, bisect).
+    /// libgit2 cannot do (bisect, shallow fetches, signing).
     fn run_git(&self, args: &[&str], env: &[(&str, &str)]) -> Result<String, GitError> {
         let mut cmd = std::process::Command::new("git");
         cmd.args(args).current_dir(&self.workdir);
@@ -138,68 +138,6 @@ impl Git2Backend {
             } else {
                 msg.to_owned()
             }))
-        }
-    }
-
-    /// Run a `git rebase` step. On the terminal (`tty`) git gets stdio for its
-    /// editors; otherwise the todo and messages are taken as they are. A stop
-    /// is reported with git's own lines, without its progress and hints.
-    fn rebase_git(&self, args: &[&str], tty: bool) -> Result<String, GitError> {
-        let result = if tty {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&self.workdir)
-                .status()
-                .map_err(|e| GitError::Cli(format!("could not run git: {e}")))?;
-            if status.success() {
-                Ok(String::new())
-            } else {
-                Err(GitError::Cli("the rebase stopped or was aborted".into()))
-            }
-        } else {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&self.workdir)
-                .env("GIT_SEQUENCE_EDITOR", "true")
-                .env("GIT_EDITOR", "true")
-                .output()
-                .map_err(|e| GitError::Cli(format!("could not run git: {e}")))?;
-            let stdout = String::from_utf8_lossy(&out.stdout).trim_end().to_owned();
-            if out.status.success() {
-                Ok(stdout)
-            } else {
-                // git reports CONFLICT lines on stdout and the stop on stderr.
-                Err(GitError::Cli(format!(
-                    "{stdout}\n{}",
-                    String::from_utf8_lossy(&out.stderr)
-                )))
-            }
-        };
-        let stopped = self.repo.lock().expect("repo mutex").state() != git2::RepositoryState::Clean;
-        match result {
-            Err(GitError::Cli(msg)) if stopped => {
-                let why: Vec<&str> = msg
-                    .split(['\r', '\n'])
-                    .map(str::trim_end)
-                    .filter(|l| {
-                        !l.is_empty()
-                            && !l.starts_with("hint:")
-                            && !l.starts_with("Rebasing (")
-                            && !l.starts_with("Could not apply ")
-                    })
-                    .collect();
-                Err(GitError::Conflict(format!(
-                    "{}\nresolve, then run `rgit rebase --continue` (or --skip / --abort)",
-                    why.join("\n")
-                )))
-            }
-            Err(GitError::Cli(msg)) => Err(GitError::Cli(
-                msg.split(['\r', '\n'])
-                    .filter(|l| !l.is_empty() && !l.starts_with("Rebasing ("))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )),
-            other => other,
         }
     }
 
@@ -269,7 +207,7 @@ impl Git2Backend {
 /// is safe only where there are no unwritten in-memory index changes - i.e. at
 /// the entry of an operation, NOT mid-merge/rebase where the in-memory index
 /// holds conflict state not yet on disk.
-fn sync_index(repo: &Repository) -> Result<(), GitError> {
+pub(crate) fn sync_index(repo: &Repository) -> Result<(), GitError> {
     repo.index()?.read(true)?;
     Ok(())
 }
@@ -1922,10 +1860,8 @@ impl GitBackend for Git2Backend {
 
     fn rebase_onto(&self, rev: &str, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
         self.logged("rebase", || {
-            let repo = self.repo.lock().expect("repo mutex");
-            let target = repo.revparse_single(rev)?.peel_to_commit()?;
-            let upstream = repo.find_annotated_commit(target.id())?;
-            run_rebase(&repo, &upstream, None, report)
+            let mut repo = self.repo.lock().expect("repo mutex");
+            crate::rebase::replay(&mut repo, rev, None, report)
         })
     }
 
@@ -1936,12 +1872,8 @@ impl GitBackend for Git2Backend {
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
         self.logged("restack", || {
-            let repo = self.repo.lock().expect("repo mutex");
-            let upstream_oid = repo.revparse_single(upstream)?.peel_to_commit()?.id();
-            let onto_oid = repo.revparse_single(onto)?.peel_to_commit()?.id();
-            let upstream = repo.find_annotated_commit(upstream_oid)?;
-            let onto = repo.find_annotated_commit(onto_oid)?;
-            run_rebase(&repo, &upstream, Some(&onto), report)
+            let mut repo = self.repo.lock().expect("repo mutex");
+            crate::rebase::replay(&mut repo, upstream, Some(onto), report)
         })
     }
 
@@ -1954,28 +1886,30 @@ impl GitBackend for Git2Backend {
         }
     }
 
-    fn rebase_abort(&self) -> Result<(), GitError> {
-        // Shell out like continue/skip: `git rebase --abort` restores the
-        // pre-rebase state for both libgit2-created and CLI-started (interactive)
-        // rebases, whereas libgit2's open_rebase cannot drive a rebase the git
-        // CLI began ("interactive rebase is not supported").
-        self.run_git(&["rebase", "--abort"], &[]).map(drop)
+    fn rebase_abort(&self) -> Result<String, GitError> {
+        self.logged("rebase abort", || {
+            crate::rebase::abort(&self.repo.lock().expect("repo mutex"))
+        })
     }
 
-    fn rebase_continue(&self) -> Result<(), GitError> {
-        self.rebase_git(&["rebase", "--continue"], false).map(drop)
+    fn rebase_continue(&self) -> Result<String, GitError> {
+        self.logged("rebase", || {
+            crate::rebase::resume(&self.repo.lock().expect("repo mutex"), false)
+        })
     }
 
-    fn rebase_skip(&self) -> Result<(), GitError> {
-        self.rebase_git(&["rebase", "--skip"], false).map(drop)
+    fn rebase_skip(&self) -> Result<String, GitError> {
+        self.logged("rebase", || {
+            crate::rebase::resume(&self.repo.lock().expect("repo mutex"), true)
+        })
     }
 
     fn rebase_quit(&self) -> Result<(), GitError> {
-        self.run_git(&["rebase", "--quit"], &[]).map(drop)
+        crate::rebase::quit(&self.repo.lock().expect("repo mutex"))
     }
 
     fn rebase_edit_todo(&self) -> Result<(), GitError> {
-        self.rebase_git(&["rebase", "--edit-todo"], true).map(drop)
+        crate::rebase::edit_todo(&self.repo.lock().expect("repo mutex"))
     }
 
     fn rebase_with(
@@ -1983,37 +1917,10 @@ impl GitBackend for Git2Backend {
         upstream: Option<&str>,
         opts: &crate::RebaseOptions,
     ) -> Result<String, GitError> {
-        // libgit2's rebase has no todo list, so these run on git's sequencer.
-        let mut args = vec!["rebase"];
-        args.extend(opts.flags.iter().map(String::as_str));
-        if opts.interactive || opts.autosquash {
-            args.push("-i");
-        }
-        if opts.autosquash {
-            args.push("--autosquash");
-        }
-        for cmd in &opts.exec {
-            args.extend(["--exec", cmd]);
-        }
-        if opts.root {
-            args.push("--root");
-        }
-        if opts.update_refs {
-            args.push("--update-refs");
-        }
-        if let Some(side) = &opts.strategy_option {
-            args.extend(["-X", side]);
-        }
-        if let Some(onto) = &opts.onto {
-            args.extend(["--onto", onto]);
-        }
-        // `<upstream> <branch>` needs an upstream; --root takes the branch alone.
-        if opts.branch.is_some() && upstream.is_none() && !opts.root {
-            args.push("@{upstream}");
-        }
-        args.extend(upstream);
-        args.extend(opts.branch.as_deref());
-        self.logged("rebase", || self.rebase_git(&args, opts.interactive))
+        self.logged("rebase", || {
+            let mut repo = self.repo.lock().expect("repo mutex");
+            crate::rebase::start(&mut repo, upstream, opts)
+        })
     }
 
     fn undo(&self) -> Result<String, GitError> {
@@ -2171,11 +2078,18 @@ impl GitBackend for Git2Backend {
             }
             // If autosquash conflicts, abort so the repo is not left mid-rebase with
             // the synthetic fixup commits; the op-log snapshot then fully restores.
-            if let Err(e) = self.run_git(
-                &["rebase", "-i", "--autosquash", &base.to_string()],
-                &[("GIT_SEQUENCE_EDITOR", "true"), ("GIT_EDITOR", "true")],
-            ) {
-                let _ = self.run_git(&["rebase", "--abort"], &[]);
+            let opts = crate::RebaseOptions {
+                autosquash: true,
+                autostash: true,
+                fork_point: Some(false),
+                quiet: true,
+                ..Default::default()
+            };
+            let mut repo = self.repo.lock().expect("repo mutex");
+            if let Err(e) = crate::rebase::start(&mut repo, Some(&base.to_string()), &opts) {
+                if repo.path().join("rebase-merge").exists() {
+                    let _ = crate::rebase::abort(&repo);
+                }
                 return Err(e);
             }
             Ok(format!(
@@ -4813,7 +4727,9 @@ impl GitBackend for Git2Backend {
             let target = repo.refname_to_id(&format!("refs/remotes/{remote}/{branch}"))?;
             let mut status = StatusOptions::new();
             status.include_untracked(false);
+            // A rebase keeps its own autostash, restored when it ends.
             let dirty = autostash
+                && !rebase
                 && repo
                     .statuses(Some(&mut status))?
                     .iter()
@@ -4827,8 +4743,18 @@ impl GitBackend for Git2Backend {
                 )));
             }
             let result = if rebase {
-                let upstream = repo.find_annotated_commit(target)?;
-                run_rebase(&repo, &upstream, None, report)
+                // git's pull narrows the upstream by its reflog, like --fork-point.
+                let opts = crate::RebaseOptions {
+                    fork_point: Some(true),
+                    autostash,
+                    ..Default::default()
+                };
+                let upstream = format!("refs/remotes/{remote}/{branch}");
+                crate::rebase::start(&mut repo, Some(&upstream), &opts).map(|out| {
+                    for line in out.lines() {
+                        report(OpProgress::Line(line.to_owned()));
+                    }
+                })
             } else {
                 let url = remote_urls(&repo, &remote, false)?
                     .into_iter()
@@ -5922,7 +5848,7 @@ fn expand_push_refspec(
 }
 
 /// A ref name without its `refs/heads/`, `refs/tags/` or `refs/remotes/` prefix.
-fn short_ref(name: &str) -> &str {
+pub(crate) fn short_ref(name: &str) -> &str {
     ["refs/heads/", "refs/tags/", "refs/remotes/"]
         .iter()
         .find_map(|p| name.strip_prefix(p))
@@ -6787,7 +6713,7 @@ fn regex_escape(s: &str) -> String {
 }
 
 /// A 7-character short oid, as git prints in ref-update lines.
-fn short7(oid: git2::Oid) -> String {
+pub(crate) fn short7(oid: git2::Oid) -> String {
     let s = oid.to_string();
     s[..7.min(s.len())].to_owned()
 }
@@ -7158,7 +7084,7 @@ fn only_paths_tree(
 }
 
 /// `msg` with the committer's `Signed-off-by` trailer, as `git commit -s` adds it.
-fn signoff(msg: &str, sig: &git2::Signature) -> String {
+pub(crate) fn signoff(msg: &str, sig: &git2::Signature) -> String {
     let line = format!(
         "Signed-off-by: {} <{}>",
         sig.name().unwrap_or(""),
@@ -7371,7 +7297,7 @@ fn stash_commit<'r>(
 }
 
 /// Point `refs/stash` at `id`, logging `message` in its reflog.
-fn store_stash(repo: &Repository, id: Oid, message: &str) -> Result<(), GitError> {
+pub(crate) fn store_stash(repo: &Repository, id: Oid, message: &str) -> Result<(), GitError> {
     // libgit2 logs refs/stash only once its reflog exists.
     repo.reference_ensure_log("refs/stash")?;
     repo.reference("refs/stash", id, true, message)?;
@@ -7881,46 +7807,6 @@ fn apply_one_hunk(
     Ok(())
 }
 
-/// Check out the local branch `name`, updating the worktree and HEAD. A safe
-/// checkout errors rather than clobbering conflicting local changes.
-/// Drive a libgit2 rebase to completion, reporting git-style progress and
-/// aborting on the first conflict. `onto` is `None` for a plain rebase onto
-/// `upstream`, or `Some` for a three-point `--onto` rebase.
-fn run_rebase(
-    repo: &Repository,
-    upstream: &git2::AnnotatedCommit,
-    onto: Option<&git2::AnnotatedCommit>,
-    report: &dyn Fn(OpProgress),
-) -> Result<(), GitError> {
-    let mut rebase = repo.rebase(None, Some(upstream), onto, None)?;
-    let sig = repo.signature()?;
-    while let Some(op) = rebase.next() {
-        let op = op?;
-        if let Some(summary) = repo
-            .find_commit(op.id())
-            .ok()
-            .and_then(|c| c.summary().ok().flatten().map(str::to_owned))
-        {
-            report(OpProgress::Line(format!("Applying: {summary}")));
-        }
-        if repo.index()?.has_conflicts() {
-            rebase.abort()?;
-            report(OpProgress::Line(
-                "CONFLICT: rebase hit a conflict and was aborted".to_owned(),
-            ));
-            return Err(GitError::Conflict(
-                "rebase hit a conflict and was aborted".into(),
-            ));
-        }
-        rebase.commit(None, &sig, None)?;
-    }
-    rebase.finish(Some(&sig))?;
-    report(OpProgress::Line(
-        "Successfully rebased and updated HEAD.".to_owned(),
-    ));
-    Ok(())
-}
-
 /// The commit the smartlog treats as the trunk: HEAD's upstream if it has one,
 /// else the first existing local `main`/`master`/`develop`/`trunk`.
 fn detect_trunk(repo: &Repository) -> Option<git2::Oid> {
@@ -7942,7 +7828,9 @@ fn detect_trunk(repo: &Repository) -> Option<git2::Oid> {
     None
 }
 
-fn checkout(repo: &Repository, name: &str) -> Result<(), GitError> {
+/// Check out the local branch `name`, updating the worktree and HEAD. A safe
+/// checkout errors rather than clobbering conflicting local changes.
+pub(crate) fn checkout(repo: &Repository, name: &str) -> Result<(), GitError> {
     let refname = format!("refs/heads/{name}");
     let object = repo.revparse_single(&refname)?;
     repo.checkout_tree(&object, Some(CheckoutBuilder::new().safe()))?;
@@ -8694,7 +8582,7 @@ fn run_picks(
 /// Write the merge result `index` over the index and working tree, which hold
 /// `from`: only the paths that differ are touched, so other staged changes
 /// stay, and a local change in one of them stops it, as git does.
-fn checkout_merged(
+pub(crate) fn checkout_merged(
     repo: &Repository,
     index: &mut git2::Index,
     from: &git2::Tree<'_>,
@@ -8757,7 +8645,7 @@ fn checkout_merged(
 /// Let the user edit `msg` in their editor (GIT_EDITOR, core.editor, VISUAL,
 /// EDITOR), as git's `-e` does, through `.git/<file>`. Comment lines are
 /// dropped and an empty message aborts.
-fn edit_message(repo: &Repository, file: &str, msg: &str) -> Result<String, GitError> {
+pub(crate) fn edit_message(repo: &Repository, file: &str, msg: &str) -> Result<String, GitError> {
     let path = repo.path().join(file);
     std::fs::write(&path, msg)?;
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
@@ -8829,7 +8717,7 @@ fn pick_index(
 }
 
 /// The libgit2 file favor for git's `-X ours` / `-X theirs`.
-fn file_favor(side: &str) -> Result<git2::FileFavor, GitError> {
+pub(crate) fn file_favor(side: &str) -> Result<git2::FileFavor, GitError> {
     match side {
         "ours" => Ok(git2::FileFavor::Ours),
         "theirs" => Ok(git2::FileFavor::Theirs),
@@ -9622,7 +9510,7 @@ fn new_worktree_branch(
 }
 
 /// The path of the worktree, main or linked, that has `refname` checked out.
-fn checked_out_at(repo: &Repository, refname: &str) -> Result<Option<String>, GitError> {
+pub(crate) fn checked_out_at(repo: &Repository, refname: &str) -> Result<Option<String>, GitError> {
     let on = |r: &Repository| {
         r.find_reference("HEAD")
             .ok()
