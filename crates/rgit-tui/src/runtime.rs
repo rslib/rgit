@@ -1437,7 +1437,8 @@ fn restack_note(outcome: &rgit_git::RestackOutcome) -> Option<String> {
 }
 
 fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), GitError> {
-    match mutation {
+    let since = backend.index_second();
+    let result = match mutation {
         Mutation::StageAll => backend.stage_all(),
         Mutation::UnstageAll => backend.unstage_all(),
         Mutation::StageFile(path) => backend.stage_file(path),
@@ -1502,9 +1503,20 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::StackPrev => stack_move(backend, false),
         Mutation::Reorder { rev, target } => backend.reorder(rev, target, true),
         Mutation::Split { rev, paths } => backend.split(rev, paths),
-        Mutation::RemovePath(path) => backend.remove_path(path, false, true),
-        Mutation::MovePath { from, to } => backend.move_path(from, to, false),
-    }
+        Mutation::RemovePath(path) => backend
+            .remove_paths(
+                std::slice::from_ref(path),
+                rgit_git::RmOptions {
+                    recursive: true,
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .map(drop),
+        Mutation::MovePath { from, to } => backend.move_path(from, to, false, false).map(drop),
+    };
+    let _ = backend.smudge_racy(since);
+    result
 }
 
 /// Render a window of `path` around `line` (1-based) as preview sections, with

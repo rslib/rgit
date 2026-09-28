@@ -450,7 +450,11 @@ fn remove_path_cached_keeps_the_worktree_file() {
     commit(&dir, "f.txt", "v1\n", "seed");
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    backend.remove_path("f.txt", true, false).unwrap();
+    let opts = rgit_git::RmOptions {
+        cached: true,
+        ..Default::default()
+    };
+    backend.remove_paths(&["f.txt".to_owned()], opts).unwrap();
 
     assert!(
         dir.join("f.txt").exists(),
@@ -480,11 +484,15 @@ fn move_path_requires_force_over_an_existing_destination() {
 
     let backend = Git2Backend::discover(&dir).unwrap();
     assert!(
-        backend.move_path("src.txt", "dst.txt", false).is_err(),
+        backend
+            .move_path("src.txt", "dst.txt", false, false)
+            .is_err(),
         "moving onto an existing path without force should error"
     );
 
-    backend.move_path("src.txt", "dst.txt", true).unwrap();
+    backend
+        .move_path("src.txt", "dst.txt", true, false)
+        .unwrap();
     assert!(!dir.join("src.txt").exists());
     assert_eq!(
         std::fs::read_to_string(dir.join("dst.txt")).unwrap(),

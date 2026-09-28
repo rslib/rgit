@@ -122,3 +122,38 @@ fn rm_mv_clean_and_status_take_git_forms() {
     ok(&dir, &["clean", "-X"]);
     assert!(!dir.join("x.log").exists() && dir.join("u.txt").exists());
 }
+
+/// git trusts an entry whose size and second match the file, unless it was
+/// staged in the index's own second. After rgit rewrites the index, such an
+/// entry must still show as changed.
+#[test]
+fn an_edit_in_the_index_second_stays_visible_after_rgit_writes() {
+    use std::time::{Duration, SystemTime};
+    let dir = repo("racy");
+    let at = |p: &str, ms: u64| {
+        let second = SystemTime::now() - Duration::from_secs(10);
+        let second = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(
+                second
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            );
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join(p))
+            .unwrap()
+            .set_modified(second + Duration::from_millis(ms))
+            .unwrap();
+    };
+    std::fs::write(dir.join("c.txt"), "2\n").unwrap();
+    at("c.txt", 100);
+    git(&dir, &["add", "c.txt"]);
+    at(".git/index", 500);
+    std::fs::write(dir.join("c.txt"), "3\n").unwrap();
+    at("c.txt", 100);
+
+    std::fs::write(dir.join("x.txt"), "x\n").unwrap();
+    ok(&dir, &["stage", "x.txt"]);
+    assert_eq!(short(&dir), "MM c.txt\nA  x.txt\n");
+}

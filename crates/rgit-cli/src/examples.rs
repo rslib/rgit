@@ -143,6 +143,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit add src/ '*.md'",
             "rgit add -A",
             "rgit add -u",
+            "rgit add -p",
+            "rgit add -n .",
         ],
     ),
     (
@@ -158,6 +160,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit restore src/lib.rs",
             "rgit restore --staged src/lib.rs",
             "rgit restore --source HEAD~1 src/lib.rs",
+            "rgit restore --ours src/lib.rs",
         ],
     ),
     (
@@ -176,6 +179,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit commit -m \"<subject>\" -m \"<body>\"",
             "rgit commit --amend --no-edit",
             "rgit commit --fixup <rev>",
+            "rgit commit -C <rev> --reset-author",
         ],
     ),
     ("extend", &["rgit extend"]),
@@ -252,6 +256,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit checkout -b <new_branch>",
             "rgit checkout -",
             "rgit checkout <rev> -- src/lib.rs",
+            "rgit checkout -f <branch>",
+            "rgit checkout --theirs -- src/lib.rs",
         ],
     ),
     (
@@ -261,6 +267,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit switch -c <new_branch>",
             "rgit switch -",
             "rgit switch --detach <rev>",
+            "rgit switch -m <branch>",
+            "rgit switch --orphan <new_branch>",
         ],
     ),
     (
@@ -271,6 +279,9 @@ const EXAMPLES: &[Entry] = &[
             "rgit merge <branch> --squash",
             "rgit merge <branch> -m \"<message>\"",
             "rgit merge <a> <b>",
+            "rgit merge <branch> -s ours",
+            "rgit merge <branch> --log --no-stat",
+            "rgit merge <branch> --allow-unrelated-histories",
             "rgit merge --continue",
             "rgit merge --abort",
         ],
@@ -283,7 +294,9 @@ const EXAMPLES: &[Entry] = &[
             "rgit rebase --autosquash main",
             "rgit rebase --exec \"cargo test\" main",
             "rgit rebase --root",
+            "rgit rebase -r --committer-date-is-author-date main",
             "rgit rebase --continue",
+            "rgit rebase --show-current-patch",
         ],
     ),
     ("undo", &["rgit undo"]),
@@ -296,7 +309,50 @@ const EXAMPLES: &[Entry] = &[
             "rgit bisect start HEAD main",
             "rgit bisect good",
             "rgit bisect bad",
+            "rgit bisect run cargo test",
+            "rgit bisect reset",
         ],
+    ),
+    (
+        "bisect start",
+        &[
+            "rgit bisect start",
+            "rgit bisect start <bad> <good>",
+            "rgit bisect start <bad> <good> -- src/",
+            "rgit bisect start --term-new fixed --term-old broken",
+        ],
+    ),
+    ("bisect bad", &["rgit bisect bad", "rgit bisect bad <rev>"]),
+    (
+        "bisect good",
+        &["rgit bisect good", "rgit bisect good <a> <b>"],
+    ),
+    ("bisect new", &["rgit bisect new"]),
+    ("bisect old", &["rgit bisect old"]),
+    (
+        "bisect skip",
+        &["rgit bisect skip", "rgit bisect skip <a>..<b>"],
+    ),
+    (
+        "bisect reset",
+        &["rgit bisect reset", "rgit bisect reset <rev>"],
+    ),
+    ("bisect log", &["rgit bisect log > bisect.log"]),
+    ("bisect replay", &["rgit bisect replay bisect.log"]),
+    (
+        "bisect run",
+        &[
+            "rgit bisect run cargo test",
+            "rgit bisect run ./check.sh --quick",
+        ],
+    ),
+    (
+        "bisect visualize",
+        &["rgit bisect visualize", "rgit bisect view"],
+    ),
+    (
+        "bisect terms",
+        &["rgit bisect terms", "rgit bisect terms --term-good"],
     ),
     (
         "reset",
@@ -305,6 +361,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit reset --hard <rev>",
             "rgit reset src/lib.rs",
             "rgit reset <rev> -- src/lib.rs",
+            "rgit reset --merge",
         ],
     ),
     (
@@ -315,8 +372,10 @@ const EXAMPLES: &[Entry] = &[
             "rgit cherry-pick <a> <b>",
             "rgit cherry-pick main~3..main -x",
             "rgit cherry-pick <merge> -m 1",
+            "rgit cherry-pick <rev> -s --empty=drop",
             "rgit cherry-pick --continue",
             "rgit cherry-pick --abort",
+            "rgit cherry-pick --quit",
         ],
     ),
     (
@@ -326,6 +385,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit revert <rev> --no-commit",
             "rgit revert HEAD~2..HEAD",
             "rgit revert <merge> -m 1",
+            "rgit revert <rev> --reference",
             "rgit revert --continue",
         ],
     ),
@@ -411,8 +471,21 @@ const EXAMPLES: &[Entry] = &[
     ("gc", &["rgit gc", "rgit gc --prune=now"]),
     ("fsck", &["rgit fsck", "rgit fsck --unreachable"]),
     ("clean", &["rgit clean", "rgit clean --dry-run"]),
-    ("rm", &["rgit rm src/lib.rs", "rgit rm src/lib.rs --cached"]),
-    ("mv", &["rgit mv src/old.rs src/new.rs"]),
+    (
+        "rm",
+        &[
+            "rgit rm src/lib.rs",
+            "rgit rm src/lib.rs --cached",
+            "rgit rm -n -r src/",
+        ],
+    ),
+    (
+        "mv",
+        &[
+            "rgit mv src/old.rs src/new.rs",
+            "rgit mv -n src/old.rs src/new.rs",
+        ],
+    ),
     (
         "describe",
         &[

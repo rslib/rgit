@@ -143,6 +143,15 @@ pub enum Command {
         /// Also list ignored files (git's --ignored).
         #[arg(long)]
         ignored: bool,
+        /// Also show the staged diff; repeat for the unstaged one (git's -v).
+        #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+        verbose: u8,
+        /// Count commits ahead of and behind the upstream (git's default).
+        #[arg(long, overrides_with = "no_ahead_behind")]
+        ahead_behind: bool,
+        /// Skip the ahead/behind count against the upstream.
+        #[arg(long)]
+        no_ahead_behind: bool,
         /// Limit to these paths: files, folders or globs.
         paths: Vec<String>,
     },
@@ -300,6 +309,22 @@ pub enum Command {
         /// Add ignored files too.
         #[arg(short = 'f', long)]
         force: bool,
+        /// Show what would be added without adding it (git's -n).
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// Print each added or removed path.
+        #[arg(short = 'v', long)]
+        verbose: bool,
+        /// Record only that untracked paths will be added, with no content
+        /// (git's -N).
+        #[arg(short = 'N', long)]
+        intent_to_add: bool,
+        /// Add what can be added and report the paths that failed.
+        #[arg(long)]
+        ignore_errors: bool,
+        /// Pick hunks to stage, one by one (needs a terminal).
+        #[arg(short = 'p', long)]
+        patch: bool,
     },
     /// Stage every change.
     StageAll,
@@ -321,7 +346,7 @@ pub enum Command {
     /// the index or a revision.
     Restore {
         /// The paths to restore: files, folders or globs.
-        #[arg(required = true)]
+        #[arg(required_unless_present = "patch")]
         paths: Vec<String>,
         /// Restore from this revision (default: the index, or HEAD with --staged).
         #[arg(short = 's', long, value_name = "REV")]
@@ -332,6 +357,24 @@ pub enum Command {
         /// Restore the working tree (the default; with --staged, both).
         #[arg(short = 'W', long)]
         worktree: bool,
+        /// For conflicted paths, take our side (git's --ours).
+        #[arg(long, conflicts_with_all = ["theirs", "source", "staged"])]
+        ours: bool,
+        /// For conflicted paths, take their side (git's --theirs).
+        #[arg(long, conflicts_with_all = ["source", "staged"])]
+        theirs: bool,
+        /// Keep files the source lacks instead of removing them.
+        #[arg(long, overrides_with = "no_overlay")]
+        overlay: bool,
+        /// Remove files the source lacks (the default).
+        #[arg(long, hide = true)]
+        no_overlay: bool,
+        /// Pick hunks to restore, one by one (needs a terminal).
+        #[arg(short = 'p', long, conflicts_with = "source")]
+        patch: bool,
+        /// Accepted for git compatibility.
+        #[arg(short = 'q', long, hide = true)]
+        quiet: bool,
     },
     /// Resolve a conflicted path by taking ours or theirs.
     Resolve {
@@ -356,16 +399,51 @@ pub enum Command {
         /// Amend the previous commit instead of creating a new one.
         #[arg(long)]
         amend: bool,
-        /// Keep the amended commit's message (with --amend).
+        /// Keep the amended commit's message (with --amend), or -c's without
+        /// opening the editor.
         #[arg(long)]
         no_edit: bool,
+        /// Edit the message in the editor before committing (git's -e).
+        #[arg(short = 'e', long, overrides_with = "no_edit")]
+        edit: bool,
+        /// Reuse this commit's message and author (git's -C).
+        #[arg(
+            short = 'C',
+            long,
+            value_name = "REV",
+            conflicts_with_all = ["message", "file", "reedit_message"]
+        )]
+        reuse_message: Option<String>,
+        /// Like -C, but edit the message first when on a terminal (git's -c).
+        #[arg(short = 'c', long, value_name = "REV", conflicts_with_all = ["message", "file"])]
+        reedit_message: Option<String>,
+        /// With -C, -c or --amend, make the committer the author, dated now.
+        #[arg(long)]
+        reset_author: bool,
+        /// The author date: `YYYY-MM-DD[THH:MM:SS]`, `@<unix>` or
+        /// `<unix>`, each with an optional `+HHMM` offset.
+        #[arg(long, value_name = "DATE")]
+        date: Option<String>,
+        /// Show what would be committed, without committing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Stage the given paths too, then commit the whole index (git's -i).
+        #[arg(short = 'i', long, requires = "paths")]
+        include: bool,
+        /// Commit only the given paths (the default with paths; git's -o).
+        #[arg(short = 'o', long, hide = true)]
+        only: bool,
+        /// Accepted for git compatibility.
+        #[arg(short = 'v', long, hide = true)]
+        verbose: bool,
         /// Stage all tracked, modified files before committing (git's -a).
         #[arg(short = 'a', long = "all", conflicts_with = "paths")]
         all: bool,
         /// Skip the pre-commit and commit-msg hooks (git's --no-verify).
         #[arg(short = 'n', long = "no-verify")]
         no_verify: bool,
-        /// Set the author, as `Name <email>`.
+        /// Set the author, as `Name <email>` or a pattern that names an
+        /// existing author.
         #[arg(long, value_name = "NAME <EMAIL>")]
         author: Option<String>,
         /// Add a Signed-off-by trailer for the committer (git's -s).
@@ -551,6 +629,40 @@ pub enum Command {
         /// branch named after the remote one.
         #[arg(short = 't', long)]
         track: bool,
+        /// Never set an upstream for the new branch.
+        #[arg(long, conflicts_with = "track")]
+        no_track: bool,
+        /// Throw away local changes when switching (git's -f).
+        #[arg(short = 'f', long)]
+        force: bool,
+        /// Carry local changes over to the new branch with a three-way merge.
+        #[arg(short = 'm', long, conflicts_with = "force")]
+        merge: bool,
+        /// Conflict marker style for -m: `merge` or `diff3`.
+        #[arg(long, value_name = "STYLE", value_parser = ["merge", "diff3"])]
+        conflict: Option<String>,
+        /// Start a new branch with no history at `rev` (default HEAD).
+        #[arg(long, value_name = "NEW_BRANCH", conflicts_with_all = ["branch", "force_branch", "detach"])]
+        orphan: Option<String>,
+        /// For conflicted paths, write our side to the working tree.
+        #[arg(long, conflicts_with = "theirs")]
+        ours: bool,
+        /// For conflicted paths, write their side to the working tree.
+        #[arg(long)]
+        theirs: bool,
+        /// Do not turn a remote branch's name into a local tracking branch.
+        #[arg(long, overrides_with = "guess")]
+        no_guess: bool,
+        /// Turn a remote branch's name into a local tracking branch (default).
+        #[arg(long, hide = true)]
+        guess: bool,
+        /// Pick hunks to discard from the working tree, one by one (needs a
+        /// terminal).
+        #[arg(short = 'p', long)]
+        patch: bool,
+        /// Accepted for git compatibility.
+        #[arg(short = 'q', long, hide = true)]
+        quiet: bool,
         /// Paths to restore (after `--`).
         #[arg(last = true, value_name = "PATH")]
         paths: Vec<String>,
@@ -578,6 +690,30 @@ pub enum Command {
         /// Track the start point as the new branch's upstream.
         #[arg(short = 't', long)]
         track: bool,
+        /// Never set an upstream for the new branch.
+        #[arg(long, conflicts_with = "track")]
+        no_track: bool,
+        /// Throw away local changes when switching.
+        #[arg(short = 'f', long, alias = "force")]
+        discard_changes: bool,
+        /// Carry local changes over to the new branch with a three-way merge.
+        #[arg(short = 'm', long, conflicts_with = "discard_changes")]
+        merge: bool,
+        /// Conflict marker style for -m: `merge` or `diff3`.
+        #[arg(long, value_name = "STYLE", value_parser = ["merge", "diff3"])]
+        conflict: Option<String>,
+        /// Start a new branch with no history and an empty working tree.
+        #[arg(long, value_name = "NEW_BRANCH", conflicts_with_all = ["create", "force_create", "detach"])]
+        orphan: Option<String>,
+        /// Do not turn a remote branch's name into a local tracking branch.
+        #[arg(long, overrides_with = "guess")]
+        no_guess: bool,
+        /// Turn a remote branch's name into a local tracking branch (default).
+        #[arg(long, hide = true)]
+        guess: bool,
+        /// Accepted for git compatibility.
+        #[arg(short = 'q', long, hide = true)]
+        quiet: bool,
     },
     /// Merge revisions into the current branch (several make an octopus merge).
     Merge {
@@ -598,24 +734,67 @@ pub enum Command {
         /// The merge commit message.
         #[arg(short = 'm', long = "message")]
         message: Option<String>,
+        /// Read the merge commit message from a file (`-` for stdin).
+        #[arg(
+            short = 'F',
+            long = "file",
+            value_name = "PATH",
+            conflicts_with = "message"
+        )]
+        file: Option<String>,
         /// Take this side on conflicting hunks (git's -X).
         #[arg(short = 'X', long = "strategy-option", value_parser = ["ours", "theirs"])]
         strategy_option: Option<String>,
-        /// Accepted for git compatibility; rgit never opens an editor.
-        #[arg(long = "no-edit", hide = true)]
+        /// The merge strategy; `ours` records the merge but keeps HEAD's tree.
+        #[arg(short = 's', long, value_parser = ["ort", "recursive", "resolve", "octopus", "ours"])]
+        strategy: Option<String>,
+        /// Allow merging histories that share no commit.
+        #[arg(long = "allow-unrelated-histories")]
+        allow_unrelated_histories: bool,
+        /// Add the merged commits' subjects (at most N, default 20) to the message.
+        #[arg(long, value_name = "N", num_args = 0..=1, require_equals = true, default_missing_value = "20")]
+        log: Option<usize>,
+        /// Show a diffstat at the end (the default).
+        #[arg(long, visible_alias = "summary")]
+        stat: bool,
+        /// Do not show a diffstat at the end.
+        #[arg(short = 'n', long = "no-stat", conflicts_with = "stat")]
+        no_stat: bool,
+        /// Open the editor on the merge commit message.
+        #[arg(short = 'e', long)]
+        edit: bool,
+        /// Keep the generated message without an editor (the default).
+        #[arg(long = "no-edit", hide = true, conflicts_with = "edit")]
         no_edit: bool,
+        /// Skip the pre-merge-commit and commit-msg hooks.
+        #[arg(long = "no-verify")]
+        no_verify: bool,
+        /// Run the pre-merge-commit and commit-msg hooks (the default).
+        #[arg(long, hide = true, conflicts_with = "no_verify")]
+        verify: bool,
+        /// Add a Signed-off-by trailer.
+        #[arg(long)]
+        signoff: bool,
+        /// Print nothing on success.
+        #[arg(short = 'q', long)]
+        quiet: bool,
         /// Commit a merge whose conflicts are resolved.
         #[arg(long = "continue")]
         cont: bool,
         /// Abort an in-progress (conflicted) merge, restoring HEAD.
         #[arg(long)]
         abort: bool,
+        /// Forget an in-progress merge, leaving the index and working tree as they are.
+        #[arg(long)]
+        quit: bool,
     },
     /// Rebase onto a revision, or continue/skip/abort an in-progress rebase.
     Rebase {
         /// The upstream to rebase onto (prompted for if omitted). With --onto,
         /// this is the upstream whose commits after it are replayed.
         onto: Option<String>,
+        /// Check out this branch first and rebase it (git's `<upstream> <branch>`).
+        branch: Option<String>,
         /// Replay commits after <upstream> onto this new base (git's --onto).
         #[arg(long = "onto", value_name = "NEWBASE")]
         onto_new: Option<String>,
@@ -637,6 +816,8 @@ pub enum Command {
         /// Take this side on conflicting hunks (git's -X).
         #[arg(short = 'X', long = "strategy-option", value_parser = ["ours", "theirs"])]
         strategy_option: Option<String>,
+        #[command(flatten)]
+        more: RebaseFlags,
         /// Continue after resolving conflicts.
         #[arg(long = "continue")]
         cont: bool,
@@ -646,6 +827,15 @@ pub enum Command {
         /// Abort the in-progress rebase.
         #[arg(long)]
         abort: bool,
+        /// Stop the rebase, leaving HEAD, the index and the working tree as they are.
+        #[arg(long)]
+        quit: bool,
+        /// Edit the todo list of the in-progress rebase (needs a terminal).
+        #[arg(long = "edit-todo")]
+        edit_todo: bool,
+        /// Show the commit the rebase stopped at.
+        #[arg(long = "show-current-patch")]
+        show_current_patch: bool,
     },
     /// Undo the last operation from the op-log, restoring HEAD and the working
     /// tree (recovers uncommitted work). Set RGIT_OPLOG=0 to disable the op-log.
@@ -657,11 +847,11 @@ pub enum Command {
     /// Smartlog: your local/draft commits and the trunk they branch from.
     #[command(visible_alias = "sl")]
     Smartlog,
-    /// Run a git bisect subcommand: `start <bad> <good>`, `good`, `bad`, `reset`.
+    /// Find the commit that introduced a change by binary search: `start <bad>
+    /// <good>`, then mark each step `good`/`bad` (or `run <cmd>`), then `reset`.
     Bisect {
-        /// Arguments passed to `git bisect`.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        #[command(subcommand)]
+        cmd: BisectCmd,
     },
     /// Reset HEAD to a revision (default mixed).
     Reset {
@@ -673,17 +863,27 @@ pub enum Command {
         #[arg(value_name = "PATH")]
         pathspec: Vec<String>,
         /// Move HEAD only, keep the index and working tree.
-        #[arg(long, conflicts_with_all = ["hard", "mixed", "keep"])]
+        #[arg(long, conflicts_with_all = ["hard", "mixed", "keep", "merge"])]
         soft: bool,
         /// Reset the index but not the working tree (the default).
-        #[arg(long, conflicts_with_all = ["hard", "keep"])]
+        #[arg(long, conflicts_with_all = ["hard", "keep", "merge"])]
         mixed: bool,
         /// Reset the index and working tree too (discards changes).
-        #[arg(long, conflicts_with = "keep")]
+        #[arg(long, conflicts_with_all = ["keep", "merge"])]
         hard: bool,
         /// Like --hard, but keep local changes and refuse to overwrite them.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "merge")]
         keep: bool,
+        /// Reset the index and the files that change, keeping unstaged
+        /// changes to other files (aborts a merge; git's --merge).
+        #[arg(long)]
+        merge: bool,
+        /// Pick staged hunks to unstage, one by one (needs a terminal).
+        #[arg(short = 'p', long, conflicts_with_all = ["soft", "hard", "keep", "merge"])]
+        patch: bool,
+        /// Print nothing on success.
+        #[arg(short = 'q', long)]
+        quiet: bool,
         /// Paths to reset (after `--`).
         #[arg(last = true, value_name = "PATH")]
         paths: Vec<String>,
@@ -704,9 +904,27 @@ pub enum Command {
         /// Take this side on conflicting hunks (git's -X).
         #[arg(short = 'X', long = "strategy-option", value_parser = ["ours", "theirs"])]
         strategy_option: Option<String>,
-        /// Accepted for git compatibility; rgit keeps the original message.
-        #[arg(long = "no-edit", hide = true)]
+        /// Open the editor on each commit message.
+        #[arg(short = 'e', long)]
+        edit: bool,
+        /// Keep the original message without an editor (the default).
+        #[arg(long = "no-edit", hide = true, conflicts_with = "edit")]
         no_edit: bool,
+        /// Add a Signed-off-by trailer.
+        #[arg(short = 's', long)]
+        signoff: bool,
+        /// Fast-forward over a commit whose parent is HEAD instead of copying it.
+        #[arg(long, conflicts_with_all = ["no_commit", "record_origin", "signoff", "edit"])]
+        ff: bool,
+        /// Keep commits that were empty to begin with.
+        #[arg(long = "allow-empty")]
+        allow_empty: bool,
+        /// Keep commits that become empty (same as --empty=keep).
+        #[arg(long = "keep-redundant-commits", conflicts_with = "empty")]
+        keep_redundant_commits: bool,
+        /// What to do with a commit whose change is already in HEAD.
+        #[arg(long, value_parser = ["stop", "drop", "keep"])]
+        empty: Option<String>,
         /// Commit the resolved commit and apply the rest.
         #[arg(long = "continue")]
         cont: bool,
@@ -716,6 +934,9 @@ pub enum Command {
         /// Cancel and return to where the cherry-pick started.
         #[arg(long)]
         abort: bool,
+        /// Forget the stopped cherry-pick, leaving HEAD, the index and the working tree as they are.
+        #[arg(long)]
+        quit: bool,
     },
     /// Revert commits on HEAD, or continue/skip/abort a stopped revert.
     Revert {
@@ -730,9 +951,18 @@ pub enum Command {
         /// Take this side on conflicting hunks (git's -X).
         #[arg(short = 'X', long = "strategy-option", value_parser = ["ours", "theirs"])]
         strategy_option: Option<String>,
-        /// Accepted for git compatibility; rgit writes git's revert message.
-        #[arg(long = "no-edit", hide = true)]
+        /// Open the editor on each revert message.
+        #[arg(short = 'e', long)]
+        edit: bool,
+        /// Keep git's revert message without an editor (the default).
+        #[arg(long = "no-edit", hide = true, conflicts_with = "edit")]
         no_edit: bool,
+        /// Add a Signed-off-by trailer.
+        #[arg(short = 's', long)]
+        signoff: bool,
+        /// Name the reverted commit as `abbrev (subject, date)`, under a title to fill in.
+        #[arg(long)]
+        reference: bool,
         /// Commit the resolved revert and apply the rest.
         #[arg(long = "continue")]
         cont: bool,
@@ -742,6 +972,9 @@ pub enum Command {
         /// Cancel and return to where the revert started.
         #[arg(long)]
         abort: bool,
+        /// Forget the stopped revert, leaving HEAD, the index and the working tree as they are.
+        #[arg(long)]
+        quit: bool,
     },
     /// Branch management: no subcommand lists local branches, `branch <name>
     /// [<start>]` creates one without switching to it, and git's flags work as
@@ -1063,6 +1296,9 @@ pub enum Command {
         /// Accepted for git compatibility: rgit needs no -f.
         #[arg(short = 'f', long, hide = true)]
         force: bool,
+        /// Print nothing on success.
+        #[arg(short = 'q', long)]
+        quiet: bool,
         /// Limit to these paths.
         paths: Vec<String>,
     },
@@ -1077,9 +1313,18 @@ pub enum Command {
         /// Remove folders recursively (git's -r).
         #[arg(short = 'r')]
         recursive: bool,
-        /// Accepted for git compatibility.
-        #[arg(short = 'f', long, hide = true)]
+        /// Remove files even with staged or unstaged changes.
+        #[arg(short = 'f', long)]
         force: bool,
+        /// List what would be removed without removing it (git's -n).
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// Print nothing on success.
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        /// Succeed even when a path matches no file.
+        #[arg(long)]
+        ignore_unmatch: bool,
     },
     /// Rename/move tracked files or folders.
     Mv {
@@ -1089,6 +1334,15 @@ pub enum Command {
         /// Overwrite the destination if it exists (git's -f).
         #[arg(short = 'f', long)]
         force: bool,
+        /// Skip moves that would fail instead of stopping (git's -k).
+        #[arg(short = 'k')]
+        skip_errors: bool,
+        /// Show what would be moved without moving it (git's -n).
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// Print each move.
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// Describe a revision relative to the nearest tag (default HEAD).
     Describe {
@@ -1865,6 +2119,216 @@ pub struct StashPush {
     pub keep_index: bool,
 }
 
+/// `bisect` subcommands.
+#[derive(Subcommand)]
+pub enum BisectCmd {
+    /// Start a bisect, optionally with the bad commit and good ones.
+    Start {
+        /// The bad (new) commit, then good (old) ones.
+        revs: Vec<String>,
+        /// The word for the new state instead of `bad` (e.g. `fixed`).
+        #[arg(long = "term-new", visible_alias = "term-bad", value_name = "TERM")]
+        term_new: Option<String>,
+        /// The word for the old state instead of `good` (e.g. `broken`).
+        #[arg(long = "term-old", visible_alias = "term-good", value_name = "TERM")]
+        term_old: Option<String>,
+        /// Leave the working tree alone; move BISECT_HEAD to each step instead.
+        #[arg(long = "no-checkout")]
+        no_checkout: bool,
+        /// Follow only the first parent of merge commits.
+        #[arg(long = "first-parent")]
+        first_parent: bool,
+        /// Only test commits that touch these paths (after `--`).
+        #[arg(last = true, value_name = "PATH")]
+        paths: Vec<String>,
+    },
+    /// Mark commits (HEAD by default) as bad: the change is there.
+    Bad { revs: Vec<String> },
+    /// Mark commits (HEAD by default) as good: the change is not there yet.
+    Good { revs: Vec<String> },
+    /// Mark commits as new (with `--term-new`/`--term-old` terms).
+    New { revs: Vec<String> },
+    /// Mark commits as old (with `--term-new`/`--term-old` terms).
+    Old { revs: Vec<String> },
+    /// Skip commits (HEAD by default) or ranges `A..B` that cannot be tested.
+    Skip { revs: Vec<String> },
+    /// End the bisect and check out where it started (or `commit`).
+    Reset { commit: Option<String> },
+    /// Print the bisect log, to save for `replay`.
+    Log,
+    /// Redo the bisect a saved log records.
+    Replay { file: String },
+    /// Mark each step by running a command: exit 0 good, 125 skip, other bad.
+    Run {
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "CMD"
+        )]
+        cmd: Vec<String>,
+    },
+    /// List the commits still in the search.
+    #[command(visible_alias = "view")]
+    Visualize,
+    /// Print the terms for the old and new states.
+    Terms {
+        /// Print only the term for good (old) commits.
+        #[arg(long = "term-good", visible_alias = "term-old")]
+        good: bool,
+        /// Print only the term for bad (new) commits.
+        #[arg(long = "term-bad", visible_alias = "term-new", conflicts_with = "good")]
+        bad: bool,
+    },
+    /// Mark commits with a custom term set by `start --term-new/--term-old`.
+    #[command(external_subcommand)]
+    Mark(Vec<String>),
+}
+
+impl BisectCmd {
+    /// The `git bisect` arguments for this subcommand.
+    fn git_args(&self) -> Vec<String> {
+        let words = |cmd: &str, rest: &[String]| {
+            std::iter::once(cmd.to_owned())
+                .chain(rest.iter().cloned())
+                .collect::<Vec<_>>()
+        };
+        match self {
+            BisectCmd::Start {
+                revs,
+                term_new,
+                term_old,
+                no_checkout,
+                first_parent,
+                paths,
+            } => {
+                let mut args = vec!["start".to_owned()];
+                args.extend(term_new.iter().map(|t| format!("--term-new={t}")));
+                args.extend(term_old.iter().map(|t| format!("--term-old={t}")));
+                if *no_checkout {
+                    args.push("--no-checkout".into());
+                }
+                if *first_parent {
+                    args.push("--first-parent".into());
+                }
+                args.extend(revs.iter().cloned());
+                args.push("--".into());
+                args.extend(paths.iter().cloned());
+                args
+            }
+            BisectCmd::Bad { revs } => words("bad", revs),
+            BisectCmd::Good { revs } => words("good", revs),
+            BisectCmd::New { revs } => words("new", revs),
+            BisectCmd::Old { revs } => words("old", revs),
+            BisectCmd::Skip { revs } => words("skip", revs),
+            BisectCmd::Reset { commit } => words("reset", commit.as_slice()),
+            BisectCmd::Log => words("log", &[]),
+            BisectCmd::Replay { file } => words("replay", std::slice::from_ref(file)),
+            BisectCmd::Run { cmd } => words("run", cmd),
+            BisectCmd::Visualize => words("visualize", &[]),
+            BisectCmd::Terms { good, bad } => {
+                let flag = match (good, bad) {
+                    (true, _) => vec!["--term-good".to_owned()],
+                    (_, true) => vec!["--term-bad".to_owned()],
+                    _ => Vec::new(),
+                };
+                words("terms", &flag)
+            }
+            BisectCmd::Mark(args) => args.clone(),
+        }
+    }
+}
+
+/// `rebase` flags handed as they are to git's sequencer.
+#[derive(clap::Args, Default)]
+pub struct RebaseFlags {
+    /// Keep commits that start out empty.
+    #[arg(long = "keep-empty")]
+    pub keep_empty: bool,
+    /// Do not move `fixup!`/`squash!` commits (overrides rebase.autoSquash).
+    #[arg(long = "no-autosquash", conflicts_with = "autosquash")]
+    pub no_autosquash: bool,
+    /// Replay every commit, even ones that could be kept as they are.
+    #[arg(short = 'f', long = "force-rebase", visible_alias = "no-ff")]
+    pub force_rebase: bool,
+    /// Refine the upstream with its reflog (git's merge-base --fork-point).
+    #[arg(long = "fork-point")]
+    pub fork_point: bool,
+    /// Use the upstream as it is, without its reflog.
+    #[arg(long = "no-fork-point", conflicts_with = "fork_point")]
+    pub no_fork_point: bool,
+    /// Keep the base: replay onto the merge base of the upstream and the branch.
+    #[arg(long = "keep-base")]
+    pub keep_base: bool,
+    /// Give each commit its author date as the committer date.
+    #[arg(long = "committer-date-is-author-date")]
+    pub committer_date_is_author_date: bool,
+    /// Give each commit the current time as its author date.
+    #[arg(long = "reset-author-date", visible_alias = "ignore-date")]
+    pub reset_author_date: bool,
+    /// Recreate merge commits instead of flattening them.
+    #[arg(short = 'r', long = "rebase-merges", value_name = "MODE", num_args = 0..=1,
+          require_equals = true, default_missing_value = "no-rebase-cousins",
+          value_parser = ["rebase-cousins", "no-rebase-cousins"])]
+    pub rebase_merges: Option<String>,
+    /// What to do with a commit that becomes empty.
+    #[arg(long, value_parser = ["drop", "keep", "stop"])]
+    pub empty: Option<String>,
+    /// Apply every commit, even ones already upstream.
+    #[arg(long = "reapply-cherry-picks")]
+    pub reapply_cherry_picks: bool,
+    /// Add a Signed-off-by trailer to each commit.
+    #[arg(long)]
+    pub signoff: bool,
+    /// Stash local changes first and restore them after.
+    #[arg(long)]
+    pub autostash: bool,
+    /// Skip the pre-rebase hook.
+    #[arg(long = "no-verify")]
+    pub no_verify: bool,
+    /// Print nothing on success.
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+    /// Show a diffstat of what changed upstream.
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+impl RebaseFlags {
+    fn git_flags(&self) -> Vec<String> {
+        let mut flags: Vec<String> = [
+            (self.keep_empty, "--keep-empty"),
+            (self.no_autosquash, "--no-autosquash"),
+            (self.force_rebase, "--force-rebase"),
+            (self.fork_point, "--fork-point"),
+            (self.no_fork_point, "--no-fork-point"),
+            (self.keep_base, "--keep-base"),
+            (
+                self.committer_date_is_author_date,
+                "--committer-date-is-author-date",
+            ),
+            (self.reset_author_date, "--reset-author-date"),
+            (self.reapply_cherry_picks, "--reapply-cherry-picks"),
+            (self.signoff, "--signoff"),
+            (self.autostash, "--autostash"),
+            (self.no_verify, "--no-verify"),
+            (self.quiet, "--quiet"),
+            (self.verbose, "--verbose"),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, flag)| flag.to_owned())
+        .collect();
+        flags.extend(
+            self.rebase_merges
+                .iter()
+                .map(|m| format!("--rebase-merges={m}")),
+        );
+        flags.extend(self.empty.iter().map(|e| format!("--empty={e}")));
+        flags
+    }
+}
+
 /// A stash as git names it: `N` or `stash@{N}`.
 pub(crate) fn stash_ref(s: &str) -> Result<usize, String> {
     s.strip_prefix("stash@{")
@@ -2625,6 +3089,37 @@ pub(crate) fn parse_date(s: &str) -> anyhow::Result<i64> {
     Ok(secs)
 }
 
+/// A commit `--date`: `@<unix>`, `<unix>` or an ISO date, each with an
+/// optional `+HHMM`, `+HH:MM` or `Z` offset (default UTC), as unix seconds and
+/// the offset in minutes.
+pub(crate) fn parse_git_date(s: &str) -> anyhow::Result<(i64, i32)> {
+    let s = s.trim();
+    let (rest, offset) = match s.strip_suffix('Z') {
+        Some(rest) => (rest, 0),
+        None => {
+            let tz = s
+                .rfind(['+', '-'])
+                .map(|i| (&s[..i], s[i..].replace(':', "")));
+            match tz {
+                Some((rest, tz))
+                    if tz.len() == 5 && tz[1..].bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    let (h, m): (i32, i32) = (tz[1..3].parse()?, tz[3..].parse()?);
+                    let sign = if tz.starts_with('-') { -1 } else { 1 };
+                    (rest, sign * (h * 60 + m))
+                }
+                _ => (s, 0),
+            }
+        }
+    };
+    let rest = rest.trim();
+    let unix = rest.strip_prefix('@').unwrap_or(rest);
+    if let Ok(secs) = unix.parse::<i64>() {
+        return Ok((secs, offset));
+    }
+    Ok((parse_date(rest)? - i64::from(offset) * 60, offset))
+}
+
 /// One-line identity shared by the home view and the installed skill.
 pub const DESCRIPTION: &str = "Inspect and change the git repository in the current directory";
 
@@ -3107,7 +3602,20 @@ pub fn run(
             all,
             update,
             force,
+            dry_run,
+            verbose,
+            intent_to_add,
+            ignore_errors,
+            patch,
         } => {
+            if patch {
+                return crate::interactive::patch(
+                    backend,
+                    interactive,
+                    crate::interactive::PatchMode::Stage,
+                    &paths,
+                );
+            }
             if paths.is_empty() && !all && !update {
                 return Err(anyhow::Error::new(CliError {
                     message: "nothing specified, nothing added".to_owned(),
@@ -3115,7 +3623,50 @@ pub fn run(
                     code: 2,
                 }));
             }
-            ok(backend.add(&paths, update, force))?
+            if intent_to_add {
+                backend.intent_to_add(&paths)?;
+                return Ok("ok".to_owned());
+            }
+            // git's `add -n`/`-v` lines: what the add changes in the index.
+            let specs: Vec<String> = paths
+                .iter()
+                .map(|p| if p == "." { "*".to_owned() } else { p.clone() })
+                .collect();
+            let lines: Vec<String> = backend
+                .status()?
+                .entries
+                .into_iter()
+                .filter(|e| !matches!(e.worktree, rgit_git::StatusCode::Unmodified))
+                .filter(|e| !(update && e.is_untracked()))
+                .filter(|e| specs.is_empty() || rgit_git::pathspec_matches(&specs, &e.path))
+                .map(|e| match e.worktree {
+                    rgit_git::StatusCode::Deleted => format!("remove '{}'", e.path),
+                    _ => format!("add '{}'", e.path),
+                })
+                .collect();
+            if !dry_run {
+                if ignore_errors && paths.len() > 1 {
+                    let failed: Vec<String> = paths
+                        .iter()
+                        .filter_map(|p| {
+                            backend
+                                .add(std::slice::from_ref(p), update, force)
+                                .err()
+                                .map(|e| e.to_string())
+                        })
+                        .collect();
+                    if !failed.is_empty() {
+                        anyhow::bail!("{}", failed.join("\n"));
+                    }
+                } else {
+                    backend.add(&paths, update, force)?;
+                }
+            }
+            if dry_run || verbose {
+                lines.join("\n")
+            } else {
+                "ok".to_owned()
+            }
         }
         Command::StageAll => ok(backend.stage_all())?,
         Command::UnstageAll => ok(backend.unstage_all())?,
@@ -3141,13 +3692,35 @@ pub fn run(
             source,
             staged,
             worktree,
-        } => ok(backend.restore(
-            &paths,
-            source.as_deref(),
-            staged,
-            worktree || !staged,
-            false,
-        ))?,
+            ours,
+            theirs,
+            overlay,
+            patch,
+            ..
+        } => {
+            if patch {
+                use crate::interactive::PatchMode;
+                let mode = if staged && !worktree {
+                    PatchMode::Unstage
+                } else if !staged {
+                    PatchMode::Discard
+                } else {
+                    anyhow::bail!("restore -p restores the index or the working tree, not both");
+                };
+                return crate::interactive::patch(backend, interactive, mode, &paths);
+            }
+            if ours || theirs {
+                ok(backend.checkout_side(&paths, ours))?
+            } else {
+                ok(backend.restore(
+                    &paths,
+                    source.as_deref(),
+                    staged,
+                    worktree || !staged,
+                    overlay,
+                ))?
+            }
+        }
         Command::Resolve { path, ours, theirs } => {
             if !ours && !theirs {
                 anyhow::bail!("resolve needs --ours or --theirs");
@@ -3166,14 +3739,25 @@ pub fn run(
             allow_empty,
             fixup,
             squash,
+            edit,
+            reuse_message,
+            reedit_message,
+            reset_author,
+            date,
+            dry_run,
+            include,
             quiet: _,
-            paths,
+            only: _,
+            verbose: _,
+            mut paths,
         } => {
-            let mut text = match file.as_deref() {
-                Some("-") => std::io::read_to_string(std::io::stdin())?,
-                Some(f) => std::fs::read_to_string(f)
+            let reuse = reuse_message.as_ref().or(reedit_message.as_ref());
+            let mut text = match (file.as_deref(), reuse) {
+                (Some("-"), _) => std::io::read_to_string(std::io::stdin())?,
+                (Some(f), _) => std::fs::read_to_string(f)
                     .map_err(|e| anyhow::anyhow!("could not read {f}: {e}"))?,
-                None => message.join("\n\n"),
+                (None, Some(rev)) => backend.commit_overview(rev)?.message,
+                (None, None) => message.join("\n\n"),
             };
             let target = fixup
                 .map(|r| ("fixup", r))
@@ -3187,17 +3771,37 @@ pub fn run(
                     format!("{head}\n\n{text}")
                 };
             }
-            if text.is_empty() && amend && no_edit {
+            if text.is_empty() && amend && (no_edit || edit) {
                 text = backend.head_message().unwrap_or_default();
             }
+            // Like git: a merge, squash or stopped pick prepared the message.
+            if text.is_empty() && !amend {
+                text = backend.prepared_message().unwrap_or_default();
+            }
+            // -e always opens the editor, -c only on a terminal, as git would
+            // have no one to edit for.
+            if edit || (reedit_message.is_some() && !no_edit && interactive) {
+                text = crate::interactive::edit_message(backend, &text)?;
+            }
+            if dry_run {
+                let status = backend.status()?;
+                if status.staged.is_empty() && !all && paths.is_empty() && !allow_empty {
+                    anyhow::bail!("nothing to commit");
+                }
+                return Ok(render::status(&status));
+            }
             let message = resolve(
-                (!text.is_empty()).then_some(text),
+                (!text.trim().is_empty()).then_some(text),
                 "a commit message",
                 &|| crate::interactive::input("Commit message"),
             )?;
             // -a: stage worktree changes to tracked files (not untracked ones).
             if all {
                 backend.add(&[], true, false)?;
+            }
+            if include {
+                backend.add(&paths, true, false)?;
+                paths.clear();
             }
             backend.commit_with(
                 &message,
@@ -3207,6 +3811,9 @@ pub fn run(
                     allow_empty,
                     signoff,
                     author,
+                    author_from: reuse.cloned(),
+                    reset_author,
+                    date: date.as_deref().map(parse_git_date).transpose()?,
                     paths,
                 },
             )?;
@@ -3388,11 +3995,42 @@ pub fn run(
             force_branch,
             detach,
             track,
+            no_track,
+            force,
+            merge,
+            conflict,
+            orphan,
+            ours,
+            theirs,
+            no_guess,
+            guess: _,
+            patch,
+            quiet: _,
             paths,
         } => {
             let (rev, paths) = rev_and_paths(rev, pathspec, paths, |r| {
                 r == "-" || backend.rev_parse(r).is_ok() || guess_remote(backend, r).is_some()
             });
+            if patch {
+                if let Some(rev) = rev {
+                    anyhow::bail!(
+                        "checkout -p from a revision ({rev}) is not supported; run `rgit checkout -p` to discard working-tree hunks"
+                    );
+                }
+                return crate::interactive::patch(
+                    backend,
+                    interactive,
+                    crate::interactive::PatchMode::Discard,
+                    &paths,
+                );
+            }
+            if ours || theirs {
+                if paths.is_empty() {
+                    anyhow::bail!("--ours/--theirs needs paths");
+                }
+                backend.checkout_side(&paths, ours)?;
+                return Ok(format!("checked out {} from the conflict", paths.join(" ")));
+            }
             if !paths.is_empty() {
                 // `checkout [<rev>] -- <paths>`: take the paths from <rev> into
                 // the index and working tree, or from the index.
@@ -3400,10 +4038,22 @@ pub fn run(
                 let from = rev.as_deref().unwrap_or("the index");
                 return Ok(format!("restored {} from {from}", paths.join(" ")));
             }
+            if let Some(name) = orphan {
+                backend.checkout_orphan(&name, Some(rev.as_deref().unwrap_or("HEAD")))?;
+                return Ok(format!("switched to a new branch {name} with no history"));
+            }
             let new = branch
                 .map(|b| (b, false))
                 .or(force_branch.map(|b| (b, true)));
             let rev = match rev {
+                // `checkout -f`/`-m` alone re-checks out the current branch.
+                None if new.is_none() && !detach && (force || merge) => Some(
+                    backend
+                        .status()?
+                        .head
+                        .branch
+                        .unwrap_or_else(|| "HEAD".to_owned()),
+                ),
                 None if new.is_none() && !detach => {
                     Some(resolve(None, "a branch or revision", &|| {
                         crate::interactive::pick_branch(backend, "Check out which branch?")
@@ -3411,7 +4061,15 @@ pub fn run(
                 }
                 rev => rev,
             };
-            switch(backend, rev, new, detach, track, true)?
+            let opts = SwitchOpts {
+                detach,
+                track,
+                no_track,
+                guess: !no_guess,
+                mode: checkout_mode(force, merge, conflict.as_deref()),
+                detach_ok: true,
+            };
+            switch(backend, rev, new, &opts)?
         }
         Command::Switch {
             rev,
@@ -3419,7 +4077,19 @@ pub fn run(
             force_create,
             detach,
             track,
+            no_track,
+            discard_changes,
+            merge,
+            conflict,
+            orphan,
+            no_guess,
+            guess: _,
+            quiet: _,
         } => {
+            if let Some(name) = orphan {
+                backend.checkout_orphan(&name, None)?;
+                return Ok(format!("switched to a new branch {name} with no history"));
+            }
             let new = create
                 .map(|b| (b, false))
                 .or(force_create.map(|b| (b, true)));
@@ -3429,7 +4099,15 @@ pub fn run(
                 })?),
                 rev => rev,
             };
-            switch(backend, rev, new, detach, track, false)?
+            let opts = SwitchOpts {
+                detach,
+                track,
+                no_track,
+                guess: !no_guess,
+                mode: checkout_mode(discard_changes, merge, conflict.as_deref()),
+                detach_ok: false,
+            };
+            switch(backend, rev, new, &opts)?
         }
         Command::Merge {
             mut revs,
@@ -3438,21 +4116,39 @@ pub fn run(
             squash,
             no_commit,
             message,
+            file,
             strategy_option,
+            strategy,
+            allow_unrelated_histories,
+            log,
+            stat: _,
+            no_stat,
+            edit,
             no_edit: _,
+            no_verify,
+            verify: _,
+            signoff,
+            quiet,
             cont,
             abort,
+            quit,
         } => {
             if abort {
                 ok(backend.merge_abort())?
             } else if cont {
                 ok(backend.merge_continue())?
+            } else if quit {
+                ok(backend.merge_quit())?
             } else {
                 if revs.is_empty() {
                     revs.push(resolve(None, "a revision to merge", &|| {
                         crate::interactive::pick_branch(backend, "Merge which branch?")
                     })?);
                 }
+                let message = match file.as_deref() {
+                    Some(f) => Some(String::from_utf8_lossy(&read_input(f)?).into_owned()),
+                    None => message,
+                };
                 let opts = rgit_git::MergeOptions {
                     no_ff,
                     ff_only,
@@ -3460,14 +4156,23 @@ pub fn run(
                     no_commit,
                     message,
                     strategy_option,
+                    strategy,
+                    allow_unrelated: allow_unrelated_histories,
+                    log,
+                    edit,
+                    no_verify,
+                    signoff,
+                    stat: !no_stat && !quiet,
                 };
-                net(interactive, "merge", |r| {
+                let out = net(interactive, "merge", |r| {
                     backend.merge_with(&revs, &opts, r)
-                })?
+                })?;
+                if quiet { "ok".to_owned() } else { out }
             }
         }
         Command::Rebase {
             onto,
+            branch,
             onto_new,
             edit,
             root,
@@ -3475,9 +4180,13 @@ pub fn run(
             exec,
             update_refs,
             strategy_option,
+            more,
             cont,
             skip,
             abort,
+            quit,
+            edit_todo,
+            show_current_patch,
         } => {
             if abort {
                 ok(backend.rebase_abort())?
@@ -3485,13 +4194,19 @@ pub fn run(
                 ok(backend.rebase_continue())?
             } else if skip {
                 ok(backend.rebase_skip())?
-            } else if edit
-                || root
-                || autosquash
-                || update_refs
-                || !exec.is_empty()
-                || strategy_option.is_some()
-            {
+            } else if quit {
+                ok(backend.rebase_quit())?
+            } else if edit_todo {
+                if !interactive {
+                    anyhow::bail!("rebase --edit-todo needs a terminal");
+                }
+                ok(backend.rebase_edit_todo())?
+            } else if show_current_patch {
+                if backend.rev_parse("REBASE_HEAD").is_err() {
+                    anyhow::bail!("no rebase in progress");
+                }
+                show_one(backend, "REBASE_HEAD", &[], DiffFormat::default(), false)?
+            } else {
                 if edit && !interactive {
                     anyhow::bail!("interactive rebase needs a terminal");
                 }
@@ -3503,6 +4218,8 @@ pub fn run(
                     )?),
                     onto => onto,
                 };
+                // git's own sequencer, so a conflict stops for --continue as in
+                // git; no upstream argument means the branch's upstream.
                 let opts = rgit_git::RebaseOptions {
                     onto: onto_new,
                     interactive: edit,
@@ -3511,33 +4228,22 @@ pub fn run(
                     exec,
                     update_refs,
                     strategy_option,
+                    branch,
+                    flags: more.git_flags(),
                 };
-                ok(backend.rebase_with(onto.as_deref(), &opts))?
-            } else if let Some(newbase) = onto_new {
-                // `rebase --onto NEWBASE UPSTREAM`: replay UPSTREAM..HEAD onto NEWBASE.
-                let upstream = resolve(onto, "the upstream (after --onto NEWBASE)", &|| {
-                    crate::interactive::pick_branch(backend, "Replay commits after which upstream?")
-                })?;
-                net(interactive, "rebase", |r| {
-                    backend.rebase_range(&upstream, &newbase, r)
-                })?
-            } else {
-                let onto = resolve(
-                    onto,
-                    "a target revision, or --continue/--skip/--abort",
-                    &|| crate::interactive::pick_branch(backend, "Rebase onto which branch?"),
-                )?;
-                net(interactive, "rebase", |r| backend.rebase_onto(&onto, r))?
+                let out = backend.rebase_with(onto.as_deref(), &opts)?;
+                if out.is_empty() || more.quiet {
+                    "ok".to_owned()
+                } else {
+                    out
+                }
             }
         }
         Command::Undo => format!("undid {}", backend.undo()?),
         Command::Redo => format!("redid {}", backend.redo()?),
         Command::Oplog => render::oplog(&backend.oplog()?),
         Command::Smartlog => render::smartlog(&backend.smartlog()?),
-        Command::Bisect { args } => {
-            let out = backend.bisect(&args)?;
-            if out.is_empty() { "ok".to_owned() } else { out }
-        }
+        Command::Bisect { cmd } => bisect(backend, cmd)?.0,
         Command::Reset {
             rev,
             pathspec,
@@ -3545,10 +4251,27 @@ pub fn run(
             mixed: _,
             hard,
             keep,
+            merge,
+            patch,
+            quiet,
             paths,
         } => {
             let (rev, paths) =
                 rev_and_paths(rev, pathspec, paths, |r| backend.rev_parse(r).is_ok());
+            if patch {
+                if let Some(rev) = rev.filter(|r| r != "HEAD") {
+                    anyhow::bail!(
+                        "reset -p to a revision ({rev}) is not supported; run `rgit reset -p` to unstage hunks"
+                    );
+                }
+                return crate::interactive::patch(
+                    backend,
+                    interactive,
+                    crate::interactive::PatchMode::Unstage,
+                    &paths,
+                );
+            }
+            let done = |text: String| if quiet { String::new() } else { text };
             // `reset [<rev>] [--] <paths>` resets those index entries to <rev>
             // (default HEAD), leaving HEAD and the working tree alone.
             if !paths.is_empty() {
@@ -3556,18 +4279,22 @@ pub fn run(
                     for p in &paths {
                         backend.unstage_file(p)?;
                     }
-                    return Ok(format!("unstaged {}", paths.join(", ")));
+                    return Ok(done(format!("unstaged {}", paths.join(", "))));
                 };
                 backend.reset_paths(&rev, &paths)?;
-                return Ok(format!("reset {} to {rev}", paths.join(", ")));
+                return Ok(done(format!("reset {} to {rev}", paths.join(", "))));
             }
-            let rev = resolve(rev, "a revision to reset to", &|| {
-                crate::interactive::pick_commit(backend, "Reset to which commit?")
-            })?;
-            let mode = match (soft, hard, keep) {
-                (true, _, _) => ResetMode::Soft,
-                (_, true, _) => ResetMode::Hard,
-                (_, _, true) => ResetMode::Keep,
+            let rev = match rev {
+                None if merge || keep || hard || !interactive => "HEAD".to_owned(),
+                rev => resolve(rev, "a revision to reset to", &|| {
+                    crate::interactive::pick_commit(backend, "Reset to which commit?")
+                })?,
+            };
+            let mode = match (soft, hard, keep, merge) {
+                (true, ..) => ResetMode::Soft,
+                (_, true, ..) => ResetMode::Hard,
+                (_, _, true, _) => ResetMode::Keep,
+                (.., true) => ResetMode::Merge,
                 _ => ResetMode::Mixed,
             };
             if hard
@@ -3578,7 +4305,7 @@ pub fn run(
             {
                 "cancelled".to_owned()
             } else {
-                ok(backend.reset(&rev, mode))?
+                done(ok(backend.reset(&rev, mode))?)
             }
         }
         Command::CherryPick {
@@ -3587,38 +4314,64 @@ pub fn run(
             record_origin,
             mainline,
             strategy_option,
+            edit,
             no_edit: _,
+            signoff,
+            ff,
+            allow_empty,
+            keep_redundant_commits,
+            empty,
             cont,
             skip,
             abort,
+            quit,
         } => {
+            let empty = match empty.as_deref() {
+                Some("drop") => rgit_git::EmptyCommit::Drop,
+                Some("keep") => rgit_git::EmptyCommit::Keep,
+                _ if keep_redundant_commits => rgit_git::EmptyCommit::Keep,
+                _ => rgit_git::EmptyCommit::Stop,
+            };
             let opts = rgit_git::PickOptions {
                 revert: false,
                 no_commit,
                 record_origin,
                 mainline,
                 strategy_option,
+                edit,
+                signoff,
+                allow_empty: allow_empty || keep_redundant_commits,
+                empty,
+                ff,
+                reference: false,
             };
-            pick(backend, revs, &opts, (cont, skip, abort), interactive)?
+            pick(backend, revs, &opts, (cont, skip, abort, quit), interactive)?
         }
         Command::Revert {
             revs,
             no_commit,
             mainline,
             strategy_option,
+            edit,
             no_edit: _,
+            signoff,
+            reference,
             cont,
             skip,
             abort,
+            quit,
         } => {
             let opts = rgit_git::PickOptions {
                 revert: true,
                 no_commit,
-                record_origin: false,
                 mainline,
                 strategy_option,
+                edit,
+                signoff,
+                reference,
+                ..Default::default()
             };
-            pick(backend, revs, &opts, (cont, skip, abort), interactive)?
+            pick(backend, revs, &opts, (cont, skip, abort, quit), interactive)?
         }
         Command::Branch { cmd, opts } => match cmd {
             None if opts.is_listing() => {
@@ -4195,6 +4948,7 @@ pub fn run(
             only_ignored,
             exclude,
             paths,
+            quiet,
             ..
         } => {
             let mut args: Vec<String> = Vec::new();
@@ -4220,14 +4974,21 @@ pub fn run(
                 "cancelled".to_owned()
             } else {
                 backend.clean(false, &args)?;
-                "ok".to_owned()
+                if quiet {
+                    String::new()
+                } else {
+                    "ok".to_owned()
+                }
             }
         }
         Command::Rm {
             paths,
             cached,
             recursive,
-            ..
+            force,
+            dry_run,
+            quiet,
+            ignore_unmatch,
         } => {
             let paths = if paths.is_empty() {
                 vec![resolve(None, "a path", &|| {
@@ -4236,20 +4997,55 @@ pub fn run(
             } else {
                 paths
             };
-            for p in &paths {
-                backend.remove_path(p, cached, recursive)?;
+            let opts = rgit_git::RmOptions {
+                cached,
+                recursive,
+                force,
+                dry_run,
+                ignore_unmatch,
+            };
+            let removed = backend.remove_paths(&paths, opts)?;
+            if quiet {
+                String::new()
+            } else {
+                removed
+                    .iter()
+                    .map(|p| format!("rm '{p}'"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }
-            "ok".to_owned()
         }
-        Command::Mv { paths, force } => {
+        Command::Mv {
+            paths,
+            force,
+            skip_errors,
+            dry_run,
+            verbose,
+        } => {
             let (to, from) = paths.split_last().expect("clap requires two paths");
             if from.len() > 1 && !backend.workdir().join(to).is_dir() {
                 anyhow::bail!("destination '{to}' is not a directory");
             }
+            let mut out = Vec::new();
             for f in from {
-                backend.move_path(f, to, force)?;
+                match backend.move_path(f, to, force, dry_run) {
+                    Ok(dest) => {
+                        if dry_run {
+                            out.push(format!("Checking rename of '{f}' to '{dest}'"));
+                        }
+                        if dry_run || verbose {
+                            out.push(format!("Renaming {f} to {dest}"));
+                        }
+                    }
+                    Err(_) if skip_errors => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
-            "ok".to_owned()
+            if dry_run || verbose {
+                out.join("\n")
+            } else {
+                "ok".to_owned()
+            }
         }
         Command::Describe {
             rev,
@@ -4304,16 +5100,87 @@ fn remote_and_refspecs(
     }
 }
 
-/// Cherry-pick or revert `revs`, or continue/skip/abort a stopped sequence.
+/// Run a bisect subcommand, checked here and stepped by git's bisect. Returns
+/// the text and, for `visualize`, the commits still in the search.
+pub(crate) fn bisect(
+    backend: &Arc<dyn GitBackend>,
+    cmd: BisectCmd,
+) -> anyhow::Result<(String, Option<Vec<rgit_git::LogEntry>>)> {
+    let dir = backend.git_dir();
+    let terms = std::fs::read_to_string(dir.join("BISECT_TERMS")).unwrap_or_default();
+    let mut terms = terms.lines();
+    let bad = terms.next().unwrap_or("bad").to_owned();
+    let good = terms.next().unwrap_or("good").to_owned();
+    let mut args = cmd.git_args();
+    match cmd {
+        BisectCmd::Mark(words) => {
+            let term = words.first().map(String::as_str).unwrap_or("");
+            if term != bad && term != good {
+                return Err(CliError::usage(format!(
+                    "unknown bisect subcommand '{term}'; the terms are {bad} and {good}"
+                )));
+            }
+        }
+        BisectCmd::Replay { file } => {
+            let path = std::fs::canonicalize(&file)
+                .map_err(|e| anyhow::anyhow!("could not read {file}: {e}"))?;
+            args[1] = path.display().to_string();
+        }
+        BisectCmd::Visualize => {
+            let refs = backend.ref_details()?;
+            let Some(tip) = refs.iter().find(|r| r.name == format!("refs/bisect/{bad}")) else {
+                anyhow::bail!("no {bad} commit marked yet; run `rgit bisect {bad} <rev>`");
+            };
+            let mut revs = vec![tip.id.clone()];
+            let old = format!("refs/bisect/{good}-");
+            revs.extend(
+                refs.iter()
+                    .filter(|r| r.name.starts_with(&old))
+                    .map(|r| format!("^{}", r.id)),
+            );
+            let names = std::fs::read_to_string(dir.join("BISECT_NAMES")).unwrap_or_default();
+            let entries = backend.log(&LogOptions {
+                limit: usize::MAX,
+                revs,
+                paths: names
+                    .split('\'')
+                    .skip(1)
+                    .step_by(2)
+                    .map(str::to_owned)
+                    .collect(),
+                ..Default::default()
+            })?;
+            let text = entries
+                .iter()
+                .map(|e| format!("{} {}", e.short_id, e.summary))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok((text, Some(entries)));
+        }
+        _ => {}
+    }
+    let out = backend.bisect(&args)?;
+    Ok((if out.is_empty() { "ok".to_owned() } else { out }, None))
+}
+
+/// Cherry-pick or revert `revs`, or continue/skip/abort/quit a stopped sequence.
 fn pick(
     backend: &Arc<dyn GitBackend>,
     mut revs: Vec<String>,
     opts: &rgit_git::PickOptions,
-    (cont, skip, abort): (bool, bool, bool),
+    (cont, skip, abort, quit): (bool, bool, bool, bool),
     interactive: bool,
 ) -> anyhow::Result<String> {
     if abort {
-        return ok(backend.pick_abort());
+        let warning = backend.pick_abort()?;
+        return Ok(if warning.is_empty() {
+            "ok".to_owned()
+        } else {
+            warning
+        });
+    }
+    if quit {
+        return ok(backend.pick_quit());
     }
     if cont {
         return ok(backend.pick_continue());
@@ -4421,6 +5288,29 @@ fn guess_remote(backend: &Arc<dyn GitBackend>, name: &str) -> Option<String> {
     }
 }
 
+/// Branch-switch flags shared by `checkout` and `switch`.
+struct SwitchOpts {
+    detach: bool,
+    track: bool,
+    no_track: bool,
+    guess: bool,
+    mode: rgit_git::CheckoutMode,
+    detach_ok: bool,
+}
+
+/// The checkout mode for -f/-m and `--conflict`, which implies -m.
+fn checkout_mode(force: bool, merge: bool, conflict: Option<&str>) -> rgit_git::CheckoutMode {
+    if force {
+        rgit_git::CheckoutMode::Force
+    } else if merge || conflict.is_some() {
+        rgit_git::CheckoutMode::Merge {
+            diff3: conflict == Some("diff3"),
+        }
+    } else {
+        rgit_git::CheckoutMode::Safe
+    }
+}
+
 /// Switch branches for `checkout` and `switch`: create `new` at `rev`
 /// (resetting it when forced), detach at `rev`, or switch to the branch `rev`,
 /// guessing a remote one. `-` is the previous branch. Only checkout
@@ -4429,9 +5319,7 @@ fn switch(
     backend: &Arc<dyn GitBackend>,
     rev: Option<String>,
     new: Option<(String, bool)>,
-    detach: bool,
-    track: bool,
-    detach_ok: bool,
+    o: &SwitchOpts,
 ) -> anyhow::Result<String> {
     let prev = rev.as_deref() == Some("-");
     let rev = if prev {
@@ -4439,27 +5327,48 @@ fn switch(
     } else {
         rev
     };
+    let safe = o.mode == rgit_git::CheckoutMode::Safe;
+    let create = |name: &str, start: &str, force: bool, track: bool| -> anyhow::Result<()> {
+        if safe {
+            backend.branch_from(name, start, force, track)?;
+        } else {
+            backend.create_branch_at(name, start, force)?;
+            if track {
+                backend.set_upstream(name, Some(start))?;
+            }
+            backend.checkout_with(name, true, o.mode)?;
+        }
+        if o.no_track && backend.branch_upstream(name)?.is_some() {
+            backend.set_upstream(name, None)?;
+        }
+        Ok(())
+    };
     if let Some((name, force)) = new {
-        backend.branch_from(&name, rev.as_deref().unwrap_or("HEAD"), force, track)?;
+        create(&name, rev.as_deref().unwrap_or("HEAD"), force, o.track)?;
         return Ok("ok".to_owned());
     }
     let rev = rev.unwrap_or_else(|| "HEAD".to_owned());
     let tracked = |name: &str, start: &str| -> anyhow::Result<String> {
-        backend.branch_from(name, start, false, true)?;
-        Ok(format!("created branch {name} tracking {start}"))
+        create(name, start, false, !o.no_track)?;
+        Ok(if o.no_track {
+            format!("created branch {name} from {start}")
+        } else {
+            format!("created branch {name} tracking {start}")
+        })
     };
-    if detach {
-        backend.checkout_detached(&rev)?;
+    let guess = || o.guess.then(|| guess_remote(backend, &rev)).flatten();
+    if o.detach {
+        backend.checkout_with(&rev, false, o.mode)?;
     } else if backend.local_branches()?.contains(&rev) {
-        backend.checkout_branch(&rev)?;
-    } else if let Some((_, name)) = rev.split_once('/').filter(|_| track) {
+        backend.checkout_with(&rev, true, o.mode)?;
+    } else if let Some((_, name)) = rev.split_once('/').filter(|_| o.track) {
         return tracked(name, &rev);
-    } else if detach_ok && backend.rev_parse(&rev).is_ok() {
-        backend.checkout_detached(&rev)?;
-    } else if let Some(remote) = guess_remote(backend, &rev) {
+    } else if o.detach_ok && backend.rev_parse(&rev).is_ok() {
+        backend.checkout_with(&rev, false, o.mode)?;
+    } else if let Some(remote) = guess() {
         return tracked(&rev, &remote);
-    } else if detach_ok {
-        backend.checkout_detached(&rev)?;
+    } else if o.detach_ok {
+        backend.checkout_with(&rev, false, o.mode)?;
     } else if backend.rev_parse(&rev).is_ok() {
         return Err(anyhow::Error::new(CliError {
             message: format!("a branch is expected, got '{rev}'"),
@@ -4742,11 +5651,11 @@ pub(crate) fn status_view(
 
 /// Rewrite path arguments typed in a subfolder of the repo into repo-root
 /// paths, since git reads pathspecs relative to the current folder.
-pub fn from_cwd(mut command: Command, workdir: &Path) -> Command {
+pub fn from_cwd(mut command: Command, backend: &Arc<dyn GitBackend>) -> Command {
     let Some((root, prefix)) = std::env::current_dir()
         .and_then(|cwd| cwd.canonicalize())
         .ok()
-        .zip(workdir.canonicalize().ok())
+        .zip(backend.workdir().canonicalize().ok())
         .and_then(|(cwd, root)| {
             let prefix = cwd.strip_prefix(&root).ok()?.to_path_buf();
             Some((root, prefix))
@@ -4787,8 +5696,19 @@ pub fn from_cwd(mut command: Command, workdir: &Path) -> Command {
             paths,
             ..
         } => {
-            // A first word naming a file here is a path, not a revision.
-            if let Some(r) = rev.as_mut().filter(|r| root.join(&prefix).join(r).exists()) {
+            // A first word naming a file here, even a deleted one git still
+            // tracks, is a path, not a revision.
+            let tracked = |r: &str| {
+                let p = repo_path(&root, &prefix, r);
+                backend
+                    .index_entries()
+                    .is_ok_and(|e| e.iter().any(|e| e.path == p))
+                    || backend.read_blob("HEAD", &p).is_ok()
+            };
+            if let Some(r) = rev
+                .as_mut()
+                .filter(|r| root.join(&prefix).join(r).exists() || tracked(r))
+            {
                 fix(r);
             }
             pathspec.iter_mut().chain(paths).for_each(fix);

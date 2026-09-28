@@ -74,3 +74,31 @@ fn stage_unstage_and_discard_several_hunks() {
     rgit(&dir, &["discard", "f.txt", "--hunk", "1,14"]);
     assert_eq!(hunk_starts(&git(&dir, &["diff"])), ["+26,6"]);
 }
+
+#[test]
+fn a_line_that_starts_no_hunk_is_an_error() {
+    let dir = std::env::temp_dir().join(format!("rgit-hunks-miss-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["config", "user.email", "t@t"]);
+    git(&dir, &["config", "user.name", "t"]);
+    std::fs::write(dir.join("f.txt"), "a\nb\n").unwrap();
+    git(&dir, &["add", "f.txt"]);
+    git(&dir, &["commit", "-qm", "init"]);
+    std::fs::write(dir.join("f.txt"), "A\nb\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(["stage", "f.txt", "--hunk", "99"])
+        .current_dir(&dir)
+        .env("RGIT_OPLOG", "0")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success());
+    assert!(
+        text.contains("no hunk at line 99 of f.txt; hunks start at: 1"),
+        "{text}"
+    );
+    assert_eq!(git(&dir, &["diff", "--cached"]), "");
+}

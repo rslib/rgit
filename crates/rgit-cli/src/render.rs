@@ -44,6 +44,9 @@ pub fn status(s: &RepoStatus) -> String {
     if s.head.behind > 0 {
         out.push_str(&paint(&format!(" -{}", s.head.behind), RED));
     }
+    if let Some(r) = &s.rebase {
+        out.push_str(&rebase_progress(r));
+    }
 
     let staged: Vec<&StatusEntry> = s.entries.iter().filter(|e| e.is_staged()).collect();
     let unstaged: Vec<&StatusEntry> = s
@@ -62,6 +65,45 @@ pub fn status(s: &RepoStatus) -> String {
         e.worktree.letter()
     });
     group(&mut out, "Untracked", &untracked, RED, |_| "?");
+    out
+}
+
+/// A stopped rebase as `git status` words it: the last commands done, the
+/// next ones to do, and what is rebased onto what.
+pub fn rebase_progress(r: &rgit_git::RebaseProgress) -> String {
+    let plural = |n: usize, one: &'static str, many: &'static str| if n == 1 { one } else { many };
+    let mut out = format!("\ninteractive rebase in progress; onto {}", r.onto);
+    if !r.done.is_empty() {
+        let n = r.done.len();
+        out.push_str(&format!(
+            "\n{} ({n} {} done):",
+            plural(n, "Last command done", "Last commands done"),
+            plural(n, "command", "commands")
+        ));
+        for line in &r.done[n.saturating_sub(2)..] {
+            out.push_str(&format!("\n   {line}"));
+        }
+    }
+    if r.todo.is_empty() {
+        out.push_str("\nNo commands remaining.");
+    } else {
+        let n = r.todo.len();
+        out.push_str(&format!(
+            "\n{} ({n} remaining {}):",
+            plural(n, "Next command to do", "Next commands to do"),
+            plural(n, "command", "commands")
+        ));
+        for line in r.todo.iter().take(2) {
+            out.push_str(&format!("\n   {line}"));
+        }
+    }
+    match &r.branch {
+        Some(b) => out.push_str(&format!(
+            "\nYou are currently rebasing branch '{b}' on '{}'.",
+            r.onto
+        )),
+        None => out.push_str("\nYou are currently rebasing."),
+    }
     out
 }
 

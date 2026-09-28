@@ -13,6 +13,21 @@ pub struct RepoStatus {
     pub recent: Vec<Commit>,
     /// An in-progress sequencer operation (merge, rebase, ...), if any.
     pub state: RepoState,
+    /// Where a stopped rebase is, when one is in progress.
+    pub rebase: Option<RebaseProgress>,
+}
+
+/// Where a stopped rebase is, from git's `rebase-merge` state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RebaseProgress {
+    /// The branch being rebased, if any.
+    pub branch: Option<String>,
+    /// The abbreviated commit it is rebased onto.
+    pub onto: String,
+    /// Todo lines already done; the last is where it stopped.
+    pub done: Vec<String>,
+    /// Todo lines still to do.
+    pub todo: Vec<String>,
 }
 
 /// A sequencer operation in progress, mirroring git's on-disk state.
@@ -50,6 +65,37 @@ pub enum ResetMode {
     /// Update the files that differ from the target, refusing to overwrite
     /// local changes to them, and keep other local changes (git's `--keep`).
     Keep,
+    /// Reset the index and the files that differ from the target, keeping
+    /// unstaged changes to other files (git's `--merge`).
+    Merge,
+}
+
+/// How a branch switch treats local changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CheckoutMode {
+    /// Keep local changes, refusing to overwrite them.
+    #[default]
+    Safe,
+    /// Throw local changes away (git's `-f`).
+    Force,
+    /// Carry local changes over with a three-way merge, leaving conflicts
+    /// marked (git's `-m`); `diff3` adds the base to the markers.
+    Merge { diff3: bool },
+}
+
+/// How [`crate::GitBackend::remove_paths`] removes paths (git's `rm` flags).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RmOptions {
+    /// Remove from the index only, keeping the working-tree files.
+    pub cached: bool,
+    /// Remove folders recursively.
+    pub recursive: bool,
+    /// Skip git's up-to-date checks.
+    pub force: bool,
+    /// Report what would be removed without removing it.
+    pub dry_run: bool,
+    /// Succeed even when a pathspec matches nothing.
+    pub ignore_unmatch: bool,
 }
 
 /// How [`crate::GitBackend::commit_with`] builds a commit beyond its message.
@@ -63,8 +109,16 @@ pub struct CommitOptions {
     pub allow_empty: bool,
     /// Append a `Signed-off-by` trailer for the committer.
     pub signoff: bool,
-    /// The author as `Name <email>`, instead of the committer.
+    /// The author as `Name <email>`, or a pattern naming an existing author,
+    /// instead of the committer.
     pub author: Option<String>,
+    /// Take the author (name, email and date) from this commit (git's `-C`).
+    pub author_from: Option<String>,
+    /// Make the committer the author, dated now, even with `amend` or
+    /// `author_from`.
+    pub reset_author: bool,
+    /// The author date, as unix seconds and a UTC offset in minutes.
+    pub date: Option<(i64, i32)>,
     /// Commit only these paths, as they are in the working tree, on top of
     /// HEAD; other staged changes stay staged (git's `commit <paths>`).
     pub paths: Vec<String>,
@@ -83,6 +137,30 @@ pub struct PickOptions {
     pub mainline: Option<u32>,
     /// `ours` or `theirs`: the side taken on conflicting hunks (git's `-X`).
     pub strategy_option: Option<String>,
+    /// Open the editor on each message (git's `-e`).
+    pub edit: bool,
+    /// Append a `Signed-off-by` trailer for the committer (git's `-s`).
+    pub signoff: bool,
+    /// Keep commits that were empty to begin with (git's `--allow-empty`).
+    pub allow_empty: bool,
+    /// What to do with a commit whose change is already in HEAD (git's `--empty`).
+    pub empty: EmptyCommit,
+    /// Fast-forward over a commit whose parent is HEAD (git's `--ff`).
+    pub ff: bool,
+    /// Name a reverted commit as `abbrev (subject, date)` (git's `--reference`).
+    pub reference: bool,
+}
+
+/// What a cherry-pick does with a commit whose change is already in HEAD.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EmptyCommit {
+    /// Stop so it can be committed or skipped by hand.
+    #[default]
+    Stop,
+    /// Leave it out.
+    Drop,
+    /// Commit it with no change.
+    Keep,
 }
 
 /// Options for a merge.
@@ -100,6 +178,20 @@ pub struct MergeOptions {
     pub message: Option<String>,
     /// `ours` or `theirs`: the side taken on conflicting hunks (git's `-X`).
     pub strategy_option: Option<String>,
+    /// The merge strategy (git's `-s`); `ours` keeps HEAD's tree.
+    pub strategy: Option<String>,
+    /// Merge histories with no common ancestor (git's `--allow-unrelated-histories`).
+    pub allow_unrelated: bool,
+    /// Add up to this many merged commit subjects to the message (git's `--log`).
+    pub log: Option<usize>,
+    /// Open the editor on the message (git's `-e`).
+    pub edit: bool,
+    /// Skip the pre-merge-commit and commit-msg hooks (git's `--no-verify`).
+    pub no_verify: bool,
+    /// Append a `Signed-off-by` trailer for the committer (git's `--signoff`).
+    pub signoff: bool,
+    /// Report a diffstat of what the merge brought in (git's `--stat`).
+    pub stat: bool,
 }
 
 /// Rebase options that go past libgit2's rebase, run through git's sequencer.
@@ -119,6 +211,10 @@ pub struct RebaseOptions {
     pub update_refs: bool,
     /// `ours` or `theirs`: the side taken on conflicting hunks (git's `-X`).
     pub strategy_option: Option<String>,
+    /// Check out this branch first (git's `<upstream> <branch>`).
+    pub branch: Option<String>,
+    /// Further git rebase flags the CLI has checked (`--keep-empty`, `-f`, ...).
+    pub flags: Vec<String>,
 }
 
 /// Which config file a `config` command reads or writes. `Any` reads the

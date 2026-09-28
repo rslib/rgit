@@ -15,8 +15,9 @@ use rgit_git::{Git2Backend, GitBackend, GrepQuery};
 use serde_json::{Map, Value, json};
 
 use crate::cli::{
-    BranchCmd, BranchOpts, CliError, Command, DiffFormat, FlowCmd, IndexCmd, LanesCmd, NotesCmd,
-    Plumbing, RemoteCmd, StackCmd, StashCmd, StashPush, WorkspaceCmd, WorktreeCmd,
+    BisectCmd, BranchCmd, BranchOpts, CliError, Command, DiffFormat, FlowCmd, IndexCmd, LanesCmd,
+    NotesCmd, Plumbing, RebaseFlags, RemoteCmd, StackCmd, StashCmd, StashPush, WorkspaceCmd,
+    WorktreeCmd,
 };
 use crate::output::Output;
 use crate::toon::{Node, Obj};
@@ -866,24 +867,30 @@ fn tools() -> Vec<Tool> {
             "git_add",
             "Stage paths as git add does: new, changed and deleted files under `paths` (files, \
              folders, globs, `.`). `all` with no paths stages the whole repo; `update` stages \
-             only tracked files; `force` adds ignored files.",
+             only tracked files; `force` adds ignored files. `dry_run` lists what would be \
+             added; `intent_to_add` records untracked paths with no content (git add -N).",
             &[
                 ("paths", "paths", false),
                 ("all", "boolean", false),
                 ("update", "boolean", false),
                 ("force", "boolean", false),
+                ("dry_run", "boolean", false),
+                ("intent_to_add", "boolean", false),
             ],
         ),
         tool(
             "git_restore",
             "Restore paths in the working tree from the index, or from `source` (a revision). \
              `staged` restores the index instead (unstage); with `worktree` too, both. \
-             Destructive; git_undo restores them.",
+             `ours`/`theirs` write that side of conflicted paths. Destructive; git_undo \
+             restores them.",
             &[
                 ("paths", "paths", true),
                 ("source", "string", false),
                 ("staged", "boolean", false),
                 ("worktree", "boolean", false),
+                ("ours", "boolean", false),
+                ("theirs", "boolean", false),
             ],
         ),
         tool(
@@ -896,8 +903,11 @@ fn tools() -> Vec<Tool> {
             "Commit the index with a message (runs hooks). `paths` commits only those paths as \
              they are in the working tree. `amend` replaces HEAD (`no_edit` keeps its message), \
              `all` stages tracked changes first, `no_verify` skips hooks, `author` is \
-             `Name <email>`, `signoff` adds Signed-off-by, `allow_empty` commits no change, \
-             `fixup`/`squash` make an autosquash commit for a revision. Returns the commit report.",
+             `Name <email>` or a pattern naming an existing author, `date` sets the author \
+             date, `reuse_message` takes a revision's message and author (git -C), \
+             `reset_author` makes you the author again, `signoff` adds Signed-off-by, \
+             `allow_empty` commits no change, `fixup`/`squash` make an autosquash commit for \
+             a revision. Returns the commit report.",
             &[
                 ("message", "string", false),
                 ("paths", "paths", false),
@@ -906,6 +916,9 @@ fn tools() -> Vec<Tool> {
                 ("all", "boolean", false),
                 ("no_verify", "boolean", false),
                 ("author", "string", false),
+                ("date", "string", false),
+                ("reuse_message", "string", false),
+                ("reset_author", "boolean", false),
                 ("signoff", "boolean", false),
                 ("allow_empty", "boolean", false),
                 ("fixup", "string", false),
@@ -968,8 +981,11 @@ fn tools() -> Vec<Tool> {
             "git_checkout",
             "Check out a branch (or a revision/tag as detached HEAD; `-` is the previous branch). \
              A no-op when already on it. `create` makes a new branch at `rev` (`force` resets \
-             an existing one), `detach` detaches, `track` sets the upstream. With `paths`, \
-             restores them from `rev` (index and working tree) or from the index instead.",
+             an existing one), `detach` detaches, `track` sets the upstream (`no_track` never). \
+             `discard_changes` throws local changes away (git -f), `merge` carries them over \
+             with a three-way merge (git -m), `orphan` starts a branch with no history at \
+             `rev`. With `paths`, restores them from `rev` (index and working tree) or from \
+             the index instead; `ours`/`theirs` write that side of conflicted paths.",
             &[
                 ("rev", "string", false),
                 ("paths", "paths", false),
@@ -977,6 +993,12 @@ fn tools() -> Vec<Tool> {
                 ("force", "boolean", false),
                 ("detach", "boolean", false),
                 ("track", "boolean", false),
+                ("no_track", "boolean", false),
+                ("discard_changes", "boolean", false),
+                ("merge", "boolean", false),
+                ("orphan", "string", false),
+                ("ours", "boolean", false),
+                ("theirs", "boolean", false),
             ],
         ),
         tool(
@@ -984,13 +1006,19 @@ fn tools() -> Vec<Tool> {
             "Switch to a branch (`-` is the previous one; a remote branch's name creates a \
              local tracking branch). `create` makes a new branch at `branch` or HEAD (`force` \
              resets an existing one), `detach` checks out a revision as a detached HEAD, \
-             `track` sets the upstream.",
+             `track` sets the upstream (`no_track` never). `discard_changes` throws local \
+             changes away, `merge` carries them over with a three-way merge, `orphan` starts \
+             a branch with no history and an empty working tree.",
             &[
                 ("branch", "string", false),
                 ("create", "string", false),
                 ("force", "boolean", false),
                 ("detach", "boolean", false),
                 ("track", "boolean", false),
+                ("no_track", "boolean", false),
+                ("discard_changes", "boolean", false),
+                ("merge", "boolean", false),
+                ("orphan", "string", false),
             ],
         ),
         tool(
@@ -998,8 +1026,13 @@ fn tools() -> Vec<Tool> {
             "Merge a revision (or several, an octopus merge) into the current branch. `no_ff` \
              forces a merge commit, `ff_only` refuses a non-fast-forward, `squash` stages the \
              result without a merge commit, `no_commit` stops before committing, `message` sets \
-             the commit message, `strategy_option` (ours|theirs) settles conflicting hunks. \
-             `continue` commits a resolved merge, `abort` cancels a conflicted one.",
+             the commit message, `strategy_option` (ours|theirs) settles conflicting hunks, \
+             `strategy` (ort|recursive|resolve|octopus|ours; ours keeps HEAD's tree), \
+             `allow_unrelated_histories` merges histories with no common commit, `log` adds up \
+             to N merged subjects to the message, `signoff` adds Signed-off-by, `no_verify` \
+             skips the pre-merge-commit and commit-msg hooks, `no_stat` drops the diffstat. \
+             `continue` commits a resolved merge, `abort` cancels a conflicted one, `quit` \
+             forgets it and keeps the index and working tree.",
             &[
                 ("rev", "paths", false),
                 ("no_ff", "boolean", false),
@@ -1008,8 +1041,15 @@ fn tools() -> Vec<Tool> {
                 ("no_commit", "boolean", false),
                 ("message", "string", false),
                 ("strategy_option", "string", false),
+                ("strategy", "string", false),
+                ("allow_unrelated_histories", "boolean", false),
+                ("log", "integer", false),
+                ("signoff", "boolean", false),
+                ("no_verify", "boolean", false),
+                ("no_stat", "boolean", false),
                 ("continue", "boolean", false),
                 ("abort", "boolean", false),
+                ("quit", "boolean", false),
             ],
         ),
         tool(
@@ -1018,15 +1058,31 @@ fn tools() -> Vec<Tool> {
              `newbase` replays the commits after `onto` onto it (git's --onto). `root` rebases \
              down to the root commit, `autosquash` folds fixup!/squash! commits, `exec` runs \
              shell commands after each commit, `update_refs` moves branches inside the range, \
-             `strategy_option` (ours|theirs) settles conflicting hunks.",
+             `strategy_option` (ours|theirs) settles conflicting hunks. `branch` is checked out \
+             first. `keep_empty`, `force_rebase` (replay every commit), `rebase_merges` \
+             (recreate merges), `keep_base`, `committer_date_is_author_date`, \
+             `reset_author_date`, `reapply_cherry_picks`, `empty` (drop|keep|stop), `signoff`, \
+             `autostash` and `no_verify` work as in git.",
             &[
                 ("onto", "string", false),
                 ("newbase", "string", false),
+                ("branch", "string", false),
                 ("root", "boolean", false),
                 ("autosquash", "boolean", false),
                 ("exec", "string[]", false),
                 ("update_refs", "boolean", false),
                 ("strategy_option", "string", false),
+                ("keep_empty", "boolean", false),
+                ("force_rebase", "boolean", false),
+                ("rebase_merges", "boolean", false),
+                ("keep_base", "boolean", false),
+                ("committer_date_is_author_date", "boolean", false),
+                ("reset_author_date", "boolean", false),
+                ("reapply_cherry_picks", "boolean", false),
+                ("empty", "string", false),
+                ("signoff", "boolean", false),
+                ("autostash", "boolean", false),
+                ("no_verify", "boolean", false),
             ],
         ),
         tool(
@@ -1041,41 +1097,64 @@ fn tools() -> Vec<Tool> {
         ),
         tool("git_rebase_abort", "Abort an in-progress rebase.", none),
         tool(
+            "git_rebase_quit",
+            "Stop an in-progress rebase, leaving HEAD, the index and the working tree as they are.",
+            none,
+        ),
+        tool(
+            "git_rebase_current_patch",
+            "Show the commit an in-progress rebase stopped at.",
+            none,
+        ),
+        tool(
             "git_cherry_pick",
             "Cherry-pick commits onto HEAD in order; `rev` is a commit, a range `A..B`, or a list. \
              `record_origin` appends \"(cherry picked from commit ...)\", `mainline` picks the \
              parent (from 1) of a merge commit, `strategy_option` (ours|theirs) settles \
-             conflicting hunks. After a conflict: `continue`, `skip` or `abort`.",
+             conflicting hunks, `signoff` adds Signed-off-by, `ff` fast-forwards over a commit \
+             whose parent is HEAD, `allow_empty` keeps commits that were empty, `empty` \
+             (stop|drop|keep) handles commits already in HEAD. After a conflict: `continue`, \
+             `skip`, `abort` or `quit` (forget the sequence, keep the files).",
             &[
                 ("rev", "paths", false),
                 ("no_commit", "boolean", false),
                 ("record_origin", "boolean", false),
                 ("mainline", "integer", false),
                 ("strategy_option", "string", false),
+                ("signoff", "boolean", false),
+                ("ff", "boolean", false),
+                ("allow_empty", "boolean", false),
+                ("empty", "string", false),
                 ("continue", "boolean", false),
                 ("skip", "boolean", false),
                 ("abort", "boolean", false),
+                ("quit", "boolean", false),
             ],
         ),
         tool(
             "git_revert",
             "Revert commits on HEAD; `rev` is a commit, a range `A..B` (newest first), or a list. \
              `mainline` picks the parent (from 1) of a merge commit, `strategy_option` \
-             (ours|theirs) settles conflicting hunks. After a conflict: `continue`, `skip` or \
-             `abort`.",
+             (ours|theirs) settles conflicting hunks, `signoff` adds Signed-off-by, `reference` \
+             names the commit as `abbrev (subject, date)`. After a conflict: `continue`, `skip`, \
+             `abort` or `quit`.",
             &[
                 ("rev", "paths", false),
                 ("no_commit", "boolean", false),
                 ("mainline", "integer", false),
                 ("strategy_option", "string", false),
+                ("signoff", "boolean", false),
+                ("reference", "boolean", false),
                 ("continue", "boolean", false),
                 ("skip", "boolean", false),
                 ("abort", "boolean", false),
+                ("quit", "boolean", false),
             ],
         ),
         tool(
             "git_reset",
-            "Reset HEAD to a revision. `mode` is soft, mixed (default), hard, or keep. With \
+            "Reset HEAD to a revision. `mode` is soft, mixed (default), hard, keep, or merge \
+             (keeps unstaged changes; aborts a conflicted merge). With \
              `paths`, resets only their index entries to `rev` (default HEAD), leaving HEAD \
              alone.",
             &[
@@ -1287,9 +1366,23 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_bisect",
-            "Run a `git bisect` subcommand (e.g. [\"start\",\"<bad>\",\"<good>\"], [\"good\"], \
-             [\"bad\"], [\"reset\"]).",
-            &[("args", "string[]", true), FULL],
+            "Find the commit that introduced a change by binary search. `command`: start (revs: \
+             bad then good ones; paths, term_new, term_old, no_checkout, first_parent), \
+             good|bad|new|old|skip (revs, HEAD by default), reset (revs: where to end up), log, \
+             replay (file), run (cmd: the test command and its arguments), visualize (the \
+             commits left), terms. Returns the step: remaining, steps, current, or first_bad.",
+            &[
+                ("command", "string", true),
+                ("revs", "string[]", false),
+                ("paths", "string[]", false),
+                ("term_new", "string", false),
+                ("term_old", "string", false),
+                ("no_checkout", "boolean", false),
+                ("first_parent", "boolean", false),
+                ("file", "string", false),
+                ("cmd", "string[]", false),
+                FULL,
+            ],
         ),
         tool(
             "git_stash_push",
@@ -1620,21 +1713,29 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_rm",
             "Remove tracked paths (files, folders, globs) from the index and the working tree. \
-             `cached` removes them from the index only; `recursive` is needed for a folder.",
+             `cached` removes them from the index only; `recursive` is needed for a folder. \
+             Files with staged or unstaged changes are refused unless `force`. `dry_run` lists \
+             what would be removed; `ignore_unmatch` allows paths that match nothing.",
             &[
                 ("path", "paths", true),
                 ("cached", "boolean", false),
                 ("recursive", "boolean", false),
+                ("force", "boolean", false),
+                ("dry_run", "boolean", false),
+                ("ignore_unmatch", "boolean", false),
             ],
         ),
         tool(
             "git_mv",
             "Rename/move tracked files or folders. `from` may list several paths when `to` is a \
-             folder. `force` overwrites an existing destination.",
+             folder. `force` overwrites an existing destination, `skip_errors` skips moves that \
+             would fail, `dry_run` only reports the moves.",
             &[
                 ("from", "paths", true),
                 ("to", "string", true),
                 ("force", "boolean", false),
+                ("skip_errors", "boolean", false),
+                ("dry_run", "boolean", false),
             ],
         ),
         tool(
@@ -1828,10 +1929,13 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> anyhow::
     let a = Args { tool: name, args };
     let fields = a.strings("fields")?;
     let full = a.flag("full");
+    let since = backend.index_second();
     let output = match command(&a)? {
-        Some(command) => crate::axi::run(backend, command, false)?,
-        None => local(backend, &a, full)?,
+        Some(command) => crate::axi::run(backend, command, false),
+        None => local(backend, &a, full),
     };
+    let _ = backend.smudge_racy(since);
+    let output = output?;
     let mut value = output.finalize(&fields, full, RERUN)?;
     if let Some((_, Node::List(help))) = value.iter_mut().find(|(k, _)| k == "help") {
         let cli = format!("Run `{RERUN} --full`");
@@ -1851,6 +1955,13 @@ const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
     ("rebase --continue", "git_rebase_continue", &[]),
     ("rebase --abort", "git_rebase_abort", &[]),
     ("rebase --skip", "git_rebase_skip", &[]),
+    ("rebase --quit", "git_rebase_quit", &[]),
+    (
+        "rebase --show-current-patch",
+        "git_rebase_current_patch",
+        &[],
+    ),
+    ("bisect", "git_bisect", &["command", "revs"]),
     ("stash pop", "git_stash_pop", &["index"]),
     ("stash list", "git_stashes", &[]),
     ("stash show", "git_stash_show", &["index"]),
@@ -2126,8 +2237,9 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         cmd: Some(cmd),
         opts: BranchOpts::default(),
     };
-    let rebase = |onto, cont, skip, abort| Command::Rebase {
-        onto,
+    let rebase = |step: &str| Command::Rebase {
+        onto: None,
+        branch: None,
         onto_new: None,
         edit: false,
         root: false,
@@ -2135,9 +2247,13 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         exec: Vec::new(),
         update_refs: false,
         strategy_option: None,
-        cont,
-        skip,
-        abort,
+        more: RebaseFlags::default(),
+        cont: step == "continue",
+        skip: step == "skip",
+        abort: step == "abort",
+        quit: step == "quit",
+        edit_todo: false,
+        show_current_patch: step == "show-current-patch",
     };
     let stash = |cmd| Command::Stash {
         cmd: Some(cmd),
@@ -2186,6 +2302,9 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             z: false,
             untracked: a.str("untracked"),
             ignored: a.flag("ignored"),
+            verbose: 0,
+            ahead_behind: false,
+            no_ahead_behind: false,
             paths: a.strs("paths").unwrap_or_default(),
         },
         "git_log" => Command::Log {
@@ -2304,12 +2423,23 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             all: a.flag("all"),
             update: a.flag("update"),
             force: a.flag("force"),
+            dry_run: a.flag("dry_run"),
+            verbose: false,
+            intent_to_add: a.flag("intent_to_add"),
+            ignore_errors: false,
+            patch: false,
         },
         "git_restore" => Command::Restore {
             paths: a.strs("paths")?,
             source: a.str("source"),
             staged: a.flag("staged"),
             worktree: a.flag("worktree"),
+            ours: a.flag("ours"),
+            theirs: a.flag("theirs"),
+            overlay: false,
+            no_overlay: false,
+            patch: false,
+            quiet: false,
         },
         "git_resolve" => Command::Resolve {
             path: a.req("path")?,
@@ -2328,6 +2458,15 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             allow_empty: a.flag("allow_empty"),
             fixup: a.str("fixup"),
             squash: a.str("squash"),
+            edit: false,
+            reuse_message: a.str("reuse_message"),
+            reedit_message: None,
+            reset_author: a.flag("reset_author"),
+            date: a.str("date"),
+            dry_run: false,
+            include: false,
+            only: false,
+            verbose: false,
             quiet: false,
             paths: a.strs("paths").unwrap_or_default(),
         },
@@ -2378,6 +2517,17 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                 force_branch,
                 detach: a.flag("detach"),
                 track: a.flag("track"),
+                no_track: a.flag("no_track"),
+                force: a.flag("discard_changes"),
+                merge: a.flag("merge"),
+                conflict: None,
+                orphan: a.str("orphan"),
+                ours: a.flag("ours"),
+                theirs: a.flag("theirs"),
+                no_guess: false,
+                guess: false,
+                patch: false,
+                quiet: false,
                 paths: a.strs("paths").unwrap_or_default(),
             }
         }
@@ -2392,6 +2542,14 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                 force_create,
                 detach: a.flag("detach"),
                 track: a.flag("track"),
+                no_track: a.flag("no_track"),
+                discard_changes: a.flag("discard_changes"),
+                merge: a.flag("merge"),
+                conflict: None,
+                orphan: a.str("orphan"),
+                no_guess: false,
+                guess: false,
+                quiet: false,
             }
         }
         "git_merge" => Command::Merge {
@@ -2401,13 +2559,26 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             squash: a.flag("squash"),
             no_commit: a.flag("no_commit"),
             message: a.str("message"),
+            file: None,
             strategy_option: a.str("strategy_option"),
+            strategy: a.str("strategy"),
+            allow_unrelated_histories: a.flag("allow_unrelated_histories"),
+            log: a.num("log")?.map(|n| n as usize),
+            stat: false,
+            no_stat: a.flag("no_stat"),
+            edit: false,
             no_edit: false,
+            no_verify: a.flag("no_verify"),
+            verify: false,
+            signoff: a.flag("signoff"),
+            quiet: false,
             cont: a.flag("continue"),
             abort: a.flag("abort"),
+            quit: a.flag("quit"),
         },
         "git_rebase" => Command::Rebase {
             onto: a.str("onto"),
+            branch: a.str("branch"),
             onto_new: a.str("newbase"),
             edit: false,
             root: a.flag("root"),
@@ -2415,41 +2586,77 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             exec: a.strings("exec")?,
             update_refs: a.flag("update_refs"),
             strategy_option: a.str("strategy_option"),
+            more: RebaseFlags {
+                keep_empty: a.flag("keep_empty"),
+                force_rebase: a.flag("force_rebase"),
+                rebase_merges: a
+                    .flag("rebase_merges")
+                    .then(|| "no-rebase-cousins".to_owned()),
+                keep_base: a.flag("keep_base"),
+                committer_date_is_author_date: a.flag("committer_date_is_author_date"),
+                reset_author_date: a.flag("reset_author_date"),
+                reapply_cherry_picks: a.flag("reapply_cherry_picks"),
+                empty: a.str("empty"),
+                signoff: a.flag("signoff"),
+                autostash: a.flag("autostash"),
+                no_verify: a.flag("no_verify"),
+                ..Default::default()
+            },
             cont: false,
             skip: false,
             abort: false,
+            quit: false,
+            edit_todo: false,
+            show_current_patch: false,
         },
-        "git_rebase_continue" => rebase(None, true, false, false),
-        "git_rebase_skip" => rebase(None, false, true, false),
-        "git_rebase_abort" => rebase(None, false, false, true),
+        "git_rebase_continue" => rebase("continue"),
+        "git_rebase_skip" => rebase("skip"),
+        "git_rebase_abort" => rebase("abort"),
+        "git_rebase_quit" => rebase("quit"),
+        "git_rebase_current_patch" => rebase("show-current-patch"),
         "git_cherry_pick" => Command::CherryPick {
             revs: a.strs("rev").unwrap_or_default(),
             no_commit: a.flag("no_commit"),
             record_origin: a.flag("record_origin"),
             mainline: a.num("mainline")?.map(|m| m as u32),
             strategy_option: a.str("strategy_option"),
+            edit: false,
             no_edit: false,
+            signoff: a.flag("signoff"),
+            ff: a.flag("ff"),
+            allow_empty: a.flag("allow_empty"),
+            keep_redundant_commits: false,
+            empty: a.str("empty"),
             cont: a.flag("continue"),
             skip: a.flag("skip"),
             abort: a.flag("abort"),
+            quit: a.flag("quit"),
         },
         "git_revert" => Command::Revert {
             revs: a.strs("rev").unwrap_or_default(),
             no_commit: a.flag("no_commit"),
             mainline: a.num("mainline")?.map(|m| m as u32),
             strategy_option: a.str("strategy_option"),
+            edit: false,
             no_edit: false,
+            signoff: a.flag("signoff"),
+            reference: a.flag("reference"),
             cont: a.flag("continue"),
             skip: a.flag("skip"),
             abort: a.flag("abort"),
+            quit: a.flag("quit"),
         },
         "git_reset" => {
-            let (soft, hard, keep) = match a.str("mode").as_deref() {
-                None | Some("mixed") => (false, false, false),
-                Some("soft") => (true, false, false),
-                Some("hard") => (false, true, false),
-                Some("keep") => (false, false, true),
-                Some(_) => return Err(a.invalid("mode", "one of soft, mixed, hard, keep")),
+            let mode = a.str("mode");
+            let (soft, hard, keep, merge) = match mode.as_deref() {
+                None | Some("mixed") => (false, false, false, false),
+                Some("soft") => (true, false, false, false),
+                Some("hard") => (false, true, false, false),
+                Some("keep") => (false, false, true, false),
+                Some("merge") => (false, false, false, true),
+                Some(_) => {
+                    return Err(a.invalid("mode", "one of soft, mixed, hard, keep, merge"));
+                }
             };
             Command::Reset {
                 rev: a.str("rev"),
@@ -2458,6 +2665,9 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                 mixed: false,
                 hard,
                 keep,
+                merge,
+                patch: false,
+                quiet: false,
                 paths: a.strs("paths").unwrap_or_default(),
             }
         }
@@ -2555,9 +2765,41 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             lane: a.req("lane")?,
         }),
         "git_lanes_restack" => lanes(LanesCmd::Restack),
-        "git_bisect" => Command::Bisect {
-            args: a.req_strings("args")?,
-        },
+        "git_bisect" => {
+            let revs = a.strings("revs")?;
+            let cmd = match a.req("command")?.as_str() {
+                "start" => BisectCmd::Start {
+                    revs,
+                    term_new: a.str("term_new"),
+                    term_old: a.str("term_old"),
+                    no_checkout: a.flag("no_checkout"),
+                    first_parent: a.flag("first_parent"),
+                    paths: a.strings("paths")?,
+                },
+                "bad" => BisectCmd::Bad { revs },
+                "good" => BisectCmd::Good { revs },
+                "new" => BisectCmd::New { revs },
+                "old" => BisectCmd::Old { revs },
+                "skip" => BisectCmd::Skip { revs },
+                "reset" => BisectCmd::Reset {
+                    commit: revs.into_iter().next(),
+                },
+                "log" => BisectCmd::Log,
+                "replay" => BisectCmd::Replay {
+                    file: a.req("file")?,
+                },
+                "run" => BisectCmd::Run {
+                    cmd: a.req_strings("cmd")?,
+                },
+                "visualize" | "view" => BisectCmd::Visualize,
+                "terms" => BisectCmd::Terms {
+                    good: false,
+                    bad: false,
+                },
+                term => BisectCmd::Mark(std::iter::once(term.to_owned()).chain(revs).collect()),
+            };
+            Command::Bisect { cmd }
+        }
 
         "git_stash_push" => stash(StashCmd::Push {
             push: StashPush {
@@ -2797,17 +3039,24 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             exclude: a.strs("exclude").unwrap_or_default(),
             dirs: true,
             force: true,
+            quiet: false,
             paths: a.strs("paths").unwrap_or_default(),
         },
         "git_rm" => Command::Rm {
             paths: a.strs("path")?,
             cached: a.flag("cached"),
             recursive: a.flag("recursive"),
-            force: false,
+            force: a.flag("force"),
+            dry_run: a.flag("dry_run"),
+            quiet: false,
+            ignore_unmatch: a.flag("ignore_unmatch"),
         },
         "git_mv" => Command::Mv {
             paths: [a.strs("from")?, vec![a.req("to")?]].concat(),
             force: a.flag("force"),
+            skip_errors: a.flag("skip_errors"),
+            dry_run: a.flag("dry_run"),
+            verbose: false,
         },
         "git_rev_parse" => Command::Plumbing(Plumbing::RevParse {
             short: a.num("short")?.map(|n| n as usize),
@@ -3242,6 +3491,9 @@ mod tests {
                 z: false,
                 untracked: None,
                 ignored: false,
+                verbose: 0,
+                ahead_behind: false,
+                no_ahead_behind: false,
                 paths: Vec::new(),
             })
         );

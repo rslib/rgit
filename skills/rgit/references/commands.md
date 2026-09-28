@@ -19,17 +19,17 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `unstage`: Unstage paths, some hunks of one path, or specific lines of one hunk. e.g. `rgit unstage src/lib.rs`, `rgit unstage src/lib.rs --hunk 42`
 - `stage-all`: Stage every change. e.g. `rgit stage-all`
 - `unstage-all`: Unstage everything. e.g. `rgit unstage-all`
-- `add`: Stage paths as git's `add` does: `add <paths>`, `add .`, `add -A`, `add -u`. e.g. `rgit add .`, `rgit add src/ '*.md'`, `rgit add -A`, `rgit add -u`
+- `add`: Stage paths as git's `add` does: `add <paths>`, `add .`, `add -A`, `add -u`. e.g. `rgit add .`, `rgit add src/ '*.md'`, `rgit add -A`, `rgit add -u`, `rgit add -p`, `rgit add -n .`
 - `discard`: Discard unstaged changes to paths, some hunks of one path, or specific lines. e.g. `rgit discard src/lib.rs`, `rgit discard src/lib.rs --hunk 10`
-- `restore`: Restore files in the working tree (or, with --staged, the index) from the index or a revision. e.g. `rgit restore src/lib.rs`, `rgit restore --staged src/lib.rs`, `rgit restore --source HEAD~1 src/lib.rs`
+- `restore`: Restore files in the working tree (or, with --staged, the index) from the index or a revision. e.g. `rgit restore src/lib.rs`, `rgit restore --staged src/lib.rs`, `rgit restore --source HEAD~1 src/lib.rs`, `rgit restore --ours src/lib.rs`
 - `resolve`: Resolve a conflicted path by taking ours or theirs. e.g. `rgit resolve src/lib.rs --ours`, `rgit resolve src/lib.rs --theirs`
-- `rm`: Remove tracked paths from the index and working tree. e.g. `rgit rm src/lib.rs`, `rgit rm src/lib.rs --cached`
-- `mv`: Rename/move tracked files or folders. e.g. `rgit mv src/old.rs src/new.rs`
+- `rm`: Remove tracked paths from the index and working tree. e.g. `rgit rm src/lib.rs`, `rgit rm src/lib.rs --cached`, `rgit rm -n -r src/`
+- `mv`: Rename/move tracked files or folders. e.g. `rgit mv src/old.rs src/new.rs`, `rgit mv -n src/old.rs src/new.rs`
 - `clean`: Remove untracked files and directories. e.g. `rgit clean`, `rgit clean --dry-run`
 
 ## Commit and rewrite history
 
-- `commit`: Commit the staged changes (runs hooks), or only the given paths. e.g. `rgit commit -m "<message>"`, `rgit commit -a -m "<message>"`, `rgit commit src/lib.rs -m "<message>"`, `rgit commit -m "<subject>" -m "<body>"`, `rgit commit --amend --no-edit`, `rgit commit --fixup <rev>`
+- `commit`: Commit the staged changes (runs hooks), or only the given paths. e.g. `rgit commit -m "<message>"`, `rgit commit -a -m "<message>"`, `rgit commit src/lib.rs -m "<message>"`, `rgit commit -m "<subject>" -m "<body>"`, `rgit commit --amend --no-edit`, `rgit commit --fixup <rev>`, `rgit commit -C <rev> --reset-author`
 - `extend`: Amend HEAD with the staged changes, keeping its message (no editor). e.g. `rgit extend`
 - `reword`: Change any commit's message and restack its descendants (default HEAD). e.g. `rgit reword -m "<message>"`, `rgit reword -m "<message>" <rev>`
 - `uncommit`: Undo the last commit(s), keeping the changes staged (default 1). e.g. `rgit uncommit`, `rgit uncommit 2`
@@ -37,9 +37,9 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `move`: Move a commit before or after another in the current branch's history. e.g. `rgit move <rev> --before <rev>`, `rgit move <rev> --after <rev>`
 - `split`: Split a commit into two by path (given paths first, the rest second). e.g. `rgit split src/lib.rs src/main.rs`, `rgit split --rev <rev> src/lib.rs`
 - `absorb`: Fold each pending change into the stacked commit that last touched those lines (blame-routed fixups + autosquash). e.g. `rgit absorb`
-- `cherry-pick`: Cherry-pick commits onto HEAD, or continue/skip/abort a stopped one. e.g. `rgit cherry-pick <rev>`, `rgit cherry-pick <rev> --no-commit`, `rgit cherry-pick <a> <b>`, `rgit cherry-pick main~3..main -x`, `rgit cherry-pick <merge> -m 1`, `rgit cherry-pick --continue`, `rgit cherry-pick --abort`
-- `revert`: Revert commits on HEAD, or continue/skip/abort a stopped revert. e.g. `rgit revert <rev>`, `rgit revert <rev> --no-commit`, `rgit revert HEAD~2..HEAD`, `rgit revert <merge> -m 1`, `rgit revert --continue`
-- `reset`: Reset HEAD to a revision (default mixed). e.g. `rgit reset HEAD~1`, `rgit reset --hard <rev>`, `rgit reset src/lib.rs`, `rgit reset <rev> -- src/lib.rs`
+- `cherry-pick`: Cherry-pick commits onto HEAD, or continue/skip/abort a stopped one. e.g. `rgit cherry-pick <rev>`, `rgit cherry-pick <rev> --no-commit`, `rgit cherry-pick <a> <b>`, `rgit cherry-pick main~3..main -x`, `rgit cherry-pick <merge> -m 1`, `rgit cherry-pick <rev> -s --empty=drop`, `rgit cherry-pick --continue`, `rgit cherry-pick --abort`, `rgit cherry-pick --quit`
+- `revert`: Revert commits on HEAD, or continue/skip/abort a stopped revert. e.g. `rgit revert <rev>`, `rgit revert <rev> --no-commit`, `rgit revert HEAD~2..HEAD`, `rgit revert <merge> -m 1`, `rgit revert <rev> --reference`, `rgit revert --continue`
+- `reset`: Reset HEAD to a revision (default mixed). e.g. `rgit reset HEAD~1`, `rgit reset --hard <rev>`, `rgit reset src/lib.rs`, `rgit reset <rev> -- src/lib.rs`, `rgit reset --merge`
 
 ## Undo
 
@@ -55,10 +55,10 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `branch delete`: Delete branches (multiselect prompt if no name on a terminal). e.g. `rgit branch delete <branch> <branch>`, `rgit branch delete <branch> --force`
   - `branch rename`: Rename a branch. e.g. `rgit branch rename <old> <new>`
   - `branch prune`: Delete every local branch already merged into a base (default HEAD). e.g. `rgit branch prune`, `rgit branch prune main`
-- `checkout`: Check out a branch or, for any other revision, a detached HEAD; or restore paths from a revision or the index. e.g. `rgit checkout main`, `rgit checkout -b <new_branch>`, `rgit checkout -`, `rgit checkout <rev> -- src/lib.rs`
-- `switch`: Switch branches: `switch <branch>`, `-c <new> [<start>]`, `--detach <rev>`, or `-` for the previous branch. e.g. `rgit switch main`, `rgit switch -c <new_branch>`, `rgit switch -`, `rgit switch --detach <rev>`
-- `merge`: Merge revisions into the current branch (several make an octopus merge). e.g. `rgit merge <branch>`, `rgit merge <branch> --no-ff`, `rgit merge <branch> --squash`, `rgit merge <branch> -m "<message>"`, `rgit merge <a> <b>`, `rgit merge --continue`, `rgit merge --abort`
-- `rebase`: Rebase onto a revision, or continue/skip/abort an in-progress rebase. e.g. `rgit rebase main`, `rgit rebase --onto <newbase> <upstream>`, `rgit rebase --autosquash main`, `rgit rebase --exec "cargo test" main`, `rgit rebase --root`, `rgit rebase --continue`
+- `checkout`: Check out a branch or, for any other revision, a detached HEAD; or restore paths from a revision or the index. e.g. `rgit checkout main`, `rgit checkout -b <new_branch>`, `rgit checkout -`, `rgit checkout <rev> -- src/lib.rs`, `rgit checkout -f <branch>`, `rgit checkout --theirs -- src/lib.rs`
+- `switch`: Switch branches: `switch <branch>`, `-c <new> [<start>]`, `--detach <rev>`, or `-` for the previous branch. e.g. `rgit switch main`, `rgit switch -c <new_branch>`, `rgit switch -`, `rgit switch --detach <rev>`, `rgit switch -m <branch>`, `rgit switch --orphan <new_branch>`
+- `merge`: Merge revisions into the current branch (several make an octopus merge). e.g. `rgit merge <branch>`, `rgit merge <branch> --no-ff`, `rgit merge <branch> --squash`, `rgit merge <branch> -m "<message>"`, `rgit merge <a> <b>`, `rgit merge <branch> -s ours`, `rgit merge <branch> --log --no-stat`, `rgit merge <branch> --allow-unrelated-histories`, `rgit merge --continue`, `rgit merge --abort`
+- `rebase`: Rebase onto a revision, or continue/skip/abort an in-progress rebase. e.g. `rgit rebase main`, `rgit rebase --onto <newbase> <upstream>`, `rgit rebase --autosquash main`, `rgit rebase --exec "cargo test" main`, `rgit rebase --root`, `rgit rebase -r --committer-date-is-author-date main`, `rgit rebase --continue`, `rgit rebase --show-current-patch`
 - `tag`: Tag management: `tag` lists, `tag <name> [<rev>]` creates, `tag -d <name>...` deletes, `tag -l <pattern>...` lists matching tags. e.g. `rgit tag`, `rgit tag v1.0.0 -m "<message>"`, `rgit tag v1.0.0 <rev>`, `rgit tag -l "v1.*" -n`, `rgit tag --contains <rev>`, `rgit tag -d v1.0.0 v1.0.1`
 - `stash`: Stash management (no subcommand stashes the working tree, taking `stash push`'s flags). e.g. `rgit stash`, `rgit stash -u`, `rgit stash push -m "<message>"`
   - `stash push`: Stash the working tree, or only some paths, with an optional message. e.g. `rgit stash push -m "<message>" --include-untracked`, `rgit stash push -- src/lib.rs`
@@ -69,7 +69,19 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `stash show`: Show the changes a stash records, as a diffstat (-p for the patch). e.g. `rgit stash show`, `rgit stash show -p stash@{1}`
   - `stash branch`: Create and check out a branch at the stash's base commit, apply the stash there and drop it. e.g. `rgit stash branch <branch>`
   - `stash clear`: Drop every stash. e.g. `rgit stash clear`
-- `bisect`: Run a git bisect subcommand: `start <bad> <good>`, `good`, `bad`, `reset`. e.g. `rgit bisect start HEAD main`, `rgit bisect good`, `rgit bisect bad`
+- `bisect`: Find the commit that introduced a change by binary search: `start <bad> <good>`, then mark each step `good`/`bad` (or `run <cmd>`), then `reset`. e.g. `rgit bisect start HEAD main`, `rgit bisect good`, `rgit bisect bad`, `rgit bisect run cargo test`, `rgit bisect reset`
+  - `bisect start`: Start a bisect, optionally with the bad commit and good ones. e.g. `rgit bisect start`, `rgit bisect start <bad> <good>`, `rgit bisect start <bad> <good> -- src/`, `rgit bisect start --term-new fixed --term-old broken`
+  - `bisect bad`: Mark commits (HEAD by default) as bad: the change is there. e.g. `rgit bisect bad`, `rgit bisect bad <rev>`
+  - `bisect good`: Mark commits (HEAD by default) as good: the change is not there yet. e.g. `rgit bisect good`, `rgit bisect good <a> <b>`
+  - `bisect new`: Mark commits as new (with `--term-new`/`--term-old` terms). e.g. `rgit bisect new`
+  - `bisect old`: Mark commits as old (with `--term-new`/`--term-old` terms). e.g. `rgit bisect old`
+  - `bisect skip`: Skip commits (HEAD by default) or ranges `A..B` that cannot be tested. e.g. `rgit bisect skip`, `rgit bisect skip <a>..<b>`
+  - `bisect reset`: End the bisect and check out where it started (or `commit`). e.g. `rgit bisect reset`, `rgit bisect reset <rev>`
+  - `bisect log`: Print the bisect log, to save for `replay`. e.g. `rgit bisect log > bisect.log`
+  - `bisect replay`: Redo the bisect a saved log records. e.g. `rgit bisect replay bisect.log`
+  - `bisect run`: Mark each step by running a command: exit 0 good, 125 skip, other bad. e.g. `rgit bisect run cargo test`, `rgit bisect run ./check.sh --quick`
+  - `bisect visualize`: List the commits still in the search. e.g. `rgit bisect visualize`, `rgit bisect view`
+  - `bisect terms`: Print the terms for the old and new states. e.g. `rgit bisect terms`, `rgit bisect terms --term-good`
 - `prune`: Prune unreachable objects (git's `prune`). For deleting merged branches, use `branch prune`. e.g. `rgit prune`, `rgit prune --dry-run`
 
 ## Stacks, lanes, workspaces, worktrees

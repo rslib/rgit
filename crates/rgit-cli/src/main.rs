@@ -217,8 +217,18 @@ fn main() -> ! {
             z,
             untracked,
             ignored,
+            verbose,
+            ahead_behind,
+            no_ahead_behind,
             paths,
-        }) if porcelain.is_some() || short || branch || z => {
+        }) if porcelain.is_some()
+            || short
+            || branch
+            || z
+            || verbose > 0
+            || ahead_behind
+            || no_ahead_behind =>
+        {
             if let Err(error) = discover_or_init(false) {
                 die(error, &emit);
             }
@@ -229,6 +239,9 @@ fn main() -> ! {
             args.extend(z.then(|| "-z".to_owned()));
             args.extend(untracked.map(|m| format!("--untracked-files={m}")));
             args.extend(ignored.then(|| "--ignored".to_owned()));
+            args.extend((0..verbose).map(|_| "-v".to_owned()));
+            args.extend(ahead_behind.then(|| "--ahead-behind".to_owned()));
+            args.extend(no_ahead_behind.then(|| "--no-ahead-behind".to_owned()));
             args.push("--".to_owned());
             args.extend(paths);
             // Run in the current folder so paths read and print as git's do.
@@ -249,7 +262,7 @@ fn main() -> ! {
                 format,
                 prefix,
                 ..
-            } = cli::from_cwd(command, backend.workdir())
+            } = cli::from_cwd(command, &backend)
             else {
                 unreachable!()
             };
@@ -309,12 +322,14 @@ fn main() -> ! {
                 Ok(backend) => backend,
                 Err(error) => die(error, &emit),
             };
-            let command = cli::from_cwd(command, backend.workdir());
+            let command = cli::from_cwd(command, &backend);
+            let since = backend.index_second();
             let result = if structured_output {
                 axi::run(&backend, command, can_prompt)
             } else {
                 cli::run(&backend, command, can_prompt).map(Output::from)
             };
+            let _ = backend.smudge_racy(since);
             finish(result, &emit)
         }
         None if structured_output => finish(Ok(home()), &emit),

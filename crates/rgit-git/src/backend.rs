@@ -13,6 +13,18 @@ pub trait GitBackend: Send + Sync {
     /// per-file diffs, and recent commits.
     fn status(&self) -> Result<RepoStatus, GitError>;
 
+    /// The second of the index file's last write: git's racy-clean mark.
+    fn index_second(&self) -> Option<i64> {
+        None
+    }
+
+    /// After a write that started when the index was last written at `since`,
+    /// mark entries staged in or after that second whose file changed since
+    /// (size 0), as git does, so git re-reads them rather than trusting stat.
+    fn smudge_racy(&self, _since: Option<i64>) -> Result<(), GitError> {
+        Ok(())
+    }
+
     /// Ignored files and folders in the working tree (`git status --ignored`).
     fn ignored(&self) -> Result<Vec<StatusEntry>, GitError>;
 
@@ -141,6 +153,10 @@ pub trait GitBackend: Send + Sync {
 
     /// The full message of the HEAD commit, to prefill an amend editor.
     fn head_message(&self) -> Option<String>;
+
+    /// The message a stopped merge, squash, cherry-pick or revert prepared
+    /// (SQUASH_MSG or MERGE_MSG, without comment lines), for a plain `commit`.
+    fn prepared_message(&self) -> Option<String>;
 
     /// The staged changes as a unified patch, e.g. to summarize for a message.
     fn staged_patch(&self) -> Result<String, GitError>;
@@ -392,6 +408,19 @@ pub trait GitBackend: Send + Sync {
     /// Check out a revision (tag or remote branch) as a detached HEAD.
     fn checkout_detached(&self, rev: &str) -> Result<(), GitError>;
 
+    /// Check out the local branch `rev` (`branch`) or the revision `rev` as a
+    /// detached HEAD, treating local changes as `mode` says.
+    fn checkout_with(
+        &self,
+        rev: &str,
+        branch: bool,
+        mode: crate::CheckoutMode,
+    ) -> Result<(), GitError>;
+
+    /// Start the unborn branch `name` (git's `--orphan`), with the index and
+    /// working tree of `start`, or empty when `None`.
+    fn checkout_orphan(&self, name: &str, start: Option<&str>) -> Result<(), GitError>;
+
     /// Rebase the current branch onto `rev` in-process; aborts on conflict.
     /// `report` receives git-style progress lines (`Applying: ...`).
     fn rebase_onto(&self, rev: &str, report: &dyn Fn(crate::OpProgress)) -> Result<(), GitError>;
@@ -433,15 +462,24 @@ pub trait GitBackend: Send + Sync {
     /// Skip the current commit of an in-progress rebase. Shells out to `git`.
     fn rebase_skip(&self) -> Result<(), GitError>;
 
+    /// Stop an in-progress rebase, leaving HEAD, the index and the working tree
+    /// where they are (git's `--quit`). Shells out to `git`.
+    fn rebase_quit(&self) -> Result<(), GitError>;
+
+    /// Edit the todo list of an in-progress interactive rebase in the editor on
+    /// the terminal (git's `--edit-todo`). Shells out to `git`.
+    fn rebase_edit_todo(&self) -> Result<(), GitError>;
+
     /// Rebase onto `upstream` (the branch's upstream when `None`) with options
     /// libgit2's rebase lacks (`-i`, `--root`, `--autosquash`, `--exec`,
     /// `--update-refs`, `-X`), run through git's sequencer. `-i` inherits the
     /// terminal for the todo editor. A conflict leaves the rebase in progress.
+    /// Returns what git printed on stdout (the `-v` diffstat).
     fn rebase_with(
         &self,
         upstream: Option<&str>,
         opts: &crate::RebaseOptions,
-    ) -> Result<(), GitError>;
+    ) -> Result<String, GitError>;
 
     /// Undo the last destructive operation, restoring HEAD, its branch, and the
     /// working tree from the operation log (recovers uncommitted work too).
@@ -581,15 +619,36 @@ pub trait GitBackend: Send + Sync {
     /// Returns git's output.
     fn clean(&self, dry_run: bool, args: &[String]) -> Result<String, GitError>;
 
-    /// Remove tracked paths matching `path` (a file, folder or glob) from the
-    /// index (`git rm`). With `cached` (git's `--cached`), leave the working-tree
-    /// files in place; otherwise delete them too. A folder needs `recursive`.
-    fn remove_path(&self, path: &str, cached: bool, recursive: bool) -> Result<(), GitError>;
+    /// Remove tracked paths matching `paths` (files, folders or globs) from the
+    /// index (`git rm`), and from the working tree unless `opts.cached`. A
+    /// folder needs `recursive`. Without `force`, refuse like git when a file
+    /// has staged or unstaged changes. Nothing is removed when any path fails.
+    /// Returns the removed paths.
+    fn remove_paths(
+        &self,
+        paths: &[String],
+        opts: crate::RmOptions,
+    ) -> Result<Vec<String>, GitError>;
 
     /// Rename a tracked file or folder (`git mv`). An existing folder as `to`
     /// receives `from` inside it. Without `force`, refuse to overwrite an
     /// existing destination (git's default); `force` (git's `-f`) overwrites it.
-    fn move_path(&self, from: &str, to: &str, force: bool) -> Result<(), GitError>;
+    /// `dry_run` only checks. Returns the destination path.
+    fn move_path(
+        &self,
+        from: &str,
+        to: &str,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<String, GitError>;
+
+    /// Mark untracked files under `paths` as intended to be added (git's
+    /// `add -N`): an empty index entry, so diff and status show them.
+    fn intent_to_add(&self, paths: &[String]) -> Result<Vec<String>, GitError>;
+
+    /// Write our (`ours`) or their side of the conflicted paths under `paths`
+    /// to the working tree, keeping the conflict (checkout's `--ours`/`--theirs`).
+    fn checkout_side(&self, paths: &[String], ours: bool) -> Result<(), GitError>;
 
     /// Describe a revision relative to the nearest tag (`git describe`).
     /// Describe `rev` relative to the nearest tag. `tags` also considers
@@ -655,7 +714,13 @@ pub trait GitBackend: Send + Sync {
     fn pick_skip(&self) -> Result<(), GitError>;
 
     /// Cancel a stopped cherry-pick or revert, restoring the HEAD it started from.
-    fn pick_abort(&self) -> Result<(), GitError>;
+    /// When HEAD has moved since the stop, only the sequencer state is dropped
+    /// and git's warning is returned; otherwise the result is empty.
+    fn pick_abort(&self) -> Result<String, GitError>;
+
+    /// Forget a stopped cherry-pick or revert, leaving HEAD, the index and the
+    /// working tree as they are (git's `--quit`).
+    fn pick_quit(&self) -> Result<(), GitError>;
 
     /// Merge `rev` into the current branch. Fast-forwards when possible unless
     /// `no_ff` forces a merge commit. `report` receives git-style progress lines
@@ -691,6 +756,10 @@ pub trait GitBackend: Send + Sync {
     /// Abort an in-progress merge, restoring the working tree and index to HEAD
     /// (git's `merge --abort`).
     fn merge_abort(&self) -> Result<(), GitError>;
+
+    /// Forget an in-progress merge, leaving the index and working tree as they
+    /// are (git's `merge --quit`).
+    fn merge_quit(&self) -> Result<(), GitError>;
 
     /// Resolve a conflicted path by taking our side (`ours`) or theirs, writing
     /// that version to the worktree and staging it.

@@ -407,3 +407,264 @@ fn rebase_exec_conflict_stops_for_continue() {
     ok(&dir, &["rebase", "--continue"]);
     assert_eq!(git(&dir, &["log", "--format=%s", "-3"]), "s2\ns1\nm1\n");
 }
+
+/// main: f (8 lines); side: s1 changes the last line, s2 adds g.
+fn lines(dir: &Path) {
+    commit(dir, "f", "1\n2\n3\n4\n5\n6\n7\n8\n", "base");
+    git(dir, &["checkout", "-qb", "side"]);
+    commit(dir, "f", "1\n2\n3\n4\n5\n6\n7\nX\n", "s1");
+    commit(dir, "g", "g\n", "s2");
+    git(dir, &["checkout", "-q", "main"]);
+}
+
+#[test]
+fn cherry_pick_no_commit_merges_into_staged_changes() {
+    let (a, b) = twins("n-staged", lines);
+    for d in [&a, &b] {
+        std::fs::write(d.join("f"), "Y\n2\n3\n4\n5\n6\n7\n8\n").unwrap();
+        git(d, &["add", "f"]);
+    }
+    git(&a, &["cherry-pick", "-n", "side~1"]);
+    ok(&b, &["cherry-pick", "-n", "side~1"]);
+    assert_eq!(result(&a, 1), result(&b, 1));
+    assert_eq!(
+        std::fs::read_to_string(b.join("f")).unwrap(),
+        "Y\n2\n3\n4\n5\n6\n7\nX\n"
+    );
+    assert_eq!(git(&b, &["status", "--short"]), "M  f\n");
+}
+
+#[test]
+fn cherry_pick_signoff_and_revert_reference_match_git() {
+    let (a, b) = twins("signoff", side_branch);
+    git(&a, &["cherry-pick", "-x", "-s", "side"]);
+    ok(&b, &["cherry-pick", "-x", "-s", "side"]);
+    assert_eq!(result(&a, 1), result(&b, 1));
+    assert!(result(&b, 1).contains("Signed-off-by: t <t@t>"));
+    git(&a, &["revert", "--no-edit", "--reference", "side"]);
+    ok(&b, &["revert", "--reference", "side"]);
+    assert_eq!(result(&a, 1), result(&b, 1));
+}
+
+#[test]
+fn cherry_pick_empty_commits_match_git() {
+    let (a, b) = twins("empty", side_branch);
+    for d in [&a, &b] {
+        git(d, &["cherry-pick", "side"]);
+        git(d, &["commit", "-q", "--allow-empty", "-m", "nothing"]);
+        git(d, &["branch", "hollow"]);
+        git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+    }
+    // s3 is already applied: stop by default, drop or keep on request.
+    fails(&b, &["cherry-pick", "side"]);
+    ok(&b, &["cherry-pick", "--abort"]);
+    let start = head(&b);
+    ok(&b, &["cherry-pick", "--empty=drop", "side"]);
+    assert_eq!(head(&b), start);
+    git(&a, &["cherry-pick", "--empty=keep", "side"]);
+    ok(&b, &["cherry-pick", "--empty=keep", "side"]);
+    assert_eq!(result(&a, 1), result(&b, 1));
+    // An empty commit needs --allow-empty.
+    fails(&b, &["cherry-pick", "hollow"]);
+    ok(&b, &["cherry-pick", "--quit"]);
+    assert!(!state_file(&b, "CHERRY_PICK_HEAD"));
+    git(&a, &["cherry-pick", "--allow-empty", "hollow"]);
+    ok(&b, &["cherry-pick", "--allow-empty", "hollow"]);
+    assert_eq!(result(&a, 2), result(&b, 2));
+}
+
+#[test]
+fn cherry_pick_ff_moves_head_to_the_commit() {
+    let dir = repo("ff");
+    side_branch(&dir);
+    git(&dir, &["checkout", "-q", "--detach", "side~2"]);
+    ok(&dir, &["cherry-pick", "--ff", "side~1", "side"]);
+    assert_eq!(head(&dir), git(&dir, &["rev-parse", "side"]).trim());
+}
+
+#[test]
+fn cherry_pick_abort_keeps_a_moved_head() {
+    let dir = repo("abort-moved");
+    conflicting(&dir);
+    fails(&dir, &["cherry-pick", "side~2..side"]);
+    std::fs::write(dir.join("f"), "resolved\n").unwrap();
+    git(&dir, &["add", "f"]);
+    git(&dir, &["commit", "-qm", "by hand"]);
+    let moved = head(&dir);
+    let out = ok(&dir, &["cherry-pick", "--abort"]);
+    assert!(out.contains("moved HEAD"), "{out}");
+    assert_eq!(head(&dir), moved);
+    assert!(!state_file(&dir, "sequencer"));
+}
+
+#[test]
+fn merge_messages_and_ours_strategy_match_git() {
+    let (a, b) = twins("merge-msg", diverged);
+    git(&a, &["merge", "--no-edit", "--log", "feat"]);
+    let out = ok(&b, &["--human", "merge", "--log", "feat"]);
+    assert!(out.contains("2 files changed"), "{out}");
+    assert_eq!(result(&a, 1), result(&b, 1));
+
+    for d in [&a, &b] {
+        git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+        git(d, &["checkout", "-qb", "other"]);
+    }
+    git(&a, &["merge", "--no-edit", "-s", "ours", "feat"]);
+    let out = ok(&b, &["--human", "merge", "-s", "ours", "-n", "feat"]);
+    assert!(!out.contains("changed"), "{out}");
+    assert_eq!(result(&a, 1), result(&b, 1));
+}
+
+/// `diverged`, plus `lone`: a root commit of its own.
+fn unrelated(dir: &Path) {
+    diverged(dir);
+    git(dir, &["checkout", "-q", "--orphan", "lone"]);
+    git(dir, &["rm", "-qrf", "."]);
+    commit(dir, "z", "z\n", "lone");
+    git(dir, &["checkout", "-q", "main"]);
+}
+
+#[test]
+fn merge_unrelated_histories_needs_the_flag() {
+    let (a, b) = twins("unrelated", unrelated);
+    let out = fails(&b, &["merge", "lone"]);
+    assert!(out.contains("unrelated histories"), "{out}");
+    git(
+        &a,
+        &["merge", "--no-edit", "--allow-unrelated-histories", "lone"],
+    );
+    ok(&b, &["merge", "--allow-unrelated-histories", "lone"]);
+    assert_eq!(result(&a, 1), result(&b, 1));
+}
+
+#[test]
+fn merge_squash_message_feeds_the_next_commit() {
+    let (a, b) = twins("squash-msg", diverged);
+    git(&a, &["merge", "--squash", "feat"]);
+    ok(&b, &["merge", "--squash", "feat"]);
+    assert_eq!(
+        std::fs::read_to_string(a.join(".git/SQUASH_MSG")).unwrap(),
+        std::fs::read_to_string(b.join(".git/SQUASH_MSG")).unwrap()
+    );
+    git(&a, &["commit", "-q", "--no-edit"]);
+    ok(&b, &["commit"]);
+    assert_eq!(result(&a, 1), result(&b, 1));
+    assert!(!state_file(&b, "SQUASH_MSG"));
+}
+
+#[test]
+fn merge_quit_keeps_the_conflicted_files() {
+    let dir = repo("merge-quit");
+    conflicting(&dir);
+    fails(&dir, &["merge", "side"]);
+    ok(&dir, &["merge", "--quit"]);
+    assert!(!state_file(&dir, "MERGE_HEAD"));
+    assert!(
+        std::fs::read_to_string(dir.join("f"))
+            .unwrap()
+            .contains("<<<<<<<")
+    );
+}
+
+#[test]
+fn rebase_stop_is_reported_cleanly_with_progress_in_status() {
+    let dir = repo("rebase-clean");
+    conflicting(&dir);
+    git(&dir, &["checkout", "-q", "side"]);
+    let out = fails(&dir, &["--human", "rebase", "main"]);
+    assert!(
+        !out.contains('\r') && !out.contains("Rebasing ("),
+        "{out:?}"
+    );
+    assert!(
+        out.lines()
+            .any(|l| l.contains("CONFLICT (content): Merge conflict in f")),
+        "{out}"
+    );
+    let status = ok(&dir, &["--human", "status"]);
+    for line in [
+        "Last command done (1 command done):",
+        "Next command to do (1 remaining command):",
+        "You are currently rebasing branch 'side'",
+    ] {
+        assert!(status.contains(line), "{status}");
+    }
+    let toon = ok(&dir, &["--toon", "status"]);
+    assert!(
+        toon.contains("step: 1/2") && toon.contains("remaining: 1"),
+        "{toon}"
+    );
+    let patch = ok(&dir, &["--human", "rebase", "--show-current-patch"]);
+    assert!(patch.contains("s1"), "{patch}");
+    ok(&dir, &["rebase", "--quit"]);
+    assert!(!dir.join(".git/rebase-merge").exists());
+    assert_ne!(head(&dir), git(&dir, &["rev-parse", "side"]).trim());
+}
+
+#[test]
+fn rebase_date_and_force_flags_match_git() {
+    let (a, b) = twins("rebase-flags", diverged);
+    for d in [&a, &b] {
+        git(d, &["checkout", "-q", "feat"]);
+    }
+    git(
+        &a,
+        &["rebase", "-f", "--committer-date-is-author-date", "main"],
+    );
+    ok(
+        &b,
+        &["rebase", "-f", "--committer-date-is-author-date", "main"],
+    );
+    assert_eq!(head(&a), head(&b));
+}
+
+/// main: n1..n6, each writing its number to n.
+fn numbers(dir: &Path) {
+    for i in 1..=6 {
+        commit(dir, "n", &format!("{i}\n"), &format!("n{i}"));
+    }
+}
+
+#[test]
+fn bisect_steps_to_the_first_bad_commit() {
+    let dir = repo("bisect");
+    numbers(&dir);
+    let out = ok(&dir, &["--toon", "bisect", "start", "HEAD", "HEAD~5"]);
+    assert!(
+        out.contains("remaining:") && out.contains("current:"),
+        "{out}"
+    );
+    let left = ok(&dir, &["--toon", "bisect", "visualize"]);
+    assert!(left.contains("remaining: 5"), "{left}");
+    let out = ok(
+        &dir,
+        &["--toon", "bisect", "run", "sh", "-c", "test $(cat n) -lt 4"],
+    );
+    let n4 = git(&dir, &["rev-parse", "--short=7", "main~2"]);
+    assert!(out.contains(&format!("first_bad: {}", n4.trim())), "{out}");
+    let log = ok(&dir, &["--human", "bisect", "log"]);
+    assert!(log.contains("# first bad commit"), "{log}");
+    std::fs::write(dir.join(".git/saved-log"), log).unwrap();
+    ok(&dir, &["bisect", "reset"]);
+    assert_eq!(
+        git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "main"
+    );
+    ok(&dir, &["bisect", "replay", ".git/saved-log"]);
+    assert!(state_file(&dir, "BISECT_LOG"));
+    let out = fails(&dir, &["bisect", "fixed"]);
+    assert!(out.contains("unknown bisect subcommand"), "{out}");
+    ok(&dir, &["bisect", "reset"]);
+}
+
+#[test]
+fn merge_during_bisect_keeps_the_bisect_log() {
+    let dir = repo("bisect-log");
+    side_branch(&dir);
+    git(&dir, &["checkout", "-qb", "other"]);
+    commit(&dir, "o", "o\n", "o");
+    git(&dir, &["checkout", "-q", "main"]);
+    git(&dir, &["bisect", "start", "side", "main"]);
+    ok(&dir, &["merge", "other"]);
+    assert!(state_file(&dir, "BISECT_LOG"));
+}

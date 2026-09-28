@@ -36,12 +36,13 @@ pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 pub use error::GitError;
 pub use git_repo::{Git2Backend, clone, config_value, init, pathspec_matches};
 pub use model::{
-    BlameLine, Blob, CloneArgs, Commit, CommitDetails, CommitFile, CommitOptions, CommitOverview,
-    CommitRef, ConfigScope, Deco, DiffSpec, FetchArgs, FileActivity, GrepMatch, GrepQuery, Head,
-    HunkRef, Lane, LanesState, LastCommit, LogEntry, LogOptions, MergeOptions, OpLogEntry,
-    OpProgress, PickOptions, PushArgs, RebaseOptions, RefEntry, RefKind, Remote, RepoState,
-    RepoStatus, ResetMode, RestackOutcome, SmartlogEntry, Stash, StatusCode, StatusEntry, TagInfo,
-    TreeEntry, Worktree, activity_weights, group_decorations,
+    BlameLine, Blob, CheckoutMode, CloneArgs, Commit, CommitDetails, CommitFile, CommitOptions,
+    CommitOverview, CommitRef, ConfigScope, Deco, DiffSpec, EmptyCommit, FetchArgs, FileActivity,
+    GrepMatch, GrepQuery, Head, HunkRef, Lane, LanesState, LastCommit, LogEntry, LogOptions,
+    MergeOptions, OpLogEntry, OpProgress, PickOptions, PushArgs, RebaseOptions, RebaseProgress,
+    RefEntry, RefKind, Remote, RepoState, RepoStatus, ResetMode, RestackOutcome, RmOptions,
+    SmartlogEntry, Stash, StatusCode, StatusEntry, TagInfo, TreeEntry, Worktree, activity_weights,
+    group_decorations,
 };
 pub use plumbing::{
     GitGrep, GrepHit, GrepSyntax, Ident, IgnoreRule, IndexItem, ObjectCounts, PathState, RawObject,

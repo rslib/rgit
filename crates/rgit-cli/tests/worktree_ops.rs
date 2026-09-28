@@ -74,7 +74,7 @@ fn state(dir: &Path) -> String {
         git(dir, &["status", "--short", "--branch"]),
         git(dir, &["ls-files", "--stage"]),
         git(dir, &["diff"]),
-        git(dir, &["log", "--format=%T %an <%ae>%n%B"]),
+        out_of(dir, &["log", "--format=%T %an <%ae>%n%B"]),
     ]
     .join("\n")
 }
@@ -437,4 +437,376 @@ fn reset_rev_paths_resets_the_index_from_rev() {
     assert_eq!(git(&dir, &["show", ":a"]), "1\n");
     assert_eq!(read(&dir, "a"), "2\n");
     assert_eq!(git(&dir, &["log", "--format=%s", "-1"]), "two\n");
+}
+
+fn out_of(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// `git <args>` and `rgit <args>` in two copies of the same repo print the
+/// same, succeed or fail together, and leave the same state.
+fn same_out(tag: &str, setup: impl Fn(&Path), args: &[&str]) {
+    both_ways(tag, setup, args, true);
+}
+
+/// Like [`same_out`], but rgit may word its output its own way.
+fn same_res(tag: &str, setup: impl Fn(&Path), args: &[&str]) {
+    both_ways(tag, setup, args, false);
+}
+
+fn both_ways(tag: &str, setup: impl Fn(&Path), args: &[&str], output: bool) {
+    let (g, r) = (repo(&format!("{tag}-git")), repo(&format!("{tag}-rgit")));
+    setup(&g);
+    setup(&r);
+    let gout = Command::new("git")
+        .args(args)
+        .current_dir(&g)
+        .output()
+        .unwrap();
+    let (rout, success) = rgit(&r, &[&["--human"], args].concat());
+    assert_eq!(success, gout.status.success(), "rgit {args:?}: {rout}");
+    if output {
+        assert_eq!(rout, String::from_utf8_lossy(&gout.stdout), "rgit {args:?}");
+    }
+    assert_eq!(state(&r), state(&g), "rgit {args:?}");
+}
+
+#[test]
+fn commit_reuses_messages_authors_and_dates() {
+    let by_x = |d: &Path| {
+        git(
+            d,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "--author",
+                "Xavier <x@y>",
+                "-m",
+                "by x",
+            ],
+        );
+        edit_a_b(d);
+    };
+    same(
+        "reuse",
+        by_x,
+        &["commit", "-q", "-C", "HEAD"],
+        &["commit", "-C", "HEAD"],
+    );
+    same(
+        "reedit",
+        by_x,
+        &["commit", "-q", "-c", "HEAD", "--no-edit"],
+        &["commit", "-c", "HEAD", "--no-edit"],
+    );
+    same(
+        "reset-author",
+        by_x,
+        &["commit", "-q", "-C", "HEAD", "--reset-author"],
+        &["commit", "-C", "HEAD", "--reset-author"],
+    );
+    same(
+        "author-pattern",
+        by_x,
+        &["commit", "-q", "--author=xav", "-m", "m"],
+        &["commit", "--author=xav", "-m", "m"],
+    );
+    same(
+        "include",
+        edit_a_b,
+        &["commit", "-q", "-i", "a", "-m", "m"],
+        &["commit", "-i", "a", "-m", "m"],
+    );
+    let date = |d: &Path| out_of(d, &["log", "-1", "--format=%ad", "--date=raw"]);
+    for (tag, when) in [
+        ("date-iso", "2020-01-02T03:04:05+0200"),
+        ("date-unix", "@1234567890 -0130"),
+    ] {
+        let r = same(
+            tag,
+            edit_a_b,
+            &["commit", "-q", "--date", when, "-m", "m"],
+            &["commit", "--date", when, "-m", "m"],
+        );
+        let g = r.with_file_name(format!("rgit-wtops-{}-{tag}-git", std::process::id()));
+        assert_eq!(date(&r), date(&g));
+    }
+
+    let dir = repo("commit-edit");
+    edit_a_b(&dir);
+    let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(["commit", "-e", "-m", "draft"])
+        .current_dir(&dir)
+        .env("GIT_EDITOR", "printf 'edited\\n# gone\\n' >")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(git(&dir, &["log", "-1", "--format=%B"]), "edited\n\n");
+
+    let (_, success) = rgit(&dir, &["commit", "--dry-run"]);
+    assert!(!success, "nothing staged");
+    git(&dir, &["add", "a"]);
+    ok(&dir, &["commit", "--dry-run"]);
+    assert_eq!(short(&dir), "M  a\n");
+}
+
+#[test]
+fn commit_paths_runs_pre_commit_on_the_partial_index() {
+    let hook = |d: &Path| {
+        let path = d.join(".git/hooks/pre-commit");
+        write(
+            d,
+            ".git/hooks/pre-commit",
+            "#!/bin/sh\ngit diff --cached --name-only > .git/seen\n",
+        );
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        edit_a_b(d);
+    };
+    let r = same(
+        "hook-paths",
+        hook,
+        &["commit", "-q", "a", "-m", "a"],
+        &["commit", "a", "-m", "a"],
+    );
+    let g = r.with_file_name(format!("rgit-wtops-{}-hook-paths-git", std::process::id()));
+    assert_eq!(read(&r, ".git/seen"), "a\n");
+    assert_eq!(read(&r, ".git/seen"), read(&g, ".git/seen"));
+}
+
+#[test]
+fn add_dry_run_verbose_and_intent_to_add() {
+    let mess = |d: &Path| {
+        write(d, "a", "3\n");
+        write(d, "d/new", "n\n");
+        std::fs::remove_file(d.join("b")).unwrap();
+    };
+    same_out("add-n", mess, &["add", "-n", "."]);
+    same_out("add-nu", mess, &["add", "-n", "-u"]);
+    same_out("add-v", mess, &["add", "-v", "d", "a"]);
+    same("add-N", mess, &["add", "-N", "d"], &["add", "-N", "d"]);
+}
+
+#[test]
+fn rm_keeps_git_safety_rules() {
+    let changed = |d: &Path| write(d, "a", "local\n");
+    let staged = |d: &Path| {
+        write(d, "a", "local\n");
+        git(d, &["add", "a"]);
+    };
+    let both = |d: &Path| {
+        staged(d);
+        write(d, "a", "again\n");
+    };
+    let new = |d: &Path| {
+        write(d, "n", "n\n");
+        git(d, &["add", "n"]);
+    };
+    for (tag, setup) in [
+        ("rm-changed", &changed as &dyn Fn(&Path)),
+        ("rm-staged", &staged),
+        ("rm-both", &both),
+    ] {
+        same_out(tag, setup, &["rm", "a"]);
+        same_out(&format!("{tag}-cached"), setup, &["rm", "--cached", "a"]);
+        same_out(&format!("{tag}-f"), setup, &["rm", "-f", "a"]);
+    }
+    same_out("rm-new", new, &["rm", "n"]);
+    same_out("rm-new-cached", new, &["rm", "--cached", "n"]);
+    same_out("rm-n", |_| {}, &["rm", "-n", "a", "b"]);
+    same_out("rm-q", |_| {}, &["rm", "-q", "a"]);
+    same_out("rm-r", |_| {}, &["rm", "-r", "d"]);
+    same_out(
+        "rm-unmatch",
+        |_| {},
+        &["rm", "--ignore-unmatch", "nope", "a"],
+    );
+    same_out("rm-nomatch", |_| {}, &["rm", "nope", "a"]);
+}
+
+#[test]
+fn mv_dry_run_verbose_and_skip() {
+    same_out("mv-n", |_| {}, &["mv", "-n", "a", "z"]);
+    same_out("mv-v", |_| {}, &["mv", "-v", "a", "b", "d"]);
+    same_res(
+        "mv-k",
+        |d| write(d, "u", "u\n"),
+        &["mv", "-k", "u", "a", "d"],
+    );
+}
+
+/// Adds `m`, then `feat` changes its first line, `side` and main change `a`
+/// differently, and HEAD is back on main.
+fn branches(d: &Path) {
+    write(d, "m", "1\n2\n3\n4\n5\n6\n7\n8\n9\n");
+    git(d, &["add", "m"]);
+    git(d, &["commit", "-qm", "m"]);
+    git(d, &["branch", "side"]);
+    git(d, &["branch", "feat"]);
+    write(d, "a", "main\n");
+    git(d, &["commit", "-qam", "main a"]);
+    git(d, &["switch", "-q", "feat"]);
+    write(d, "m", "one\n2\n3\n4\n5\n6\n7\n8\n9\n");
+    git(d, &["commit", "-qam", "feat m"]);
+    git(d, &["switch", "-q", "side"]);
+    write(d, "a", "side\n");
+    git(d, &["commit", "-qam", "side a"]);
+    git(d, &["switch", "-q", "main"]);
+}
+
+fn conflicted(d: &Path) {
+    branches(d);
+    let _ = out_of(d, &["merge", "side"]);
+}
+
+#[test]
+fn checkout_force_merge_orphan_and_sides() {
+    let local = |d: &Path| {
+        branches(d);
+        write(d, "a", "local\n");
+        write(d, "m", "1\n2\n3\n4\n5\n6\n7\n8\nnine\n");
+    };
+    same_res("co-f", local, &["checkout", "-q", "-f", "feat"]);
+    same_res(
+        "sw-discard",
+        local,
+        &["switch", "-q", "--discard-changes", "feat"],
+    );
+    same_res("co-f-alone", local, &["checkout", "-q", "-f"]);
+    let lines = |d: &Path| {
+        branches(d);
+        write(d, "m", "1\n2\n3\n4\n5\n6\n7\n8\nnine\n");
+    };
+    same_res("co-m", lines, &["checkout", "-q", "-m", "feat"]);
+    same_res("sw-m", lines, &["switch", "-q", "-m", "feat"]);
+    let clash = |d: &Path| {
+        branches(d);
+        write(d, "m", "uno\n2\n3\n4\n5\n6\n7\n8\n9\n");
+    };
+    let (g, r) = (repo("co-m-clash-git"), repo("co-m-clash-rgit"));
+    clash(&g);
+    clash(&r);
+    let _ = out_of(&g, &["checkout", "-q", "-m", "feat"]);
+    ok(&r, &["checkout", "-m", "feat"]);
+    assert_eq!(short(&r), short(&g));
+    assert_eq!(
+        out_of(&r, &["ls-files", "-s"]),
+        out_of(&g, &["ls-files", "-s"])
+    );
+    assert!(read(&r, "m").contains("<<<<<<< feat"), "{}", read(&r, "m"));
+
+    same_res(
+        "co-orphan",
+        |_| {},
+        &["checkout", "-q", "--orphan", "fresh"],
+    );
+    same_res(
+        "co-orphan-start",
+        |_| {},
+        &["checkout", "-q", "--orphan", "fresh", "HEAD~1"],
+    );
+    same_res("sw-orphan", |_| {}, &["switch", "-q", "--orphan", "fresh"]);
+    same_res("co-ours", conflicted, &["checkout", "--ours", "a"]);
+    same_res(
+        "co-theirs",
+        conflicted,
+        &["checkout", "--theirs", "--", "a"],
+    );
+    same_res("rs-ours", conflicted, &["restore", "--ours", "a"]);
+    same_res("rs-theirs", conflicted, &["restore", "--theirs", "a"]);
+}
+
+#[test]
+fn checkout_no_track_and_no_guess() {
+    let src = repo("notrack-src");
+    git(&src, &["branch", "other"]);
+    let dst = src.with_file_name(format!("rgit-wtops-{}-notrack-dst", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dst);
+    git(&src, &["clone", "-q", ".", dst.to_str().unwrap()]);
+    let upstream = |b: &str| out_of(&dst, &["rev-parse", "--abbrev-ref", &format!("{b}@{{u}}")]);
+    ok(
+        &dst,
+        &["checkout", "--no-track", "-b", "mine", "origin/other"],
+    );
+    assert_eq!(upstream("mine"), "");
+    let (_, success) = rgit(&dst, &["switch", "--no-guess", "other"]);
+    assert!(
+        !success,
+        "--no-guess must not create other from origin/other"
+    );
+    ok(&dst, &["switch", "--no-track", "other"]);
+    assert_eq!(upstream("other"), "");
+}
+
+#[test]
+fn reset_merge_and_quiet() {
+    same_res("reset-merge-abort", conflicted, &["reset", "--merge"]);
+    let kept = |d: &Path| {
+        conflicted(d);
+        write(d, "m", "local\n");
+    };
+    same_res("reset-merge-keeps", kept, &["reset", "--merge"]);
+    let staged = |d: &Path| {
+        write(d, "a", "3\n");
+        git(d, &["add", "a"]);
+        write(d, "d/c", "local\n");
+    };
+    same_res("reset-merge-rev", staged, &["reset", "--merge", "HEAD~1"]);
+    let risky = |d: &Path| write(d, "a", "local\n");
+    same_res("reset-merge-refuse", risky, &["reset", "--merge", "HEAD~1"]);
+    same_out("reset-q", edit_a_b, &["reset", "-q", "HEAD~1"]);
+}
+
+#[test]
+fn restore_source_removes_files_it_lacks() {
+    let new = |d: &Path| {
+        write(d, "n", "n\n");
+        git(d, &["add", "n"]);
+    };
+    same_res("rs-src-new", new, &["restore", "--source=HEAD~1", "."]);
+    same_res(
+        "rs-src-new-sw",
+        new,
+        &["restore", "--source=HEAD~1", "-SW", "."],
+    );
+    same_res(
+        "rs-overlay",
+        new,
+        &["restore", "--overlay", "--source=HEAD~1", "."],
+    );
+}
+
+#[test]
+fn deleted_paths_from_a_subfolder() {
+    let dir = repo("sub-deleted");
+    std::fs::remove_file(dir.join("d/c")).unwrap();
+    ok(&dir.join("d"), &["checkout", "c"]);
+    assert_eq!(read(&dir, "d/c"), "1\n");
+    git(&dir, &["rm", "-q", "--cached", "d/c"]);
+    std::fs::remove_file(dir.join("d/c")).unwrap();
+    ok(&dir.join("d"), &["reset", "c"]);
+    assert_eq!(short(&dir), " D d/c\n");
+}
+
+#[test]
+fn status_formats_match_git() {
+    let dir = repo("st");
+    edit_a_b(&dir);
+    write(&dir, "u", "u\n");
+    for args in [
+        &["status", "--porcelain=v2", "-b"][..],
+        &["status", "-v"],
+        &["status", "-sb", "--no-ahead-behind"],
+        &["status", "-sb", "--ahead-behind"],
+    ] {
+        assert_eq!(ok(&dir, args), git(&dir, args), "{args:?}");
+    }
 }

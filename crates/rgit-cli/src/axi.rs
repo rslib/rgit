@@ -648,6 +648,21 @@ pub fn run(
                 .help("Run `rgit undo` to undo the newest operation")
         }
         Command::Smartlog => smartlog(&backend.smartlog()?),
+        Command::Bisect { cmd } => match crate::cli::bisect(backend, cmd)? {
+            (text, Some(left)) => {
+                let rows = left
+                    .iter()
+                    .map(|e| crate::obj! { "id" => e.short_id, "summary" => e.summary })
+                    .collect();
+                Output::new(text).with("remaining", left.len()).list(
+                    "commits",
+                    rows,
+                    &["id", "summary"],
+                    "0 commits left to test",
+                )
+            }
+            (text, None) => bisect_step(text),
+        },
         Command::Stack {
             cmd: None | Some(StackCmd::List),
         } => stack(backend)?,
@@ -657,6 +672,48 @@ pub fn run(
             out
         }
     })
+}
+
+/// A bisect step from git's report: the commits left and roughly how many
+/// steps, the commit to test now, or the first bad commit once found.
+fn bisect_step(text: String) -> Output {
+    let mut out = Output::new(text.clone());
+    let mut testing = false;
+    if !text.lines().any(|l| {
+        l.starts_with("Bisecting: ") || l.contains(" is the first ") || l.starts_with("status: ")
+    }) {
+        return Output::message(text);
+    }
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Bisecting: ") {
+            let mut nums = rest
+                .split(|c: char| !c.is_ascii_digit())
+                .filter_map(|n| n.parse::<usize>().ok());
+            out = out
+                .with("remaining", nums.next().unwrap_or(0))
+                .with("steps", nums.next().unwrap_or(0));
+        } else if let Some((oid, subject)) = line.strip_prefix('[').and_then(|l| l.split_once("] "))
+        {
+            testing = true;
+            out = out.with("current", format!("{} {subject}", &oid[..oid.len().min(7)]));
+        } else if let Some((oid, _)) = line.split_once(" is the first ")
+            && oid.len() == 40
+        {
+            out = out
+                .with("first_bad", &oid[..7])
+                .help("Run `rgit show <id>` for the commit's details")
+                .help("Run `rgit bisect reset` to end the bisect");
+        } else if let Some(status) = line.strip_prefix("status: ") {
+            out = out.with("status", status);
+        }
+    }
+    if testing {
+        out = out
+            .help("Run `rgit bisect good` if this commit does not have the change")
+            .help("Run `rgit bisect bad` if it does")
+            .help("Run `rgit bisect skip` if this commit cannot be tested");
+    }
+    out
 }
 
 fn kind(k: RefKind) -> &'static str {
@@ -729,6 +786,16 @@ pub fn run_status(s: &RepoStatus) -> Output {
     }
     if let Some(state) = s.state.label() {
         out = out.with("state", state);
+    }
+    if let Some(r) = &s.rebase {
+        out = out
+            .with("onto", r.onto.as_str())
+            .with(
+                "step",
+                format!("{}/{}", r.done.len(), r.done.len() + r.todo.len()),
+            )
+            .with("current", r.done.last().map(String::as_str).unwrap_or(""))
+            .with("remaining", r.todo.len());
     }
     let staged = s.entries.iter().filter(|e| e.is_staged()).count();
     let untracked = s.entries.iter().filter(|e| e.is_untracked()).count();
@@ -1134,6 +1201,9 @@ fn done_message(c: &Command) -> Option<String> {
         }
         Command::Merge { abort: true, .. } => "merge aborted".to_owned(),
         Command::Merge { cont: true, .. } => "merge committed".to_owned(),
+        Command::Merge { quit: true, .. } => {
+            "merge forgotten; index and working tree kept".to_owned()
+        }
         Command::Merge {
             squash: true, revs, ..
         } => {
@@ -1151,6 +1221,10 @@ fn done_message(c: &Command) -> Option<String> {
         Command::Rebase { abort: true, .. } => "rebase aborted".to_owned(),
         Command::Rebase { cont: true, .. } => "rebase continued".to_owned(),
         Command::Rebase { skip: true, .. } => "skipped the current commit".to_owned(),
+        Command::Rebase { quit: true, .. } => "rebase stopped; HEAD left where it is".to_owned(),
+        Command::Rebase {
+            edit_todo: true, ..
+        } => "rebase todo list edited".to_owned(),
         Command::Rebase {
             onto: Some(onto), ..
         } => format!("rebased onto {onto}"),
@@ -1160,12 +1234,14 @@ fn done_message(c: &Command) -> Option<String> {
             soft,
             hard,
             keep,
+            merge,
             ..
         } => {
-            let mode = match (soft, hard, keep) {
-                (true, _, _) => "soft",
-                (_, true, _) => "hard",
-                (_, _, true) => "keep",
+            let mode = match (soft, hard, keep, merge) {
+                (true, ..) => "soft",
+                (_, true, ..) => "hard",
+                (_, _, true, _) => "keep",
+                (.., true) => "merge",
                 _ => "mixed",
             };
             format!("reset to {rev} ({mode})")
@@ -1174,6 +1250,9 @@ fn done_message(c: &Command) -> Option<String> {
         Command::CherryPick { cont: true, .. } => "cherry-pick continued".to_owned(),
         Command::CherryPick { skip: true, .. } | Command::Revert { skip: true, .. } => {
             "skipped the current commit".to_owned()
+        }
+        Command::CherryPick { quit: true, .. } | Command::Revert { quit: true, .. } => {
+            "sequence forgotten; HEAD, index and working tree kept".to_owned()
         }
         Command::CherryPick { revs, .. } if !revs.is_empty() => {
             format!("cherry-picked {}", revs.join(" "))

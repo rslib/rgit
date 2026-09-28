@@ -63,6 +63,16 @@ fn shorten(name: &str) -> String {
         .to_owned()
 }
 
+/// git's editor: GIT_EDITOR, core.editor, VISUAL, EDITOR, then vi.
+pub(crate) fn editor(backend: &Arc<dyn GitBackend>) -> String {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    env("GIT_EDITOR")
+        .or_else(|| backend.config_get("core.editor").ok().flatten())
+        .or_else(|| env("VISUAL"))
+        .or_else(|| env("EDITOR"))
+        .unwrap_or_else(|| "vi".to_owned())
+}
+
 pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyhow::Result<Output> {
     Ok(match command {
         Plumbing::RevParse {
@@ -790,13 +800,7 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
         Plumbing::Var { name } => {
             let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
             let config = |k: &str| backend.config_get(k).ok().flatten();
-            let editor = || {
-                env("GIT_EDITOR")
-                    .or_else(|| config("core.editor"))
-                    .or_else(|| env("VISUAL"))
-                    .or_else(|| env("EDITOR"))
-                    .unwrap_or_else(|| "vi".to_owned())
-            };
+            let editor = || editor(backend);
             let value = match name.as_str() {
                 "GIT_AUTHOR_IDENT" => backend.ident(false)?,
                 "GIT_COMMITTER_IDENT" => backend.ident(true)?,

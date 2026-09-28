@@ -8,8 +8,15 @@ pub enum GitError {
     #[error("repository at {0} has no working tree")]
     Bare(PathBuf),
 
-    #[error("hunk at line {new_start} of {path} not found")]
-    HunkNotFound { path: String, new_start: u32 },
+    #[error(
+        "no hunk at line {new_start} of {path}; hunks start at: {}",
+        list_starts(starts)
+    )]
+    HunkNotFound {
+        path: String,
+        new_start: u32,
+        starts: Vec<u32>,
+    },
 
     #[error("nothing staged to commit")]
     NothingToCommit,
@@ -43,4 +50,15 @@ pub enum GitError {
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+fn list_starts(starts: &[u32]) -> String {
+    if starts.is_empty() {
+        return "none (no changes)".to_owned();
+    }
+    starts
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }

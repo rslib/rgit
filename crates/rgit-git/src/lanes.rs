@@ -543,7 +543,7 @@ fn worktree_entry(repo: &Repository, workdir: &Path, path: &str) -> Result<Index
 }
 
 #[cfg(unix)]
-fn executable_mode(meta: &std::fs::Metadata) -> u32 {
+pub(crate) fn executable_mode(meta: &std::fs::Metadata) -> u32 {
     use std::os::unix::fs::MetadataExt;
     if meta.mode() & 0o111 != 0 {
         0o100755
@@ -553,7 +553,7 @@ fn executable_mode(meta: &std::fs::Metadata) -> u32 {
 }
 
 #[cfg(not(unix))]
-fn executable_mode(_meta: &std::fs::Metadata) -> u32 {
+pub(crate) fn executable_mode(_meta: &std::fs::Metadata) -> u32 {
     0o100644
 }
 
