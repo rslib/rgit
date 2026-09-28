@@ -1,5 +1,5 @@
 //! `log --graph`: a port of git's graph.c, so the ASCII graph matches git's
-//! byte for byte (colors left out).
+//! byte for byte, in its column colors when color is on.
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -17,7 +17,23 @@ struct Line {
     width: usize,
 }
 
+/// git's column_colors_ansi, cycled through as branches start.
+const COLORS: [&str; 12] = [
+    "31", "32", "33", "34", "35", "36", "1;31", "1;32", "1;33", "1;34", "1;35", "1;36",
+];
+
 impl Line {
+    /// `c` in column color `color` (none past the palette).
+    fn col(&mut self, c: char, color: usize) {
+        match COLORS.get(color) {
+            Some(code) => {
+                self.buf.push_str(&format!("\x1b[{code}m{c}\x1b[m"));
+                self.width += 1;
+            }
+            None => self.push(c),
+        }
+    }
+
     fn push(&mut self, c: char) {
         self.buf.push(c);
         self.width += 1;
@@ -43,6 +59,11 @@ pub struct Graph {
     prev_edges_added: i32,
     columns: Vec<String>,
     new_columns: Vec<String>,
+    /// Each column's color, alongside `columns` and `new_columns`.
+    colors: Vec<usize>,
+    new_colors: Vec<usize>,
+    default_color: usize,
+    color: bool,
     mapping: Vec<i32>,
     old_mapping: Vec<i32>,
     mapping_size: usize,
@@ -66,6 +87,10 @@ impl Graph {
             prev_edges_added: 0,
             columns: Vec::new(),
             new_columns: Vec::new(),
+            colors: Vec::new(),
+            new_colors: Vec::new(),
+            default_color: COLORS.len() - 1,
+            color: crate::render::color_on(),
             mapping: Vec::new(),
             old_mapping: Vec::new(),
             mapping_size: 0,
@@ -105,7 +130,13 @@ impl Graph {
         let i = match self.find_new_column(commit) {
             Some(i) => i,
             None => {
+                let color = match self.columns.iter().position(|c| c == commit) {
+                    Some(at) => self.colors[at],
+                    None if self.color => self.default_color,
+                    None => COLORS.len(),
+                };
                 self.new_columns.push(commit.to_owned());
+                self.new_colors.push(color);
                 self.new_columns.len() - 1
             }
         };
@@ -136,7 +167,9 @@ impl Graph {
 
     fn update_columns(&mut self) {
         std::mem::swap(&mut self.columns, &mut self.new_columns);
+        std::mem::swap(&mut self.colors, &mut self.new_colors);
         self.new_columns.clear();
+        self.new_colors.clear();
         let max_new = self.columns.len() + self.num_parents();
         if self.mapping.len() < 2 * max_new {
             self.mapping.resize(2 * max_new, -1);
@@ -166,6 +199,10 @@ impl Graph {
                 self.commit_index = i;
                 self.merge_layout = -1;
                 for p in self.parents.clone() {
+                    // A merge, or a new childless column, takes the next color.
+                    if self.num_parents() > 1 || i == num_columns {
+                        self.default_color = (self.default_color + 1) % COLORS.len();
+                    }
                     self.insert_into_new_columns(&p, i as i32);
                 }
                 if self.num_parents() == 0 {
@@ -204,8 +241,8 @@ impl Graph {
     }
 
     fn padding(&mut self, line: &mut Line) {
-        for _ in 0..self.new_columns.len() {
-            line.push('|');
+        for i in 0..self.new_columns.len() {
+            line.col('|', self.new_colors[i]);
             line.push(' ');
         }
     }
@@ -223,20 +260,21 @@ impl Graph {
     fn pre_commit(&mut self, line: &mut Line) {
         let mut seen_this = false;
         for i in 0..self.columns.len() {
+            let color = self.colors[i];
             if self.columns[i] == self.commit {
                 seen_this = true;
-                line.push('|');
+                line.col('|', color);
                 line.push_n(' ', self.expansion_row);
             } else if seen_this && self.expansion_row == 0 {
                 if self.prev_state == State::PostMerge && self.prev_commit_index < i {
-                    line.push('\\');
+                    line.col('\\', color);
                 } else {
-                    line.push('|');
+                    line.col('|', color);
                 }
             } else if seen_this {
-                line.push('\\');
+                line.col('\\', color);
             } else {
-                line.push('|');
+                line.col('|', color);
             }
             line.push(' ');
         }
@@ -249,8 +287,14 @@ impl Graph {
     fn octopus(&self, line: &mut Line) {
         let dashed = self.num_dashed_parents();
         for i in 0..dashed {
-            line.push('-');
-            line.push(if i == dashed - 1 { '.' } else { '-' });
+            let j = self.mapping[(self.commit_index + i as usize + 2) * 2];
+            let color = self
+                .new_colors
+                .get(j as usize)
+                .copied()
+                .unwrap_or(COLORS.len());
+            line.col('-', color);
+            line.col(if i == dashed - 1 { '.' } else { '-' }, color);
         }
     }
 
@@ -266,6 +310,7 @@ impl Graph {
             } else {
                 self.columns[i] == self.commit
             };
+            let color = self.colors.get(i).copied().unwrap_or(COLORS.len());
             if is_commit {
                 seen_this = true;
                 line.push('*');
@@ -273,23 +318,23 @@ impl Graph {
                     self.octopus(line);
                 }
             } else if seen_this && self.edges_added > 1 {
-                line.push('\\');
+                line.col('\\', color);
             } else if seen_this && self.edges_added == 1 {
                 if self.prev_state == State::PostMerge
                     && self.prev_edges_added > 0
                     && self.prev_commit_index < i
                 {
-                    line.push('\\');
+                    line.col('\\', color);
                 } else {
-                    line.push('|');
+                    line.col('|', color);
                 }
             } else if self.prev_state == State::Collapsing
                 && self.old_mapping.get(2 * i + 1) == Some(&(i as i32))
                 && self.mapping.get(2 * i).is_some_and(|&m| m < i as i32)
             {
-                line.push('/');
+                line.col('/', color);
             } else {
-                line.push('|');
+                line.col('|', color);
             }
             line.push(' ');
         }
@@ -306,7 +351,7 @@ impl Graph {
     fn post_merge(&mut self, line: &mut Line) {
         let mut seen_this = false;
         let first_parent = self.parents.first().cloned();
-        let mut parent_col = false;
+        let mut parent_col: Option<usize> = None;
         let num_columns = self.columns.len();
         for i in 0..=num_columns {
             let col_commit = if i == num_columns {
@@ -317,11 +362,15 @@ impl Graph {
             } else {
                 self.columns[i].clone()
             };
+            let color = self.colors.get(i).copied().unwrap_or(COLORS.len());
             if col_commit == self.commit {
                 seen_this = true;
                 let mut idx = self.merge_layout as usize;
                 for j in 0..self.num_parents() {
-                    line.push(MERGE_CHARS[idx]);
+                    let par = self
+                        .find_new_column(&self.parents[j])
+                        .map_or(COLORS.len(), |c| self.new_colors[c]);
+                    line.col(MERGE_CHARS[idx], par);
                     if idx == 2 {
                         if self.edges_added > 0 || j + 1 < self.num_parents() {
                             line.push(' ');
@@ -334,16 +383,19 @@ impl Graph {
                     line.push(' ');
                 }
             } else if seen_this {
-                line.push(if self.edges_added > 0 { '\\' } else { '|' });
+                line.col(if self.edges_added > 0 { '\\' } else { '|' }, color);
                 line.push(' ');
             } else {
-                line.push('|');
+                line.col('|', color);
                 if self.merge_layout != 0 || i + 1 != self.commit_index {
-                    line.push(if parent_col { '_' } else { ' ' });
+                    match parent_col {
+                        Some(c) => line.col('_', c),
+                        None => line.push(' '),
+                    }
                 }
             }
             if Some(&col_commit) == first_parent.as_ref() {
-                parent_col = true;
+                parent_col = Some(color);
             }
         }
         let next = if self.is_mapping_correct() {
@@ -402,21 +454,25 @@ impl Graph {
         }
         for i in 0..self.mapping_size {
             let target = self.mapping[i];
+            let color = usize::try_from(target)
+                .ok()
+                .and_then(|t| self.new_colors.get(t).copied())
+                .unwrap_or(COLORS.len());
             if target < 0 {
                 line.push(' ');
             } else if (target * 2) as usize == i {
-                line.push('|');
+                line.col('|', color);
             } else if target == horizontal_edge_target && i as i32 != horizontal_edge - 1 {
                 if i != (target * 2) as usize + 3 {
                     self.mapping[i] = -1;
                 }
                 used_horizontal = true;
-                line.push('_');
+                line.col('_', color);
             } else {
                 if used_horizontal && (i as i32) < horizontal_edge {
                     self.mapping[i] = -1;
                 }
-                line.push('/');
+                line.col('/', color);
             }
         }
         if self.is_mapping_correct() {
@@ -454,8 +510,8 @@ impl Graph {
             return self.next_line().0;
         }
         let mut line = Line::default();
-        for c in &self.columns {
-            line.push('|');
+        for (c, &color) in self.columns.iter().zip(&self.colors) {
+            line.col('|', color);
             if *c == self.commit && self.num_parents() > 2 {
                 line.push_n(' ', (self.num_parents() - 2) * 2);
             } else {

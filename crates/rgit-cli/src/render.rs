@@ -21,10 +21,37 @@ pub fn color_on() -> bool {
     COLOR.load(Ordering::Relaxed)
 }
 
+static TEXT: AtomicBool = AtomicBool::new(false);
+static FLAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record whether output is human text and the `--color`/`--no-color` flag,
+/// then turn color on for a terminal unless the flag says otherwise.
+pub fn init_color(text: bool, flag: Option<&str>) {
+    TEXT.store(text, Ordering::Relaxed);
+    if let Some(f) = flag {
+        let _ = FLAG.set(f.to_owned());
+    }
+    set_color(want_color(None));
+}
+
+/// git's want_color: the `--color` flag, else `config` (a color.* value),
+/// with `auto` or unset meaning stdout is a terminal. Never in agent output.
+pub fn want_color(config: Option<&str>) -> bool {
+    use std::io::IsTerminal;
+    if !TEXT.load(Ordering::Relaxed) {
+        return false;
+    }
+    match FLAG.get().map(String::as_str).or(config) {
+        Some("always") => true,
+        Some("never" | "false" | "no" | "off" | "0") => false,
+        _ => std::io::stdout().is_terminal(),
+    }
+}
+
 /// Wrap `s` in an SGR code when color is on, otherwise return it unchanged.
 fn paint(s: &str, code: &str) -> String {
     if !s.is_empty() && COLOR.load(Ordering::Relaxed) {
-        format!("\x1b[{code}m{s}\x1b[0m")
+        format!("\x1b[{code}m{s}\x1b[m")
     } else {
         s.to_owned()
     }
@@ -470,30 +497,48 @@ pub fn patch(files: &[FileDiff]) -> String {
     use rgit_git::LineOrigin;
     let mut out = String::new();
     for f in files {
-        if f.header.is_empty() {
-            out.push_str(&paint(&format!("--- a/{p}\n+++ b/{p}\n", p = f.path), BOLD));
+        let color = color_on();
+        // git's diff colors: every line ends in a reset, even plain ones.
+        let reset = if color { "\x1b[m" } else { "" };
+        let header = if f.header.is_empty() {
+            format!("--- a/{p}\n+++ b/{p}\n", p = f.path)
         } else {
-            for line in f.header.lines() {
+            f.header.clone()
+        };
+        for line in header.lines() {
+            if line.starts_with("Binary files ") {
+                out.push_str(line);
+            } else {
                 out.push_str(&paint(line, BOLD));
-                out.push('\n');
             }
+            out.push('\n');
         }
         for h in &f.hunks {
-            out.push_str(&paint(&h.header, CYAN));
+            let (frag, func) = match h.header.match_indices("@@").nth(1) {
+                Some((i, _)) => h.header.split_at(i + 2),
+                None => (h.header.as_str(), ""),
+            };
+            out.push_str(&paint(frag, CYAN));
+            if !func.is_empty() {
+                out.push_str(func);
+                out.push_str(reset);
+            }
             out.push('\n');
             for l in &h.lines {
-                let (prefix, color) = match l.origin {
-                    LineOrigin::Added => ("+", GREEN),
-                    LineOrigin::Removed => ("-", RED),
-                    LineOrigin::Context => (" ", ""),
-                    LineOrigin::Meta => ("", DIM),
-                };
-                let line = format!("{prefix}{}", l.text.trim_matches('\n'));
-                out.push_str(&if color.is_empty() {
-                    line
-                } else {
-                    paint(&line, color)
-                });
+                let text = l.text.trim_matches('\n');
+                match l.origin {
+                    LineOrigin::Added if color => {
+                        // A trailing-whitespace error shows on a red ground.
+                        let body = text.trim_end_matches([' ', '\t']);
+                        out.push_str(&paint("+", GREEN));
+                        out.push_str(&paint(body, GREEN));
+                        out.push_str(&paint(&text[body.len()..], "41"));
+                    }
+                    LineOrigin::Added => out.push_str(&format!("+{text}")),
+                    LineOrigin::Removed => out.push_str(&paint(&format!("-{text}"), RED)),
+                    LineOrigin::Context => out.push_str(&format!(" {text}{reset}")),
+                    LineOrigin::Meta => out.push_str(&format!("{text}{reset}")),
+                }
                 out.push('\n');
             }
         }
@@ -563,19 +608,7 @@ pub fn stat_summary(files: &[FileDiff]) -> String {
 /// git's `--stat`: ` name | count +++--` per file, scaled to the terminal
 /// width (80 when piped), then the summary line.
 pub fn stat(files: &[FileDiff], indent: usize) -> String {
-    use std::io::IsTerminal;
-    let width = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|c| c.parse::<usize>().ok())
-        .or_else(|| {
-            std::io::stdout()
-                .is_terminal()
-                .then(|| crossterm::terminal::size().ok())
-                .flatten()
-                .map(|(w, _)| usize::from(w))
-        })
-        .unwrap_or(80)
-        .saturating_sub(indent);
+    let width = term_columns().saturating_sub(indent);
     let rows: Vec<(String, usize, usize, bool)> = files
         .iter()
         .map(|f| {
@@ -690,5 +723,273 @@ pub fn stat(files: &[FileDiff], indent: usize) -> String {
         ));
     }
     out.push_str(&stat_summary(files));
+    out
+}
+
+/// The terminal's width as git's term_columns finds it: `COLUMNS`, else the
+/// terminal on stdout, else 80.
+pub fn term_columns() -> usize {
+    use std::io::IsTerminal;
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse::<usize>().ok())
+        .filter(|&c| c > 0)
+        .or_else(|| {
+            std::io::stdout()
+                .is_terminal()
+                .then(|| crossterm::terminal::size().ok())
+                .flatten()
+                .map(|(w, _)| usize::from(w))
+        })
+        .unwrap_or(80)
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub enum ColEnable {
+    #[default]
+    Never,
+    Always,
+    Auto,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub enum ColLayout {
+    #[default]
+    Column,
+    Row,
+    Plain,
+}
+
+/// git's column options (`column.ui`, `--column=<options>`).
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Colopts {
+    pub enable: ColEnable,
+    pub layout: ColLayout,
+    pub dense: bool,
+}
+
+impl Colopts {
+    /// Apply a comma- or space-separated option list on top, as git's
+    /// parse_config does: a layout with no always/never/auto means always.
+    pub fn parse(&mut self, value: &str) -> Result<(), String> {
+        let (mut layout_set, mut enable_set) = (false, false);
+        for word in value.split([' ', ',']).filter(|w| !w.is_empty()) {
+            match word {
+                "always" => (self.enable, enable_set) = (ColEnable::Always, true),
+                "never" => (self.enable, enable_set) = (ColEnable::Never, true),
+                "auto" => (self.enable, enable_set) = (ColEnable::Auto, true),
+                "column" => (self.layout, layout_set) = (ColLayout::Column, true),
+                "row" => (self.layout, layout_set) = (ColLayout::Row, true),
+                "plain" => (self.layout, layout_set) = (ColLayout::Plain, true),
+                "dense" => self.dense = true,
+                "nodense" => self.dense = false,
+                _ => return Err(format!("unsupported option '{word}'")),
+            }
+        }
+        if layout_set && !enable_set {
+            self.enable = ColEnable::Always;
+        }
+        Ok(())
+    }
+
+    /// Whether to lay out in columns, `auto` meaning stdout is a terminal.
+    pub fn active(&self) -> bool {
+        use std::io::IsTerminal;
+        match self.enable {
+            ColEnable::Always => true,
+            ColEnable::Never => false,
+            ColEnable::Auto => std::io::stdout().is_terminal(),
+        }
+    }
+}
+
+/// The escape for a git color spec (`bold red`, `reset`, `#ff0000`, `208`),
+/// as git's color_parse writes it; None when it does not parse.
+pub fn ansi(spec: &str) -> Option<String> {
+    const NAMES: [&str; 8] = [
+        "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+    ];
+    const ATTRS: [(&str, u8); 7] = [
+        ("bold", 1),
+        ("dim", 2),
+        ("italic", 3),
+        ("ul", 4),
+        ("blink", 5),
+        ("reverse", 7),
+        ("strike", 9),
+    ];
+    if spec.trim() == "reset" {
+        return Some("\x1b[m".to_owned());
+    }
+    let color = |w: &str, base: u8| -> Option<Option<String>> {
+        if w == "normal" {
+            return Some(None);
+        }
+        if w == "default" {
+            return Some(Some((base + 9).to_string()));
+        }
+        if let Some(i) = NAMES.iter().position(|n| *n == w) {
+            return Some(Some((base + i as u8).to_string()));
+        }
+        if let Some(i) = w
+            .strip_prefix("bright")
+            .and_then(|b| NAMES.iter().position(|n| *n == b))
+        {
+            return Some(Some((base + 60 + i as u8).to_string()));
+        }
+        if let Some(hex) = w.strip_prefix('#').filter(|h| h.len() == 6) {
+            let c = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+            return Some(Some(format!(
+                "{};2;{};{};{}",
+                base + 8,
+                c(0)?,
+                c(2)?,
+                c(4)?
+            )));
+        }
+        match w.parse::<i32>().ok()? {
+            -1 => Some(None),
+            n @ 0..8 => Some(Some((base as i32 + n).to_string())),
+            n @ 8..16 => Some(Some((base as i32 + 60 + n - 8).to_string())),
+            n @ 16..256 => Some(Some(format!("{};5;{n}", base + 8))),
+            _ => None,
+        }
+    };
+    let (mut attrs, mut fg, mut bg) = (Vec::new(), None, None);
+    let mut colors = 0;
+    for w in spec.split_whitespace() {
+        let w = w.to_lowercase();
+        let (neg, name) = match w.strip_prefix("no") {
+            Some(n) => (true, n.trim_start_matches('-')),
+            None => (false, w.as_str()),
+        };
+        if let Some(i) = ATTRS.iter().position(|(n, _)| *n == name) {
+            let code = if neg {
+                [22, 22, 23, 24, 25, 27, 29][i]
+            } else {
+                ATTRS[i].1
+            };
+            let key = i + if neg { ATTRS.len() } else { 0 };
+            attrs.push((key, code));
+            continue;
+        }
+        match colors {
+            0 => fg = color(&w, 30)?,
+            1 => bg = color(&w, 40)?,
+            _ => return None,
+        }
+        colors += 1;
+    }
+    attrs.sort();
+    attrs.dedup();
+    let parts: Vec<String> = attrs
+        .iter()
+        .map(|(_, c)| c.to_string())
+        .chain(fg)
+        .chain(bg)
+        .collect();
+    Some(if parts.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", parts.join(";"))
+    })
+}
+
+/// Visible width of `s`, ANSI color codes left out.
+fn visible_width(s: &str) -> usize {
+    let mut n = 0;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            chars.by_ref().find(|&c| c == 'm');
+        } else {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// `items` laid out as git's print_columns does, each row ending in a
+/// newline; one per line when `opts` is not active. The width is the
+/// terminal's less one.
+pub fn columns(items: &[String], opts: Colopts, indent: &str, padding: usize) -> String {
+    let mut out = String::new();
+    if !opts.active() || opts.layout == ColLayout::Plain {
+        let indent = if opts.active() { indent } else { "" };
+        for s in items {
+            out.push_str(&format!("{indent}{s}\n"));
+        }
+        return out;
+    }
+    let n = items.len();
+    if n == 0 {
+        return out;
+    }
+    let total = term_columns().saturating_sub(1);
+    let len: Vec<usize> = items.iter().map(|s| visible_width(s)).collect();
+    let by_column = opts.layout == ColLayout::Column;
+    let initial = len.iter().copied().max().unwrap_or(0) + padding;
+    let mut cols = (total.saturating_sub(indent.len()) / initial).max(1);
+    let mut rows = n.div_ceil(cols);
+    let at = |x: usize, y: usize, rows: usize, cols: usize| {
+        if by_column {
+            x * rows + y
+        } else {
+            y * cols + x
+        }
+    };
+    let widths = |rows: usize, cols: usize| -> Vec<usize> {
+        (0..cols)
+            .map(|x| {
+                (0..rows)
+                    .map(|y| at(x, y, rows, cols))
+                    .filter(|&i| i < n)
+                    .map(|i| len[i])
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect()
+    };
+    // dense: take rows away while the narrower columns still fit.
+    let mut width = None;
+    if opts.dense {
+        while rows > 1 {
+            let (r, c) = (rows - 1, n.div_ceil(rows - 1));
+            let w = widths(r, c);
+            if indent.len() + w.iter().map(|w| w + padding).sum::<usize>() > total {
+                break;
+            }
+            (rows, cols) = (r, c);
+        }
+        width = Some(widths(rows, cols));
+    }
+    for y in 0..rows {
+        for x in 0..cols {
+            let i = at(x, y, rows, cols);
+            if i >= n {
+                break;
+            }
+            let mut l = len[i];
+            if let Some(w) = &width
+                && w[x] < initial
+            {
+                l = (l + initial - w[x]).saturating_sub(padding);
+            }
+            let newline = if by_column {
+                i + rows >= n
+            } else {
+                x == cols - 1 || i == n - 1
+            };
+            if x == 0 {
+                out.push_str(indent);
+            }
+            out.push_str(&items[i]);
+            if newline {
+                out.push('\n');
+            } else {
+                out.push_str(&" ".repeat(initial.saturating_sub(l)));
+            }
+        }
+    }
     out
 }

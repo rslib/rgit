@@ -384,13 +384,11 @@ pub fn run(
             diff(&files, &format!("stash@{{{i}}}"), &base, patch, name_only)
         }
         Command::Stash {
-            cmd:
-                Some(StashCmd::List {
-                    format: None,
-                    max_count,
-                }),
+            cmd: Some(StashCmd::List {
+                pretty, max_count, ..
+            }),
             ..
-        } => {
+        } if !pretty.any() && pretty.pretty.is_none() => {
             let mut stashes = backend.status()?.stashes;
             stashes.truncate(max_count.unwrap_or(usize::MAX));
             let rows = stashes
@@ -1438,7 +1436,7 @@ fn done_message(c: &Command) -> Option<String> {
         Command::Stash { cmd: Some(cmd), .. } => match cmd {
             StashCmd::Pop { index, .. } => stash("popped", index),
             StashCmd::Apply { index, .. } => stash("applied", index),
-            StashCmd::Drop { index } => stash("dropped", index),
+            StashCmd::Drop { index, .. } => stash("dropped", index),
             StashCmd::Branch { name, index } => {
                 format!("{} onto new branch {name}", stash("popped", index))
             }

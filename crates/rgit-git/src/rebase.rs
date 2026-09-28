@@ -366,40 +366,19 @@ const HELP: &str = "#
 #
 ";
 
-fn hook_path(repo: &Repository, name: &str) -> Option<PathBuf> {
-    let workdir = repo.workdir().unwrap_or(repo.path());
-    let dir = match repo.config().ok()?.get_path("core.hooksPath") {
-        Ok(p) => workdir.join(p),
-        Err(_) => repo.commondir().join("hooks"),
-    };
-    let hook = dir.join(name);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        hook.metadata()
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .then_some(hook)
-    }
-    #[cfg(not(unix))]
-    hook.is_file().then_some(hook)
-}
-
-/// Run hook `name` if there is one; whether it passed.
+/// Run hook `name` if there is one, its output on stderr; whether it passed.
 fn run_hook(repo: &Repository, name: &str, args: &[&str], stdin: &str) -> Result<bool, GitError> {
     use std::io::Write;
-    let Some(hook) = hook_path(repo, name) else {
+    let workdir = repo.workdir().unwrap_or(repo.path());
+    let dir = crate::git_repo::hooks_dir(repo);
+    let Some(out) = crate::git_repo::run_hook(&dir, workdir, name, args, Some(stdin.as_bytes()))?
+    else {
         return Ok(true);
     };
-    let mut child = std::process::Command::new(hook)
-        .args(args)
-        .current_dir(repo.workdir().unwrap_or(repo.path()))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::io::stderr())
-        .spawn()?;
-    if let Some(mut input) = child.stdin.take() {
-        let _ = input.write_all(stdin.as_bytes());
-    }
-    Ok(child.wait()?.success())
+    let mut err = std::io::stderr();
+    let _ = err.write_all(&out.stdout);
+    let _ = err.write_all(&out.stderr);
+    Ok(out.status.success())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

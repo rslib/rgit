@@ -46,6 +46,18 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_color: bool,
 
+    /// Color output: always, never or auto (a terminal); overrides the
+    /// color.* config. Bare `--color` means always.
+    #[arg(
+        long,
+        global = true,
+        value_name = "WHEN",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "always"
+    )]
+    pub color: Option<String>,
+
     /// Extra table columns to print in agent output (comma-separated).
     #[arg(long, global = true, value_delimiter = ',', value_name = "FIELD,...")]
     pub fields: Vec<String>,
@@ -2429,12 +2441,28 @@ pub struct BranchOpts {
     /// Match patterns and sort case-insensitively (git's -i).
     #[arg(short = 'i', long = "ignore-case")]
     pub ignore_case: bool,
-    /// Accepted for git compatibility; branches list one per line.
-    #[arg(long, value_name = "STYLE", num_args = 0..=1, require_equals = true, default_missing_value = "always")]
+    /// Lay the list out in columns: always, never, auto, column, row, plain,
+    /// dense, nodense (default `column.branch`, `column.ui`).
+    #[arg(long, value_name = "OPTIONS", num_args = 0..=1, require_equals = true, default_missing_value = "always")]
     pub column: Option<String>,
-    /// Accepted for git compatibility.
+    /// List one branch per line.
     #[arg(long = "no-column")]
     pub no_column: bool,
+    /// With -v, show object names in at least N hex digits.
+    #[arg(long, value_name = "N", require_equals = true)]
+    pub abbrev: Option<usize>,
+    /// With -v, show full object names.
+    #[arg(long = "no-abbrev")]
+    pub no_abbrev: bool,
+    /// With --format, print no newline for a branch that formats empty.
+    #[arg(long = "omit-empty")]
+    pub omit_empty: bool,
+    /// Keep a reflog for the new branch.
+    #[arg(long = "create-reflog")]
+    pub create_reflog: bool,
+    /// Accepted for git compatibility (submodules are left alone).
+    #[arg(long = "recurse-submodules")]
+    pub recurse_submodules: bool,
     /// A new branch tracks its start point, or with `=inherit` the start
     /// point's own upstream (git's -t).
     #[arg(
@@ -2608,12 +2636,20 @@ pub struct TagOpts {
     /// Match patterns and sort case-insensitively (git's -i).
     #[arg(short = 'i', long = "ignore-case")]
     pub ignore_case: bool,
-    /// Accepted for git compatibility; tags list one per line.
-    #[arg(long, value_name = "STYLE", num_args = 0..=1, require_equals = true, default_missing_value = "always")]
+    /// Lay the list out in columns: always, never, auto, column, row, plain,
+    /// dense, nodense (default `column.tag`, `column.ui`).
+    #[arg(long, value_name = "OPTIONS", num_args = 0..=1, require_equals = true, default_missing_value = "always")]
     pub column: Option<String>,
-    /// Accepted for git compatibility.
+    /// List one tag per line.
     #[arg(long = "no-column")]
     pub no_column: bool,
+    /// Add a `<token>: <value>` (or `<token>=<value>`) trailer to the
+    /// message; implies an annotated tag.
+    #[arg(long, value_name = "TOKEN[(=|:)VALUE]")]
+    pub trailer: Vec<String>,
+    /// Keep a reflog for the new tag.
+    #[arg(long = "create-reflog")]
+    pub create_reflog: bool,
 }
 
 impl TagOpts {
@@ -2682,6 +2718,9 @@ pub enum StashCmd {
         /// Restore the staged changes too (git's --index).
         #[arg(long = "index")]
         restore_index: bool,
+        /// Print nothing on success.
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Apply a stash without dropping it.
     Apply {
@@ -2691,19 +2730,26 @@ pub enum StashCmd {
         /// Restore the staged changes too (git's --index).
         #[arg(long = "index")]
         restore_index: bool,
+        /// Print nothing on success.
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Drop a stash.
     Drop {
         /// The stash: `N` or `stash@{N}` (defaults to the most recent).
         #[arg(value_parser = stash_ref)]
         index: Option<usize>,
+        /// Print nothing on success.
+        #[arg(short, long)]
+        quiet: bool,
     },
-    /// List the stashes.
+    /// List the stashes, as `git log -g refs/stash` in the `%gd: %gs` format
+    /// unless another is given (`%gd`, `%gD` and `%gs` name the entry).
     List {
-        /// Print each stash in a log format: `%gd` (stash@{N}), `%gs` (its
-        /// message), `%H`, `%h`, `%s`, `%an`, `%ae`, `%ar`, `%ad`, `%cr`, `%n`.
-        #[arg(long, alias = "pretty", value_name = "FORMAT")]
-        format: Option<String>,
+        #[command(flatten)]
+        pretty: PrettyArgs,
+        #[command(flatten)]
+        diff: DiffFormat,
         /// Show at most N stashes.
         #[arg(short = 'n', long = "max-count", value_name = "N")]
         max_count: Option<usize>,
@@ -2734,6 +2780,9 @@ pub enum StashCmd {
         /// Show only the stashed untracked files.
         #[arg(long = "only-untracked", conflicts_with = "include_untracked")]
         only_untracked: bool,
+        /// The diffstat, then the patch.
+        #[arg(long = "patch-with-stat")]
+        patch_with_stat: bool,
     },
     /// Make a stash commit of the local changes and print its id, without
     /// storing it or touching the working tree (git's `stash create`).
@@ -4006,6 +4055,13 @@ pub enum WorktreeCmd {
         /// A new branch tracks nothing, even when BRANCH is remote.
         #[arg(long = "no-track")]
         no_track: bool,
+        /// With no BRANCH, start the new branch from the one remote branch
+        /// named after PATH, tracking it (default `worktree.guessRemote`).
+        #[arg(long = "guess-remote", overrides_with = "no_guess_remote")]
+        guess_remote: bool,
+        /// Start the new branch from HEAD even when a remote has its name.
+        #[arg(long = "no-guess-remote")]
+        no_guess_remote: bool,
         /// Accepted for git compatibility.
         #[arg(short, long)]
         quiet: bool,
@@ -5174,6 +5230,17 @@ pub fn run(
     if interactive {
         backend.set_credential_prompt(Box::new(crate::creds::TerminalPrompt));
     }
+    let slot = match &command {
+        Command::Branch { .. } => Some("color.branch"),
+        Command::Log { .. } | Command::Show { .. } | Command::Diff { .. } => Some("color.diff"),
+        Command::Plumbing(Plumbing::Grep { .. }) => Some("color.grep"),
+        Command::Status { .. } => Some("color.status"),
+        _ => None,
+    };
+    let cfg = |k: &str| backend.config_get(k).ok().flatten();
+    crate::render::set_color(crate::render::want_color(
+        slot.and_then(cfg).or_else(|| cfg("color.ui")).as_deref(),
+    ));
     // Resolve a possibly-missing string arg: use it, prompt for it, or error.
     let resolve = |value: Option<String>,
                    what: &str,
@@ -5787,9 +5854,33 @@ pub fn run(
                 all,
                 depth,
             };
+            let old = head_or_zero(backend);
+            let rebasing = args.rebase.unwrap_or_else(|| {
+                let current = backend
+                    .symbolic_ref("HEAD")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let key = format!(
+                    "branch.{}.rebase",
+                    current.trim_start_matches("refs/heads/")
+                );
+                [key.as_str(), "pull.rebase"]
+                    .iter()
+                    .find_map(|k| backend.config_get(k).ok().flatten())
+                    .is_some_and(|v| !matches!(v.as_str(), "false" | "no" | "off" | "0"))
+            });
             let out = net(interactive, "pull", |r| {
                 backend.pull(repository.as_deref(), branch.as_deref(), &args, r)
             })?;
+            if !rebasing && !no_commit && (squash || head_or_zero(backend) != old) {
+                post_hook(
+                    backend,
+                    backend.workdir(),
+                    "post-merge",
+                    &[if squash { "1" } else { "0" }],
+                )?;
+            }
             if quiet { String::new() } else { out }
         }
         Command::Submit => backend.submit_stack(&|_| {})?.join("\n"),
@@ -5886,6 +5977,7 @@ pub fn run(
             quiet: _,
             paths,
         } => {
+            let old = head_or_zero(backend);
             let (rev, paths) = rev_and_paths(rev, pathspec, paths, |r| {
                 r == "-" || backend.rev_parse(r).is_ok() || guess_remote(backend, r).is_some()
             });
@@ -5913,11 +6005,13 @@ pub fn run(
                 // `checkout [<rev>] -- <paths>`: take the paths from <rev> into
                 // the index and working tree, or from the index.
                 backend.restore(&paths, rev.as_deref(), rev.is_some(), true, true)?;
+                post_checkout(backend, &old, false)?;
                 let from = rev.as_deref().unwrap_or("the index");
                 return Ok(format!("restored {} from {from}", paths.join(" ")));
             }
             if let Some(name) = orphan {
                 backend.checkout_orphan(&name, Some(rev.as_deref().unwrap_or("HEAD")))?;
+                post_checkout(backend, &old, true)?;
                 return Ok(format!("switched to a new branch {name} with no history"));
             }
             let new = branch
@@ -5947,7 +6041,9 @@ pub fn run(
                 mode: checkout_mode(force, merge, conflict.as_deref()),
                 detach_ok: true,
             };
-            switch(backend, rev, new, &opts)?
+            let out = switch(backend, rev, new, &opts)?;
+            post_checkout(backend, &old, true)?;
+            out
         }
         Command::Switch {
             rev,
@@ -5964,8 +6060,10 @@ pub fn run(
             guess: _,
             quiet: _,
         } => {
+            let old = head_or_zero(backend);
             if let Some(name) = orphan {
                 backend.checkout_orphan(&name, None)?;
+                post_checkout(backend, &old, true)?;
                 return Ok(format!("switched to a new branch {name} with no history"));
             }
             let new = create
@@ -5985,7 +6083,9 @@ pub fn run(
                 mode: checkout_mode(discard_changes, merge, conflict.as_deref()),
                 detach_ok: false,
             };
-            switch(backend, rev, new, &opts)?
+            let out = switch(backend, rev, new, &opts)?;
+            post_checkout(backend, &old, true)?;
+            out
         }
         Command::Merge {
             mut revs,
@@ -6042,9 +6142,18 @@ pub fn run(
                     signoff,
                     stat: !no_stat && !quiet,
                 };
+                let old = head_or_zero(backend);
                 let out = net(interactive, "merge", |r| {
                     backend.merge_with(&revs, &opts, r)
                 })?;
+                if !no_commit && (squash || head_or_zero(backend) != old) {
+                    post_hook(
+                        backend,
+                        backend.workdir(),
+                        "post-merge",
+                        &[if squash { "1" } else { "0" }],
+                    )?;
+                }
                 if quiet { "ok".to_owned() } else { out }
             }
         }
@@ -6340,34 +6449,41 @@ pub fn run(
             Some(StashCmd::Pop {
                 index,
                 restore_index,
-            }) => ok(backend.stash_apply_opts(
-                stash_index(backend, index, interactive, "Pop which stash?")?,
-                restore_index,
-                true,
-            ))?,
+                quiet,
+            }) => quietly(
+                quiet,
+                ok(backend.stash_apply_opts(
+                    stash_index(backend, index, interactive, "Pop which stash?")?,
+                    restore_index,
+                    true,
+                ))?,
+            ),
             Some(StashCmd::Apply {
                 index,
                 restore_index,
-            }) => ok(backend.stash_apply_opts(
-                stash_index(backend, index, interactive, "Apply which stash?")?,
-                restore_index,
-                false,
-            ))?,
-            Some(StashCmd::Drop { index }) => ok(backend.stash_drop(stash_index(
-                backend,
-                index,
-                interactive,
-                "Drop which stash?",
-            )?))?,
+                quiet,
+            }) => quietly(
+                quiet,
+                ok(backend.stash_apply_opts(
+                    stash_index(backend, index, interactive, "Apply which stash?")?,
+                    restore_index,
+                    false,
+                ))?,
+            ),
+            Some(StashCmd::Drop { index, quiet }) => quietly(
+                quiet,
+                ok(backend.stash_drop(stash_index(
+                    backend,
+                    index,
+                    interactive,
+                    "Drop which stash?",
+                )?))?,
+            ),
             Some(StashCmd::List {
-                format: Some(format),
+                pretty,
+                diff,
                 max_count,
-            }) => stash_log(backend, &format, max_count)?,
-            Some(StashCmd::List { max_count, .. }) => {
-                let mut stashes = backend.status()?.stashes;
-                stashes.truncate(max_count.unwrap_or(usize::MAX));
-                render::stashes(&stashes)
-            }
+            }) => stash_log(backend, pretty, diff, max_count)?,
             Some(StashCmd::Show {
                 index,
                 patch,
@@ -6377,21 +6493,35 @@ pub fn run(
                 stat,
                 include_untracked,
                 only_untracked,
-            }) => diff_out(
-                &stash_diff(
-                    backend,
-                    index.unwrap_or(0),
-                    (!only_untracked, include_untracked || only_untracked),
-                )?,
-                DiffFormat {
-                    patch,
+                patch_with_stat,
+            }) => {
+                let bool_config = |k: &str, default: bool| {
+                    backend.config_get(k).ok().flatten().map_or(default, |v| {
+                        matches!(v.to_lowercase().as_str(), "true" | "yes" | "on" | "1")
+                    })
+                };
+                let mut format = DiffFormat {
+                    patch: patch || patch_with_stat,
                     name_only,
                     name_status,
                     numstat,
-                    stat,
+                    stat: stat || patch_with_stat,
                     shortstat: false,
-                },
-            ),
+                };
+                // git's defaults: stash.showStat and stash.showPatch.
+                if !format.any() {
+                    format.stat = bool_config("stash.showStat", true);
+                    format.patch = bool_config("stash.showPatch", false);
+                }
+                let untracked = include_untracked
+                    || !only_untracked && bool_config("stash.showIncludeUntracked", false);
+                let files = stash_diff(
+                    backend,
+                    index.unwrap_or(0),
+                    (!only_untracked, untracked || only_untracked),
+                )?;
+                diff_out(&files, format)
+            }
             Some(StashCmd::Create { message }) => {
                 let message = message.join(" ");
                 backend
@@ -6418,16 +6548,23 @@ pub fn run(
         Command::Tag { names, opts } => {
             if opts.is_listing(&names) {
                 let tags = tag_list(backend, &names, &opts)?;
-                if let Some(fmt) = &opts.format {
-                    crate::plumbing::format_refs(backend, &tags, fmt)?
-                } else if tags.is_empty() {
-                    "no tags".to_owned()
-                } else {
-                    tags.iter()
+                let lines = match &opts.format {
+                    Some(fmt) => crate::plumbing::format_refs(backend, &tags, fmt)?,
+                    None => tags
+                        .iter()
                         .map(|t| tag_with_message(t, opts.lines))
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                        .collect(),
+                };
+                let mut cols = colopts(backend, "tag", opts.column.as_deref(), opts.no_column)?;
+                if opts.lines.is_some() {
+                    if opts.column.is_some() && cols.active() {
+                        return Err(CliError::usage(
+                            "options '--column' and '-n' cannot be used together",
+                        ));
+                    }
+                    cols.enable = render::ColEnable::Never;
                 }
+                render::columns(&lines, cols, "", 2)
             } else if opts.delete {
                 if names.is_empty() {
                     return Err(CliError::usage("tag -d needs a tag name"));
@@ -6611,10 +6748,20 @@ pub fn run(
                 }
                 let branch = match branch {
                     Some(b) => b,
-                    None => backend
-                        .remote_heads(&name)?
-                        .1
-                        .ok_or_else(|| anyhow::anyhow!("Cannot determine remote HEAD"))?,
+                    None => {
+                        let (heads, head) = backend.remote_heads(&name)?;
+                        match remote_head_guess(&heads, head).as_slice() {
+                            [one] => one.clone(),
+                            [] => anyhow::bail!("Cannot determine remote HEAD"),
+                            many => anyhow::bail!(
+                                "Multiple remote HEAD branches. Please choose one explicitly with:\n{}",
+                                many.iter()
+                                    .map(|b| format!("  git remote set-head {name} {b}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            ),
+                        }
+                    }
                 };
                 let target = format!("refs/remotes/{name}/{branch}");
                 if backend.rev_parse(&target).is_err() {
@@ -6695,9 +6842,11 @@ pub fn run(
                 reason,
                 track,
                 no_track,
+                guess_remote,
+                no_guess_remote,
                 quiet: _,
             }) => {
-                let args = rgit_git::WorktreeAddArgs {
+                let mut args = rgit_git::WorktreeAddArgs {
                     reset: reset_branch.is_some(),
                     new_branch: new_branch.or(reset_branch),
                     detach,
@@ -6708,7 +6857,40 @@ pub fn run(
                     reason,
                     track: (track || no_track).then_some(track),
                 };
-                ok(backend.worktree_add(&path, commitish.as_deref(), &args))?
+                let guess = !no_guess_remote
+                    && (guess_remote
+                        || backend
+                            .config_get("worktree.guessRemote")?
+                            .is_some_and(|v| matches!(v.as_str(), "true" | "yes" | "on" | "1")));
+                let mut commitish = commitish;
+                let base = Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if guess
+                    && commitish.is_none()
+                    && args.new_branch.is_none()
+                    && !detach
+                    && !orphan
+                    && !backend.local_branches()?.contains(&base)
+                    && let Some(remote) = self::guess_remote(backend, &base)
+                {
+                    args.new_branch = Some(base);
+                    args.track = args.track.or(Some(true));
+                    commitish = Some(remote);
+                }
+                backend.worktree_add(&path, commitish.as_deref(), &args)?;
+                if !no_checkout {
+                    let wt = rgit_git::Git2Backend::discover(&path)?;
+                    let new = wt.rev_parse("HEAD").unwrap_or_else(|_| "0".repeat(40));
+                    post_hook(
+                        backend,
+                        wt.workdir(),
+                        "post-checkout",
+                        &["0".repeat(40).as_str(), &new, "1"],
+                    )?;
+                }
+                "ok".to_owned()
             }
             Some(WorktreeCmd::Repair { paths }) => backend.repair_worktrees(&paths)?.join("\n"),
             Some(WorktreeCmd::Remove { name, force }) => ok(backend.remove_worktree(&name, force))?,
@@ -9015,22 +9197,6 @@ pub(crate) struct BranchRow {
     pub detail: rgit_git::RefDetail,
 }
 
-impl BranchRow {
-    /// The name as `git branch` prints it: `remotes/` in front of a remote
-    /// branch with -a, and `-> <target>` after a symbolic one.
-    fn label(&self, all: bool) -> String {
-        let mut s = if self.remote && all {
-            format!("remotes/{}", self.name)
-        } else {
-            self.name.clone()
-        };
-        if let Some(t) = &self.symref {
-            s.push_str(&format!(" -> {t}"));
-        }
-        s
-    }
-}
-
 /// The branches `rgit branch` lists under `opts`' filters, in `--sort` order.
 pub(crate) fn branch_rows(
     backend: &Arc<dyn GitBackend>,
@@ -9131,65 +9297,264 @@ pub(crate) fn branch_rows(
 }
 
 /// Branches as `git branch` prints them: plainly, with -v / -vv, or in a
-/// for-each-ref `--format`.
+/// for-each-ref `--format`, colored and in columns as git's build_format and
+/// print_columns do.
 fn render_branch_rows(
     backend: &Arc<dyn GitBackend>,
     rows: &[BranchRow],
     opts: &BranchOpts,
 ) -> anyhow::Result<String> {
     let all = opts.all && !opts.remotes;
-    if let Some(fmt) = &opts.format {
-        return crate::plumbing::format_refs(backend, rows.iter().map(|r| &r.detail), fmt);
+    let colopts = colopts(backend, "branch", opts.column.as_deref(), opts.no_column)?;
+    if opts.verbose > 0 && opts.column.is_some() && colopts.active() {
+        return Err(CliError::usage(
+            "options '--column' and '--verbose' cannot be used together",
+        ));
     }
-    if opts.verbose == 0 {
-        let labels: Vec<String> = rows.iter().map(|r| r.label(all)).collect();
-        let current = rows.iter().find(|r| r.current).map(|r| r.name.as_str());
-        return Ok(render::branches(&labels, current));
+    let lines = if let Some(fmt) = &opts.format {
+        crate::plumbing::format_refs(backend, rows.iter().map(|r| &r.detail), fmt)?
+            .into_iter()
+            .filter(|l| !(opts.omit_empty && l.is_empty()))
+            .collect()
+    } else {
+        branch_lines(backend, rows, opts, all)?
+    };
+    if opts.verbose > 0 || !colopts.active() {
+        return Ok(lines.iter().map(|l| format!("{l}\n")).collect());
     }
-    if rows.is_empty() {
-        return Ok("no branches".to_owned());
+    Ok(render::columns(&lines, colopts, "", 1))
+}
+
+/// `command`'s column options: `column.ui`, then `column.<command>`, then
+/// `--column[=<options>]` / `--no-column`, as git's builtins read them.
+pub(crate) fn colopts(
+    backend: &Arc<dyn GitBackend>,
+    command: &str,
+    flag: Option<&str>,
+    no_column: bool,
+) -> anyhow::Result<render::Colopts> {
+    let mut c = render::Colopts::default();
+    for key in ["column.ui".to_owned(), format!("column.{command}")] {
+        if let Some(v) = backend.config_get(&key).ok().flatten() {
+            c.parse(&v)
+                .map_err(|e| anyhow::anyhow!("invalid column.{command} mode {v}: {e}"))?;
+        }
     }
+    if no_column {
+        c.enable = render::ColEnable::Never;
+    } else if let Some(f) = flag {
+        c.enable = render::ColEnable::Always;
+        c.parse(f).map_err(CliError::usage)?;
+    }
+    Ok(c)
+}
+
+/// git's `(HEAD detached at X)` label for the branch list, or None on a
+/// branch.
+fn head_description(backend: &Arc<dyn GitBackend>) -> Option<String> {
+    if backend.symbolic_ref("HEAD").ok().flatten().is_some() {
+        return None;
+    }
+    let git_dir = backend.git_dir();
+    let read = |p: &str| std::fs::read_to_string(git_dir.join(p)).ok();
+    let short = |r: &str| r.trim().trim_start_matches("refs/heads/").to_owned();
+    if let Some(name) = read("rebase-merge/head-name").or_else(|| read("rebase-apply/head-name")) {
+        return Some(format!("(no branch, rebasing {})", short(&name)));
+    }
+    if let Some(start) = read("BISECT_START") {
+        return Some(format!("(no branch, bisect started on {})", short(&start)));
+    }
+    let head = backend.rev_parse("HEAD").ok()?;
+    let from = backend.reflog("HEAD").ok().and_then(|log| {
+        log.into_iter().find_map(|e| {
+            let to = e.message.strip_prefix("checkout: moving from ")?;
+            let to = to.rsplit_once(" to ")?.1.to_owned();
+            Some((to, e.id))
+        })
+    });
+    let Some((to, id)) = from else {
+        return Some("(no branch)".to_owned());
+    };
+    let named = ["refs/tags/", "refs/remotes/"].iter().find_map(|p| {
+        let full = backend.full_ref_name(&to).ok().flatten()?;
+        let name = full.strip_prefix(p)?.to_owned();
+        let tip = backend.rev_parse(&format!("{full}^{{commit}}")).ok()?;
+        (tip == id).then_some(name)
+    });
+    let label = named.unwrap_or_else(|| backend.abbrev_id(&id, 0).unwrap_or(id.clone()));
+    let at = if head == id { "at" } else { "from" };
+    Some(format!("(HEAD detached {at} {label})"))
+}
+
+/// Each branch other worktrees have checked out, by full ref name, with the
+/// worktree's path.
+fn worktree_branches(backend: &Arc<dyn GitBackend>) -> std::collections::HashMap<String, String> {
+    let git_dir = backend.git_dir();
+    let common = common_dir(backend);
+    let mut map = std::collections::HashMap::new();
+    let mut admin: Vec<(PathBuf, String)> = Vec::new();
+    if common.file_name().is_some_and(|n| n == ".git") {
+        let top = common.parent().map(|p| p.to_string_lossy().into_owned());
+        admin.extend(top.map(|t| (common.clone(), t)));
+    }
+    for d in std::fs::read_dir(common.join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if let Ok(g) = std::fs::read_to_string(d.path().join("gitdir")) {
+            let g = g.trim();
+            admin.push((d.path(), g.strip_suffix("/.git").unwrap_or(g).to_owned()));
+        }
+    }
+    for (dir, path) in admin {
+        let same = dir.canonicalize().ok() == git_dir.canonicalize().ok();
+        if let Some(r) = std::fs::read_to_string(dir.join("HEAD"))
+            .ok()
+            .and_then(|h| h.trim().strip_prefix("ref: ").map(str::to_owned))
+            && !same
+        {
+            map.insert(r, path);
+        }
+    }
+    map
+}
+
+/// The lines of git's default branch format (build_format).
+fn branch_lines(
+    backend: &Arc<dyn GitBackend>,
+    rows: &[BranchRow],
+    opts: &BranchOpts,
+    all: bool,
+) -> anyhow::Result<Vec<String>> {
+    let on = render::color_on();
+    let c = |code: &str| {
+        if on {
+            format!("\x1b[{code}m")
+        } else {
+            String::new()
+        }
+    };
+    let reset = if on { "\x1b[m" } else { "" };
+    let worktrees = worktree_branches(backend);
+    let listing_heads = !opts.remotes && opts.args.is_empty() && opts.format.is_none();
+    let detached = listing_heads
+        .then(|| head_description(backend))
+        .flatten()
+        .filter(|_| {
+            let head = |r: &Option<String>, want| {
+                r.as_ref()
+                    .is_none_or(|rev| backend.is_ancestor("HEAD", rev).is_ok_and(|m| m == want))
+            };
+            let contains = |r: &Option<String>, want| {
+                r.as_ref()
+                    .is_none_or(|rev| backend.is_ancestor(rev, "HEAD").is_ok_and(|m| m == want))
+            };
+            head(&opts.merged, true)
+                && head(&opts.no_merged, false)
+                && contains(&opts.contains, true)
+                && contains(&opts.no_contains, false)
+                && opts
+                    .points_at
+                    .as_ref()
+                    .is_none_or(|p| backend.rev_parse(p).ok() == backend.rev_parse("HEAD").ok())
+        });
+    let oid = |id: &str| -> String {
+        match opts.abbrev {
+            _ if opts.no_abbrev => id.to_owned(),
+            Some(n) => backend.abbrev_id(id, n).unwrap_or_else(|_| id.to_owned()),
+            None => backend.abbrev_id(id, 0).unwrap_or_else(|_| id.to_owned()),
+        }
+    };
+    let mut lines = Vec::new();
     let width = rows
         .iter()
-        .filter(|r| r.symref.is_none())
-        .map(|r| r.label(all).len())
+        .map(|r| {
+            let w = r.name.chars().count();
+            if r.remote && all { w + 8 } else { w }
+        })
+        .chain(detached.iter().map(|d| d.chars().count()))
         .max()
         .unwrap_or(0);
-    Ok(rows
-        .iter()
-        .map(|r| {
-            let mark = if r.current { "*" } else { " " };
-            if r.symref.is_some() {
-                return format!("{mark} {}", r.label(all));
+    if let Some(desc) = &detached {
+        let mut line = format!("* {}{desc}", c("32"));
+        if opts.verbose > 0 {
+            let tip = backend.rev_parse("HEAD")?;
+            let subject = backend
+                .log(&LogOptions {
+                    limit: 1,
+                    revs: vec!["HEAD".to_owned()],
+                    ..LogOptions::default()
+                })?
+                .into_iter()
+                .next()
+                .map(|e| e.summary)
+                .unwrap_or_default();
+            let pad = width - desc.chars().count();
+            line = format!("{line}{}{reset} {} {subject}", " ".repeat(pad), oid(&tip));
+        } else {
+            line.push_str(reset);
+        }
+        lines.push(line);
+    }
+    for r in rows {
+        let name = if r.remote && all {
+            format!("remotes/{}", r.name)
+        } else {
+            r.name.clone()
+        };
+        let wt = worktrees.get(&r.detail.name).filter(|_| !r.current);
+        let (mark, color) = if r.remote {
+            ("  ", c("31"))
+        } else if r.current {
+            ("* ", c("32"))
+        } else if wt.is_some() {
+            ("+ ", c("36"))
+        } else {
+            ("  ", String::new())
+        };
+        let mut line = format!("{mark}{color}{name}");
+        if opts.verbose == 0 {
+            line.push_str(reset);
+            if let Some(t) = &r.symref {
+                line.push_str(&format!(" -> {t}"));
             }
-            let track = match &r.upstream {
-                Some((up, ahead, behind)) => {
-                    let mut counts = Vec::new();
-                    if *ahead > 0 {
-                        counts.push(format!("ahead {ahead}"));
-                    }
-                    if *behind > 0 {
-                        counts.push(format!("behind {behind}"));
-                    }
-                    let counts = counts.join(", ");
-                    match (opts.verbose > 1, counts.is_empty()) {
-                        (true, true) => format!("[{up}] "),
-                        (true, false) => format!("[{up}: {counts}] "),
-                        (false, false) => format!("[{counts}] "),
-                        (false, true) => String::new(),
-                    }
-                }
-                None => String::new(),
-            };
-            format!(
-                "{mark} {:<width$} {} {track}{}",
-                r.label(all),
-                r.id,
-                r.summary
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n"))
+            lines.push(line);
+            continue;
+        }
+        line.push_str(&" ".repeat(width - name.chars().count()));
+        line.push_str(reset);
+        if let Some(t) = &r.symref {
+            line.push_str(&format!(" -> {t}"));
+            lines.push(line);
+            continue;
+        }
+        line.push_str(&format!(" {} ", oid(&r.detail.id)));
+        if opts.verbose > 1
+            && let Some(path) = wt
+        {
+            line.push_str(&format!("({}{path}{reset}) ", c("36")));
+        }
+        if let Some((up, ahead, behind)) = &r.upstream {
+            let mut counts = Vec::new();
+            if *ahead > 0 {
+                counts.push(format!("ahead {ahead}"));
+            }
+            if *behind > 0 {
+                counts.push(format!("behind {behind}"));
+            }
+            let counts = counts.join(", ");
+            line.push_str(&match (opts.verbose > 1, counts.is_empty()) {
+                (true, true) => format!("[{}{up}{reset}] ", c("34")),
+                (true, false) => format!("[{}{up}{reset}: {counts}] ", c("34")),
+                (false, false) => format!("[{counts}] "),
+                (false, true) => String::new(),
+            });
+        }
+        line.push_str(&r.summary);
+        lines.push(line);
+    }
+    Ok(lines)
 }
 
 /// Delete each of `names`, reporting every failure rather than stopping at
@@ -9299,6 +9664,9 @@ fn branch_change(
             ));
         }
     };
+    if o.create_reflog {
+        ensure_reflog(backend, &format!("refs/heads/{name}"))?;
+    }
     backend.create_branch_at(name, start, o.force)?;
     let upstream = match o.track.as_deref() {
         Some("inherit") => backend.branch_upstream(start)?.map(|(up, ..)| up),
@@ -9516,14 +9884,18 @@ fn remote_show(backend: &Arc<dyn GitBackend>, name: &str, query: bool) -> anyhow
     } else {
         (Vec::new(), None)
     };
-    out.push(format!(
-        "  HEAD branch: {}",
-        match (query, &head) {
-            (false, _) => "(not queried)",
-            (true, Some(h)) => h,
-            (true, None) => "(unknown)",
+    let guess = remote_head_guess(&heads, head);
+    match guess.as_slice() {
+        _ if !query => out.push("  HEAD branch: (not queried)".to_owned()),
+        [] => out.push("  HEAD branch: (unknown)".to_owned()),
+        [one] => out.push(format!("  HEAD branch: {one}")),
+        many => {
+            out.push(
+                "  HEAD branch (remote HEAD is ambiguous, may be one of the following):".to_owned(),
+            );
+            out.extend(many.iter().map(|b| format!("    {b}")));
         }
-    ));
+    }
 
     let prefix = format!("refs/remotes/{name}/");
     let branches = remote_branches(backend, name, &heads)?;
@@ -9594,10 +9966,19 @@ fn remote_show(backend: &Arc<dyn GitBackend>, name: &str, query: bool) -> anyhow
             .to_owned();
         let how = match get(&format!("branch.{b}.rebase")) {
             Some("interactive" | "i") => "rebases interactively onto remote",
+            Some("merges" | "m") => "rebases interactively (with merges) onto remote",
             Some(v) if !matches!(v, "false" | "no" | "off" | "0") => "rebases onto remote",
-            _ => " merges with remote",
+            _ => "merges with remote",
         };
         pulls.push((b, how, merge));
+    }
+    // A merging branch lines up with rebasing ones, as in git.
+    if pulls.iter().any(|(_, how, _)| how.starts_with("rebases")) {
+        for p in &mut pulls {
+            if p.1 == "merges with remote" {
+                p.1 = " merges with remote";
+            }
+        }
     }
     if !pulls.is_empty() {
         out.push(format!(
@@ -9619,60 +10000,169 @@ fn remote_show(backend: &Arc<dyn GitBackend>, name: &str, query: bool) -> anyhow
         .filter(|(k, _)| k.eq_ignore_ascii_case(&format!("remote.{name}.push")))
         .map(|(_, v)| v.as_str())
         .collect();
-    let mut pushes: Vec<(String, String, bool)> = Vec::new();
-    if specs.is_empty() && query {
-        for b in backend.local_branches()? {
-            if heads.iter().any(|(h, _)| *h == format!("refs/heads/{b}")) {
-                pushes.push((b.clone(), b, false));
-            }
-        }
+    let mut pushes = if query {
+        push_states(backend, &specs, &heads)?
     } else if specs.is_empty() {
-        pushes.push(("(matching)".to_owned(), "(matching)".to_owned(), false));
-    }
-    for spec in specs {
-        let forced = spec.starts_with('+');
-        let (src, dst) = spec
-            .trim_start_matches('+')
-            .split_once(':')
-            .unwrap_or((spec, spec));
-        let short = |s: &str| {
-            s.strip_prefix("refs/heads/")
-                .unwrap_or(s)
-                .trim_start_matches('+')
-                .to_owned()
-        };
-        pushes.push((short(src), short(dst), forced));
-    }
+        vec![("(matching)".to_owned(), "(matching)".to_owned(), false, "")]
+    } else {
+        specs
+            .iter()
+            .filter(|s| !s.starts_with('^'))
+            .map(|spec| {
+                let forced = spec.starts_with('+');
+                let spec = spec.trim_start_matches('+');
+                let (src, dst) = spec.split_once(':').unwrap_or((spec, ""));
+                let src = match (src, dst) {
+                    ("", "") => "(matching)",
+                    ("", _) => "(delete)",
+                    (s, _) => s,
+                };
+                let dst = if dst.is_empty() { src } else { dst };
+                (src.to_owned(), dst.to_owned(), forced, "")
+            })
+            .collect()
+    };
+    pushes.sort();
     if !pushes.is_empty() {
         out.push(format!(
             "  {} configured for 'git push'{not_queried}:",
             plural(pushes.len(), "Local ref", "Local refs")
         ));
         let w1 = pushes.iter().map(|(s, ..)| s.len()).max().unwrap_or(0);
-        let w2 = pushes.iter().map(|(_, d, _)| d.len()).max().unwrap_or(0);
-        for (src, dst, forced) in &pushes {
+        let w2 = pushes.iter().map(|(_, d, ..)| d.len()).max().unwrap_or(0);
+        for (src, dst, forced, status) in &pushes {
             let verb = if *forced { "forces to" } else { "pushes to" };
-            if !query {
-                out.push(format!("    {src:<w1$} {verb} {dst}"));
-                continue;
-            }
-            let theirs = heads
-                .iter()
-                .find(|(h, _)| *h == format!("refs/heads/{dst}"))
-                .map(|(_, id)| id.as_str());
-            let ours = backend.rev_parse(&format!("refs/heads/{src}")).ok();
-            let status = match (theirs, ours) {
-                (None, _) => "create",
-                (Some(t), Some(o)) if t == o => "up to date",
-                (Some(t), Some(o)) if backend.is_ancestor(t, &o).unwrap_or(false) => {
-                    "fast-forwardable"
-                }
-                _ => "local out of date",
-            };
-            out.push(format!("    {src:<w1$} {verb} {dst:<w2$} ({status})"));
+            out.push(if status.is_empty() {
+                format!("    {src:<w1$} {verb} {dst}")
+            } else {
+                format!("    {src:<w1$} {verb} {dst:<w2$} ({status})")
+            });
         }
     }
     Ok(out.join("\n"))
+}
+
+/// The branches a remote's HEAD may be: the one it names, else every branch
+/// at its commit, as git's guess_remote_head.
+fn remote_head_guess(heads: &[(String, String)], head: Option<String>) -> Vec<String> {
+    if let Some(h) = head {
+        return vec![h];
+    }
+    let Some((_, id)) = heads.iter().find(|(n, _)| n == "HEAD") else {
+        return Vec::new();
+    };
+    heads
+        .iter()
+        .filter(|(n, i)| i == id && n.starts_with("refs/heads/"))
+        .map(|(n, _)| n["refs/heads/".len()..].to_owned())
+        .collect()
+}
+
+/// What `git push` would do with each ref the push refspecs (or `:`, the
+/// matching branches) pick, as git's get_push_ref_states: local name,
+/// remote name, forced, and status against the remote's `heads`.
+fn push_states(
+    backend: &Arc<dyn GitBackend>,
+    specs: &[&str],
+    heads: &[(String, String)],
+) -> anyhow::Result<Vec<(String, String, bool, &'static str)>> {
+    let theirs: std::collections::HashMap<&str, &str> = heads
+        .iter()
+        .filter(|(n, _)| !n.ends_with("^{}"))
+        .map(|(n, i)| (n.as_str(), i.as_str()))
+        .collect();
+    let ours: Vec<(String, String)> = backend
+        .ref_details()?
+        .into_iter()
+        .filter(|r| r.symref.is_none())
+        .map(|r| (r.name, r.id))
+        .collect();
+    let find = |name: &str| ours.iter().find(|(n, _)| n == name).map(|(_, i)| i.clone());
+    let dwim = |s: &str| {
+        [
+            s.to_owned(),
+            format!("refs/{s}"),
+            format!("refs/tags/{s}"),
+            format!("refs/heads/{s}"),
+            format!("refs/remotes/{s}"),
+        ]
+        .into_iter()
+        .find(|n| find(n).is_some())
+    };
+    let specs = if specs.is_empty() { &[":"][..] } else { specs };
+    let mut picked: Vec<(String, String, String, bool)> = Vec::new();
+    for spec in specs {
+        let forced = spec.starts_with('+');
+        let spec = spec.trim_start_matches('+');
+        if spec.starts_with('^') {
+            continue;
+        }
+        let (src, dst) = spec.split_once(':').unwrap_or((spec, ""));
+        if src.is_empty() {
+            if dst.is_empty() {
+                for (n, id) in &ours {
+                    if n.starts_with("refs/heads/") && theirs.contains_key(n.as_str()) {
+                        picked.push((n.clone(), n.clone(), id.clone(), forced));
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some((pre, post)) = src.split_once('*') {
+            for (n, id) in &ours {
+                if let Some(mid) = n
+                    .strip_prefix(pre)
+                    .and_then(|m| m.strip_suffix(post))
+                    .filter(|_| n.len() >= pre.len() + post.len())
+                {
+                    let to = if dst.is_empty() { src } else { dst };
+                    picked.push((n.clone(), to.replacen('*', mid, 1), id.clone(), forced));
+                }
+            }
+            continue;
+        }
+        let (label, full) = if src == "HEAD" {
+            let Some(full) = backend.symbolic_ref("HEAD")? else {
+                continue;
+            };
+            ("HEAD".to_owned(), full)
+        } else {
+            let Some(full) = dwim(src) else { continue };
+            (full.clone(), full)
+        };
+        let Some(id) = find(&full) else { continue };
+        let to = if dst.is_empty() {
+            full.clone()
+        } else if dst.starts_with("refs/") {
+            dst.to_owned()
+        } else {
+            ["refs/heads/", "refs/tags/"]
+                .iter()
+                .map(|p| format!("{p}{dst}"))
+                .find(|n| theirs.contains_key(n.as_str()))
+                .unwrap_or_else(|| {
+                    let kind = if full.starts_with("refs/tags/") {
+                        "refs/tags/"
+                    } else {
+                        "refs/heads/"
+                    };
+                    format!("{kind}{dst}")
+                })
+        };
+        picked.push((label, to, id, forced));
+    }
+    let short = |s: &str| s.strip_prefix("refs/heads/").unwrap_or(s).to_owned();
+    let mut out = Vec::new();
+    for (src, dst, id, forced) in picked {
+        let status = match theirs.get(dst.as_str()) {
+            None => "create",
+            Some(old) if *old == id => "up to date",
+            Some(old) if backend.is_ancestor(old, &id).unwrap_or(false) => "fast-forwardable",
+            Some(_) => "local out of date",
+        };
+        out.push((short(&src), short(&dst), forced, status));
+    }
+    Ok(out)
 }
 
 /// Tags matching any of `patterns` (all when none) and `o`'s filters, in its
@@ -9729,7 +10219,7 @@ pub(crate) fn tag_list(
 /// A tag, with up to `n` lines of its message laid out like `git tag -n`.
 fn tag_with_message(t: &rgit_git::RefDetail, n: Option<usize>) -> String {
     let name = t.name.strip_prefix("refs/tags/").unwrap_or(&t.name);
-    let Some(n) = n else {
+    let Some(n) = n.filter(|&n| n > 0) else {
         return name.to_owned();
     };
     // A signed tag's signature is not part of its message.
@@ -9765,7 +10255,7 @@ fn create_tag(
         None => o.message,
     };
     let signed = o.sign || o.local_user.is_some();
-    let annotated = message.is_some() || o.annotate || signed;
+    let annotated = message.is_some() || o.annotate || signed || !o.trailer.is_empty();
     if o.edit || message.is_none() && annotated {
         if !interactive {
             let what = if o.edit {
@@ -9794,6 +10284,12 @@ fn create_tag(
         None if o.sign || annotated && gpg_sign && !o.no_sign => Some(String::new()),
         None => None,
     };
+    if !o.trailer.is_empty() {
+        message = message.map(|m| add_trailers(&m, &o.trailer));
+    }
+    if o.create_reflog {
+        ensure_reflog(backend, &format!("refs/tags/{name}"))?;
+    }
     ok(backend.tag_with(
         name,
         rev,
@@ -9802,6 +10298,52 @@ fn create_tag(
         key.as_deref(),
         o.force,
     ))
+}
+
+/// `msg` with each `<token>: <value>` (or `=`) trailer appended, in its own
+/// paragraph unless the last one is already trailers, as interpret-trailers
+/// does.
+fn add_trailers(msg: &str, trailers: &[String]) -> String {
+    let mut body = msg.trim_end().to_owned();
+    for t in trailers {
+        let (k, v) = t.split_once([':', '=']).unwrap_or((t, ""));
+        let last = body.rsplit("\n\n").next().unwrap_or("");
+        let block = body.contains("\n\n")
+            && last.lines().all(|l| {
+                l.split_once(": ")
+                    .is_some_and(|(k, _)| !k.is_empty() && !k.contains(' '))
+            });
+        let sep = match (body.is_empty(), block) {
+            (true, _) => "",
+            (false, true) => "\n",
+            (false, false) => "\n\n",
+        };
+        body = format!("{body}{sep}{}: {}", k.trim(), v.trim());
+    }
+    body + "\n"
+}
+
+/// The repository's common git dir (the main one's, from a linked
+/// worktree).
+fn common_dir(backend: &Arc<dyn GitBackend>) -> PathBuf {
+    let git_dir = backend.git_dir();
+    std::fs::read_to_string(git_dir.join("commondir"))
+        .map(|c| git_dir.join(c.trim()))
+        .unwrap_or(git_dir)
+}
+
+/// Start an empty reflog for `refname` so its updates are logged, as git's
+/// `--create-reflog` does.
+fn ensure_reflog(backend: &Arc<dyn GitBackend>, refname: &str) -> anyhow::Result<()> {
+    let path = common_dir(backend).join("logs").join(refname);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    Ok(())
 }
 
 /// `text` without its `#` lines.
@@ -9860,70 +10402,95 @@ fn pathspec_from_file(file: &str, nul: bool) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
-/// `git stash list --format`: each stash in a log format.
+/// HEAD's commit id, or git's all-zero id before the first commit.
+fn head_or_zero(backend: &Arc<dyn GitBackend>) -> String {
+    backend.rev_parse("HEAD").unwrap_or_else(|_| "0".repeat(40))
+}
+
+/// Run the `post-checkout` hook after a checkout from `old`: `branch` for a
+/// switch of HEAD, else a checkout of paths.
+fn post_checkout(backend: &Arc<dyn GitBackend>, old: &str, branch: bool) -> anyhow::Result<()> {
+    let new = head_or_zero(backend);
+    let flag = if branch { "1" } else { "0" };
+    let old = if branch { old } else { &new };
+    post_hook(
+        backend,
+        backend.workdir(),
+        "post-checkout",
+        &[old, &new, flag],
+    )
+}
+
+/// Run a hook git runs after a command (`post-checkout`, `post-merge`), in
+/// `cwd`, its output on stderr as git shows it. A failing post-checkout hook
+/// fails the command, as in git.
+pub(crate) fn post_hook(
+    backend: &Arc<dyn GitBackend>,
+    cwd: &Path,
+    name: &str,
+    args: &[&str],
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let Some(out) = rgit_git::run_hook(&backend.hooks_dir(), cwd, name, args, None)? else {
+        return Ok(());
+    };
+    let mut err = std::io::stderr();
+    let _ = err.write_all(&out.stdout);
+    let _ = err.write_all(&out.stderr);
+    if !out.status.success() && name == "post-checkout" {
+        set_exit(true);
+    }
+    Ok(())
+}
+
+/// `out`, or nothing with -q.
+fn quietly(quiet: bool, out: String) -> String {
+    if quiet { String::new() } else { out }
+}
+
+/// `git stash list`: `git log -g refs/stash` in the `%gd: %gs` format or
+/// the one asked for, with each stash's diff against its base when asked.
 fn stash_log(
     backend: &Arc<dyn GitBackend>,
-    format: &str,
+    mut args: PrettyArgs,
+    format: DiffFormat,
     max: Option<usize>,
 ) -> anyhow::Result<String> {
     if backend.status()?.stashes.is_empty() {
         return Ok(String::new());
     }
-    let mut out = Vec::new();
+    if args.format.is_none() && args.pretty.is_none() && !args.oneline {
+        args.format = Some("%gd: %gs".to_owned());
+    }
+    let mut pretty = crate::pretty::Pretty::new(backend, &args, None)?.expect("a format");
+    let (mut commits, mut diffs) = (Vec::new(), Vec::new());
     for (i, item) in backend
         .reflog("refs/stash")?
         .into_iter()
         .enumerate()
         .take(max.unwrap_or(usize::MAX))
     {
-        let Some(c) = backend
-            .rev_walk(&rgit_git::RevWalk {
-                revs: vec![item.id.clone()],
-                max: Some(1),
-                ..rgit_git::RevWalk::default()
-            })?
-            .into_iter()
-            .next()
-        else {
-            continue;
-        };
-        let mut line = String::new();
-        let mut chars = format.chars();
-        while let Some(ch) = chars.next() {
-            if ch != '%' {
-                line.push(ch);
-                continue;
-            }
-            let date = crate::pretty::format_date;
-            let a = &c.author;
-            let cm = &c.committer;
-            let code: String = match chars.next() {
-                Some(c2 @ ('a' | 'c' | 'g')) => [c2].into_iter().chain(chars.next()).collect(),
-                Some(c2) => c2.to_string(),
-                None => String::new(),
-            };
-            line.push_str(&match code.as_str() {
-                "gd" => format!("stash@{{{i}}}"),
-                "gs" => item.message.clone(),
-                "H" => c.id.clone(),
-                "h" => backend.abbrev_id(&c.id, 7)?,
-                "s" => c.summary.clone(),
-                "an" => a.name.clone(),
-                "ae" => a.email.clone(),
-                "ad" => date(a.time, a.offset, "default"),
-                "ar" => date(a.time, a.offset, "relative"),
-                "cn" => cm.name.clone(),
-                "ce" => cm.email.clone(),
-                "cd" => date(cm.time, cm.offset, "default"),
-                "cr" => date(cm.time, cm.offset, "relative"),
-                "n" => "\n".to_owned(),
-                "%" => "%".to_owned(),
-                other => format!("%{other}"),
-            });
-        }
-        out.push(line);
+        let c = crate::pretty::parse(&backend.read_object(&item.id)?);
+        diffs.push(if format.any() {
+            Some(backend.diff(&rgit_git::DiffSpec {
+                from: c.parents.first().cloned(),
+                to: Some(c.id.clone()),
+                ..Default::default()
+            })?)
+        } else {
+            None
+        });
+        pretty.reflog.insert(
+            c.id.clone(),
+            [
+                format!("stash@{{{i}}}"),
+                format!("refs/stash@{{{i}}}"),
+                item.message,
+            ],
+        );
+        commits.push(c);
     }
-    Ok(out.join("\n"))
+    Ok(pretty_log(&pretty, &commits, &diffs, format))
 }
 
 /// Status limited to `paths`, with untracked files per git's `-u` mode and

@@ -3442,15 +3442,16 @@ impl GitBackend for Git2Backend {
         let rejected = std::sync::atomic::AtomicBool::new(false);
         let callbacks = remote_callbacks(&|_| {}, &rejected, cred_guard.as_deref());
         let conn = remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None)?;
-        let heads = conn
-            .list()?
+        let list = conn.list()?;
+        let heads = list
             .iter()
             .map(|h| (h.name().to_owned(), h.oid().to_string()))
             .collect();
-        let head = conn
-            .default_branch()
-            .ok()
-            .and_then(|b| b.as_str().ok().map(|s| short_ref(s).to_owned()));
+        let head = list
+            .iter()
+            .find(|h| h.name() == "HEAD")
+            .and_then(|h| h.symref_target())
+            .map(|s| short_ref(s).to_owned());
         Ok((heads, head))
     }
 
@@ -4507,19 +4508,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn hooks_dir(&self) -> PathBuf {
-        let repo = self.repo.lock().expect("repo mutex");
-        // core.hooksPath wins (relative to the working directory); otherwise the
-        // repository's own hooks directory.
-        if let Ok(cfg) = repo.config()
-            && let Ok(p) = cfg.get_path("core.hooksPath")
-        {
-            return if p.is_absolute() {
-                p
-            } else {
-                self.workdir.join(p)
-            };
-        }
-        repo.path().join("hooks")
+        hooks_dir(&self.repo.lock().expect("repo mutex"))
     }
 
     fn commit_no_verify(&self, message: &str) -> Result<(), GitError> {
@@ -5301,7 +5290,7 @@ fn push_one(
                     })
                     .collect();
                 let hook = git2_hooks::hooks_pre_push(repo, None, Some(remote_name), url, &refs);
-                if let Err(e) = run_hook("pre-push", hook) {
+                if let Err(e) = check_hook("pre-push", hook) {
                     *hook_failed.lock().expect("hook mutex") = Some(e.to_string());
                     stop.store(true, Relaxed);
                     return Err(git2::Error::from_str("pre-push hook failed"));
@@ -6676,7 +6665,7 @@ fn merge_commit(
         message = edit_message(repo, "MERGE_MSG", &message)?;
     }
     if !opts.no_verify {
-        run_hook(
+        check_hook(
             "commit-msg",
             git2_hooks::hooks_commit_msg(repo, None, &mut message),
         )?;
@@ -6712,15 +6701,28 @@ fn merge_title(repo: &Repository, name: &str) -> Result<String, GitError> {
     Ok(title)
 }
 
-/// Run a hook git2_hooks has no helper for (`pre-merge-commit`), if the hooks
-/// directory has it as an executable file.
-fn run_hook_file(repo: &Repository, name: &str) -> Result<(), GitError> {
+/// Where `repo`'s hooks are: `core.hooksPath` (relative to the working
+/// directory), else the hooks folder every worktree shares.
+pub(crate) fn hooks_dir(repo: &Repository) -> PathBuf {
     let workdir = repo.workdir().unwrap_or(repo.path());
-    let dir = match repo.config()?.get_path("core.hooksPath") {
+    match repo.config().and_then(|c| c.get_path("core.hooksPath")) {
         Ok(p) => workdir.join(p),
-        Err(_) => repo.path().join("hooks"),
-    };
-    let hook = dir.join(name);
+        Err(_) => repo.commondir().join("hooks"),
+    }
+}
+
+/// Run the `name` hook from `hooks_dir` (see [`GitBackend::hooks_dir`]) in
+/// `cwd` with `args`, feeding it `stdin`, if it is an executable file there.
+/// Returns its output, or None when there is no such hook.
+pub fn run_hook(
+    hooks_dir: &Path,
+    cwd: &Path,
+    name: &str,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> Result<Option<std::process::Output>, GitError> {
+    use std::process::Stdio;
+    let hook = hooks_dir.join(name);
     #[cfg(unix)]
     let runnable = {
         use std::os::unix::fs::PermissionsExt;
@@ -6730,11 +6732,33 @@ fn run_hook_file(repo: &Repository, name: &str) -> Result<(), GitError> {
     #[cfg(not(unix))]
     let runnable = hook.is_file();
     if !runnable {
-        return Ok(());
+        return Ok(None);
     }
-    let out = std::process::Command::new(&hook)
-        .current_dir(workdir)
-        .output()?;
+    let mut child = std::process::Command::new(&hook)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        // A hook that exits without reading its input is not an error.
+        let _ = std::io::Write::write_all(&mut pipe, data);
+    }
+    Ok(Some(child.wait_with_output()?))
+}
+
+/// Run a hook git2_hooks has no helper for (`pre-merge-commit`), if the hooks
+/// directory has it as an executable file.
+fn run_hook_file(repo: &Repository, name: &str) -> Result<(), GitError> {
+    let workdir = repo.workdir().unwrap_or(repo.path());
+    let Some(out) = run_hook(&hooks_dir(repo), workdir, name, &[], None)? else {
+        return Ok(());
+    };
     if out.status.success() {
         return Ok(());
     }
@@ -7863,7 +7887,7 @@ fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(
                 .and_then(|()| Ok(git2::Index::open(&tmp)?.write_tree_to(repo)?));
             let _ = std::fs::remove_file(&tmp);
             *only = hook?;
-            run_hook(
+            check_hook(
                 "commit-msg",
                 git2_hooks::hooks_commit_msg(repo, None, &mut msg),
             )?;
@@ -8053,11 +8077,7 @@ fn find_author(repo: &Repository, ident: &str) -> Result<git2::Signature<'static
 /// for `commit <paths>`.
 fn pre_commit_with_index(repo: &Repository, index: &Path) -> Result<(), GitError> {
     let workdir = repo.workdir().unwrap_or(repo.path());
-    let dir = match repo.config()?.get_path("core.hooksPath") {
-        Ok(p) => workdir.join(p),
-        Err(_) => repo.path().join("hooks"),
-    };
-    let hook = dir.join("pre-commit");
+    let hook = hooks_dir(repo).join("pre-commit");
     let runnable = hook
         .metadata()
         .is_ok_and(|m| m.is_file() && crate::lanes::executable_mode(&m) == 0o100755);
@@ -8354,14 +8374,14 @@ fn replay_onto(repo: &Repository, commits: &[&git2::Commit], base: Oid) -> Resul
 
 /// Run the pre-commit and commit-msg hooks, letting commit-msg rewrite `msg`.
 fn run_commit_hooks(repo: &Repository, msg: &mut String) -> Result<(), GitError> {
-    run_hook("pre-commit", git2_hooks::hooks_pre_commit(repo, None))?;
-    run_hook("commit-msg", git2_hooks::hooks_commit_msg(repo, None, msg))?;
+    check_hook("pre-commit", git2_hooks::hooks_pre_commit(repo, None))?;
+    check_hook("commit-msg", git2_hooks::hooks_commit_msg(repo, None, msg))?;
     Ok(())
 }
 
 /// Turn a hook result into an error when the hook ran and failed, surfacing its
 /// output so the user sees why.
-fn run_hook(
+fn check_hook(
     name: &str,
     result: Result<git2_hooks::HookResult, git2_hooks::HooksError>,
 ) -> Result<(), GitError> {

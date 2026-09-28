@@ -85,9 +85,14 @@ pub struct Pretty {
     date: String,
     decorate: bool,
     color: bool,
-    decorations: HashMap<String, Vec<String>>,
+    decorations: HashMap<String, Vec<(&'static str, String)>>,
     notes: HashSet<String>,
     backend: Arc<dyn GitBackend>,
+    /// Each commit's reflog entry when walking one (`log -g`, `stash list`):
+    /// short selector (`stash@{0}`), full one and message.
+    pub reflog: HashMap<String, [String; 3]>,
+    /// Inside a format after `%C(auto)`.
+    auto: std::cell::Cell<bool>,
 }
 
 impl Pretty {
@@ -154,6 +159,8 @@ impl Pretty {
             decorations: decorations(backend),
             notes,
             backend: backend.clone(),
+            reflog: HashMap::new(),
+            auto: std::cell::Cell::new(false),
         }))
     }
 
@@ -183,10 +190,44 @@ impl Pretty {
 
     /// ` (HEAD -> main, tag: v1)`, or empty.
     fn decor(&self, id: &str) -> String {
-        match self.decorations.get(id) {
-            Some(labels) => format!(" ({})", labels.join(", ")),
-            None => String::new(),
+        self.decor_in(id, false, true)
+    }
+
+    /// [`Self::decor`] in git's decoration colors when `color`, without the
+    /// ` (` and `)` around it unless `wrap` (`%D`).
+    fn decor_in(&self, id: &str, color: bool, wrap: bool) -> String {
+        let Some(labels) = self.decorations.get(id) else {
+            return String::new();
+        };
+        let paint = |s: &str, code: &str| {
+            if color {
+                format!("\x1b[{code}m{s}\x1b[m")
+            } else {
+                s.to_owned()
+            }
+        };
+        let mut out = String::new();
+        for (i, (code, label)) in labels.iter().enumerate() {
+            match (i, wrap) {
+                (0, false) => {}
+                (0, true) => out.push_str(&paint(" (", "33")),
+                _ => out.push_str(&paint(", ", "33")),
+            }
+            if let Some(branch) = label.strip_prefix("HEAD -> ") {
+                out.push_str(&paint("HEAD", code));
+                out.push_str(&paint(" -> ", "33"));
+                out.push_str(&paint(branch, "1;32"));
+            } else if let Some(tag) = label.strip_prefix("tag: ") {
+                out.push_str(&paint("tag: ", code));
+                out.push_str(&paint(tag, code));
+            } else {
+                out.push_str(&paint(label, code));
+            }
         }
+        if wrap {
+            out.push_str(&paint(")", "33"));
+        }
+        out
     }
 
     /// One commit as git's show_log prints it, without the separator or
@@ -205,7 +246,7 @@ impl Pretty {
             c.id.clone()
         };
         let decor = if self.decorate {
-            self.decor(&c.id)
+            self.decor_in(&c.id, self.color, true)
         } else {
             String::new()
         };
@@ -213,11 +254,21 @@ impl Pretty {
             Fmt::User(f) => return (String::new(), self.expand(f, c)),
             Fmt::Oneline => (
                 format!("{}{decor} ", self.paint(&hash, "33")),
-                subject(&c.message, " "),
+                match self.reflog.get(&c.id) {
+                    Some([_, full, msg]) => format!("{full}: {msg}"),
+                    None => subject(&c.message, " "),
+                },
             ),
             fmt => {
                 let head = format!("{}{decor}\n", self.paint(&format!("commit {hash}"), "33"));
                 let mut out = String::new();
+                if let Some([_, full, msg]) = self.reflog.get(&c.id) {
+                    let who = &c.committer;
+                    out.push_str(&format!(
+                        "Reflog: {full} ({} <{}>)\nReflog message: {msg}\n",
+                        who.name, who.email
+                    ));
+                }
                 if *fmt == Fmt::Raw {
                     out.push_str(&c.header);
                 } else {
@@ -321,9 +372,19 @@ impl Pretty {
     fn expand(&self, fmt: &str, c: &Commit) -> String {
         let mut out = String::new();
         let mut rest = fmt;
+        self.auto.set(false);
         while let Some(i) = rest.find('%') {
             out.push_str(&rest[..i]);
             rest = &rest[i + 1..];
+            // %C(auto): color %h, %H, %d and %D from here on, as git does.
+            if let Some(r) = rest.strip_prefix("C(auto)") {
+                self.auto.set(self.color);
+                if self.color && !out.is_empty() {
+                    out.push_str("\x1b[m");
+                }
+                rest = r;
+                continue;
+            }
             let magic = rest.chars().next().filter(|m| matches!(m, '+' | '-' | ' '));
             let spec = &rest[magic.map_or(0, char::len_utf8)..];
             let Some((value, used)) = self.placeholder(spec, c) else {
@@ -351,6 +412,10 @@ impl Pretty {
         match first {
             '%' => one("%".to_owned()),
             'n' => one("\n".to_owned()),
+            'H' if self.auto.get() => one(self.paint(&c.id, "33")),
+            'h' if self.auto.get() => one(self.paint(&self.abbrev(&c.id), "33")),
+            'd' if self.auto.get() => one(self.decor_in(&c.id, true, true)),
+            'D' if self.auto.get() => one(self.decor_in(&c.id, true, false)),
             'H' => one(c.id.clone()),
             'h' => one(self.abbrev(&c.id)),
             'T' => one(c.tree.clone()),
@@ -368,12 +433,19 @@ impl Pretty {
             )),
             'b' => one(body(&c.message).to_owned()),
             'B' => one(c.message.clone()),
+            'g' => {
+                let entry = self.reflog.get(&c.id);
+                let v = match (s[1..].chars().next()?, entry) {
+                    ('d', Some([short, ..])) => short.clone(),
+                    ('D', Some([_, full, _])) => full.clone(),
+                    ('s', Some([.., msg])) => msg.clone(),
+                    ('d' | 'D' | 's', None) => String::new(),
+                    _ => return None,
+                };
+                Some((v, 2))
+            }
             'd' => one(self.decor(&c.id)),
-            'D' => one(self
-                .decor(&c.id)
-                .trim_start_matches(" (")
-                .trim_end_matches(')')
-                .to_owned()),
+            'D' => one(self.decor_in(&c.id, false, false)),
             'e' | 'N' => one(String::new()),
             'x' => {
                 let hex = s.get(1..3)?;
@@ -381,6 +453,8 @@ impl Pretty {
                 Some(((b as char).to_string(), 3))
             }
             'C' => {
+                // An explicit color ends %C(auto)'s coloring, as in git.
+                self.auto.set(false);
                 let (name, used) = if let Some(spec) = s[1..].strip_prefix('(') {
                     let end = spec.find(')')?;
                     (&spec[..end], end + 3)
@@ -472,7 +546,7 @@ fn body(message: &str) -> &str {
 }
 
 /// git's %f: the subject with runs of other characters turned into `-`.
-fn sanitize(subject: &str) -> String {
+pub(crate) fn sanitize(subject: &str) -> String {
     let mut out = String::new();
     let mut space = 2;
     let b = subject.as_bytes();
@@ -517,8 +591,8 @@ fn expand_tabs(line: &str) -> String {
 
 /// Ref labels per commit id, in git's --decorate order: HEAD first, then
 /// tags, remote-tracking branches and branches, each in reverse name order.
-pub fn decorations(backend: &Arc<dyn GitBackend>) -> HashMap<String, Vec<String>> {
-    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+pub fn decorations(backend: &Arc<dyn GitBackend>) -> HashMap<String, Vec<(&'static str, String)>> {
+    let mut map: HashMap<String, Vec<(&'static str, String)>> = HashMap::new();
     let head = backend.symbolic_ref("HEAD").ok().flatten();
     let mut refs = backend.ref_details().unwrap_or_default();
     refs.sort_by(|a, b| b.name.cmp(&a.name));
@@ -527,13 +601,13 @@ pub fn decorations(backend: &Arc<dyn GitBackend>) -> HashMap<String, Vec<String>
             continue;
         }
         let label = if let Some(n) = r.name.strip_prefix("refs/heads/") {
-            n.to_owned()
+            ("1;32", n.to_owned())
         } else if let Some(n) = r.name.strip_prefix("refs/remotes/") {
-            n.to_owned()
+            ("1;31", n.to_owned())
         } else if let Some(n) = r.name.strip_prefix("refs/tags/") {
-            format!("tag: {n}")
+            ("1;33", format!("tag: {n}"))
         } else if r.name == "refs/stash" {
-            r.name.clone()
+            ("1;35", r.name.clone())
         } else {
             continue;
         };
@@ -545,7 +619,7 @@ pub fn decorations(backend: &Arc<dyn GitBackend>) -> HashMap<String, Vec<String>
             Some(branch) => format!("HEAD -> {branch}"),
             None => "HEAD".to_owned(),
         };
-        map.entry(id).or_default().insert(0, label);
+        map.entry(id).or_default().insert(0, ("1;36", label));
     }
     map
 }

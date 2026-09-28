@@ -156,6 +156,8 @@ pub struct GitGrep {
     pub max_count: Option<u64>,
     /// Fill `GrepHit::parts` with each match (`-o`).
     pub only_matching: bool,
+    /// Fill each hit's match `spans` (to color them).
+    pub spans: bool,
     /// Return one `line` 0 hit per file with no match instead (`-L`).
     pub files_without_match: bool,
     /// Skip binary files (`-I`).
@@ -172,6 +174,8 @@ pub struct GrepHit {
     pub context: bool,
     /// The matching parts of the line, with `only_matching`.
     pub parts: Vec<String>,
+    /// The byte ranges of the matches in `text`, with `spans`.
+    pub spans: Vec<(usize, usize)>,
 }
 
 /// The ignore rule that excludes a path (`git check-ignore -v`).
@@ -689,6 +693,7 @@ pub(crate) fn grep(
                 path,
                 matcher: &matcher,
                 only: q.only_matching,
+                spans: q.spans,
                 hits: Vec::new(),
             };
             if !(binary && q.skip_binary) {
@@ -711,6 +716,7 @@ pub(crate) fn grep(
                 binary,
                 context: false,
                 parts: Vec::new(),
+                spans: Vec::new(),
             };
             if q.files_without_match {
                 hits = if matched || binary && q.skip_binary {
@@ -731,6 +737,7 @@ struct Hits<'a> {
     path: &'a str,
     matcher: &'a grep::regex::RegexMatcher,
     only: bool,
+    spans: bool,
     hits: Vec<GrepHit>,
 }
 
@@ -738,10 +745,14 @@ impl Hits<'_> {
     fn push(&mut self, line: Option<u64>, bytes: &[u8], context: bool) {
         use grep::matcher::Matcher;
         let mut parts = Vec::new();
-        if self.only && !context {
+        let mut spans = Vec::new();
+        if (self.only || self.spans) && !context {
             let _ = self.matcher.find_iter(bytes, |m| {
                 if !m.is_empty() {
-                    parts.push(String::from_utf8_lossy(&bytes[m]).into_owned());
+                    spans.push((m.start(), m.end()));
+                    if self.only {
+                        parts.push(String::from_utf8_lossy(&bytes[m]).into_owned());
+                    }
                 }
                 true
             });
@@ -755,6 +766,7 @@ impl Hits<'_> {
             binary: false,
             context,
             parts,
+            spans,
         });
     }
 }

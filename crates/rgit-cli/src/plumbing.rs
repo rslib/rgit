@@ -864,6 +864,22 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             let before = before.or(context).unwrap_or(0);
             let after = after.or(context).unwrap_or(0);
             let show_name = !no_filename && !heading;
+            // git's default grep colors.
+            let color = crate::render::color_on();
+            let paint = |s: &str, code: &str| {
+                if color && !s.is_empty() {
+                    format!("\x1b[{code}m{s}\x1b[m")
+                } else {
+                    s.to_owned()
+                }
+            };
+            let psep = |c: char| {
+                if c == '\0' {
+                    c.to_string()
+                } else {
+                    paint(&c.to_string(), "36")
+                }
+            };
             let mut text = String::new();
             let mut rows = Vec::new();
             let mut last: Option<(String, u64)> = None;
@@ -883,6 +899,7 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                     only_matching,
                     files_without_match,
                     skip_binary,
+                    spans: color,
                 })?;
                 let mut per_file: Vec<(String, usize)> = Vec::new();
                 for h in &hits {
@@ -915,7 +932,7 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                     match &last {
                         Some(_) if new_file && break_ => text.push('\n'),
                         Some((_, l)) if hunks && (new_file || h.line != l + 1) => {
-                            text.push_str("--\n")
+                            text.push_str(&format!("{}\n", paint("--", "36")))
                         }
                         _ => {}
                     }
@@ -929,32 +946,45 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                         continue;
                     }
                     if heading && new_file {
-                        text.push_str(&format!("{file}\n"));
+                        text.push_str(&format!("{}\n", paint(&file, "35")));
                     }
-                    let s = if h.context { ctx_sep } else { sep };
+                    let s = psep(if h.context { ctx_sep } else { sep });
                     let mut lead = String::new();
                     if show_name {
-                        lead.push_str(&format!("{file}{s}"));
+                        lead.push_str(&format!("{}{s}", paint(&file, "35")));
                     }
                     if line_number {
-                        lead.push_str(&format!("{}{s}", h.line));
+                        lead.push_str(&format!("{}{s}", paint(&h.line.to_string(), "32")));
                     }
                     if only_matching {
                         for part in &h.parts {
-                            text.push_str(&format!("{lead}{part}\n"));
+                            text.push_str(&format!("{lead}{}\n", paint(part, "1;31")));
                         }
+                    } else if color && !h.spans.is_empty() {
+                        let mut line = String::new();
+                        let mut at = 0;
+                        for &(a, b) in &h.spans {
+                            if a < at || b > h.text.len() {
+                                continue;
+                            }
+                            line.push_str(&h.text[at..a]);
+                            line.push_str(&paint(&h.text[a..b], "1;31"));
+                            at = b;
+                        }
+                        line.push_str(&h.text[at..]);
+                        text.push_str(&format!("{lead}{line}\n"));
                     } else {
                         text.push_str(&format!("{lead}{}\n", h.text));
                     }
                 }
                 for (p, n) in per_file {
                     if files && n > 0 || files_without_match {
-                        text.push_str(&format!("{p}{end}"));
+                        text.push_str(&format!("{}{end}", paint(&p, "35")));
                     } else if count && n > 0 {
                         if no_filename {
                             text.push_str(&format!("{n}\n"));
                         } else {
-                            text.push_str(&format!("{p}{sep}{n}\n"));
+                            text.push_str(&format!("{}{}{n}\n", paint(&p, "35"), psep(sep)));
                         }
                     }
                 }
@@ -1592,6 +1622,7 @@ fn date_of<'a>(r: &'a RefDetail, atom: &str) -> Option<Option<&'a Ident>> {
 struct RefFormat<'a> {
     backend: &'a Arc<dyn GitBackend>,
     head: Option<String>,
+    color: bool,
 }
 
 /// Order refs by git's `--sort` keys (for-each-ref, branch and tag), the
@@ -1605,19 +1636,30 @@ pub(crate) fn sort_refs(
     RefFormat::new(backend).sort(refs, sort, icase)
 }
 
-/// Each ref in a for-each-ref `format` (branch and tag `--format`).
+/// Each ref in a for-each-ref `format` (branch and tag `--format`), with
+/// `%(color)` on when color is.
 pub(crate) fn format_refs<'r>(
     backend: &Arc<dyn GitBackend>,
     refs: impl IntoIterator<Item = &'r RefDetail>,
     format: &str,
-) -> anyhow::Result<String> {
-    let ctx = RefFormat::new(backend);
+) -> anyhow::Result<Vec<String>> {
+    let mut ctx = RefFormat::new(backend);
+    ctx.color = crate::render::color_on();
     let fmt = parse_format(format)?;
-    let lines: Vec<String> = refs
-        .into_iter()
-        .map(|r| ctx.render(&fmt, r))
-        .collect::<anyhow::Result<_>>()?;
-    Ok(lines.join("\n"))
+    // Like ref-filter, end each line in a reset when the last color set is
+    // not one.
+    let reset = ctx.color
+        && format.contains("%(color:")
+        && !format
+            .rsplit("%(color:")
+            .next()
+            .is_some_and(|c| c.starts_with("reset)"));
+    refs.into_iter()
+        .map(|r| {
+            let line = ctx.render(&fmt, r)?;
+            Ok(if reset { line + "\x1b[m" } else { line })
+        })
+        .collect()
 }
 
 impl<'a> RefFormat<'a> {
@@ -1625,6 +1667,7 @@ impl<'a> RefFormat<'a> {
         RefFormat {
             backend,
             head: backend.symbolic_ref("HEAD").ok().flatten(),
+            color: false,
         }
     }
 
@@ -1777,6 +1820,7 @@ impl<'a> RefFormat<'a> {
             ("parent", _) if r.kind == "commit" => parents().join(" "),
             ("numparent", _) if r.kind == "commit" => parents().len().to_string(),
             ("tree" | "parent" | "numparent", _) => String::new(),
+            ("subject", "sanitize") => crate::pretty::sanitize(&subject()),
             ("subject", _) | ("contents", "subject") => subject(),
             ("body", _) => body(),
             ("contents", "body") => body()
@@ -1784,7 +1828,28 @@ impl<'a> RefFormat<'a> {
                 .unwrap_or_default()
                 .to_owned(),
             ("contents", "signature") => signature.to_owned(),
-            ("contents", _) => message.to_owned(),
+            ("contents", "size") => message.len().to_string(),
+            ("contents", "") => message.to_owned(),
+            ("trailers", _) => trailers(message.strip_suffix(signature).unwrap_or(message), arg)?,
+            ("contents", a) if a == "trailers" || a.starts_with("trailers:") => trailers(
+                message.strip_suffix(signature).unwrap_or(message),
+                a.trim_start_matches("trailers").trim_start_matches(':'),
+            )?,
+            ("contents", a) => {
+                let n: usize = a
+                    .strip_prefix("lines=")
+                    .and_then(|n| n.parse().ok())
+                    .ok_or_else(|| anyhow::anyhow!("unrecognized %(contents) argument: {a}"))?;
+                let contents = message.strip_suffix(signature).unwrap_or(message);
+                let mut out = Vec::new();
+                let mut rest = contents;
+                while out.len() < n && !rest.is_empty() {
+                    let (line, next) = rest.split_once('\n').unwrap_or((rest, ""));
+                    out.push(line);
+                    rest = next;
+                }
+                out.join("\n    ")
+            }
             ("HEAD", _) => if self.head.as_deref() == Some(r.name.as_str()) {
                 "*"
             } else {
@@ -1818,7 +1883,11 @@ impl<'a> RefFormat<'a> {
                 }
             }
             ("upstream", _) => r.upstream.as_deref().map(short).unwrap_or_default(),
-            ("color", _) => String::new(),
+            ("color", _) => {
+                let code = crate::render::ansi(arg)
+                    .ok_or_else(|| anyhow::anyhow!("unrecognized color: %(color:{arg})"))?;
+                if self.color { code } else { String::new() }
+            }
             _ => {
                 for (role, ident) in [
                     ("author", r.author.as_ref()),
@@ -1839,6 +1908,103 @@ impl<'a> RefFormat<'a> {
 }
 
 /// Where a tag message's signature starts (git's parse_signature).
+/// git's `%(trailers[:<options>])`: the trailer block ending `message`,
+/// filtered and joined as `only`, `unfold`, `key=`, `valueonly`, `separator=`
+/// and `key_value_separator=` ask.
+fn trailers(message: &str, opts: &str) -> anyhow::Result<String> {
+    let (mut only, mut unfold, mut valueonly) = (false, false, false);
+    let (mut keys, mut sep, mut kv_sep) = (Vec::new(), None, None);
+    let flag = |v: Option<&str>| !matches!(v, Some("false" | "no" | "off" | "0"));
+    for o in opts.split(',').filter(|o| !o.is_empty()) {
+        let (k, v) = match o.split_once('=') {
+            Some((k, v)) => (k, Some(v)),
+            None => (o, None),
+        };
+        match k {
+            "only" => only = flag(v),
+            "unfold" => unfold = flag(v),
+            "valueonly" => valueonly = flag(v),
+            "key" => keys.push(v.unwrap_or_default().trim_end_matches(':').to_lowercase()),
+            "separator" => sep = v.map(expand_literal),
+            "key_value_separator" => kv_sep = v.map(expand_literal),
+            _ => anyhow::bail!("unknown %(trailers) argument: {o}"),
+        }
+    }
+    let text = message.trim_end_matches('\n');
+    let Some((_, block)) = text.split_once("\n\n").and(text.rsplit_once("\n\n")) else {
+        return Ok(String::new());
+    };
+    let mut items: Vec<String> = Vec::new();
+    for line in block.lines() {
+        match items.last_mut() {
+            Some(last) if line.starts_with([' ', '\t']) => {
+                last.push('\n');
+                last.push_str(line);
+            }
+            _ => items.push(line.to_owned()),
+        }
+    }
+    let token = |l: &str| {
+        l.split_once(':')
+            .map(|(k, v)| (k.to_owned(), v.trim_start().to_owned()))
+            .filter(|(k, _)| !k.is_empty() && !k.contains(char::is_whitespace))
+    };
+    if items.is_empty() || !items.iter().all(|l| token(l).is_some()) {
+        return Ok(String::new());
+    }
+    let raw =
+        !only && !unfold && !valueonly && keys.is_empty() && sep.is_none() && kv_sep.is_none();
+    if raw {
+        return Ok(format!("{block}\n"));
+    }
+    let out: Vec<String> = items
+        .iter()
+        .filter_map(|l| {
+            let (k, mut v) = token(l)?;
+            if !keys.is_empty() && !keys.contains(&k.to_lowercase()) {
+                return None;
+            }
+            if unfold {
+                v = v.split_whitespace().collect::<Vec<_>>().join(" ");
+            }
+            Some(if valueonly {
+                v
+            } else {
+                format!("{k}{}{v}", kv_sep.as_deref().unwrap_or(": "))
+            })
+        })
+        .collect();
+    Ok(match sep {
+        Some(sep) => out.join(&sep),
+        None => out.iter().map(|l| format!("{l}\n")).collect(),
+    })
+}
+
+/// `%n` and `%xNN` in a format option expanded, as git's
+/// strbuf_expand_literal does.
+fn expand_literal(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 1..];
+        if let Some(r) = rest.strip_prefix('n') {
+            out.push('\n');
+            rest = r;
+        } else if let Some(b) = rest
+            .strip_prefix('x')
+            .and_then(|r| r.get(..2))
+            .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(b as char);
+            rest = &rest[3..];
+        } else {
+            out.push('%');
+        }
+    }
+    out + rest
+}
+
 fn signature_start(message: &str) -> Option<usize> {
     const STARTS: [&str; 4] = [
         "-----BEGIN PGP SIGNATURE-----",

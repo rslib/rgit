@@ -57,7 +57,9 @@ pub use creds::CredentialPrompt;
 pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 pub use error::GitError;
 pub use format_patch::{CherryCommit, FormatPatchOpts, PatchMail, Thread, mbox};
-pub use git_repo::{Git2Backend, clone, diff_no_index, init, ls_remote, pathspec_matches};
+pub use git_repo::{
+    Git2Backend, clone, diff_no_index, init, ls_remote, pathspec_matches, run_hook,
+};
 pub use model::{
     BlameLine, Blob, CheckoutMode, CloneArgs, Commit, CommitDetails, CommitFile, CommitOptions,
     CommitOverview, CommitRef, Deco, DiffSpec, EmptyCommit, FetchArgs, FileActivity, GrepMatch,

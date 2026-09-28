@@ -1053,3 +1053,467 @@ fn worktree_takes_git_argument_order_and_forms() {
         "refs/heads/remote-only"
     );
 }
+
+/// `rgit --human <args>` and `git <args>` print the same bytes and exit the
+/// same way, in a 40-column terminal width.
+fn exact(dir: &Path, args: &[&str]) {
+    let run = |cmd: &mut Command| {
+        let out = cmd
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("RGIT_OPLOG", "0")
+            .env("COLUMNS", "40")
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status.code(),
+        )
+    };
+    let want = run(&mut Command::new("git"));
+    let got = run(Command::new(env!("CARGO_BIN_EXE_rgit")).arg("--human"));
+    assert_eq!(got, want, "rgit {args:?}");
+}
+
+/// `repo` with a dozen branches and tags at its first commit.
+fn many_refs(tag: &str) -> PathBuf {
+    let dir = repo(tag);
+    for b in [
+        "alpha", "beta", "delta", "epsilon", "eta", "gamma", "iota", "kappa", "lambda", "theta",
+        "zeta",
+    ] {
+        git(&dir, &["branch", b]);
+        git(&dir, &["tag", &format!("v-{b}")]);
+    }
+    dir
+}
+
+#[test]
+fn branch_and_tag_lay_out_columns_like_git() {
+    let dir = many_refs("columns");
+    for args in [
+        &["branch", "--column"][..],
+        &["branch", "--column=row"],
+        &["branch", "--column=dense"],
+        &["branch", "--column=row,dense"],
+        &["branch", "--column=plain"],
+        &["branch", "--no-column"],
+        &["tag", "--column"],
+        &["tag", "--column=dense"],
+        &["tag", "--column=row nodense"],
+    ] {
+        exact(&dir, args);
+    }
+    git(&dir, &["config", "column.ui", "always"]);
+    exact(&dir, &["branch"]);
+    exact(&dir, &["tag"]);
+    exact(&dir, &["branch", "-v"]);
+    exact(&dir, &["tag", "-n"]);
+    git(&dir, &["config", "column.branch", "never"]);
+    exact(&dir, &["branch"]);
+    exact(&dir, &["branch", "--column=row"]);
+    fails(&dir, &["--human", "branch", "-v", "--column"]);
+    fails(&dir, &["--human", "branch", "--column=diagonal"]);
+}
+
+#[test]
+fn branch_colors_abbrev_and_marks_like_git() {
+    let dir = many_refs("branch-color");
+    let wt = dir.with_extension("wt");
+    let _ = std::fs::remove_dir_all(&wt);
+    git(
+        &dir,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "beta"],
+    );
+    commit(&dir, "x", "second");
+    git(&dir, &["branch", "-q", "-u", "alpha"]);
+    for args in [
+        &["branch", "--color=always"][..],
+        &["branch", "--color=always", "-v"],
+        &["branch", "--color=always", "-vv"],
+        &["branch", "-vv"],
+        &["branch", "--abbrev=4", "-v"],
+        &["branch", "--abbrev=12", "-v"],
+        &["branch", "--no-abbrev", "-v"],
+        &["branch", "--list", "a*", "e*"],
+        &[
+            "branch",
+            "--color=always",
+            "--format=%(color:bold red)%(refname:short)",
+        ],
+        &[
+            "branch",
+            "--omit-empty",
+            "--format=%(if)%(HEAD)%(then)here%(end)",
+        ],
+    ] {
+        exact(&dir, args);
+    }
+    git(&dir, &["config", "color.branch", "always"]);
+    exact(&dir, &["branch"]);
+    exact(&dir, &["branch", "--no-color"]);
+    git(&dir, &["config", "color.branch", "never"]);
+    git(&dir, &["config", "color.ui", "always"]);
+    exact(&dir, &["branch"]);
+    git(&dir, &["config", "--unset", "color.branch"]);
+    exact(&dir, &["branch"]);
+    git(&dir, &["config", "--unset", "color.ui"]);
+
+    git(&dir, &["checkout", "-q", "--detach", "v-alpha"]);
+    exact(&dir, &["branch"]);
+    exact(&dir, &["branch", "-v", "--color=always"]);
+    commit(&dir, "y", "moved");
+    exact(&dir, &["branch"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    ok(
+        &dir,
+        &[
+            "branch",
+            "--create-reflog",
+            "--recurse-submodules",
+            "logged",
+        ],
+    );
+    assert!(dir.join(".git/logs/refs/heads/logged").exists());
+}
+
+#[test]
+fn tag_trailers_and_contents_atoms_match_git() {
+    let dir = repo("tag-contents");
+    git(
+        &dir,
+        &[
+            "tag",
+            "-m",
+            "Subject line\n\nBody one\nline two\n\nSigned-off-by: X <x@y>\nSee: also\n",
+            "t1",
+        ],
+    );
+    git(&dir, &["tag", "-m", "one", "t2"]);
+    git(&dir, &["tag", "light"]);
+    for atom in [
+        "contents",
+        "contents:subject",
+        "contents:body",
+        "contents:signature",
+        "contents:lines=2",
+        "contents:size",
+        "contents:trailers",
+        "contents:trailers:only",
+        "contents:trailers:key=Signed-off-by,valueonly",
+        "trailers",
+        "trailers:unfold,separator=%x2C",
+        "trailers:key=see,key_value_separator=%x3D",
+        "subject:sanitize",
+    ] {
+        exact(&dir, &["tag", "-l", &format!("--format=[%({atom})]")]);
+    }
+    for args in [
+        &["tag", "-n"][..],
+        &["tag", "-n0"],
+        &["tag", "-n3"],
+        &["tag", "-n99", "t*"],
+        &["tag", "--color=always", "--format=%(color:red)%(refname)"],
+    ] {
+        exact(&dir, args);
+    }
+    fails(
+        &dir,
+        &["tag", "-l", "--format=%(contents:subject:sanitize)"],
+    );
+
+    ok(
+        &dir,
+        &[
+            "tag",
+            "-m",
+            "subj",
+            "--trailer",
+            "A: b",
+            "--trailer",
+            "C=d",
+            "--create-reflog",
+            "tt",
+        ],
+    );
+    assert_eq!(
+        git(&dir, &["tag", "-l", "--format=%(contents)", "tt"]),
+        "subj\n\nA: b\nC: d\n\n"
+    );
+    assert!(dir.join(".git/logs/refs/tags/tt").exists());
+    ok(
+        &dir,
+        &["tag", "--trailer", "Only: one", "-m", "x\n\nK: v", "tt2"],
+    );
+    assert_eq!(
+        git(&dir, &["tag", "-l", "--format=%(contents)", "tt2"]),
+        "x\n\nK: v\nOnly: one\n\n"
+    );
+}
+
+#[test]
+fn stash_list_and_show_take_log_and_diff_forms() {
+    let dir = repo("stash-list-forms");
+    std::fs::write(dir.join("a"), "a\nm1\n").unwrap();
+    git(&dir, &["stash", "-q"]);
+    std::fs::write(dir.join("a"), "a\nm2\n").unwrap();
+    git(&dir, &["add", "a"]);
+    std::fs::write(dir.join("a"), "a\nm2\nm3\n").unwrap();
+    std::fs::write(dir.join("untracked"), "u\n").unwrap();
+    git(&dir, &["stash", "-q", "-u", "-m", "second one"]);
+    for args in [
+        &["stash", "list"][..],
+        &["stash", "list", "--oneline"],
+        &["stash", "list", "-p"],
+        &["stash", "list", "--stat"],
+        &["stash", "list", "-n1", "--oneline"],
+        &["stash", "list", "--pretty=oneline"],
+        &["stash", "list", "--format=%h %gd %gD %gs"],
+        &["stash", "list", "--pretty=medium", "-1"],
+        &["stash", "show"],
+        &["stash", "show", "-p"],
+        &["stash", "show", "--stat"],
+        &["stash", "show", "--patch-with-stat"],
+        &["stash", "show", "--include-untracked"],
+        &["stash", "show", "-p", "--include-untracked"],
+        &["stash", "show", "--only-untracked", "-p"],
+        &["stash", "show", "stash@{1}"],
+    ] {
+        exact(&dir, args);
+    }
+    git(&dir, &["config", "stash.showPatch", "true"]);
+    exact(&dir, &["stash", "show"]);
+    git(&dir, &["config", "stash.showStat", "false"]);
+    exact(&dir, &["stash", "show"]);
+    git(&dir, &["config", "stash.showIncludeUntracked", "true"]);
+    exact(&dir, &["stash", "show"]);
+
+    assert_eq!(ok(&dir, &["--human", "stash", "apply", "-q", "1"]), "");
+    git(&dir, &["checkout", "-q", "--", "a"]);
+    assert_eq!(ok(&dir, &["--human", "stash", "drop", "-q", "1"]), "");
+    assert_eq!(ok(&dir, &["--human", "stash", "pop", "-q"]), "");
+    assert_eq!(git(&dir, &["stash", "list"]), "");
+}
+
+#[test]
+fn remote_show_reports_push_refspecs_and_head_like_git() {
+    let dir = repo("remote-push");
+    git(&dir, &["branch", "side"]);
+    with_origin(&dir);
+    let origin = dir.with_extension("origin.git");
+    git(
+        &dir,
+        &["branch", "-q", "--set-upstream-to=origin/main", "main"],
+    );
+    commit(&dir, "local", "local");
+    git(&dir, &["tag", "vt"]);
+    let show = || {
+        exact(&dir, &["remote", "show", "origin"]);
+        exact(&dir, &["remote", "show", "-n", "origin"]);
+    };
+    show();
+    for specs in [
+        &[
+            "refs/heads/main:refs/heads/other",
+            "+refs/heads/side:refs/heads/side",
+        ][..],
+        &["refs/heads/*:refs/heads/*"],
+        &["HEAD"],
+        &[":"],
+        &["refs/tags/*:refs/tags/*"],
+        &["main:side"],
+    ] {
+        for s in specs {
+            git(&dir, &["config", "--add", "remote.origin.push", s]);
+        }
+        show();
+        git(&dir, &["config", "--unset-all", "remote.origin.push"]);
+    }
+    git(&dir, &["config", "branch.side.remote", "origin"]);
+    git(&dir, &["config", "branch.side.merge", "refs/heads/side"]);
+    git(&dir, &["config", "branch.side.rebase", "true"]);
+    show();
+
+    // A detached remote HEAD names every branch at its commit.
+    git(&origin, &["branch", "twin", "main"]);
+    git(
+        &origin,
+        &["update-ref", "--no-deref", "HEAD", "refs/heads/main"],
+    );
+    exact(&dir, &["remote", "show", "origin"]);
+    let out = fails(&dir, &["remote", "set-head", "origin", "-a"]);
+    assert!(out.contains("Multiple remote HEAD branches"), "{out}");
+
+    git(
+        &dir,
+        &["remote", "set-url", "--add", "--push", "origin", "/x/one"],
+    );
+    git(
+        &dir,
+        &["remote", "set-url", "--add", "--push", "origin", "/x/two"],
+    );
+    exact(&dir, &["remote", "get-url", "--all", "--push", "origin"]);
+    exact(&dir, &["remote", "get-url", "--push", "origin"]);
+}
+
+#[test]
+fn hooks_run_after_checkout_merge_worktree_add_and_clone() {
+    let dir = repo("hooks");
+    let log = dir.with_extension("hooklog");
+    let hooks = dir.with_extension("hooks");
+    let _ = std::fs::remove_dir_all(&hooks);
+    std::fs::create_dir_all(&hooks).unwrap();
+    for name in ["post-checkout", "post-merge"] {
+        let path = hooks.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        Command::new("chmod").arg("+x").arg(&path).status().unwrap();
+    }
+    git(&dir, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+    let take = || {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_file(&log);
+        text
+    };
+    let head = rev(&dir, "HEAD");
+    git(&dir, &["branch", "side"]);
+    // Each command once through git, once through rgit: same hook calls.
+    let both = |g: &[&str], r: &[&str], undo: &[&[&str]]| {
+        git(&dir, g);
+        let want = take();
+        for u in undo {
+            git(&dir, u);
+        }
+        let _ = take();
+        ok(&dir, r);
+        let got = take();
+        for u in undo {
+            git(&dir, u);
+        }
+        let _ = take();
+        assert_eq!(got, want, "{r:?}");
+        assert!(!got.is_empty(), "{r:?}");
+    };
+    both(
+        &["checkout", "-q", "side"],
+        &["checkout", "side"],
+        &[&["checkout", "-q", "main"]],
+    );
+    both(
+        &["switch", "-q", "side"],
+        &["switch", "side"],
+        &[&["checkout", "-q", "main"]],
+    );
+    std::fs::write(dir.join("a"), "dirty\n").unwrap();
+    both(
+        &["checkout", "-q", "--", "a"],
+        &["checkout", "--", "a"],
+        &[],
+    );
+    git(&dir, &["checkout", "-q", "side"]);
+    commit(&dir, "s", "side work");
+    git(&dir, &["checkout", "-q", "main"]);
+    let _ = take();
+    both(
+        &["merge", "-q", "side"],
+        &["merge", "side"],
+        &[&["reset", "-q", "--hard", &head]],
+    );
+    both(
+        &["merge", "-q", "--squash", "side"],
+        &["merge", "--squash", "side"],
+        &[&["reset", "-q", "--hard", &head]],
+    );
+
+    let wt = dir.with_extension("hookwt");
+    let _ = std::fs::remove_dir_all(&wt);
+    ok(&dir, &["worktree", "add", wt.to_str().unwrap(), "side"]);
+    let side = rev(&dir, "side");
+    assert_eq!(
+        take(),
+        format!("post-checkout {} {side} 1\n", "0".repeat(40))
+    );
+    git(
+        &dir,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
+    ok(
+        &dir,
+        &[
+            "worktree",
+            "add",
+            "--no-checkout",
+            wt.to_str().unwrap(),
+            "side",
+        ],
+    );
+    assert_eq!(take(), "");
+
+    // A clone runs the post-checkout hook its template brings.
+    let tpl = dir.with_extension("tpl");
+    let _ = std::fs::remove_dir_all(&tpl);
+    std::fs::create_dir_all(tpl.join("hooks")).unwrap();
+    std::fs::copy(hooks.join("post-checkout"), tpl.join("hooks/post-checkout")).unwrap();
+    let dest = dir.with_extension("hookclone");
+    let _ = std::fs::remove_dir_all(&dest);
+    let template = format!("--template={}", tpl.display());
+    ok(
+        &dir,
+        &[
+            "clone",
+            &template,
+            dir.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ],
+    );
+    let main = rev(&dir, "main");
+    assert_eq!(
+        take(),
+        format!("post-checkout {} {main} 1\n", "0".repeat(40))
+    );
+}
+
+#[test]
+fn worktree_add_guesses_the_remote_branch() {
+    let dir = repo("wt-guess");
+    git(&dir, &["branch", "topic"]);
+    with_origin(&dir);
+    git(&dir, &["branch", "-D", "topic"]);
+    let wt = dir.with_extension("topic");
+    let path = wt.parent().unwrap().join("topic");
+    let _ = std::fs::remove_dir_all(&path);
+    let path_s = path.to_str().unwrap();
+    ok(&dir, &["worktree", "add", "--guess-remote", path_s]);
+    assert_eq!(
+        git(&dir, &["rev-parse", "--abbrev-ref", "topic@{u}"]),
+        "origin/topic\n"
+    );
+    git(&dir, &["worktree", "remove", "--force", path_s]);
+    git(&dir, &["branch", "-D", "topic"]);
+    git(&dir, &["config", "worktree.guessRemote", "true"]);
+    ok(&dir, &["worktree", "add", path_s]);
+    assert_eq!(
+        git(&dir, &["rev-parse", "--abbrev-ref", "topic@{u}"]),
+        "origin/topic\n"
+    );
+    git(&dir, &["worktree", "remove", "--force", path_s]);
+    git(&dir, &["branch", "-D", "topic"]);
+    ok(&dir, &["worktree", "add", "--no-guess-remote", path_s]);
+    let out = Command::new("git")
+        .args([
+            "-C",
+            dir.to_str().unwrap(),
+            "rev-parse",
+            "--abbrev-ref",
+            "topic@{u}",
+        ])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}

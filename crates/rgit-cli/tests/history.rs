@@ -619,3 +619,48 @@ fn format_leaves_off_the_final_newline_and_tformat_keeps_it() {
     same(&dir, &["log", "-2", "--format=tformat:%h %s"]);
     same(&dir, &["show", "-s", "--format=format:%h", "HEAD"]);
 }
+
+#[test]
+fn colors_match_gits_palette() {
+    let dir = repo("colors");
+    // An octopus merge, for its dashes.
+    git(&dir, &["checkout", "-q", "-b", "o1", "HEAD~3"]);
+    commit(&dir, 9, &[("o1", "o\n")], "o1");
+    git(&dir, &["checkout", "-q", "-b", "o2", "HEAD~1"]);
+    commit(&dir, 9, &[("o2", "o\n")], "o2");
+    git(&dir, &["checkout", "-q", "main"]);
+    git_at(&dir, &["merge", "-q", "--no-edit", "o1", "o2", "topic"], 9);
+    std::fs::write(dir.join("b.txt"), "1\ntrailing  \n\nnew\n").unwrap();
+    git(&dir, &["config", "color.ui", "always"]);
+    for args in [
+        &["log", "--graph", "--oneline"][..],
+        &["log", "--graph", "--oneline", "--decorate", "--all"],
+        &["log", "--graph", "--stat", "-4"],
+        &["log", "--oneline", "--decorate"],
+        &["log", "--format=%C(auto)%h%d %C(red)%s%C(reset) %D"],
+        &["log", "--pretty=medium", "-p", "-2"],
+        &["diff", "-p"],
+        &["diff", "--stat"],
+        &["diff", "-p", "v1", "HEAD", "--", "dir"],
+        &["grep", "-n", "o"],
+        &["grep", "-c", "e"],
+        &["grep", "-l", "e"],
+        &["grep", "--heading", "-n", "-C1", "five"],
+        &["grep", "-o", "t.o"],
+        &["grep", "-n", "e", "HEAD~1"],
+    ] {
+        same(&dir, args);
+    }
+    same(&dir, &["log", "--graph", "--oneline", "--no-color"]);
+    same(&dir, &["log", "--graph", "--oneline", "--color=never"]);
+    git(&dir, &["config", "color.diff", "never"]);
+    same(&dir, &["log", "--graph", "--oneline"]);
+    same(&dir, &["diff", "-p"]);
+    same(&dir, &["grep", "-n", "o"]);
+    git(&dir, &["config", "--unset", "color.ui"]);
+    git(&dir, &["config", "--unset", "color.diff"]);
+    // Piped output stays plain unless asked.
+    same(&dir, &["log", "--graph", "--oneline", "--decorate"]);
+    same(&dir, &["log", "--graph", "--oneline", "--color"]);
+    same(&dir, &["diff", "-p", "--color=always"]);
+}

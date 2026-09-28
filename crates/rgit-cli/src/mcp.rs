@@ -2712,7 +2712,8 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             },
         },
         "git_stashes" => stash(StashCmd::List {
-            format: None,
+            pretty: Default::default(),
+            diff: Default::default(),
             max_count: None,
         }),
         "git_remotes" => Command::Remote {
@@ -3235,13 +3236,16 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         "git_stash_pop" => stash(StashCmd::Pop {
             index: stash_index()?,
             restore_index: a.flag("restore_index"),
+            quiet: false,
         }),
         "git_stash_apply" => stash(StashCmd::Apply {
             index: stash_index()?,
             restore_index: a.flag("restore_index"),
+            quiet: false,
         }),
         "git_stash_drop" => stash(StashCmd::Drop {
             index: stash_index()?,
+            quiet: false,
         }),
         "git_stash_show" => stash(StashCmd::Show {
             index: stash_index()?,
@@ -3252,6 +3256,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             stat: false,
             include_untracked: a.flag("include_untracked"),
             only_untracked: false,
+            patch_with_stat: false,
         }),
         "git_stash_branch" => stash(StashCmd::Branch {
             name: a.req("name")?,
@@ -3344,6 +3349,8 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             reason: None,
             track: false,
             no_track: false,
+            guess_remote: false,
+            no_guess_remote: false,
             quiet: false,
         }),
         "git_worktree_lock" => worktree(WorktreeCmd::Lock {

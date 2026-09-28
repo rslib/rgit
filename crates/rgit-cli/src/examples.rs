@@ -452,6 +452,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit tag -s v1.0.0 -F notes.txt",
             "rgit tag --contains <rev>",
             "rgit tag -d v1.0.0 v1.0.1",
+            "rgit tag --column=row,dense",
+            "rgit tag -m \"<message>\" --trailer \"Reviewed-by: <name>\" v1.0.0",
         ],
     ),
     ("absorb", &["rgit absorb"]),
@@ -760,6 +762,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit branch -c <branch> <new_branch>",
             "rgit branch -d <branch> <branch>",
             "rgit branch -u origin/<branch>",
+            "rgit branch --column",
+            "rgit branch -v --abbrev=12 --color=always",
         ],
     ),
     (
@@ -818,6 +822,8 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit stash list",
             "rgit stash list --format=\"%gd %cr %gs\" -n 5",
+            "rgit stash list --oneline",
+            "rgit stash list -p",
         ],
     ),
     (
@@ -888,6 +894,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit worktree add --detach ../<path> <rev>",
             "rgit worktree add -B <branch> --lock --reason \"<reason>\" ../<path>",
             "rgit worktree add --orphan -b <new_branch> ../<path>",
+            "rgit worktree add --guess-remote ../<branch>",
         ],
     ),
     (

@@ -176,6 +176,7 @@ fn main() -> ! {
                 shallow_since,
                 separate_git_dir,
             };
+            let checkout = !(no_checkout || bare || mirror) && args.filter.is_none();
             let result = rgit_git::clone(&url, std::path::Path::new(&dir), &args, &|p| {
                 if let rgit_git::OpProgress::Line(l) = p
                     && (l.starts_with("warning:") || l.starts_with("info:"))
@@ -183,6 +184,16 @@ fn main() -> ! {
                     eprintln!("{l}");
                 }
             });
+            if result.is_ok()
+                && checkout
+                && let Ok(repo) = rgit_git::Git2Backend::discover(&dir)
+            {
+                let repo: std::sync::Arc<dyn rgit_git::GitBackend> = std::sync::Arc::new(repo);
+                let zero = "0".repeat(40);
+                let head = repo.rev_parse("HEAD").unwrap_or_else(|_| zero.clone());
+                let _ =
+                    cli::post_hook(&repo, repo.workdir(), "post-checkout", &[&zero, &head, "1"]);
+            }
             finish(
                 result
                     .map(|()| {
@@ -373,8 +384,13 @@ fn main() -> ! {
         }
         Some(command) => {
             // Color and prompts only on a real terminal.
-            render::set_color(
-                output_mode == OutputMode::Text && !cli.no_color && stdout_is_terminal,
+            render::init_color(
+                output_mode == OutputMode::Text,
+                if cli.no_color {
+                    Some("never")
+                } else {
+                    cli.color.as_deref()
+                },
             );
             let repoless = command.runs_without_repo();
             let backend = match discover_or_init(can_prompt && !repoless) {
@@ -492,9 +508,14 @@ fn fail(message: String, help: Vec<String>, code: i32, mode: OutputMode) -> ! {
     exit(code);
 }
 
-/// git's `-<n>` count for `log`: `rgit log -3` is `rgit log -n 3`.
+/// git's `-<n>` count for `log` and `stash list`: `rgit log -3` is `rgit log -n 3`.
 fn count_shorthand(args: &[String]) -> Vec<String> {
-    let Some(log) = args.iter().position(|a| a == "log") else {
+    let log = args.iter().position(|a| a == "log").or_else(|| {
+        args.windows(2)
+            .position(|w| w[0] == "stash" && w[1] == "list")
+            .map(|i| i + 1)
+    });
+    let Some(log) = log else {
         return args.to_vec();
     };
     let mut out = args[..=log].to_vec();

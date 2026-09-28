@@ -935,8 +935,8 @@ pub trait GitBackend: Send + Sync {
         delete: bool,
     ) -> Result<(), GitError>;
 
-    /// The refs a remote has, as (name, id), and the branch its HEAD names,
-    /// read from its first URL (`git ls-remote`).
+    /// The refs a remote has, as (name, id), and the branch its HEAD names
+    /// when it says (a symref), read from its first URL (`git ls-remote`).
     fn remote_heads(&self, name: &str) -> Result<RemoteHeads, GitError>;
 
     /// Rename a remote and its tracking refs (git's `remote rename`).
