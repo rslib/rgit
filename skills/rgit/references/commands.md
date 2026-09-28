@@ -25,7 +25,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `resolve`: Resolve a conflicted path by taking ours or theirs. e.g. `rgit resolve src/lib.rs --ours`, `rgit resolve src/lib.rs --theirs`
 - `rm`: Remove tracked paths from the index and working tree. e.g. `rgit rm src/lib.rs`, `rgit rm src/lib.rs --cached`, `rgit rm -n -r src/`
 - `mv`: Rename/move tracked files or folders. e.g. `rgit mv src/old.rs src/new.rs`, `rgit mv -n src/old.rs src/new.rs`
-- `clean`: Remove untracked files and directories. e.g. `rgit clean`, `rgit clean --dry-run`
+- `clean`: Remove untracked files and directories. e.g. `rgit clean -n`, `rgit clean -fd`, `rgit clean -idx`
 
 ## Commit and rewrite history
 
@@ -85,7 +85,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `bisect run`: Mark each step by running a command: exit 0 good, 125 skip, other bad. e.g. `rgit bisect run cargo test`, `rgit bisect run ./check.sh --quick`
   - `bisect visualize`: List the commits still in the search. e.g. `rgit bisect visualize`, `rgit bisect view`
   - `bisect terms`: Print the terms for the old and new states. e.g. `rgit bisect terms`, `rgit bisect terms --term-good`
-- `prune`: Prune unreachable objects (git's `prune`). For deleting merged branches, use `branch prune`. e.g. `rgit prune`, `rgit prune --dry-run`
+- `prune`: Prune unreachable objects (git's `prune`). For deleting merged branches, use `branch prune`. e.g. `rgit prune`, `rgit prune --dry-run`, `rgit prune -v --expire=2.weeks.ago`
 
 ## Stacks, lanes, workspaces, worktrees
 
@@ -189,14 +189,17 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `hash-object`: Print the object id of files or stdin; -w stores them. e.g. `rgit hash-object src/lib.rs`, `rgit hash-object -w --stdin`, `rgit hash-object --stdin --path src/lib.rs`, `rgit hash-object --no-filters -t blob file.bin`
 - `gc`: Pack the object database and prune unreachable objects. e.g. `rgit gc`, `rgit gc --prune=now`, `rgit gc --aggressive --cruft`
 - `fsck`: Check the object database for corruption and dangling objects. e.g. `rgit fsck`, `rgit fsck --unreachable --no-reflogs`, `rgit fsck --lost-found`, `rgit fsck --name-objects --full`
+- `verify-commit`: Check commits' gpg, x509 or ssh signatures (`git verify-commit`). e.g. `rgit verify-commit HEAD`, `rgit verify-commit -v --raw HEAD`
+- `verify-tag`: Check annotated tags' gpg, x509 or ssh signatures (`git verify-tag`). e.g. `rgit verify-tag v1.0`, `rgit verify-tag -v v1.0`
 - `repack`: Pack the repository's objects (`git repack`). e.g. `rgit repack -a -d`, `rgit repack -a -d -b --cruft`
 - `pack-refs`: Move loose refs into packed-refs (`git pack-refs`). e.g. `rgit pack-refs --all`
 - `maintenance`: Background upkeep (`git maintenance`): run tasks now, schedule them, or (un)register this repository. e.g. `rgit maintenance run --task=gc`, `rgit maintenance start`
   - `maintenance run`: Run maintenance tasks now. e.g. `rgit maintenance run`, `rgit maintenance run --task=commit-graph --task=loose-objects`
-  - `maintenance start`: Register this repository and schedule hourly/daily/weekly runs. e.g. `rgit maintenance start`
+  - `maintenance start`: Register this repository and schedule hourly/daily/weekly runs (launchd on macOS, systemd timers or cron elsewhere). e.g. `rgit maintenance start`, `rgit maintenance start --scheduler=crontab`
   - `maintenance stop`: Remove the schedule (the repositories stay registered). e.g. `rgit maintenance stop`
   - `maintenance register`: Add this repository to the global maintenance.repo list. e.g. `rgit maintenance register`
   - `maintenance unregister`: Remove this repository from the global maintenance.repo list. e.g. `rgit maintenance unregister --force`
+- `for-each-repo`: Run an rgit command in every repository a multi-valued config key lists (`git for-each-repo`), e.g. `--config=maintenance.repo`. e.g. `rgit for-each-repo --config=maintenance.repo maintenance run --schedule=daily`
 - `cherry`: Commits not yet upstream (`git cherry`): `+ <id>` for each, `- <id>` when upstream already has an equivalent change. e.g. `rgit cherry`, `rgit cherry -v origin/main topic`
 - `bundle`: Move history as one file (`git bundle`): create, verify, list-heads, unbundle. e.g. `rgit bundle create repo.bundle --all`, `rgit bundle verify repo.bundle`
   - `bundle create`: Write a bundle of the refs and ranges given (`--all`, `main`, `v1..main`, `^old main`). e.g. `rgit bundle create repo.bundle --all`, `rgit bundle create update.bundle v1.0..main`
@@ -218,7 +221,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `for-each-ref`: List refs in a custom format, like `git for-each-ref`. e.g. `rgit for-each-ref refs/heads`, `rgit for-each-ref --sort=-committerdate --format='%(refname:short) %(subject)'`, `rgit for-each-ref --merged main refs/heads`, `rgit for-each-ref --format='%(refname:short) %(ahead-behind:main) %(*subject)'`
 - `rev-list`: List commit ids reachable from revisions, like `git rev-list`. e.g. `rgit rev-list --count HEAD`, `rgit rev-list main..HEAD`, `rgit rev-list -n 1 --all`, `rgit rev-list HEAD -- src/lib.rs`, `rgit rev-list --count --left-right main...feature`, `rgit rev-list --objects main..feature`
 - `merge-base`: Find the common ancestor of two commits, like `git merge-base`. e.g. `rgit merge-base main HEAD`, `rgit merge-base --is-ancestor main HEAD`
-- `reflog`: Show where a ref pointed over time, like `git reflog show`. e.g. `rgit reflog`, `rgit reflog show main -n 10`
+- `reflog`: Show where a ref pointed over time (`git reflog [show] [REF]`), or `expire [--expire=<date>] [--expire-unreachable=<date>] [--all] [--rewrite] [--updateref] [--stale-fix] [-n] [--verbose] [REF...]`, `delete [--rewrite] [--updateref] [-n] REF@{N}...`, `exists REF`. e.g. `rgit reflog`, `rgit reflog show main -n 10`, `rgit reflog expire --expire=30.days.ago --all`, `rgit reflog delete --rewrite HEAD@{2}`
 - `shortlog`: Summarize commits by author, like `git shortlog`. e.g. `rgit shortlog -sn`, `rgit shortlog -sne --all`
 - `grep`: Search tracked files, the index or a revision, like `git grep`. Paths print from the current folder, which limits the search by default. e.g. `rgit grep -n TODO`, `rgit grep -i -e foo -e bar -- src`, `rgit grep pattern HEAD~5`, `rgit grep -n -C2 --heading TODO`, `rgit grep -e TODO --and --not -e FIXME`, `rgit grep -W -n parse_args -- src`
 - `check-ignore`: Show which paths are ignored and by which rule, like `git check-ignore`. e.g. `rgit check-ignore -v target/out.o`, `rgit check-ignore --stdin < paths.txt`

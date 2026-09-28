@@ -10,7 +10,8 @@ fn isolate(cmd: &mut Command, dir: &Path) {
     std::fs::create_dir_all(&home).unwrap();
     cmd.env("HOME", &home)
         .env("GIT_CONFIG_GLOBAL", home.join("gitconfig"))
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GNUPGHOME", home.join("gnupg"));
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -2109,6 +2110,560 @@ fn config_scopes_types_sections_and_includes_match_git() {
         "[p]\n\tq = r\n"
     );
     fails(&out, &["config", "x.y", "3"]);
+}
+
+/// git's stdout then its stderr, and whether it succeeded.
+fn git_all(dir: &Path, args: &[&str]) -> (String, bool) {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    isolate(&mut cmd, dir);
+    let out = cmd.output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
+        out.status.success(),
+    )
+}
+
+fn have(tool: &str, arg: &str) -> bool {
+    let found = Command::new(tool)
+        .arg(arg)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+    if !found {
+        eprintln!("skipping: {tool} is not installed");
+    }
+    found
+}
+
+/// Both tools report the same signatures on every commit and tag.
+fn same_signatures(dir: &Path) {
+    let fmt = "--format=%h %G? %GS %GK %GF %GP %GT %s";
+    assert_eq!(ok(dir, &["log", fmt]), git(dir, &["log", fmt]));
+    for rev in ["HEAD", "HEAD~1", "HEAD~2"] {
+        for args in [
+            &["verify-commit", rev][..],
+            &["verify-commit", "-v", rev],
+            &["verify-commit", "--raw", rev],
+        ] {
+            let (want, good) = git_all(dir, args);
+            let (got, rgood) = rgit_in(dir, args, b"");
+            assert_eq!((got, rgood), (want.clone(), good), "{args:?}");
+        }
+    }
+    for args in [
+        &["verify-tag", "-v", "signed"][..],
+        &["verify-tag", "plain"],
+        &["verify-tag", "HEAD"],
+        &["tag", "-v", "signed"],
+    ] {
+        let (want, good) = git_all(dir, args);
+        let (got, rgood) = rgit_in(dir, args, b"");
+        assert_eq!(got.trim_end(), want.trim_end(), "{args:?}");
+        assert_eq!(rgood, good, "{args:?}");
+    }
+    let args = ["log", "-3", "--show-signature"];
+    assert_eq!(git_all(dir, &args).0, ok(dir, &args));
+}
+
+#[test]
+fn signs_and_verifies_with_gpg_like_git() {
+    if !have("gpg", "--version") {
+        return;
+    }
+    let dir = repo("gpg");
+    let gnupg = dir.with_extension("home").join("gnupg");
+    std::fs::create_dir_all(&gnupg).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&gnupg, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let mut keygen = Command::new("gpg");
+    keygen
+        .args(["--batch", "--pinentry-mode", "loopback", "--passphrase", ""])
+        .args(["--quick-gen-key", "t <t@t>", "ed25519", "sign", "never"]);
+    isolate(&mut keygen, &dir);
+    assert!(keygen.output().unwrap().status.success());
+    // gpg's first check prints its trustdb lines once.
+    git(
+        &dir,
+        &["commit", "-q", "--allow-empty", "-S", "-m", "by git"],
+    );
+    git_all(&dir, &["verify-commit", "HEAD"]);
+
+    ok(&dir, &["commit", "--allow-empty", "-S", "-m", "by rgit"]);
+    ok(&dir, &["tag", "-s", "-m", "signed tag", "signed"]);
+    ok(&dir, &["tag", "-a", "-m", "plain tag", "plain"]);
+    same_signatures(&dir);
+
+    git(&dir, &["config", "commit.gpgSign", "true"]);
+    ok(&dir, &["commit", "--allow-empty", "-m", "by config"]);
+    ok(
+        &dir,
+        &["commit", "--allow-empty", "--no-gpg-sign", "-m", "unsigned"],
+    );
+    git(&dir, &["config", "commit.gpgSign", "false"]);
+    git(&dir, &["switch", "-qc", "side", "HEAD~2"]);
+    commit(&dir, "side.txt", "side\n", "side");
+    git(&dir, &["switch", "-q", "main"]);
+    ok(
+        &dir,
+        &["merge", "-S", "--no-ff", "-m", "merge side", "side"],
+    );
+    git(&dir, &["switch", "-q", "side"]);
+    commit(&dir, "side.txt", "more\n", "more");
+    git(&dir, &["switch", "-q", "main"]);
+    ok(&dir, &["cherry-pick", "-S", "side"]);
+    ok(&dir, &["revert", "-S", "HEAD"]);
+    assert_eq!(
+        git(&dir, &["log", "-6", "--first-parent", "--format=%G? %s"]),
+        "G Revert \"more\"\nG more\nG merge side\nN unsigned\nG by config\nG by rgit\n"
+    );
+    commit(&dir, "r1.txt", "1\n", "r1");
+    commit(&dir, "r2.txt", "2\n", "r2");
+    ok(&dir, &["rebase", "-f", "-S", "HEAD~2"]);
+    assert_eq!(
+        git(&dir, &["log", "-3", "--format=%G? %s"]),
+        "G r2\nG r1\nG Revert \"more\"\n"
+    );
+    let patch = git(&dir, &["format-patch", "-1", "--stdout", "HEAD"]);
+    std::fs::write(dir.with_extension("patch"), patch).unwrap();
+    git(&dir, &["reset", "-q", "--hard", "HEAD~1"]);
+    ok(
+        &dir,
+        &["am", "-S", dir.with_extension("patch").to_str().unwrap()],
+    );
+    assert_eq!(git(&dir, &["log", "-1", "--format=%G? %s"]), "G r2\n");
+    let _ = Command::new("gpgconf")
+        .args(["--kill", "gpg-agent"])
+        .env("GNUPGHOME", &gnupg)
+        .status();
+}
+
+#[test]
+fn signs_and_verifies_with_ssh_like_git() {
+    if !have("ssh-keygen", "-?") {
+        return;
+    }
+    let dir = repo("ssh");
+    let key = dir.with_extension("home").join("id");
+    let other = dir.with_extension("home").join("other");
+    for k in [&key, &other] {
+        let status = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "t@t", "-f"])
+            .arg(k)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    let allowed = dir.with_extension("home").join("allowed");
+    git(&dir, &["config", "gpg.format", "ssh"]);
+    git(&dir, &["config", "user.signingKey", key.to_str().unwrap()]);
+    git(
+        &dir,
+        &["commit", "-q", "--allow-empty", "-S", "-m", "by git"],
+    );
+    ok(&dir, &["commit", "--allow-empty", "-S", "-m", "by rgit"]);
+    ok(&dir, &["tag", "-s", "-m", "signed tag", "signed"]);
+    ok(&dir, &["tag", "-a", "-m", "plain tag", "plain"]);
+    // Without allowed signers nothing verifies, in either tool.
+    let (want, _) = git_all(&dir, &["verify-commit", "HEAD"]);
+    assert_eq!(fails(&dir, &["verify-commit", "HEAD"]), want);
+
+    std::fs::write(&allowed, format!("t@t {public}")).unwrap();
+    git(
+        &dir,
+        &[
+            "config",
+            "gpg.ssh.allowedSignersFile",
+            allowed.to_str().unwrap(),
+        ],
+    );
+    same_signatures(&dir);
+    // A key no allowed signer lists is checked but not trusted.
+    let public = std::fs::read_to_string(other.with_extension("pub")).unwrap();
+    std::fs::write(&allowed, format!("x@x {public}")).unwrap();
+    let (want, good) = git_all(&dir, &["verify-commit", "HEAD"]);
+    assert_eq!(rgit_in(&dir, &["verify-commit", "HEAD"], b""), (want, good));
+}
+
+/// A repo with history old enough for every expiry: tags, a merge, extra
+/// branches, a dangling blob and an unreachable commit; and two copies of it
+/// for git and rgit.
+fn twins(tag: &str) -> (PathBuf, PathBuf) {
+    let base = std::env::temp_dir().join(format!("rgit-twin-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(&base).args(args);
+        isolate(&mut cmd, &base);
+        cmd.env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z");
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    };
+    run(&["init", "-q", "-b", "main"]);
+    run(&["config", "user.email", "t@t"]);
+    run(&["config", "user.name", "t"]);
+    for i in 1..=4 {
+        std::fs::write(base.join(format!("f{i}")), format!("{i}\n")).unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", &format!("c{i}")]);
+    }
+    run(&["tag", "-a", "-m", "ann", "v1", "HEAD~1"]);
+    run(&["tag", "light", "HEAD~2"]);
+    run(&["switch", "-qc", "side", "HEAD~2"]);
+    std::fs::write(base.join("s"), "s\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-qm", "side"]);
+    run(&["switch", "-q", "main"]);
+    run(&["merge", "-q", "--no-ff", "-m", "merge", "side"]);
+    run(&["branch", "b1", "HEAD~1"]);
+    std::fs::write(base.join("dangling"), "dangling\n").unwrap();
+    run(&["hash-object", "-w", "dangling"]);
+    std::fs::remove_file(base.join("dangling")).unwrap();
+    run(&["commit", "-q", "--allow-empty", "-m", "gone"]);
+    run(&["reset", "-q", "--hard", "HEAD~1"]);
+    let copy = |name: &str| {
+        let to = base.with_extension(name);
+        let _ = std::fs::remove_dir_all(&to);
+        assert!(
+            Command::new("cp")
+                .arg("-R")
+                .arg(&base)
+                .arg(&to)
+                .status()
+                .unwrap()
+                .success()
+        );
+        to
+    };
+    (copy("git"), copy("rgit"))
+}
+
+/// Every object, as `<id> <type> <size>` lines.
+fn objects(dir: &Path) -> String {
+    let mut lines: Vec<String> = git(dir, &["cat-file", "--batch-all-objects", "--batch-check"])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+fn read(dir: &Path, file: &str) -> String {
+    std::fs::read_to_string(dir.join(".git").join(file)).unwrap_or_default()
+}
+
+#[test]
+fn pack_refs_and_reflog_expire_write_what_git_writes() {
+    for args in [&["pack-refs", "--all"][..], &["pack-refs"]] {
+        let (g, r) = twins("pack-refs");
+        git(&g, args);
+        ok(&r, args);
+        assert_eq!(read(&r, "packed-refs"), read(&g, "packed-refs"), "{args:?}");
+        assert_eq!(
+            r.join(".git/refs/heads/main").exists(),
+            g.join(".git/refs/heads/main").exists()
+        );
+    }
+    let logs = |d: &Path| {
+        ["logs/HEAD", "logs/refs/heads/main", "logs/refs/heads/side"]
+            .map(|f| read(d, f))
+            .join("--\n")
+    };
+    for args in [
+        &["reflog", "expire", "--expire=now", "--all"][..],
+        &[
+            "reflog",
+            "expire",
+            "--expire=never",
+            "--expire-unreachable=now",
+            "--all",
+        ],
+        &["reflog", "delete", "--rewrite", "HEAD@{1}", "main@{0}"],
+        &["reflog", "delete", "HEAD@{0}"],
+    ] {
+        let (g, r) = twins("reflog");
+        git(&g, args);
+        ok(&r, args);
+        assert_eq!(logs(&r), logs(&g), "{args:?}");
+    }
+    let (g, r) = twins("reflog-verbose");
+    let args = [
+        "reflog",
+        "expire",
+        "-n",
+        "--verbose",
+        "--expire=never",
+        "--expire-unreachable=now",
+        "HEAD",
+    ];
+    assert_eq!(ok(&r, &args), git(&g, &args));
+    assert_eq!(logs(&r), logs(&g));
+    ok(&r, &["reflog", "exists", "refs/heads/main"]);
+    fails(&r, &["reflog", "exists", "main"]);
+}
+
+#[test]
+fn prune_repack_and_gc_keep_what_git_keeps() {
+    let (g, r) = twins("prune");
+    for d in [&g, &r] {
+        git(d, &["reflog", "expire", "--expire=now", "--all"]);
+    }
+    let sorted = |s: String| {
+        let mut l: Vec<String> = s.lines().map(str::to_owned).collect();
+        l.sort();
+        l
+    };
+    assert_eq!(
+        sorted(ok(&r, &["prune", "-n"])),
+        sorted(git(&g, &["prune", "-n"]))
+    );
+    git(&g, &["prune"]);
+    ok(&r, &["prune"]);
+    assert_eq!(objects(&r), objects(&g));
+
+    for args in [
+        &["repack"][..],
+        &["repack", "-a", "-d"],
+        &["repack", "-A", "-d"],
+        &["gc", "--prune=now"],
+        &["gc"],
+        &["gc", "--no-cruft"],
+    ] {
+        let (g, r) = twins("repack");
+        git(&g, args);
+        ok(&r, args);
+        assert_eq!(objects(&r), objects(&g), "{args:?}");
+        let counts = |d: &Path| {
+            git(d, &["count-objects", "-v"])
+                .lines()
+                .filter(|l| l.starts_with("count:") || l.starts_with("packs:"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        assert_eq!(counts(&r), counts(&g), "{args:?}");
+        git(&r, &["fsck", "--no-dangling"]);
+        if args[0] == "gc" {
+            git(&r, &["commit-graph", "verify"]);
+            assert_eq!(
+                std::fs::read(r.join(".git/objects/info/commit-graph")).unwrap(),
+                std::fs::read(g.join(".git/objects/info/commit-graph")).unwrap()
+            );
+            assert_eq!(read(&r, "packed-refs"), read(&g, "packed-refs"));
+        }
+    }
+    let (_, r) = twins("gc-auto");
+    ok(&r, &["gc", "--auto"]);
+    assert!(git(&r, &["count-objects", "-v"]).contains("packs: 0"));
+}
+
+#[test]
+fn maintenance_runs_tasks_and_writes_schedules() {
+    let (g, r) = twins("maint");
+    let args = [
+        "maintenance",
+        "run",
+        "--task=commit-graph",
+        "--task=loose-objects",
+        "--task=pack-refs",
+        "--task=reflog-expire",
+        "--task=rerere-gc",
+        "--task=worktree-prune",
+    ];
+    git(&g, &args);
+    ok(&r, &args);
+    assert_eq!(objects(&r), objects(&g));
+    assert_eq!(read(&r, "packed-refs"), read(&g, "packed-refs"));
+    git(&r, &["commit-graph", "verify"]);
+    fails(&r, &["maintenance", "run", "--task=bogus"]);
+    fails(&r, &["maintenance", "run", "--task=gc", "--task=gc"]);
+    fails(&r, &["maintenance", "run", "--schedule=never"]);
+    ok(&r, &["maintenance", "run", "--auto"]);
+
+    // A remote's branches arrive under refs/prefetch, and nothing else moves.
+    let (_, clone) = twins("maint-clone");
+    git(&clone, &["remote", "add", "origin", r.to_str().unwrap()]);
+    git(
+        &clone,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ],
+    );
+    ok(&clone, &["maintenance", "run", "--task=prefetch"]);
+    let refs = git(&clone, &["for-each-ref", "--format=%(refname)"]);
+    assert!(refs.contains("refs/prefetch/remotes/origin/main"), "{refs}");
+    assert!(!refs.contains("refs/remotes/origin/"), "{refs}");
+
+    let sched = r.with_extension("sched");
+    let _ = std::fs::remove_dir_all(&sched);
+    let start = |scheduler: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rgit"));
+        cmd.args(["--human", "maintenance", "start", "--scheduler", scheduler])
+            .current_dir(&r)
+            .env("RGIT_TEST_MAINT_SCHEDULER_DIR", &sched);
+        isolate(&mut cmd, &r);
+        assert!(cmd.status().unwrap().success());
+    };
+    let stop = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rgit"));
+        cmd.args(["--human", "maintenance", "stop"])
+            .current_dir(&r)
+            .env("RGIT_TEST_MAINT_SCHEDULER_DIR", &sched);
+        isolate(&mut cmd, &r);
+        assert!(cmd.status().unwrap().success());
+    };
+    start("crontab");
+    let cron = std::fs::read_to_string(sched.join("crontab")).unwrap();
+    assert!(
+        cron.contains(
+            "for-each-repo --keep-going --config=maintenance.repo maintenance run --schedule=hourly"
+        ),
+        "{cron}"
+    );
+    assert_eq!(
+        git(&r, &["config", "maintenance.strategy"]),
+        "incremental\n"
+    );
+    start("launchctl");
+    let plist = std::fs::read_to_string(sched.join("org.rgit.rgit.daily.plist")).unwrap();
+    assert!(
+        plist.contains("<string>--schedule=daily</string>"),
+        "{plist}"
+    );
+    start("systemd-timer");
+    assert!(sched.join("rgit-maintenance@weekly.timer").exists());
+    assert!(sched.join("rgit-maintenance@.service").exists());
+    if cfg!(target_os = "macos") {
+        stop();
+        assert!(!sched.join("org.rgit.rgit.daily.plist").exists());
+    }
+
+    // for-each-repo runs the command in each registered repository.
+    let out = ok(
+        &r,
+        &[
+            "for-each-repo",
+            "--config=maintenance.repo",
+            "rev-parse",
+            "--git-dir",
+        ],
+    );
+    assert_eq!(out, ".git\n");
+}
+
+/// stdout, stderr and exit code of `tool args` in `dir`.
+fn streams(tool: &str, dir: &Path, args: &[&str]) -> (String, String, Option<i32>) {
+    let mut cmd = Command::new(tool);
+    if tool != "git" {
+        cmd.arg("--human");
+    }
+    cmd.args(args).current_dir(dir);
+    isolate(&mut cmd, dir);
+    let out = cmd.output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
+}
+
+#[test]
+fn fsck_reports_what_git_fsck_reports() {
+    let (dir, _) = twins("fsck");
+    std::fs::write(dir.join("st"), "staged\n").unwrap();
+    git(&dir, &["add", "st"]);
+    let rgit = env!("CARGO_BIN_EXE_rgit");
+    let same = |dir: &Path, args: &[&str]| {
+        assert_eq!(
+            streams(rgit, dir, args),
+            streams("git", dir, args),
+            "{args:?}"
+        );
+    };
+    let flags: [&[&str]; 11] = [
+        &["fsck"],
+        &["fsck", "--no-reflogs"],
+        &["fsck", "--unreachable", "--no-reflogs"],
+        &["fsck", "--name-objects", "--root", "--tags"],
+        &["fsck", "--name-objects", "--unreachable", "--no-reflogs"],
+        &["fsck", "--connectivity-only", "--no-reflogs"],
+        &["fsck", "--no-dangling", "HEAD~1"],
+        &["fsck", "HEAD~1"],
+        &["fsck", "--cache", "HEAD~1"],
+        &["fsck", "--no-full"],
+        &["fsck", "--strict"],
+    ];
+    for args in flags {
+        same(&dir, args);
+    }
+    git(&dir, &["gc", "-q", "--prune=now"]);
+    for args in flags {
+        same(&dir, args);
+    }
+
+    // Broken objects, in git's words, and exit code 1.
+    let literally = |kind: &str, data: &[u8]| {
+        let mut cmd = Command::new("git");
+        cmd.args(["hash-object", "-t", kind, "-w", "--stdin", "--literally"])
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        isolate(&mut cmd, &dir);
+        let mut child = cmd.spawn().unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), data).unwrap();
+        assert!(child.wait_with_output().unwrap().status.success());
+    };
+    let empty = "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n";
+    literally(
+        "commit",
+        format!("{empty}author x x> 1 +0000\ncommitter x <x> 1 +0000\n\nm\n").as_bytes(),
+    );
+    literally(
+        "commit",
+        format!("{empty}committer x <x> 1 +0000\n\nm\n").as_bytes(),
+    );
+    literally(
+        "commit",
+        format!("{empty}author x <x> 01 +0000\ncommitter x <x> 1 +0000\n\nm\n").as_bytes(),
+    );
+    literally(
+        "tag",
+        b"object 4b825dc642cb6eb9a060e54bf8d69288fbee4904\ntype tree\ntag x\n\nm\n",
+    );
+    let id: Vec<u8> = (1..=20).collect();
+    let mut tree = b"100644 b\0".to_vec();
+    tree.extend(&id);
+    tree.extend(b"100644 a\0");
+    tree.extend(&id);
+    literally("tree", &tree);
+    let mut tree = b"100664 a\0".to_vec();
+    tree.extend(&id);
+    literally("tree", &tree);
+    same(&dir, &["fsck", "--no-reflogs"]);
+    same(&dir, &["fsck", "--strict", "--no-reflogs"]);
+
+    let lost = |tool: &str| {
+        let _ = std::fs::remove_dir_all(dir.join(".git/lost-found"));
+        streams(tool, &dir, &["fsck", "--lost-found"]);
+        let mut found: Vec<String> = ["commit", "other"]
+            .iter()
+            .flat_map(|k| {
+                std::fs::read_dir(dir.join(".git/lost-found").join(k))
+                    .into_iter()
+                    .flatten()
+            })
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        found
+    };
+    assert_eq!(lost(rgit), lost("git"));
 }
 
 /// stdout and stderr of `bin args` in `dir`, isolated, with `env` set.

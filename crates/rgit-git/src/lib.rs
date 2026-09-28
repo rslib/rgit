@@ -13,7 +13,9 @@ mod bisect;
 mod blame;
 mod bundle;
 mod change_id;
+mod clean;
 mod combine;
+mod commit_graph;
 mod config;
 mod creds;
 mod describe;
@@ -22,12 +24,14 @@ mod error;
 mod fetch_display;
 mod fmt_merge_msg;
 mod format_patch;
+mod fsck;
 mod git_repo;
 mod index_ops;
 mod lanes;
 mod line_log;
 mod lowlevel;
 mod mail;
+mod maintenance;
 mod model;
 mod name_rev;
 mod notes;
@@ -37,6 +41,7 @@ mod range_diff;
 mod rebase;
 mod shallow;
 mod show_branch;
+mod sign;
 #[cfg(feature = "ssh")]
 mod ssh;
 mod stash;
@@ -71,6 +76,7 @@ pub use attr::check_attr;
 pub use backend::GitBackend;
 pub use blame::{Blame, BlameOptions};
 pub use bundle::{BundleHeader, bundle_header};
+pub use clean::{CleanOptions, ignore_match, relative as clean_relative};
 pub use combine::CombinedFile;
 pub use config::{
     ConfigEntry, ConfigScope, SetMode, ansi_color, command_line_config, config_file,
@@ -83,6 +89,7 @@ pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 pub use error::GitError;
 pub use fmt_merge_msg::{FmtMergeMsgOpts, fmt_merge_msg};
 pub use format_patch::{CherryCommit, FormatPatchOpts, PatchMail, Thread, mbox};
+pub use fsck::{FsckOptions, FsckReport};
 pub use git_repo::{
     Git2Backend, clone, diff_no_index, init, ls_remote, pathspec_matches, run_hook,
 };
@@ -95,6 +102,9 @@ pub use lowlevel::{
     diff_tree, merge_file, merge_tree,
 };
 pub use mail::{MailinfoOpts, MailsplitOpts, mailinfo, mailsplit};
+pub use maintenance::{
+    GcOptions, MaintenanceRun, ReflogExpire, RepackOptions, TASKS as MAINTENANCE_TASKS,
+};
 pub use model::{
     BlameLine, Blob, CheckoutMode, CloneArgs, Commit, CommitDetails, CommitFile, CommitOptions,
     CommitOverview, CommitRef, Deco, DiffSpec, EmptyCommit, FetchArgs, FileActivity, GrepMatch,
@@ -112,6 +122,7 @@ pub use plumbing::{
 };
 pub use range_diff::RangeDiffOpts;
 pub use show_branch::{ShowBranchOpts, show_branch, show_branch_defaults};
+pub use sign::{SignatureCheck, sign_buffer};
 pub use text::{
     ColumnOpts, check_ref_format, collapse_slashes, column_finalize, column_mode, columns,
     comment_lines, patch_ids, quote_path, stripspace,

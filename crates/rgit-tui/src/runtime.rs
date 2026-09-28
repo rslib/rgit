@@ -1498,7 +1498,16 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::Reword { rev, message } => backend.reword(rev, message),
         Mutation::Squash(rev) => backend.squash(rev),
         Mutation::Uncommit(n) => backend.uncommit(*n),
-        Mutation::Clean => backend.clean(false, &[]).map(drop),
+        Mutation::Clean => {
+            let opts = rgit_git::CleanOptions {
+                dirs: true,
+                ..Default::default()
+            };
+            backend
+                .clean_candidates(&opts)
+                .and_then(|items| backend.clean_remove(&items, &opts))
+                .map(drop)
+        }
         Mutation::StackNext => stack_move(backend, true),
         Mutation::StackPrev => stack_move(backend, false),
         Mutation::Reorder { rev, target } => backend.reorder(rev, target, true),
@@ -1724,8 +1733,10 @@ async fn git_console_env(
     events.pause();
     ratatui::restore();
     let ran = tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("git");
-        cmd.args(&args).current_dir(&workdir);
+        // rgit itself, which runs these (commit -S, rebase -i) natively.
+        let exe = std::env::current_exe().unwrap_or_else(|_| "rgit".into());
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--human").args(&args).current_dir(&workdir);
         for (k, v) in &env {
             cmd.env(k, v);
         }

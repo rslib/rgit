@@ -744,7 +744,10 @@ pub fn run(
         Command::Stack {
             cmd: None | Some(StackCmd::List),
         } => stack(backend)?,
-        c @ Command::Fsck { .. } => fsck(crate::cli::run(backend, c, interactive)?),
+        c @ Command::Fsck { .. } => {
+            let report = crate::cli::fsck(backend, c)?;
+            fsck(report.stdout + &report.stderr)
+        }
         Command::RequestPull {
             start,
             url,
@@ -818,7 +821,7 @@ pub fn run(
 /// (dangling, unreachable, missing, root, tagged), anything else kept whole.
 fn fsck(text: String) -> Output {
     let mut rows = Vec::new();
-    if text != "no problems found" {
+    {
         for line in text.lines() {
             let mut words = line.splitn(3, ' ');
             let (kind, ty, rest) = (words.next(), words.next(), words.next());
@@ -1536,7 +1539,7 @@ fn done_message(c: &Command) -> Option<String> {
         Command::PackRefs { .. } => "packed the refs".to_owned(),
         Command::Maintenance { cmd } => match cmd {
             MaintenanceCmd::Run { .. } => "ran the maintenance tasks".to_owned(),
-            MaintenanceCmd::Start => "registered and scheduled maintenance".to_owned(),
+            MaintenanceCmd::Start { .. } => "registered and scheduled maintenance".to_owned(),
             MaintenanceCmd::Stop => "stopped scheduled maintenance".to_owned(),
             MaintenanceCmd::Register => "registered the repository for maintenance".to_owned(),
             MaintenanceCmd::Unregister { .. } => "unregistered the repository".to_owned(),

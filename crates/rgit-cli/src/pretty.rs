@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use rgit_git::{GitBackend, Ident, RawObject};
+use rgit_git::{GitBackend, Ident, RawObject, SignatureCheck};
 
 use crate::cli::{CliError, PrettyArgs};
 
@@ -112,6 +112,9 @@ pub struct Pretty {
     decorations: HashMap<String, Vec<(&'static str, String)>>,
     /// The notes refs shown and the objects each annotates.
     notes: Vec<(String, HashSet<String>)>,
+    show_signature: bool,
+    /// The last commit whose signature was checked, for the %G placeholders.
+    checked: std::cell::RefCell<Option<(String, SignatureCheck)>>,
     backend: Arc<dyn GitBackend>,
     graph: bool,
     /// Print the parents after each commit's id.
@@ -136,6 +139,7 @@ impl Pretty {
             .or(args.pretty.as_deref())
             .or(args.oneline.then_some("oneline"))
             .or((args.graph || args.no_notes || !args.notes.is_empty()).then_some("medium"))
+            .or(args.show_signature.then_some("medium"))
             .or(fallback);
         let Some(spec) = spec else {
             return Ok(None);
@@ -207,6 +211,8 @@ impl Pretty {
             color: crate::render::color_on(),
             decorations: decorations(backend),
             notes,
+            show_signature: args.show_signature,
+            checked: Default::default(),
             backend: backend.clone(),
             graph: args.graph,
             parents: false,
@@ -331,10 +337,15 @@ impl Pretty {
             Some(m) if !self.graph => format!("{m} "),
             _ => String::new(),
         };
+        let sig = if self.show_signature {
+            self.signature(c).output
+        } else {
+            String::new()
+        };
         let (head, mut out) = match &self.fmt {
-            Fmt::User(f) => return (String::new(), self.expand(f, c)),
+            Fmt::User(f) => return (sig, self.expand(f, c)),
             Fmt::Oneline => (
-                format!("{mark}{}{decor} ", self.paint(&hash, "33")),
+                format!("{mark}{}{decor} {sig}", self.paint(&hash, "33")),
                 match &c.reflog {
                     Some(r) => format!("{}: {}", r.selector, r.message),
                     None => subject(&c.message, " "),
@@ -342,7 +353,7 @@ impl Pretty {
             ),
             fmt => {
                 let head = format!(
-                    "{}{decor}\n",
+                    "{}{decor}\n{sig}",
                     self.paint(&format!("commit {mark}{hash}"), "33")
                 );
                 let mut out = String::new();
@@ -478,6 +489,25 @@ impl Pretty {
         format_date(who.time, who.offset, &self.date)
     }
 
+    /// The check of `c`'s signature, run once per commit.
+    fn signature(&self, c: &Commit) -> SignatureCheck {
+        let mut checked = self.checked.borrow_mut();
+        if let Some((id, check)) = checked.as_ref()
+            && *id == c.id
+        {
+            return check.clone();
+        }
+        let check = self
+            .backend
+            .signature_check(&c.id, false)
+            .unwrap_or_else(|_| SignatureCheck {
+                result: 'N',
+                ..SignatureCheck::default()
+            });
+        *checked = Some((c.id.clone(), check.clone()));
+        check
+    }
+
     /// Expand a `format:` string, as git's format_commit_message does.
     fn expand(&self, fmt: &str, c: &Commit) -> String {
         let mut out = String::new();
@@ -560,6 +590,20 @@ impl Pretty {
                     _ => return None,
                 };
                 Some((v.unwrap_or_default(), 2))
+            }
+            'G' => {
+                let check = self.signature(c);
+                let v = match chars.next()? {
+                    '?' => check.letter().to_string(),
+                    'S' => check.signer,
+                    'K' => check.key,
+                    'F' => check.fingerprint,
+                    'P' => check.primary_key,
+                    'T' => check.trust,
+                    'G' => check.output,
+                    _ => return None,
+                };
+                Some((v, 2))
             }
             'x' => {
                 let hex = s.get(1..3)?;

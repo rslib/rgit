@@ -11,6 +11,7 @@ use crate::output::Output;
 use crate::toon::{Node, Obj};
 
 mod axi;
+mod clean;
 mod cli;
 mod creds;
 mod date;
@@ -21,6 +22,7 @@ mod graph;
 mod interactive;
 mod lanes;
 mod logging;
+mod maintenance;
 mod mcp;
 mod output;
 mod plumbing;
@@ -51,12 +53,12 @@ fn main() -> ! {
     let args = globals::dispatch(args);
     logging::init();
     let stdout_is_terminal = std::io::stdout().is_terminal();
-    let parsed = examples::apply(Cli::command())
-        .try_get_matches_from(
-            std::iter::once("rgit".to_owned())
-                .chain(blame_scores(count_shorthand(&plumbing::grep_tokens(&args)))),
-        )
-        .and_then(|m| Cli::from_arg_matches(&m));
+    let parsed =
+        examples::apply(Cli::command())
+            .try_get_matches_from(std::iter::once("rgit".to_owned()).chain(sticky_sign(
+                blame_scores(count_shorthand(&plumbing::grep_tokens(&args))),
+            )))
+            .and_then(|m| Cli::from_arg_matches(&m));
     let cli = match parsed {
         Ok(cli) => cli,
         Err(e) => usage_exit(e, &args, stdout_is_terminal),
@@ -83,6 +85,14 @@ fn main() -> ! {
         // The MCP server takes over stdio for the process lifetime.
         Some(Command::Mcp) => exit(mcp::serve(discover_or_exit())),
         Some(Command::Skills { cmd }) => finish(cli::run_skills(cmd), &emit),
+        Some(Command::ForEachRepo {
+            config,
+            keep_going,
+            args,
+        }) => finish(
+            maintenance::for_each_repo(&config, keep_going, &args, !structured_output),
+            &emit,
+        ),
         Some(Command::Hooks { cmd }) => finish(
             match cmd {
                 HooksCmd::Install { user, app } => setup::install(app, user),
@@ -549,6 +559,24 @@ fn count_shorthand(args: &[String]) -> Vec<String> {
     }
     out.extend(rest.cloned());
     out
+}
+
+/// git's sticky `-S[<keyid>]`: `rgit cherry-pick -S topic` signs and picks
+/// topic, so `-S` never takes the next word.
+fn sticky_sign(mut args: Vec<String>) -> Vec<String> {
+    let signs = ["commit", "merge", "cherry-pick", "revert", "am", "rebase"];
+    let Some(at) = args.iter().position(|a| signs.contains(&a.as_str())) else {
+        return args;
+    };
+    for a in &mut args[at + 1..] {
+        if a == "--" {
+            break;
+        }
+        if let Some(key) = a.strip_prefix("-S") {
+            *a = format!("--gpg-sign={}", key.strip_prefix('=').unwrap_or(key));
+        }
+    }
+    args
 }
 
 /// git's attached scores for `blame`: `-M30` is `-M --move-score=30`, and

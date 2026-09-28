@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{LazyLock, Mutex};
 
 use crate::cli::{AuthCmd, ForgeBranchCmd, ForgeCmd, PrCmd, RepoCmd};
@@ -479,16 +478,12 @@ fn resolve_target(first: Option<&str>, second: Option<&str>) -> Result<(String, 
 }
 
 fn remote_target() -> Result<(String, String)> {
-    let output = Command::new("git")
-        .args(["config", "--get", "remote.origin.url"])
-        .output()
-        .map_err(|error| anyhow::anyhow!("cannot read git remote: {error}"))?;
-    ensure!(
-        output.status.success(),
-        "no remote target; pass OWNER/REPO explicitly"
-    );
-    let remote = String::from_utf8(output.stdout)
-        .map_err(|error| anyhow::anyhow!("git remote is not valid UTF-8: {error}"))?;
+    use rgit_git::GitBackend;
+    let remote = rgit_git::Git2Backend::discover(std::env::current_dir()?)
+        .ok()
+        .and_then(|backend| backend.config_get("remote.origin.url").ok().flatten());
+    let remote =
+        remote.ok_or_else(|| anyhow::anyhow!("no remote target; pass OWNER/REPO explicitly"))?;
     parse_remote_target(remote.trim())
 }
 

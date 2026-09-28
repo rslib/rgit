@@ -34,6 +34,78 @@ fn table(
     out
 }
 
+/// `git reflog expire`, `delete` and `exists`.
+fn reflog_change(
+    backend: &Arc<dyn GitBackend>,
+    args: &[String],
+    raw: bool,
+) -> anyhow::Result<Output> {
+    let mut o = rgit_git::ReflogExpire::default();
+    let mut rest = args[1..].iter();
+    let mut refs = Vec::new();
+    while let Some(a) = rest.next() {
+        let mut value = |name: &str| -> anyhow::Result<Option<String>> {
+            if let Some(v) = a.strip_prefix(&format!("{name}=")) {
+                return Ok(Some(v.to_owned()));
+            }
+            if a == name {
+                return Ok(Some(rest.next().cloned().ok_or_else(|| {
+                    CliError::usage(format!("option '{}' requires a value", &name[2..]))
+                })?));
+            }
+            Ok(None)
+        };
+        if let Some(v) = value("--expire-unreachable")? {
+            o.expire_unreachable = Some(v);
+        } else if let Some(v) = value("--expire")? {
+            o.expire = Some(v);
+        } else {
+            match a.as_str() {
+                "--all" => o.all = true,
+                "--single-worktree" => o.single_worktree = true,
+                "--rewrite" => o.rewrite = true,
+                "--updateref" => o.updateref = true,
+                "--stale-fix" => o.stale_fix = true,
+                "-n" | "--dry-run" => o.dry_run = true,
+                "--verbose" => o.verbose = true,
+                "--" => refs.extend(rest.by_ref().cloned()),
+                f if f.starts_with('-') => {
+                    return Err(CliError::usage(format!("unknown option '{f}'")));
+                }
+                r => refs.push(r.to_owned()),
+            }
+        }
+    }
+    match args[0].as_str() {
+        "exists" => {
+            let [name] = refs.as_slice() else {
+                return Err(CliError::usage("reflog exists takes one ref"));
+            };
+            if backend.reflog_exists(name) {
+                Ok(Output::new(String::new()).with("exists", true))
+            } else if raw {
+                Err(fail(raw, true, ""))
+            } else {
+                Ok(Output::new(String::new()).with("exists", false))
+            }
+        }
+        "delete" => {
+            if refs.is_empty() {
+                return Err(CliError::usage("no reflog specified to delete"));
+            }
+            backend.reflog_delete(&refs, &o)?;
+            Ok(Output::new(String::new()))
+        }
+        _ => {
+            if !o.all && refs.is_empty() {
+                return Err(CliError::usage("no reflog specified to expire"));
+            }
+            o.refs = refs;
+            Ok(lines(terminated(backend.reflog_expire(&o)?, false)))
+        }
+    }
+}
+
 /// Exit 1; silently for human output when `quiet`, as git does.
 fn fail(raw: bool, quiet: bool, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(CliError {
@@ -884,6 +956,14 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                 ));
             }
             lines(terminated(bases, false))
+        }
+        Plumbing::Reflog { args, .. }
+            if matches!(
+                args.first().map(String::as_str),
+                Some("expire" | "delete" | "exists")
+            ) =>
+        {
+            reflog_change(backend, &args, raw)?
         }
         Plumbing::Reflog { max_count, args } => {
             let args: Vec<&String> = args.iter().skip_while(|a| *a == "show").collect();

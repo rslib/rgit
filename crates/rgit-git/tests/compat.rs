@@ -139,14 +139,17 @@ fn clean_dry_run_lists_without_deleting() {
     std::fs::write(dir.join("junk.txt"), "trash\n").unwrap();
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    let out = backend.clean(true, &[]).unwrap();
-    assert!(
-        out.contains("junk.txt"),
-        "dry run should mention the file: {out}"
-    );
+    let mut opts = rgit_git::CleanOptions {
+        dry_run: true,
+        ..Default::default()
+    };
+    let items = backend.clean_candidates(&opts).unwrap();
+    let out = backend.clean_remove(&items, &opts).unwrap();
+    assert_eq!(out, ["Would remove junk.txt"]);
     assert!(dir.join("junk.txt").exists(), "dry run must not delete");
 
-    backend.clean(false, &[]).unwrap();
+    opts.dry_run = false;
+    backend.clean_remove(&items, &opts).unwrap();
     assert!(!dir.join("junk.txt").exists(), "real clean removes it");
 
     let _ = std::fs::remove_dir_all(&dir);

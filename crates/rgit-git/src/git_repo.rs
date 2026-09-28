@@ -1893,7 +1893,8 @@ impl GitBackend for Git2Backend {
                         .to_owned();
                     let tree = repo.find_tree(repo.index()?.write_tree()?)?;
                     let head = repo.head()?.peel_to_commit()?;
-                    repo.commit(
+                    crate::sign::commit_configured(
+                        &repo,
                         Some("HEAD"),
                         &sig,
                         &sig,
@@ -2280,26 +2281,64 @@ impl GitBackend for Git2Backend {
         crate::archive::archive(&self.repo.lock().expect("repo mutex"), o)
     }
 
-    fn gc(&self, args: &[String]) -> Result<String, GitError> {
-        let mut argv = vec!["gc"];
-        argv.extend(args.iter().map(String::as_str));
-        self.run_git(&argv, &[])
+    fn gc(&self, opts: &crate::GcOptions) -> Result<String, GitError> {
+        crate::maintenance::gc(&self.repo.lock().expect("repo mutex"), opts)
     }
 
-    fn fsck(&self, args: &[String]) -> Result<String, GitError> {
-        let mut argv = vec!["fsck"];
-        argv.extend(args.iter().map(String::as_str));
-        self.run_git(&argv, &[])
+    fn repack(&self, opts: &crate::RepackOptions) -> Result<String, GitError> {
+        crate::maintenance::repack(&self.repo.lock().expect("repo mutex"), opts)
     }
 
-    fn clean(&self, dry_run: bool, args: &[String]) -> Result<String, GitError> {
-        // libgit2 has no clean; -nd lists, -fd removes (files and directories).
-        let mut argv = vec!["clean", if dry_run { "-nd" } else { "-fd" }];
-        argv.extend(args.iter().map(String::as_str));
-        if dry_run {
-            return self.run_git(&argv, &[]);
+    fn pack_refs(&self, all: bool, no_prune: bool, auto: bool) -> Result<(), GitError> {
+        crate::maintenance::pack_refs(&self.repo.lock().expect("repo mutex"), all, no_prune, auto)
+    }
+
+    fn reflog_expire(&self, opts: &crate::ReflogExpire) -> Result<Vec<String>, GitError> {
+        crate::maintenance::reflog_expire(&self.repo.lock().expect("repo mutex"), opts)
+    }
+
+    fn reflog_delete(
+        &self,
+        entries: &[String],
+        opts: &crate::ReflogExpire,
+    ) -> Result<(), GitError> {
+        crate::maintenance::reflog_delete(&self.repo.lock().expect("repo mutex"), entries, opts)
+    }
+
+    fn reflog_exists(&self, name: &str) -> bool {
+        crate::maintenance::reflog_exists(&self.repo.lock().expect("repo mutex"), name)
+    }
+
+    fn maintenance_run(&self, opts: &crate::MaintenanceRun) -> Result<String, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        let prefetch = || prefetch(&repo, cred_guard.as_deref());
+        crate::maintenance::run(&repo, opts, &prefetch)
+    }
+
+    fn fsck(&self, opts: &crate::FsckOptions) -> Result<crate::FsckReport, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::fsck::fsck(&repo, opts)
+    }
+
+    fn clean_candidates(&self, opts: &crate::CleanOptions) -> Result<Vec<String>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::clean::candidates(&repo, opts)
+    }
+
+    fn clean_remove(
+        &self,
+        items: &[String],
+        opts: &crate::CleanOptions,
+    ) -> Result<Vec<String>, GitError> {
+        if opts.dry_run {
+            return Ok(crate::clean::remove(&self.workdir, items, opts));
         }
-        self.logged("clean", || self.run_git(&argv, &[]))
+        self.logged("clean", || {
+            Ok(crate::clean::remove(&self.workdir, items, opts))
+        })
     }
 
     fn remove_paths(
@@ -2592,7 +2631,18 @@ impl GitBackend for Git2Backend {
                 } else {
                     source.author().to_owned()
                 };
-                repo.commit(Some("HEAD"), &author, &committer, &message, &tree, &[&head])?;
+                let key =
+                    crate::sign::commit_key(&repo, state.opts.sign.as_deref(), state.opts.no_sign);
+                crate::sign::commit(
+                    &repo,
+                    Some("HEAD"),
+                    &author,
+                    &committer,
+                    &message,
+                    &tree,
+                    &[&head],
+                    key.as_deref(),
+                )?;
             }
             end_operation(&repo)?;
             run_picks(&repo, &state.todo[1..], &state.opts, state.orig_head)
@@ -2808,48 +2858,57 @@ impl GitBackend for Git2Backend {
                 }
             }),
         };
-        if let Some(key) = sign {
-            // libgit2 cannot sign; git runs gpg (or ssh, per gpg.format).
-            let message = message.unwrap_or_default();
-            let mut args = vec!["tag", "--cleanup=verbatim", "-m", &message];
-            if key.is_empty() {
-                args.push("-s");
-            } else {
-                args.extend(["-u", key]);
-            }
-            if force {
-                args.push("-f");
-            }
-            args.extend([name, rev]);
-            self.run_git(&args, &[])?;
-            return Ok(());
-        }
         let repo = self.repo.lock().expect("repo mutex");
         let target = repo.revparse_single(rev)?;
-        match message {
-            None => repo.tag_lightweight(name, &target, force)?,
-            Some(m) => repo.tag(name, &target, &repo.signature()?, &m, force)?,
+        let Some(m) = message else {
+            repo.tag_lightweight(name, &target, force)?;
+            return Ok(());
         };
+        let refname = format!("refs/tags/{name}");
+        if !force && repo.find_reference(&refname).is_ok() {
+            return Err(GitError::Other(format!("tag '{name}' already exists")));
+        }
+        let id = crate::sign::tag_object(&repo, name, &target, &repo.signature()?, &m, sign)?;
+        repo.reference(&refname, id, true, "")?;
         Ok(())
     }
 
     fn verify_tags(&self, names: &[String]) -> Result<String, GitError> {
-        // libgit2 cannot check signatures; git runs gpg, reporting on stderr.
-        let out = std::process::Command::new("git")
-            .args(["tag", "-v"])
-            .args(names)
-            .current_dir(&self.workdir)
-            .output()
-            .map_err(|e| GitError::Cli(format!("could not run git: {e}")))?;
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        if out.status.success() {
-            Ok(text.trim_end().to_owned())
+        let repo = self.repo.lock().expect("repo mutex");
+        let mut out = String::new();
+        let mut failed = false;
+        for name in names {
+            let id = repo
+                .find_reference(&format!("refs/tags/{name}"))
+                .ok()
+                .and_then(|r| r.target())
+                .ok_or_else(|| GitError::Other(format!("tag '{name}' not found.")))?;
+            let c = crate::sign::check_tag(&repo, id)?;
+            out.push_str(&String::from_utf8_lossy(&c.payload));
+            if c.result == 'N' {
+                out.push_str("error: no signature found\n");
+            }
+            out.push_str(&c.output);
+            failed |= !c.good;
+        }
+        if failed {
+            Err(GitError::Cli(out.trim_end().to_owned()))
         } else {
-            Err(GitError::Cli(text.trim_end().to_owned()))
+            Ok(out.trim_end().to_owned())
+        }
+    }
+
+    fn signature_check(&self, rev: &str, tag: bool) -> Result<crate::SignatureCheck, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let obj = repo.revparse_single(rev)?;
+        let kind = obj.kind().map_or("unknown", |k| k.str());
+        match (tag, obj.kind()) {
+            (true, Some(ObjectType::Tag)) => crate::sign::check_tag(&repo, obj.id()),
+            (false, Some(ObjectType::Commit)) => crate::sign::check_commit(&repo, obj.id()),
+            _ => Err(GitError::Other(format!(
+                "{rev}: cannot verify a non-{} object of type {kind}.",
+                if tag { "tag" } else { "commit" }
+            ))),
         }
     }
 
@@ -3412,13 +3471,16 @@ impl GitBackend for Git2Backend {
         Ok(pruned)
     }
 
-    fn prune_objects(&self, dry_run: bool) -> Result<String, GitError> {
-        // libgit2 has no object prune; shell out like the other gc-style ops.
-        let mut args = vec!["prune"];
-        if dry_run {
-            args.push("-n");
-        }
-        self.run_git(&args, &[])
+    fn prune_objects(
+        &self,
+        expire: Option<&str>,
+        dry_run: bool,
+        verbose: bool,
+    ) -> Result<String, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let cut =
+            expire.map_or_else(|| Ok(crate::maintenance::now()), crate::maintenance::cutoff)?;
+        Ok(crate::maintenance::prune(&repo, cut, dry_run, verbose)?.join("\n"))
     }
 
     fn config_get(&self, key: &str) -> Result<Option<String>, GitError> {
@@ -3883,7 +3945,8 @@ impl GitBackend for Git2Backend {
                 // Part 1 keeps only the subject (a fresh change id); part 2 keeps the
                 // full message and the original change id.
                 let subject = full_msg.lines().next().unwrap_or("").to_owned();
-                let c1 = repo.commit(
+                let c1 = crate::sign::commit_configured(
+                    &repo,
                     None,
                     &target.author(),
                     &sig,
@@ -3892,7 +3955,8 @@ impl GitBackend for Git2Backend {
                     &[&parent],
                 )?;
                 let c1_commit = repo.find_commit(c1)?;
-                let c2 = repo.commit(
+                let c2 = crate::sign::commit_configured(
+                    &repo,
                     None,
                     &target.author(),
                     &sig,
@@ -4098,7 +4162,15 @@ impl GitBackend for Git2Backend {
                 let msg =
                     crate::change_id::preserve(&repo, head.message().unwrap_or(""), msg.trim_end());
                 let sig = repo.signature()?;
-                let new = repo.commit(None, &head.author(), &sig, &msg, &head.tree()?, &[&base])?;
+                let new = crate::sign::commit_configured(
+                    &repo,
+                    None,
+                    &head.author(),
+                    &sig,
+                    &msg,
+                    &head.tree()?,
+                    &[&base],
+                )?;
                 repo.reference(&branch_ref, new, true, "rgit squash range")?;
             }
             let _ = self.restack();
@@ -4131,7 +4203,8 @@ impl GitBackend for Git2Backend {
                     .filter_map(|k| parent.parent(k).ok())
                     .collect();
                 let gp_refs: Vec<&git2::Commit> = grandparents.iter().collect();
-                let squashed = repo.commit(
+                let squashed = crate::sign::commit_configured(
+                    &repo,
                     None,
                     &parent.author(),
                     &sig,
@@ -6390,7 +6463,17 @@ fn conclude_merge(
         .into_iter()
         .chain(heads.iter().map(|(c, _)| *c))
         .collect();
-    let id = repo.commit(None, &sig, &sig, &message, &tree, &parents)?;
+    let key = crate::sign::commit_key(repo, opts.sign.as_deref(), opts.no_sign);
+    let id = crate::sign::commit(
+        repo,
+        None,
+        &sig,
+        &sig,
+        &message,
+        &tree,
+        &parents,
+        key.as_deref(),
+    )?;
     let log = format!(
         "merge {}: Merge made by the '{strategy}' strategy.",
         names.join(" ")
@@ -7508,6 +7591,50 @@ fn push_lane_branch(
     Ok(remote_name)
 }
 
+/// The prefetch maintenance task: fetch each remote's branches into
+/// refs/prefetch/<its tracking refs>, leaving tags, FETCH_HEAD and the
+/// remote-tracking refs alone.
+fn prefetch(repo: &Repository, cred: Option<&dyn crate::CredentialPrompt>) -> Result<(), GitError> {
+    let names = repo.remotes()?;
+    for name in names.iter().flatten().flatten() {
+        let skip = repo
+            .config()
+            .and_then(|c| c.get_bool(&format!("remote.{name}.skipFetchAll")))
+            .unwrap_or(false);
+        if skip {
+            continue;
+        }
+        let configured = repo.find_remote(name)?;
+        let Some(url) = configured.url().map(str::to_owned).ok() else {
+            continue;
+        };
+        let specs: Vec<String> = configured
+            .fetch_refspecs()?
+            .iter()
+            .flatten()
+            .flatten()
+            .filter_map(|s| {
+                let (src, dst) = s.split_once(':')?;
+                let dst = dst.strip_prefix("refs/")?;
+                let force = if src.starts_with('+') { "" } else { "+" };
+                Some(format!("{force}{src}:refs/prefetch/{dst}"))
+            })
+            .collect();
+        if specs.is_empty() {
+            continue;
+        }
+        let mut remote = repo.remote_anonymous(&url)?;
+        let ignored = std::sync::atomic::AtomicBool::new(false);
+        let mut opts = FetchOptions::new();
+        opts.remote_callbacks(remote_callbacks(&|_| {}, &ignored, cred))
+            .download_tags(git2::AutotagOption::None)
+            .update_fetchhead(false);
+        let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        remote.fetch(&specs, Some(&mut opts), None)?;
+    }
+    Ok(())
+}
+
 fn remote_callbacks<'a>(
     report: &'a dyn Fn(OpProgress),
     rejected: &'a std::sync::atomic::AtomicBool,
@@ -7739,7 +7866,26 @@ fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(
             merge_heads.push(repo.find_commit(Oid::from_str(line.trim())?)?);
         }
     }
+    let key = crate::sign::commit_key(repo, o.sign.as_deref(), o.no_sign);
     match head {
+        Some(head) if o.amend && key.is_some() => {
+            let parents: Vec<git2::Commit> = head.parents().collect();
+            let parents: Vec<&git2::Commit> = parents.iter().collect();
+            let author = author.unwrap_or_else(|| head.author().to_owned());
+            let id = crate::sign::commit(
+                repo,
+                None,
+                &author,
+                &sig,
+                &msg,
+                &tree,
+                &parents,
+                key.as_deref(),
+            )?;
+            let summary = msg.lines().next().unwrap_or("");
+            repo.head()?
+                .set_target(id, &format!("commit (amend): {summary}"))?;
+        }
         // Commit::amend rewrites HEAD keeping its parents, which the ref-updating
         // commit refuses ("current tip is not the first parent").
         Some(head) if o.amend => {
@@ -7760,7 +7906,16 @@ fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(
             }
             let parents: Vec<&git2::Commit> = head.iter().chain(&merge_heads).collect();
             let author = author.as_ref().unwrap_or(&sig);
-            repo.commit(Some("HEAD"), author, &sig, &msg, &tree, &parents)?;
+            crate::sign::commit(
+                repo,
+                Some("HEAD"),
+                author,
+                &sig,
+                &msg,
+                &tree,
+                &parents,
+                key.as_deref(),
+            )?;
         }
     }
     // Like `git commit`: the in-progress merge, cherry-pick or revert is done, but
@@ -8176,7 +8331,8 @@ fn reword_commit(repo: &Repository, target: Oid, new_message: &str) -> Result<()
             vec![repo.find_commit(new_tip)?]
         };
         let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
-        new_tip = repo.commit(
+        new_tip = crate::sign::commit_configured(
+            repo,
             None,
             &commit.author(),
             &sig,
@@ -8227,7 +8383,8 @@ fn replay_onto(repo: &Repository, commits: &[&git2::Commit], base: Oid) -> Resul
             )));
         }
         let tree = repo.find_tree(index.write_tree_to(repo)?)?;
-        tip = repo.commit(
+        tip = crate::sign::commit_configured(
+            repo,
             None,
             &c.author(),
             &sig,
@@ -9071,6 +9228,7 @@ fn read_pick_state(repo: &Repository) -> Result<PickState, GitError> {
         opts.record_origin = cfg.get_bool("options.record-origin").unwrap_or(false);
         opts.mainline = cfg.get_i32("options.mainline").ok().map(|m| m as u32);
         opts.strategy_option = cfg.get_string("options.strategy-option").ok();
+        opts.sign = cfg.get_string("options.gpg-sign").ok();
         opts.strategy = cfg.get_string("options.strategy").ok();
         opts.cleanup = cfg.get_string("options.default-msg-cleanup").ok();
         let flag = |key: &str| cfg.get_bool(&format!("options.{key}")).unwrap_or(false);
@@ -9139,6 +9297,9 @@ fn write_pick_state(
     }
     if let Some(side) = &opts.strategy_option {
         cfg.set_str("options.strategy-option", side)?;
+    }
+    if let Some(key) = &opts.sign {
+        cfg.set_str("options.gpg-sign", key)?;
     }
     if let Some(s) = &opts.strategy {
         cfg.set_str("options.strategy", s)?;
@@ -9260,7 +9421,17 @@ fn run_picks(
         } else {
             commit.author().to_owned()
         };
-        repo.commit(Some("HEAD"), &author, &committer, &message, &tree, &[&head])?;
+        let key = crate::sign::commit_key(repo, opts.sign.as_deref(), opts.no_sign);
+        crate::sign::commit(
+            repo,
+            Some("HEAD"),
+            &author,
+            &committer,
+            &message,
+            &tree,
+            &[&head],
+            key.as_deref(),
+        )?;
         ours = tree;
     }
     if let Some(mut index) = staged {

@@ -123,7 +123,15 @@ const EXAMPLES: &[Entry] = &[
             "rgit merge-base --is-ancestor main HEAD",
         ],
     ),
-    ("reflog", &["rgit reflog", "rgit reflog show main -n 10"]),
+    (
+        "reflog",
+        &[
+            "rgit reflog",
+            "rgit reflog show main -n 10",
+            "rgit reflog expire --expire=30.days.ago --all",
+            "rgit reflog delete --rewrite HEAD@{2}",
+        ],
+    ),
     (
         "shortlog",
         &["rgit shortlog -sn", "rgit shortlog -sne --all"],
@@ -412,7 +420,14 @@ const EXAMPLES: &[Entry] = &[
             "rgit split --rev <rev> src/lib.rs",
         ],
     ),
-    ("prune", &["rgit prune", "rgit prune --dry-run"]),
+    (
+        "prune",
+        &[
+            "rgit prune",
+            "rgit prune --dry-run",
+            "rgit prune -v --expire=2.weeks.ago",
+        ],
+    ),
     ("next", &["rgit next"]),
     ("prev", &["rgit prev"]),
     (
@@ -768,6 +783,17 @@ const EXAMPLES: &[Entry] = &[
         ],
     ),
     (
+        "verify-commit",
+        &[
+            "rgit verify-commit HEAD",
+            "rgit verify-commit -v --raw HEAD",
+        ],
+    ),
+    (
+        "verify-tag",
+        &["rgit verify-tag v1.0", "rgit verify-tag -v v1.0"],
+    ),
+    (
         "repack",
         &["rgit repack -a -d", "rgit repack -a -d -b --cruft"],
     ),
@@ -832,14 +858,27 @@ const EXAMPLES: &[Entry] = &[
             "rgit maintenance run --task=commit-graph --task=loose-objects",
         ],
     ),
-    ("maintenance start", &["rgit maintenance start"]),
+    (
+        "maintenance start",
+        &[
+            "rgit maintenance start",
+            "rgit maintenance start --scheduler=crontab",
+        ],
+    ),
+    (
+        "for-each-repo",
+        &["rgit for-each-repo --config=maintenance.repo maintenance run --schedule=daily"],
+    ),
     ("maintenance stop", &["rgit maintenance stop"]),
     ("maintenance register", &["rgit maintenance register"]),
     (
         "maintenance unregister",
         &["rgit maintenance unregister --force"],
     ),
-    ("clean", &["rgit clean", "rgit clean --dry-run"]),
+    (
+        "clean",
+        &["rgit clean -n", "rgit clean -fd", "rgit clean -idx"],
+    ),
     (
         "rm",
         &[

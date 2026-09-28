@@ -41,6 +41,8 @@ struct Args {
     empty: Option<String>,
     patch_format: Option<String>,
     apply: Vec<String>,
+    gpg_sign: Option<String>,
+    no_gpg_sign: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GitError> {
@@ -78,6 +80,14 @@ fn parse_args(args: &[String]) -> Result<Args, GitError> {
             "-i" | "--interactive" => a.interactive = true,
             "-n" | "--no-verify" => a.no_verify = true,
             "-q" | "--quiet" => a.quiet = true,
+            "--no-gpg-sign" => a.no_gpg_sign = true,
+            s if s.starts_with("--gpg-sign") || s.starts_with("-S") => {
+                let key = s
+                    .strip_prefix("--gpg-sign")
+                    .or_else(|| s.strip_prefix("-S"))
+                    .unwrap_or("");
+                a.gpg_sign = Some(key.strip_prefix('=').unwrap_or(key).to_owned());
+            }
             "--reject" | "--ignore-space-change" | "--ignore-whitespace" => {
                 a.apply.push(arg.clone())
             }
@@ -194,6 +204,8 @@ struct RunOpts {
     no_verify: bool,
     interactive: bool,
     empty: String,
+    gpg_sign: Option<String>,
+    no_gpg_sign: bool,
 }
 
 impl RunOpts {
@@ -204,6 +216,8 @@ impl RunOpts {
             no_verify: a.no_verify,
             interactive: a.interactive,
             empty: a.empty.clone().unwrap_or_else(|| "stop".into()),
+            gpg_sign: a.gpg_sign.clone(),
+            no_gpg_sign: a.no_gpg_sign,
         }
     }
 }
@@ -623,7 +637,17 @@ impl Session {
             out.push_str("applying to an empty history\n");
         }
         let parents: Vec<&git2::Commit> = parent.iter().collect();
-        let id = repo.commit(None, &author, &committer, &self.msg, &tree, &parents)?;
+        let key = crate::sign::commit_key(repo, self.run.gpg_sign.as_deref(), self.run.no_gpg_sign);
+        let id = crate::sign::commit(
+            repo,
+            None,
+            &author,
+            &committer,
+            &self.msg,
+            &tree,
+            &parents,
+            key.as_deref(),
+        )?;
         let log = format!("am: {}", first_line(&self.msg));
         match repo.head() {
             Ok(mut head) => {

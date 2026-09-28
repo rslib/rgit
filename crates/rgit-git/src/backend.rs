@@ -747,19 +747,46 @@ pub trait GitBackend: Send + Sync {
     /// export-ignore and export-subst attributes.
     fn archive(&self, opts: &crate::ArchiveOpts) -> Result<Vec<u8>, GitError>;
 
-    /// Pack and prune the object database (`git gc` with `args`). Shells out
-    /// to `git` (libgit2 has no gc).
-    fn gc(&self, args: &[String]) -> Result<String, GitError>;
+    /// Pack and prune the object database as `git gc` does; returns what it
+    /// reports.
+    fn gc(&self, opts: &crate::GcOptions) -> Result<String, GitError>;
 
-    /// Verify the object database (`git fsck` with `args`) and return its
-    /// report. Shells out to `git` (libgit2 has no fsck).
-    fn fsck(&self, args: &[String]) -> Result<String, GitError>;
+    /// Pack objects as `git repack` does; returns what it reports.
+    fn repack(&self, opts: &crate::RepackOptions) -> Result<String, GitError>;
 
-    /// Remove untracked files and directories (`git clean -fd`). With `dry_run`
-    /// (git's `-n`), report what would be removed without deleting. `args` are
-    /// extra `git clean` arguments (`-x`, `-X`, `-e <pattern>`, `--`, paths).
-    /// Returns git's output.
-    fn clean(&self, dry_run: bool, args: &[String]) -> Result<String, GitError>;
+    /// Move loose refs into packed-refs (`git pack-refs`): every ref with
+    /// `all`, else tags and refs already packed; `auto` only when enough loose
+    /// refs piled up.
+    fn pack_refs(&self, all: bool, no_prune: bool, auto: bool) -> Result<(), GitError>;
+
+    /// Drop old reflog entries (`git reflog expire`); git's report lines.
+    fn reflog_expire(&self, opts: &crate::ReflogExpire) -> Result<Vec<String>, GitError>;
+
+    /// Drop reflog entries named `ref@{n}` (`git reflog delete`).
+    fn reflog_delete(&self, entries: &[String], opts: &crate::ReflogExpire)
+    -> Result<(), GitError>;
+
+    /// Whether the full ref name has a reflog (`git reflog exists`).
+    fn reflog_exists(&self, name: &str) -> bool;
+
+    /// Run maintenance tasks (`git maintenance run`); returns what they report.
+    fn maintenance_run(&self, opts: &crate::MaintenanceRun) -> Result<String, GitError>;
+
+    /// Verify the object database as `git fsck` does: its stdout, stderr
+    /// and exit code.
+    fn fsck(&self, opts: &crate::FsckOptions) -> Result<crate::FsckReport, GitError>;
+
+    /// The untracked (or ignored) paths `git clean` would remove, from the
+    /// root, folders ending in `/`.
+    fn clean_candidates(&self, opts: &crate::CleanOptions) -> Result<Vec<String>, GitError>;
+
+    /// Remove `items` (from [`Self::clean_candidates`]) as `git clean` does,
+    /// or only report them with `opts.dry_run`; returns git's lines.
+    fn clean_remove(
+        &self,
+        items: &[String],
+        opts: &crate::CleanOptions,
+    ) -> Result<Vec<String>, GitError>;
 
     /// Remove tracked paths matching `paths` (files, folders or globs) from the
     /// index (`git rm`), and from the working tree unless `opts.cached`. A
@@ -922,6 +949,10 @@ pub trait GitBackend: Send + Sync {
     /// Check the named tags' signatures, returning git's report (`git tag -v`).
     fn verify_tags(&self, names: &[String]) -> Result<String, GitError>;
 
+    /// Check the signature of the commit or (with `tag`) tag object at `rev`,
+    /// as `git verify-commit` / `git verify-tag` do.
+    fn signature_check(&self, rev: &str, tag: bool) -> Result<crate::SignatureCheck, GitError>;
+
     /// Whether `ancestor` is `rev` or an ancestor of it (git's `merge-base
     /// --is-ancestor`).
     fn is_ancestor(&self, ancestor: &str, rev: &str) -> Result<bool, GitError>;
@@ -1016,9 +1047,15 @@ pub trait GitBackend: Send + Sync {
     /// prune`). Returns the names pruned.
     fn prune_worktrees(&self) -> Result<Vec<String>, GitError>;
 
-    /// Prune unreachable objects (git's `prune`). `dry_run` reports what would be
-    /// removed without deleting. Returns git's output.
-    fn prune_objects(&self, dry_run: bool) -> Result<String, GitError>;
+    /// Prune unreachable loose objects older than `expire` (default: all), as
+    /// git's `prune`; `dry_run` only reports. Returns `<id> <type>` lines
+    /// (with `dry_run` or `verbose`).
+    fn prune_objects(
+        &self,
+        expire: Option<&str>,
+        dry_run: bool,
+        verbose: bool,
+    ) -> Result<String, GitError>;
 
     /// Delete a local branch.
     /// Delete a local branch. With `force` false (git's `-d`), refuse a branch

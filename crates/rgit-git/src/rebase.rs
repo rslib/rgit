@@ -400,6 +400,9 @@ struct Seq<'r> {
     empty: Empty,
     quiet: bool,
     squash_onto: Option<Oid>,
+    /// The key commits are signed with (git's gpg_sign_opt), `""` for the
+    /// default one.
+    gpg: Option<String>,
     out: Vec<String>,
 }
 
@@ -435,6 +438,8 @@ impl<'r> Seq<'r> {
             empty,
             quiet: has("quiet"),
             squash_onto: read_oid(&dir, "squash-onto"),
+            gpg: read(&dir, "gpg_sign_opt")
+                .and_then(|s| s.trim().strip_prefix("-S").map(str::to_owned)),
             out: Vec::new(),
             dir,
         })
@@ -508,9 +513,16 @@ impl<'r> Seq<'r> {
             )?;
         }
         let tree = self.repo.find_tree(tree)?;
-        Ok(self
-            .repo
-            .commit(None, author, &committer, msg, &tree, parents)?)
+        crate::sign::commit(
+            self.repo,
+            None,
+            author,
+            &committer,
+            msg,
+            &tree,
+            parents,
+            self.gpg.as_deref(),
+        )
     }
 
     fn author_of(&self, commit: &Commit) -> Result<Signature<'static>, GitError> {
@@ -1810,6 +1822,9 @@ pub(crate) fn start(
                 write(&dir, file, text)?;
             }
         }
+        if let Some(key) = crate::sign::commit_key(repo, o.sign.as_deref(), o.no_sign) {
+            write(&dir, "gpg_sign_opt", format!("-S{key}"))?;
+        }
         let body = |repo: &Repository, items: &[Item], short: bool| -> String {
             items
                 .iter()
@@ -1900,6 +1915,7 @@ impl<'r> Seq<'r> {
             empty: Empty::Drop,
             quiet: false,
             squash_onto: None,
+            gpg: None,
             out: Vec::new(),
         }
     }

@@ -488,6 +488,9 @@ pub struct PrettyArgs {
     /// Abbreviate the commit ids in the format's header.
     #[arg(long)]
     pub abbrev_commit: bool,
+    /// Check each commit's signature and show the verifier's report.
+    #[arg(long)]
+    pub show_signature: bool,
     /// Show the notes of the default notes refs, or of this notes ref
     /// (repeatable; any format).
     #[arg(
@@ -509,9 +512,29 @@ impl PrettyArgs {
             || self.pretty.is_some()
             || self.oneline
             || self.graph
+            || self.show_signature
             || !self.notes.is_empty()
             || self.no_notes
     }
+}
+
+/// git's `-S[<keyid>]` / `--no-gpg-sign`.
+#[derive(clap::Args, Default, Clone)]
+pub struct SignArgs {
+    /// Sign the commit with gpg, gpgsm or ssh-keygen (per gpg.format), with
+    /// user.signingKey or `-S<KEYID>` (git's -S).
+    #[arg(
+        short = 'S',
+        long = "gpg-sign",
+        value_name = "KEYID",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = ""
+    )]
+    pub gpg_sign: Option<String>,
+    /// Do not sign, even with commit.gpgSign set.
+    #[arg(long, overrides_with = "gpg_sign")]
+    pub no_gpg_sign: bool,
 }
 
 #[derive(Subcommand)]
@@ -926,6 +949,8 @@ pub enum Command {
         /// Accepted for git compatibility.
         #[arg(short = 'q', long, hide = true)]
         quiet: bool,
+        #[command(flatten)]
+        sign: SignArgs,
         /// Commit only these paths, as they are in the working tree; other
         /// staged changes stay staged.
         paths: Vec<String>,
@@ -984,6 +1009,12 @@ pub enum Command {
         /// List what would be removed without deleting (git's -n).
         #[arg(short = 'n', long = "dry-run")]
         dry_run: bool,
+        /// Name each removed object.
+        #[arg(short, long)]
+        verbose: bool,
+        /// Only objects older than this (default: all).
+        #[arg(long, value_name = "DATE")]
+        expire: Option<String>,
     },
     /// Check out the branch stacked on this one (move up the stack).
     Next,
@@ -1288,6 +1319,8 @@ pub enum Command {
     Merge {
         /// The branches or revisions to merge (prompted for if omitted).
         revs: Vec<String>,
+        #[command(flatten)]
+        sign: SignArgs,
         /// Always create a merge commit, even if a fast-forward is possible.
         #[arg(long = "no-ff", conflicts_with = "ff_only")]
         no_ff: bool,
@@ -1476,6 +1509,8 @@ pub enum Command {
     CherryPick {
         /// Commits or ranges `A..B` to apply in order (prompted for if omitted on a terminal).
         revs: Vec<String>,
+        #[command(flatten)]
+        sign: SignArgs,
         /// Apply the change without committing (git's -n/--no-commit).
         #[arg(short = 'n', long = "no-commit")]
         no_commit: bool,
@@ -1528,6 +1563,8 @@ pub enum Command {
     Revert {
         /// Commits or ranges `A..B` to revert, newest first (prompted for if omitted on a terminal).
         revs: Vec<String>,
+        #[command(flatten)]
+        sign: SignArgs,
         /// Apply the inverse without committing (git's -n/--no-commit).
         #[arg(short = 'n', long = "no-commit")]
         no_commit: bool,
@@ -1732,15 +1769,49 @@ pub enum Command {
         /// Leave the largest pack as it is.
         #[arg(long)]
         keep_largest_pack: bool,
-        /// Put unreachable objects in a cruft pack instead of loose files.
-        #[arg(long)]
+        /// Put unreachable objects in a cruft pack instead of loose files
+        /// (the default, per gc.cruftPacks).
+        #[arg(long, overrides_with = "no_cruft")]
         cruft: bool,
+        /// Loosen unreachable objects instead of a cruft pack.
+        #[arg(long)]
+        no_cruft: bool,
+        /// Print nothing.
+        #[arg(short, long)]
+        quiet: bool,
+    },
+    /// Check commits' gpg, x509 or ssh signatures (`git verify-commit`).
+    VerifyCommit {
+        /// Print each commit's contents too.
+        #[arg(short, long)]
+        verbose: bool,
+        /// Print the verifier's status lines instead of its report.
+        #[arg(long)]
+        raw: bool,
+        /// The commits to check.
+        #[arg(required = true)]
+        commits: Vec<String>,
+    },
+    /// Check annotated tags' gpg, x509 or ssh signatures (`git verify-tag`).
+    VerifyTag {
+        /// Print each tag's contents too.
+        #[arg(short, long)]
+        verbose: bool,
+        /// Print the verifier's status lines instead of its report.
+        #[arg(long)]
+        raw: bool,
+        /// The tags to check.
+        #[arg(required = true)]
+        tags: Vec<String>,
     },
     /// Check the object database for corruption and dangling objects.
     Fsck {
-        /// Also check packed objects.
+        /// Also check packed objects (the default).
         #[arg(long)]
         full: bool,
+        /// Only check loose objects' contents.
+        #[arg(long, conflicts_with = "full")]
+        no_full: bool,
         /// Strict checking.
         #[arg(long)]
         strict: bool,
@@ -1812,6 +1883,21 @@ pub enum Command {
         /// Maximum delta depth.
         #[arg(long, value_name = "N")]
         depth: Option<u32>,
+        /// Leave this pack (`pack-<hash>.pack`) as it is; repeatable.
+        #[arg(long, value_name = "PACK")]
+        keep_pack: Vec<String>,
+        /// With --cruft, drop unreachable objects older than this.
+        #[arg(long, value_name = "DATE")]
+        cruft_expiration: Option<String>,
+        /// With -A, only loosen unreachable objects newer than this.
+        #[arg(long, value_name = "DATE")]
+        unpack_unreachable: Option<String>,
+        /// Do not update objects/info/packs.
+        #[arg(short = 'n')]
+        no_update_server_info: bool,
+        /// Print nothing.
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Move loose refs into packed-refs (`git pack-refs`).
     PackRefs {
@@ -1824,6 +1910,19 @@ pub enum Command {
         /// Only when enough loose refs have piled up.
         #[arg(long)]
         auto: bool,
+    },
+    /// Run an rgit command in every repository a multi-valued config key
+    /// lists (`git for-each-repo`), e.g. `--config=maintenance.repo`.
+    ForEachRepo {
+        /// The config key naming the repositories.
+        #[arg(long, value_name = "KEY", required = true)]
+        config: String,
+        /// Go on after a repository fails (exit 1 at the end).
+        #[arg(long)]
+        keep_going: bool,
+        /// The rgit command and its arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
     },
     /// Background upkeep (`git maintenance`): run tasks now, schedule them,
     /// or (un)register this repository.
@@ -1918,12 +2017,16 @@ pub enum Command {
         /// Keep files matching this pattern (git's -e).
         #[arg(short = 'e', long = "exclude", value_name = "PATTERN")]
         exclude: Vec<String>,
-        /// Accepted for git compatibility: rgit always removes folders.
-        #[arg(short = 'd', hide = true)]
+        /// Remove untracked folders too, not only files.
+        #[arg(short = 'd')]
         dirs: bool,
-        /// Accepted for git compatibility: rgit needs no -f.
-        #[arg(short = 'f', long, hide = true)]
-        force: bool,
+        /// Really remove (needed while clean.requireForce is true); twice
+        /// also removes nested repositories.
+        #[arg(short = 'f', long, action = clap::ArgAction::Count)]
+        force: u8,
+        /// Pick what to remove from git's menu, read from stdin.
+        #[arg(short = 'i', long)]
+        interactive: bool,
         /// Print nothing on success.
         #[arg(short = 'q', long)]
         quiet: bool,
@@ -2561,13 +2664,21 @@ pub enum Plumbing {
         /// The second commit.
         b: String,
     },
-    /// Show where a ref pointed over time, like `git reflog show`.
+    /// Show where a ref pointed over time (`git reflog [show] [REF]`), or
+    /// `expire [--expire=<date>] [--expire-unreachable=<date>] [--all]
+    /// [--rewrite] [--updateref] [--stale-fix] [-n] [--verbose] [REF...]`,
+    /// `delete [--rewrite] [--updateref] [-n] REF@{N}...`, `exists REF`.
     Reflog {
         /// Show at most N entries.
         #[arg(short = 'n', long = "max-count", value_name = "N")]
         max_count: Option<usize>,
-        /// `show` (optional) and the ref (default HEAD).
-        #[arg(num_args = 0..=2, value_name = "[show] REF")]
+        /// `show` (optional) and the ref (default HEAD); or expire, delete or
+        /// exists and their arguments.
+        #[arg(
+            value_name = "[show] REF",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
         args: Vec<String>,
     },
     /// Summarize commits by author, like `git shortlog`.
@@ -4078,6 +4189,8 @@ pub struct RebaseFlags {
     /// Show a diffstat of what changed upstream.
     #[arg(short = 'v', long)]
     pub verbose: bool,
+    #[command(flatten)]
+    pub sign: SignArgs,
 }
 
 impl RebaseFlags {
@@ -4101,6 +4214,8 @@ impl RebaseFlags {
             no_verify: self.no_verify,
             quiet: self.quiet,
             verbose: self.verbose,
+            sign: self.sign.gpg_sign.clone(),
+            no_sign: self.sign.no_gpg_sign,
             ..Default::default()
         }
     }
@@ -4632,6 +4747,8 @@ pub struct AmArgs {
     /// Print nothing but errors.
     #[arg(short = 'q', long)]
     pub quiet: bool,
+    #[command(flatten)]
+    pub sign: SignArgs,
 }
 
 /// `rgit archive`'s arguments, as git's.
@@ -4884,8 +5001,9 @@ pub enum NotesCmd {
 pub enum MaintenanceCmd {
     /// Run maintenance tasks now.
     Run {
-        /// Only this task (gc, commit-graph, prefetch, loose-objects,
-        /// incremental-repack, pack-refs); repeatable.
+        /// Only this task (prefetch, loose-objects, incremental-repack, gc,
+        /// commit-graph, pack-refs, reflog-expire, worktree-prune,
+        /// rerere-gc); repeatable.
         #[arg(long, value_name = "TASK")]
         task: Vec<String>,
         /// Only the tasks whose auto conditions are met.
@@ -4894,9 +5012,17 @@ pub enum MaintenanceCmd {
         /// Run the tasks of this schedule (hourly, daily, weekly).
         #[arg(long, value_name = "FREQ")]
         schedule: Option<String>,
+        /// Print nothing.
+        #[arg(short, long)]
+        quiet: bool,
     },
-    /// Register this repository and schedule hourly/daily/weekly runs.
-    Start,
+    /// Register this repository and schedule hourly/daily/weekly runs
+    /// (launchd on macOS, systemd timers or cron elsewhere).
+    Start {
+        /// auto, launchctl, systemd-timer or crontab.
+        #[arg(long, value_name = "SCHEDULER")]
+        scheduler: Option<String>,
+    },
     /// Remove the schedule (the repositories stay registered).
     Stop,
     /// Add this repository to the global maintenance.repo list.
@@ -6093,9 +6219,12 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
             "hash-object",
             "gc",
             "fsck",
+            "verify-commit",
+            "verify-tag",
             "repack",
             "pack-refs",
             "maintenance",
+            "for-each-repo",
             "cherry",
             "bundle",
             "request-pull",
@@ -6820,6 +6949,7 @@ pub fn run(
             quiet: _,
             only: _,
             verbose: _,
+            sign,
             mut paths,
         } => {
             let reuse = reuse_message.as_ref().or(reedit_message.as_ref());
@@ -6886,6 +7016,8 @@ pub fn run(
                     reset_author,
                     date: date.as_deref().map(parse_git_date).transpose()?,
                     paths,
+                    sign: sign.gpg_sign,
+                    no_sign: sign.no_gpg_sign,
                 },
             )?;
             backend.commit_report().join("\n")
@@ -6952,14 +7084,11 @@ pub fn run(
                 many => anyhow::bail!("multiple children: {}", many.join(", ")),
             }
         }
-        Command::Prune { dry_run } => {
-            let out = backend.prune_objects(dry_run)?;
-            if out.trim().is_empty() {
-                "nothing to prune".to_owned()
-            } else {
-                out.trim_end().to_owned()
-            }
-        }
+        Command::Prune {
+            dry_run,
+            verbose,
+            expire,
+        } => backend.prune_objects(expire.as_deref(), dry_run, verbose)?,
         Command::Move { rev, before, after } => match (before, after) {
             (Some(t), None) => {
                 backend.reorder(&rev, &t, true)?;
@@ -7290,6 +7419,7 @@ pub fn run(
         }
         Command::Merge {
             mut revs,
+            sign,
             no_ff,
             ff_only,
             squash,
@@ -7346,6 +7476,8 @@ pub fn run(
                     no_verify,
                     signoff,
                     stat: !no_stat && !quiet,
+                    sign: sign.gpg_sign,
+                    no_sign: sign.no_gpg_sign,
                     autostash: (autostash || no_autostash).then_some(autostash),
                     into_name,
                     cleanup,
@@ -7507,6 +7639,7 @@ pub fn run(
         }
         Command::CherryPick {
             revs,
+            sign,
             no_commit,
             record_origin,
             mainline,
@@ -7542,6 +7675,8 @@ pub fn run(
                 empty,
                 ff,
                 reference: false,
+                sign: sign.gpg_sign,
+                no_sign: sign.no_gpg_sign,
                 strategy: more.strategy,
                 cleanup: more.cleanup,
             };
@@ -7549,6 +7684,7 @@ pub fn run(
         }
         Command::Revert {
             revs,
+            sign,
             no_commit,
             mainline,
             strategy_option,
@@ -7570,6 +7706,8 @@ pub fn run(
                 edit,
                 signoff,
                 reference,
+                sign: sign.gpg_sign,
+                no_sign: sign.no_gpg_sign,
                 strategy: more.strategy,
                 cleanup: more.cleanup,
                 ..Default::default()
@@ -8547,6 +8685,8 @@ pub fn run(
             ] {
                 args.extend(value.map(|v| format!("{flag}={v}")));
             }
+            args.extend(a.sign.gpg_sign.map(|k| format!("--gpg-sign={k}")));
+            args.extend(a.sign.no_gpg_sign.then(|| "--no-gpg-sign".to_owned()));
             for g in a.exclude {
                 args.push(format!("--exclude={g}"));
             }
@@ -8573,119 +8713,73 @@ pub fn run(
             force,
             keep_largest_pack,
             cruft,
-        } => {
-            let mut args: Vec<String> = Vec::new();
-            args.extend(prune.map(|p| {
-                if p.is_empty() {
-                    "--prune".to_owned()
-                } else {
-                    format!("--prune={p}")
-                }
-            }));
-            for (on, flag) in [
-                (no_prune, "--no-prune"),
-                (aggressive, "--aggressive"),
-                (auto, "--auto"),
-                (force, "--force"),
-                (keep_largest_pack, "--keep-largest-pack"),
-                (cruft, "--cruft"),
-            ] {
-                args.extend(on.then(|| flag.to_owned()));
-            }
-            args.push("--quiet".to_owned());
-            backend.gc(&args)?;
-            "ok".to_owned()
+            no_cruft,
+            quiet,
+        } => backend.gc(&rgit_git::GcOptions {
+            prune,
+            no_prune,
+            aggressive,
+            auto,
+            force,
+            keep_largest_pack,
+            cruft: (cruft || no_cruft).then_some(cruft),
+            quiet,
+        })?,
+        Command::VerifyCommit {
+            verbose,
+            raw,
+            commits,
+        } => verify_signatures(backend, &commits, false, verbose, raw),
+        Command::VerifyTag { verbose, raw, tags } => {
+            verify_signatures(backend, &tags, true, verbose, raw)
         }
-        Command::Fsck {
-            full,
-            strict,
-            unreachable,
-            no_dangling,
-            connectivity_only,
-            lost_found,
-            name_objects,
-            root,
-            tags,
-            cache,
-            no_reflogs,
-            objects,
-        } => {
-            let mut args: Vec<String> = Vec::new();
-            for (on, flag) in [
-                (full, "--full"),
-                (strict, "--strict"),
-                (unreachable, "--unreachable"),
-                (no_dangling, "--no-dangling"),
-                (connectivity_only, "--connectivity-only"),
-                (lost_found, "--lost-found"),
-                (name_objects, "--name-objects"),
-                (root, "--root"),
-                (tags, "--tags"),
-                (cache, "--cache"),
-                (no_reflogs, "--no-reflogs"),
-            ] {
-                args.extend(on.then(|| flag.to_owned()));
-            }
-            args.extend(objects);
-            let out = backend.fsck(&args)?;
-            if out.is_empty() {
-                "no problems found".to_owned()
-            } else {
-                out
-            }
+        c @ Command::Fsck { .. } => {
+            let report = fsck(backend, c)?;
+            eprint!("{}", report.stderr);
+            report.stdout
         }
         Command::Repack {
             all,
             all_loosen,
             delete,
-            no_reuse_delta,
-            no_reuse_object,
-            local,
             keep_unreachable,
-            write_bitmap_index,
             cruft,
-            geometric,
-            window,
-            depth,
+            keep_pack,
+            cruft_expiration,
+            unpack_unreachable,
+            no_update_server_info,
+            quiet,
+            ..
         } => {
-            // libgit2 has no repack; git does the packing.
-            let mut args = vec!["repack".to_owned(), "-q".to_owned()];
-            for (on, flag) in [
-                (all, "-a"),
-                (all_loosen, "-A"),
-                (delete, "-d"),
-                (no_reuse_delta, "-f"),
-                (no_reuse_object, "-F"),
-                (local, "-l"),
-                (keep_unreachable, "-k"),
-                (write_bitmap_index, "-b"),
-                (cruft, "--cruft"),
-            ] {
-                args.extend(on.then(|| flag.to_owned()));
-            }
-            for (flag, value) in [
-                ("--geometric", geometric),
-                ("--window", window),
-                ("--depth", depth),
-            ] {
-                args.extend(value.map(|v| format!("{flag}={v}")));
-            }
-            backend.git(&args)?;
-            "ok".to_owned()
+            let date = |d: Option<String>| -> anyhow::Result<Option<i64>> {
+                d.map(|d| {
+                    rgit_git::expiry_date(&d)
+                        .ok_or_else(|| anyhow::anyhow!("malformed expiration date '{d}'"))
+                })
+                .transpose()
+            };
+            let out = backend.repack(&rgit_git::RepackOptions {
+                all,
+                all_loosen,
+                delete,
+                keep_unreachable,
+                cruft,
+                cruft_expiration: date(cruft_expiration)?,
+                unpack_unreachable: date(unpack_unreachable)?,
+                keep_pack,
+                no_update_server_info,
+            })?;
+            if quiet { String::new() } else { out }
         }
         Command::PackRefs {
             all,
             no_prune,
             auto,
         } => {
-            let mut args = vec!["pack-refs".to_owned()];
-            for (on, flag) in [(all, "--all"), (no_prune, "--no-prune"), (auto, "--auto")] {
-                args.extend(on.then(|| flag.to_owned()));
-            }
-            backend.git(&args)?;
-            "ok".to_owned()
+            backend.pack_refs(all, no_prune, auto)?;
+            String::new()
         }
-        Command::Maintenance { cmd } => maintenance(backend, cmd)?,
+        Command::Maintenance { cmd } => crate::maintenance::run(backend, cmd)?,
         Command::Cherry {
             upstream,
             head,
@@ -8788,40 +8882,26 @@ pub fn run(
             ignored_too,
             only_ignored,
             exclude,
-            paths,
+            dirs,
+            force,
+            interactive: menu,
             quiet,
-            ..
-        } => {
-            let mut args: Vec<String> = Vec::new();
-            args.extend(ignored_too.then(|| "-x".to_owned()));
-            args.extend(only_ignored.then(|| "-X".to_owned()));
-            for e in exclude {
-                args.extend(["-e".to_owned(), e]);
-            }
-            if !paths.is_empty() {
-                args.push("--".to_owned());
-                args.extend(paths);
-            }
-            if dry_run {
-                let out = backend.clean(true, &args)?;
-                if out.trim().is_empty() {
-                    "nothing to clean".to_owned()
-                } else {
-                    out.trim_end().to_owned()
-                }
-            } else if interactive
-                && !crate::interactive::confirm("Remove all untracked files and directories?")?
-            {
-                "cancelled".to_owned()
-            } else {
-                backend.clean(false, &args)?;
-                if quiet {
-                    String::new()
-                } else {
-                    "ok".to_owned()
-                }
-            }
-        }
+            paths,
+        } => crate::clean::run(
+            backend,
+            rgit_git::CleanOptions {
+                dirs,
+                ignored: ignored_too,
+                only_ignored,
+                exclude,
+                dry_run,
+                paths,
+                ..Default::default()
+            },
+            force,
+            menu,
+            quiet,
+        )?,
         Command::Rm {
             paths,
             cached,
@@ -8973,6 +9053,7 @@ pub fn run(
         Command::Git { args } => backend.git(&args)?,
         Command::Init { .. }
         | Command::Clone { .. }
+        | Command::ForEachRepo { .. }
         | Command::Mcp
         | Command::Serve { .. }
         | Command::Forge { .. } => unreachable!("handled before dispatch"),
@@ -9905,97 +9986,6 @@ fn update_ref_stdin(
         run(&batch, false)?;
     }
     Ok(String::new())
-}
-
-/// `rgit maintenance`: (un)registering is config, done here; running and
-/// scheduling tasks (gc, commit-graph, prefetch, launchd/cron/systemd timers)
-/// is git's, which libgit2 has no counterpart for.
-fn maintenance(backend: &Arc<dyn GitBackend>, cmd: MaintenanceCmd) -> anyhow::Result<String> {
-    use rgit_git::ConfigScope::{Global, Local};
-    let repo = backend.workdir().canonicalize()?.display().to_string();
-    let git_dir = backend.git_dir();
-    let registered = || -> anyhow::Result<bool> {
-        Ok(rgit_git::config_list(Some(&git_dir), &Global, false)
-            .unwrap_or_default()
-            .iter()
-            .any(|e| e.name == "maintenance.repo" && e.value.as_deref() == Some(repo.as_str())))
-    };
-    match cmd {
-        MaintenanceCmd::Register => {
-            if !registered()? {
-                rgit_git::config_set(
-                    Some(&git_dir),
-                    &Global,
-                    "maintenance.repo",
-                    &repo,
-                    None,
-                    rgit_git::SetMode::Add,
-                )?;
-            }
-            rgit_git::config_set(
-                Some(&git_dir),
-                &Local,
-                "maintenance.auto",
-                "false",
-                None,
-                rgit_git::SetMode::Replace,
-            )?;
-            if backend.config_get("maintenance.strategy")?.is_none() {
-                rgit_git::config_set(
-                    Some(&git_dir),
-                    &Local,
-                    "maintenance.strategy",
-                    "incremental",
-                    None,
-                    rgit_git::SetMode::Replace,
-                )?;
-            }
-            Ok("ok".to_owned())
-        }
-        MaintenanceCmd::Unregister { force } => {
-            if !registered()? {
-                if force {
-                    return Ok("ok".to_owned());
-                }
-                return Err(
-                    GitError::Other(format!("repository '{repo}' is not registered")).into(),
-                );
-            }
-            rgit_git::config_unset(
-                Some(&git_dir),
-                &Global,
-                "maintenance.repo",
-                Some(&rgit_git::config_fixed_value(&repo)),
-                true,
-            )?;
-            Ok("ok".to_owned())
-        }
-        MaintenanceCmd::Run {
-            task,
-            auto,
-            schedule,
-        } => {
-            let mut args = vec![
-                "maintenance".to_owned(),
-                "run".to_owned(),
-                "--quiet".to_owned(),
-            ];
-            args.extend(task.into_iter().map(|t| format!("--task={t}")));
-            args.extend(auto.then(|| "--auto".to_owned()));
-            args.extend(schedule.map(|s| format!("--schedule={s}")));
-            backend.git(&args)?;
-            Ok("ok".to_owned())
-        }
-        MaintenanceCmd::Start | MaintenanceCmd::Stop => {
-            let verb = if matches!(cmd, MaintenanceCmd::Start) {
-                "start"
-            } else {
-                "stop"
-            };
-            backend.git(&["maintenance".to_owned(), verb.to_owned()])?;
-            Ok("ok".to_owned())
-        }
-    }
 }
 
 /// `rgit bundle`; list-heads needs no repository.
@@ -12001,6 +11991,39 @@ fn create_tag(
     ))
 }
 
+/// `git verify-commit` / `git verify-tag`: each object's contents (with
+/// -v) and the verifier's report; exit 1 unless every signature is good.
+fn verify_signatures(
+    backend: &Arc<dyn GitBackend>,
+    revs: &[String],
+    tag: bool,
+    verbose: bool,
+    raw: bool,
+) -> String {
+    let mut out = String::new();
+    let mut failed = false;
+    for rev in revs {
+        let c = match backend.signature_check(rev, tag) {
+            Ok(c) => c,
+            Err(e) => {
+                out.push_str(&format!("error: {e}\n"));
+                failed = true;
+                continue;
+            }
+        };
+        if verbose {
+            out.push_str(&String::from_utf8_lossy(&c.payload));
+        }
+        if c.result == 'N' && tag {
+            out.push_str("error: no signature found\n");
+        }
+        out.push_str(if raw { &c.status } else { &c.output });
+        failed |= !c.good;
+    }
+    set_exit(failed);
+    out
+}
+
 /// `msg` with each `<token>: <value>` (or `=`) trailer appended, in its own
 /// paragraph unless the last one is already trailers, as interpret-trailers
 /// does.
@@ -13080,6 +13103,47 @@ pub(crate) fn diff_files(
 }
 
 static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// `rgit fsck`'s report; a problem sets the exit code as git's does.
+pub fn fsck(
+    backend: &Arc<dyn GitBackend>,
+    command: Command,
+) -> anyhow::Result<rgit_git::FsckReport> {
+    let Command::Fsck {
+        no_full,
+        strict,
+        unreachable,
+        no_dangling,
+        connectivity_only,
+        lost_found,
+        name_objects,
+        root,
+        tags,
+        cache,
+        no_reflogs,
+        objects,
+        ..
+    } = command
+    else {
+        unreachable!("fsck takes fsck's arguments")
+    };
+    let report = backend.fsck(&rgit_git::FsckOptions {
+        full: !no_full,
+        strict,
+        unreachable,
+        dangling: !no_dangling,
+        connectivity_only,
+        lost_found,
+        name_objects,
+        root,
+        tags,
+        cache,
+        reflogs: !no_reflogs,
+        objects,
+    })?;
+    EXIT_CODE.store(report.code, std::sync::atomic::Ordering::Relaxed);
+    Ok(report)
+}
 
 /// Make a successful run exit 1, as `diff --exit-code` does on differences.
 pub(crate) fn set_exit(differs: bool) {

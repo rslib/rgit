@@ -79,6 +79,8 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "git_config",
     "git_notes",
     "git_fsck",
+    "git_verify_commit",
+    "git_verify_tag",
     "git_rev_parse",
     "git_ls_files",
     "git_ls_tree",
@@ -2042,6 +2044,27 @@ fn tools() -> Vec<Tool> {
             ],
         ),
         tool(
+            "git_verify_commit",
+            "Check commit signatures (git verify-commit) with gpg, gpgsm or ssh-keygen per \
+             gpg.format; returns the verifier's report and fails unless every signature is good. \
+             `verbose` adds each commit's contents, `raw` gives the machine status lines.",
+            &[
+                ("revs", "paths", true),
+                ("verbose", "boolean", false),
+                ("raw", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_verify_tag",
+            "Check annotated tag signatures (git verify-tag), as git_verify_commit does for \
+             commits.",
+            &[
+                ("tags", "paths", true),
+                ("verbose", "boolean", false),
+                ("raw", "boolean", false),
+            ],
+        ),
+        tool(
             "git_cherry",
             "Commits of `head` (default HEAD) not in `upstream` (default HEAD's upstream), oldest \
              first, each marked by whether upstream already has an equivalent change (same patch \
@@ -2634,6 +2657,8 @@ const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
     ("checkout-index", "git_checkout_index", &["paths"]),
     ("gc", "git_gc", &[]),
     ("fsck", "git_fsck", &[]),
+    ("verify-commit", "git_verify_commit", &["revs"]),
+    ("verify-tag", "git_verify_tag", &["tags"]),
     ("repack", "git_repack", &[]),
     ("cherry", "git_cherry", &["upstream", "head", "limit"]),
     ("bundle", "git_bundle", &["action", "file"]),
@@ -3131,6 +3156,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             theirs: !a.flag("ours"),
         },
         "git_commit" => Command::Commit {
+            sign: Default::default(),
             message: a.str("message").into_iter().collect(),
             file: None,
             amend: a.flag("amend"),
@@ -3314,6 +3340,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             }
         }
         "git_merge" => Command::Merge {
+            sign: Default::default(),
             revs: a.strs("rev").unwrap_or_default(),
             no_ff: a.flag("no_ff"),
             ff_only: a.flag("ff_only"),
@@ -3380,6 +3407,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         "git_rebase_quit" => rebase("quit"),
         "git_rebase_current_patch" => rebase("show-current-patch"),
         "git_cherry_pick" => Command::CherryPick {
+            sign: Default::default(),
             revs: a.strs("rev").unwrap_or_default(),
             no_commit: a.flag("no_commit"),
             record_origin: a.flag("record_origin"),
@@ -3403,6 +3431,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             quit: a.flag("quit"),
         },
         "git_revert" => Command::Revert {
+            sign: Default::default(),
             revs: a.strs("rev").unwrap_or_default(),
             no_commit: a.flag("no_commit"),
             mainline: a.num("mainline")?.map(|m| m as u32),
@@ -3960,6 +3989,18 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             force: false,
             keep_largest_pack: false,
             cruft: a.flag("cruft"),
+            no_cruft: false,
+            quiet: true,
+        },
+        "git_verify_commit" => Command::VerifyCommit {
+            verbose: a.flag("verbose"),
+            raw: a.flag("raw"),
+            commits: a.strs("revs")?,
+        },
+        "git_verify_tag" => Command::VerifyTag {
+            verbose: a.flag("verbose"),
+            raw: a.flag("raw"),
+            tags: a.strs("tags")?,
         },
         "git_cherry" => Command::Cherry {
             upstream: a.str("upstream"),
@@ -4027,6 +4068,11 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             geometric: None,
             window: None,
             depth: None,
+            keep_pack: Vec::new(),
+            cruft_expiration: None,
+            unpack_unreachable: None,
+            no_update_server_info: false,
+            quiet: true,
         },
         "git_pack_refs" => Command::PackRefs {
             all: a.flag("all"),
@@ -4039,8 +4085,9 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                     task: a.strs("task").unwrap_or_default(),
                     auto: false,
                     schedule: None,
+                    quiet: true,
                 },
-                "start" => MaintenanceCmd::Start,
+                "start" => MaintenanceCmd::Start { scheduler: None },
                 "stop" => MaintenanceCmd::Stop,
                 "register" => MaintenanceCmd::Register,
                 "unregister" => MaintenanceCmd::Unregister { force: false },
@@ -4053,6 +4100,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         },
         "git_fsck" => Command::Fsck {
             full: a.flag("full"),
+            no_full: false,
             strict: a.flag("strict"),
             unreachable: a.flag("unreachable"),
             no_dangling: a.flag("no_dangling"),
@@ -4071,7 +4119,8 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             only_ignored: a.flag("only_ignored"),
             exclude: a.strs("exclude").unwrap_or_default(),
             dirs: true,
-            force: true,
+            force: 1,
+            interactive: false,
             quiet: false,
             paths: a.strs("paths").unwrap_or_default(),
         },

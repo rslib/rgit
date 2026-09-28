@@ -122,6 +122,11 @@ pub struct CommitOptions {
     /// Commit only these paths, as they are in the working tree, on top of
     /// HEAD; other staged changes stay staged (git's `commit <paths>`).
     pub paths: Vec<String>,
+    /// Sign with this key, `""` for the default (git's `-S`); else per
+    /// commit.gpgSign.
+    pub sign: Option<String>,
+    /// Do not sign, whatever commit.gpgSign says (git's `--no-gpg-sign`).
+    pub no_sign: bool,
 }
 
 /// One ref change of an `update-ref` transaction.
@@ -168,6 +173,10 @@ pub struct PickOptions {
     pub ff: bool,
     /// Name a reverted commit as `abbrev (subject, date)` (git's `--reference`).
     pub reference: bool,
+    /// Sign the commits with this key, `""` for the default (git's `-S`).
+    pub sign: Option<String>,
+    /// Do not sign, whatever commit.gpgSign says (git's `--no-gpg-sign`).
+    pub no_sign: bool,
     /// The merge strategy (git's `-s`); `ours` keeps HEAD's tree.
     pub strategy: Option<String>,
     /// How to clean up each message: strip, whitespace, verbatim, scissors or
@@ -216,6 +225,10 @@ pub struct MergeOptions {
     pub signoff: bool,
     /// Report a diffstat of what the merge brought in (git's `--stat`).
     pub stat: bool,
+    /// Sign the merge commit with this key, `""` for the default (git's `-S`).
+    pub sign: Option<String>,
+    /// Do not sign, whatever commit.gpgSign says (git's `--no-gpg-sign`).
+    pub no_sign: bool,
     /// Stash local changes first and reapply them after (git's `--autostash`);
     /// `None` follows `merge.autoStash`.
     pub autostash: Option<bool>,
@@ -274,6 +287,11 @@ pub struct RebaseOptions {
     pub quiet: bool,
     /// Show a diffstat of what changed upstream.
     pub verbose: bool,
+    /// Sign the rewritten commits with this key, `""` for the default
+    /// (git's `-S`); else per commit.gpgSign.
+    pub sign: Option<String>,
+    /// Do not sign, whatever commit.gpgSign says (git's `--no-gpg-sign`).
+    pub no_sign: bool,
 }
 
 impl RepoStatus {
