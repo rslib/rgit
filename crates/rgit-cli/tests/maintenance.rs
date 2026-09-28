@@ -543,6 +543,271 @@ fn am_keeps_subjects_dates_and_shows_the_current_patch() {
     assert_eq!(git(&dir, &["log", "-1", "--format=%s"]), "conflict\n");
 }
 
+/// Run git (`tool` "git") or rgit in `dir` with fixed dates, feeding `stdin`.
+fn dated(tool: &str, dir: &Path, args: &[&str], stdin: &[u8]) -> (String, bool) {
+    let mut cmd = if tool == "git" {
+        let mut c = Command::new("git");
+        c.arg("-C").arg(dir);
+        c
+    } else {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_rgit"));
+        c.arg("--human").current_dir(dir).env("RGIT_OPLOG", "0");
+        c
+    };
+    cmd.args(args)
+        .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+        .env("GIT_EDITOR", "true")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    isolate(&mut cmd, dir);
+    let mut child = cmd.spawn().unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), stdin).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr),
+        out.status.success(),
+    )
+}
+
+/// Two repos with the same dated history (a.txt: one two three), and a
+/// mailbox of two patches on it.
+fn am_twins(tag: &str) -> (PathBuf, PathBuf, Vec<u8>) {
+    let mut dirs = Vec::new();
+    let mut mbox = Vec::new();
+    for side in ["git", "rgit"] {
+        let d =
+            std::env::temp_dir().join(format!("rgit-maint-{}-{tag}-{side}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(d.with_extension("home"));
+        std::fs::create_dir_all(&d).unwrap();
+        let run = |args: &[&str]| {
+            let (out, success) = dated("git", &d, args, b"");
+            assert!(success, "{args:?}: {out}");
+            out
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(d.join("b.txt"), "b\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+        std::fs::write(d.join("a.txt"), "one\n2\nthree\n").unwrap();
+        run(&[
+            "commit",
+            "-qam",
+            "Caf\u{e9}: two as a digit!",
+            "--author=J\u{fc}rgen \u{d6} <j@x.org>",
+            "--date=2019-05-06T07:08:09+0200",
+        ]);
+        std::fs::write(d.join("b.txt"), "b\nb2\n").unwrap();
+        run(&[
+            "commit",
+            "-qam",
+            "[tag] add b",
+            "-m",
+            "Body.\n\nSigned-off-by: S <s@x>",
+        ]);
+        mbox = run(&["format-patch", "-2", "--stdout", "-k"]).into_bytes();
+        run(&["reset", "-q", "--hard", "HEAD~2"]);
+        dirs.push(d);
+    }
+    let b = dirs.pop().unwrap();
+    (dirs.pop().unwrap(), b, mbox)
+}
+
+fn tip(dir: &Path, n: usize) -> String {
+    git(
+        dir,
+        &["log", &format!("-{n}"), "--format=%H %an <%ae> %ad%n%B"],
+    )
+}
+
+#[test]
+fn am_parses_and_commits_mail_like_git() {
+    let (a, b, mbox) = am_twins("am-twins");
+    let file = a.with_extension("mbox");
+    std::fs::write(&file, &mbox).unwrap();
+    let file = file.to_str().unwrap();
+    for args in [
+        vec!["am", file],
+        vec![
+            "am",
+            "-k",
+            "-s",
+            "-m",
+            "--committer-date-is-author-date",
+            file,
+        ],
+        vec!["am", "--keep-non-patch", "--whitespace=fix", "-p1", file],
+    ] {
+        assert!(dated("git", &a, &args, b"").1);
+        let (out, success) = dated("rgit", &b, &args, b"");
+        assert!(success, "{out}");
+        assert_eq!(tip(&a, 2), tip(&b, 2), "{args:?}");
+        for d in [&a, &b] {
+            git(d, &["reset", "-q", "--hard", "HEAD~2"]);
+        }
+    }
+    // From stdin.
+    assert!(dated("git", &a, &["am"], &mbox).1);
+    assert!(dated("rgit", &b, &["am"], &mbox).1);
+    assert_eq!(tip(&a, 2), tip(&b, 2));
+    for d in [&a, &b] {
+        git(d, &["reset", "-q", "--hard", "HEAD~2"]);
+    }
+
+    // Encoded headers, quoted-printable, scissors and in-body headers.
+    let mail = [
+        "From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001",
+        "From: =?UTF-8?q?J=C3=BCrgen?= <j@x.org>",
+        "Date: Tue, 2 Jan 2024 10:00:00 +0100",
+        "Subject: [PATCH v2 3/7] Re: =?UTF-8?q?caf=C3=A9?=",
+        " fix",
+        "Message-ID: <abc@x.org>",
+        "Content-Type: text/plain; charset=UTF-8",
+        "Content-Transfer-Encoding: quoted-printable",
+        "",
+        "cover chatter to cut",
+        "-- >8 --",
+        "From: Real Author <real@x.org>",
+        "Subject: the real subject",
+        "",
+        "Body with =C3=A9 accent.",
+        "---",
+        " b.txt | 1 +",
+        "",
+        "diff --git a/b.txt b/b.txt",
+        "--- a/b.txt",
+        "+++ b/b.txt",
+        "@@ -1 +1,2 @@",
+        " b",
+        "+c",
+        "",
+    ]
+    .join("\n");
+    for args in [vec!["am", "-c", "-m"], vec!["am", "--no-scissors"]] {
+        assert!(dated("git", &a, &args, mail.as_bytes()).1);
+        let (out, success) = dated("rgit", &b, &args, mail.as_bytes());
+        assert!(success, "{out}");
+        assert_eq!(tip(&a, 1), tip(&b, 1), "{args:?}");
+        for d in [&a, &b] {
+            git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+        }
+    }
+}
+
+#[test]
+fn am_sessions_continue_across_git_and_rgit() {
+    let (a, b, mbox) = am_twins("am-cross");
+    let file = a.with_extension("mbox");
+    std::fs::write(&file, &mbox).unwrap();
+    let file = file.to_str().unwrap();
+    for d in [&a, &b] {
+        std::fs::write(d.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        assert!(dated("git", d, &["commit", "-qam", "conflict"], b"").1);
+    }
+    // Both stop on the first patch with the same state.
+    assert!(!dated("git", &a, &["am", file], b"").1);
+    assert!(!dated("rgit", &b, &["am", file], b"").1);
+    for f in [
+        "next",
+        "last",
+        "info",
+        "msg",
+        "patch",
+        "final-commit",
+        "author-script",
+        "keep",
+        "messageid",
+        "utf8",
+        "scissors",
+        "threeway",
+        "quiet",
+        "sign",
+        "apply-opt",
+        "abort-safety",
+        "0001",
+        "0002",
+    ] {
+        let read = |d: &Path| std::fs::read(d.join(".git/rebase-apply").join(f)).unwrap();
+        assert_eq!(read(&a), read(&b), "{f}");
+    }
+    // git continues what rgit stopped, and rgit what git stopped.
+    for d in [&a, &b] {
+        std::fs::write(d.join("a.txt"), "one\n2\nthree\n").unwrap();
+        git(d, &["add", "a.txt"]);
+    }
+    assert!(dated("rgit", &a, &["am", "--continue"], b"").1);
+    assert!(dated("git", &b, &["am", "--continue"], b"").1);
+    assert_eq!(tip(&a, 3), tip(&b, 3));
+
+    // A three-way stop, skipped by the other tool; then an abort.
+    for d in [&a, &b] {
+        git(d, &["reset", "-q", "--hard", "HEAD~2"]);
+    }
+    assert!(!dated("git", &a, &["am", "-3", file], b"").1);
+    assert!(!dated("rgit", &b, &["am", "-3", file], b"").1);
+    assert_eq!(
+        git(&a, &["status", "--short"]),
+        git(&b, &["status", "--short"])
+    );
+    assert!(dated("rgit", &a, &["am", "--skip"], b"").1);
+    assert!(dated("git", &b, &["am", "--skip"], b"").1);
+    assert_eq!(tip(&a, 2), tip(&b, 2));
+    for d in [&a, &b] {
+        git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+    }
+    let before = git(&b, &["rev-parse", "HEAD"]);
+    assert!(!dated("rgit", &b, &["am", file], b"").1);
+    assert!(dated("git", &b, &["am", "--abort"], b"").1);
+    assert_eq!(git(&b, &["rev-parse", "HEAD"]), before);
+    assert!(!dated("git", &b, &["am", file], b"").1);
+    assert!(dated("rgit", &b, &["am", "--abort"], b"").1);
+    assert_eq!(git(&b, &["rev-parse", "HEAD"]), before);
+    assert!(!b.join(".git/rebase-apply").exists());
+}
+
+#[test]
+fn am_runs_hooks_and_handles_empty_patches() {
+    let (_, b, mbox) = am_twins("am-hooks");
+    let hooks = b.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = |name: &str, body: &str| {
+        let p = hooks.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        Command::new("chmod").arg("+x").arg(&p).status().unwrap();
+    };
+    hook("applypatch-msg", "sed -i.bak 's/^Caf/Hooked caf/' \"$1\"");
+    hook("post-applypatch", "echo done >> .git/post-applypatch.log");
+    let (out, success) = dated("rgit", &b, &["am"], &mbox);
+    assert!(success, "{out}");
+    assert!(git(&b, &["log", "--format=%s", "-2"]).contains("Hooked caf"));
+    assert_eq!(
+        std::fs::read_to_string(b.join(".git/post-applypatch.log")).unwrap(),
+        "done\ndone\n"
+    );
+    hook("pre-applypatch", "exit 1");
+    git(&b, &["reset", "-q", "--hard", "HEAD~2"]);
+    assert!(!dated("rgit", &b, &["am"], &mbox).1);
+    assert!(dated("rgit", &b, &["am", "--abort"], b"").1);
+    let (out, success) = dated("rgit", &b, &["am", "--no-verify"], &mbox);
+    assert!(success, "{out}");
+    std::fs::remove_file(hooks.join("pre-applypatch")).unwrap();
+
+    let empty = "From: A <a@x>\nSubject: [PATCH] nothing\n\nno diff here\n";
+    let (out, success) = dated("rgit", &b, &["am", "-n"], empty.as_bytes());
+    assert!(!success && out.contains("Patch is empty."), "{out}");
+    let head = git(&b, &["rev-parse", "HEAD"]);
+    assert!(dated("rgit", &b, &["am", "--allow-empty"], b"").1);
+    assert_eq!(git(&b, &["rev-parse", "HEAD~1"]), head);
+    assert_eq!(git(&b, &["log", "-1", "--format=%s"]), "nothing\n");
+    let (out, success) = dated("rgit", &b, &["am", "--empty=drop"], empty.as_bytes());
+    assert!(success && out.contains("Skipping: nothing"), "{out}");
+}
+
 /// Mask what differs between two runs: the cover letter's date and the
 /// timestamp in Message-IDs.
 fn mask(mail: &str) -> String {

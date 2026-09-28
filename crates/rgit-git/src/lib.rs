@@ -4,9 +4,11 @@
 //! it entirely in-process over libgit2 - no subprocess on the refresh path.
 //! Mutations that libgit2 cannot express are layered on the same trait later.
 
+mod am;
 mod apply;
 mod archive;
 mod backend;
+mod bisect;
 mod bundle;
 mod change_id;
 mod config;

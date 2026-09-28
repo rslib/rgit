@@ -161,6 +161,11 @@ pub struct PickOptions {
     pub ff: bool,
     /// Name a reverted commit as `abbrev (subject, date)` (git's `--reference`).
     pub reference: bool,
+    /// The merge strategy (git's `-s`); `ours` keeps HEAD's tree.
+    pub strategy: Option<String>,
+    /// How to clean up each message: strip, whitespace, verbatim, scissors or
+    /// default (git's `--cleanup`).
+    pub cleanup: Option<String>,
 }
 
 /// What a cherry-pick does with a commit whose change is already in HEAD.
@@ -204,6 +209,14 @@ pub struct MergeOptions {
     pub signoff: bool,
     /// Report a diffstat of what the merge brought in (git's `--stat`).
     pub stat: bool,
+    /// Stash local changes first and reapply them after (git's `--autostash`);
+    /// `None` follows `merge.autoStash`.
+    pub autostash: Option<bool>,
+    /// The branch the default message says it merges into (git's `--into-name`).
+    pub into_name: Option<String>,
+    /// How to clean up the message: strip, whitespace, verbatim, scissors or
+    /// default (git's `--cleanup`).
+    pub cleanup: Option<String>,
 }
 
 /// `rebase` options, as git's.

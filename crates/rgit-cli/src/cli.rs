@@ -1000,6 +1000,19 @@ pub enum Command {
         /// Add a Signed-off-by trailer.
         #[arg(long)]
         signoff: bool,
+        /// Stash local changes first and reapply them after (default: merge.autoStash).
+        #[arg(long)]
+        autostash: bool,
+        /// Do not stash local changes first (overrides merge.autoStash).
+        #[arg(long = "no-autostash", conflicts_with = "autostash")]
+        no_autostash: bool,
+        /// Word the default message as merging into this branch.
+        #[arg(long = "into-name", value_name = "BRANCH")]
+        into_name: Option<String>,
+        /// How to clean up the message: strip, whitespace, verbatim, scissors or default.
+        #[arg(long, value_name = "MODE",
+              value_parser = ["strip", "whitespace", "verbatim", "scissors", "default"])]
+        cleanup: Option<String>,
         /// Print nothing on success.
         #[arg(short = 'q', long)]
         quiet: bool,
@@ -1131,6 +1144,8 @@ pub enum Command {
         /// Take this side on conflicting hunks (git's -X).
         #[arg(short = 'X', long = "strategy-option", value_parser = ["ours", "theirs"])]
         strategy_option: Option<String>,
+        #[command(flatten)]
+        more: PickFlags,
         /// Open the editor on each commit message.
         #[arg(short = 'e', long)]
         edit: bool,
@@ -1178,6 +1193,8 @@ pub enum Command {
         /// Take this side on conflicting hunks (git's -X).
         #[arg(short = 'X', long = "strategy-option", value_parser = ["ours", "theirs"])]
         strategy_option: Option<String>,
+        #[command(flatten)]
+        more: PickFlags,
         /// Open the editor on each revert message.
         #[arg(short = 'e', long)]
         edit: bool,
@@ -2885,6 +2902,8 @@ pub enum BisectCmd {
     Skip { revs: Vec<String> },
     /// End the bisect and check out where it started (or `commit`).
     Reset { commit: Option<String> },
+    /// Check out the next commit to test (after marking commits by hand).
+    Next,
     /// Print the bisect log, to save for `replay`.
     Log,
     /// Redo the bisect a saved log records.
@@ -2943,8 +2962,10 @@ impl BisectCmd {
                     args.push("--first-parent".into());
                 }
                 args.extend(revs.iter().cloned());
-                args.push("--".into());
-                args.extend(paths.iter().cloned());
+                if !paths.is_empty() {
+                    args.push("--".into());
+                    args.extend(paths.iter().cloned());
+                }
                 args
             }
             BisectCmd::Bad { revs } => words("bad", revs),
@@ -2954,6 +2975,7 @@ impl BisectCmd {
             BisectCmd::Skip { revs } => words("skip", revs),
             BisectCmd::Reset { commit } => words("reset", commit.as_slice()),
             BisectCmd::Log => words("log", &[]),
+            BisectCmd::Next => words("next", &[]),
             BisectCmd::Replay { file } => words("replay", std::slice::from_ref(file)),
             BisectCmd::Run { cmd } => words("run", cmd),
             BisectCmd::Visualize => words("visualize", &[]),
@@ -3394,6 +3416,24 @@ pub struct FormatPatchArgs {
     pub quiet: bool,
 }
 
+/// `cherry-pick` and `revert` flags past the common ones.
+#[derive(clap::Args, Default)]
+pub struct PickFlags {
+    /// The merge strategy; `ours` keeps HEAD's tree.
+    #[arg(long, value_name = "STRATEGY", value_parser = ["ort", "recursive", "resolve", "ours"])]
+    pub strategy: Option<String>,
+    /// How to clean up each message: strip, whitespace, verbatim, scissors or default.
+    #[arg(long, value_name = "MODE",
+          value_parser = ["strip", "whitespace", "verbatim", "scissors", "default"])]
+    pub cleanup: Option<String>,
+    /// Accepted for git compatibility (rerere is not run).
+    #[arg(long = "rerere-autoupdate")]
+    pub rerere_autoupdate: bool,
+    /// Accepted for git compatibility.
+    #[arg(long = "no-rerere-autoupdate", conflicts_with = "rerere_autoupdate")]
+    pub no_rerere_autoupdate: bool,
+}
+
 /// `rgit am`'s arguments, as git's.
 #[derive(clap::Args, Default)]
 pub struct AmArgs {
@@ -3416,6 +3456,15 @@ pub struct AmArgs {
     /// Stop, keeping the branch and index as they are.
     #[arg(long, conflicts_with_all = ["cont", "skip"])]
     pub quit: bool,
+    /// Commit the stopped empty patch as an empty commit and go on.
+    #[arg(long, conflicts_with_all = ["cont", "skip", "abort", "quit"])]
+    pub allow_empty: bool,
+    /// Keep CR at the end of lines (default: am.keepcr).
+    #[arg(long)]
+    pub keep_cr: bool,
+    /// Strip CR at the end of lines (overrides am.keepcr).
+    #[arg(long, conflicts_with = "keep_cr")]
+    pub no_keep_cr: bool,
     /// Print the patch am stopped at (`diff`: only its diff, `raw`: the mail).
     #[arg(long, value_name = "PART", num_args = 0..=1, require_equals = true,
           default_missing_value = "raw", value_parser = ["diff", "raw"])]
@@ -3438,6 +3487,9 @@ pub struct AmArgs {
     /// Drop everything above a `-- >8 --` scissors line.
     #[arg(short = 'c', long)]
     pub scissors: bool,
+    /// Keep a scissors line and what is above it (overrides mailinfo.scissors).
+    #[arg(long, conflicts_with = "scissors")]
+    pub no_scissors: bool,
     /// Use the author date as the committer date.
     #[arg(long)]
     pub committer_date_is_author_date: bool,
@@ -6106,6 +6158,10 @@ pub fn run(
             no_verify,
             verify: _,
             signoff,
+            autostash,
+            no_autostash,
+            into_name,
+            cleanup,
             quiet,
             cont,
             abort,
@@ -6141,6 +6197,9 @@ pub fn run(
                     no_verify,
                     signoff,
                     stat: !no_stat && !quiet,
+                    autostash: (autostash || no_autostash).then_some(autostash),
+                    into_name,
+                    cleanup,
                 };
                 let old = head_or_zero(backend);
                 let out = net(interactive, "merge", |r| {
@@ -6303,6 +6362,7 @@ pub fn run(
             record_origin,
             mainline,
             strategy_option,
+            more,
             edit,
             no_edit: _,
             signoff,
@@ -6333,6 +6393,8 @@ pub fn run(
                 empty,
                 ff,
                 reference: false,
+                strategy: more.strategy,
+                cleanup: more.cleanup,
             };
             pick(backend, revs, &opts, (cont, skip, abort, quit), interactive)?
         }
@@ -6341,6 +6403,7 @@ pub fn run(
             no_commit,
             mainline,
             strategy_option,
+            more,
             edit,
             no_edit: _,
             signoff,
@@ -6358,6 +6421,8 @@ pub fn run(
                 edit,
                 signoff,
                 reference,
+                strategy: more.strategy,
+                cleanup: more.cleanup,
                 ..Default::default()
             };
             pick(backend, revs, &opts, (cont, skip, abort, quit), interactive)?
@@ -7148,19 +7213,29 @@ pub fn run(
             if a.quiet { String::new() } else { written }
         }
         Command::Am(a) => {
-            let resume = a.abort || a.cont || a.skip || a.quit || a.show_current_patch.is_some();
+            let resume = a.abort
+                || a.cont
+                || a.skip
+                || a.quit
+                || a.allow_empty
+                || a.show_current_patch.is_some()
+                || backend.git_dir().join("rebase-apply").is_dir();
             let mut args: Vec<String> = a.strip.map(|n| format!("-p{n}")).into_iter().collect();
             for (on, flag) in [
                 (a.abort, "--abort"),
                 (a.cont, "--continue"),
                 (a.skip, "--skip"),
                 (a.quit, "--quit"),
+                (a.allow_empty, "--allow-empty"),
+                (a.keep_cr, "--keep-cr"),
+                (a.no_keep_cr, "--no-keep-cr"),
                 (a.three_way, "--3way"),
                 (a.signoff, "--signoff"),
                 (a.keep, "--keep"),
                 (a.keep_non_patch, "--keep-non-patch"),
                 (a.message_id, "--message-id"),
                 (a.scissors, "--scissors"),
+                (a.no_scissors, "--no-scissors"),
                 (
                     a.committer_date_is_author_date,
                     "--committer-date-is-author-date",

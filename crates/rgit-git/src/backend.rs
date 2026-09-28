@@ -532,7 +532,8 @@ pub trait GitBackend: Send + Sync {
     fn absorb(&self) -> Result<String, GitError>;
 
     /// Run a `git bisect` subcommand (`start <bad> <good>`, `good`, `bad`,
-    /// `reset`, ...). Shells out to `git` (libgit2 has no bisect).
+    /// `skip`, `reset`, `run`, ...) natively, with git's state files so git can
+    /// continue it. Returns what git prints.
     fn bisect(&self, args: &[String]) -> Result<String, GitError>;
 
     /// Config entries as `(name, value)`: every entry when `name` is `None`,
@@ -695,7 +696,8 @@ pub trait GitBackend: Send + Sync {
 
     /// Apply mbox patches as commits (`git am`). `args` are `git am` arguments
     /// (mbox paths, `--abort`, `--continue`, `--skip`, ...); `mbox` is patch
-    /// text to apply instead of files. Shells out to `git` (libgit2 has no am).
+    /// text to apply instead of files. The session lives in git's
+    /// `.git/rebase-apply`, so git and rgit can continue each other's.
     fn am(&self, args: &[String], mbox: Option<&[u8]>) -> Result<String, GitError>;
 
     /// A revision's tree as an archive (`git archive`), honouring the

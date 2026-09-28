@@ -2091,9 +2091,9 @@ impl GitBackend for Git2Backend {
     }
 
     fn bisect(&self, args: &[String]) -> Result<String, GitError> {
-        let mut argv = vec!["bisect"];
-        argv.extend(args.iter().map(String::as_str));
-        self.run_git(&argv, &[])
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        crate::bisect::run(&repo, args)
     }
 
     fn config_entries(
@@ -2515,39 +2515,11 @@ impl GitBackend for Git2Backend {
     }
 
     fn am(&self, args: &[String], mbox: Option<&[u8]>) -> Result<String, GitError> {
-        let mut argv: Vec<String> = vec!["am".to_owned()];
-        argv.extend(args.iter().cloned());
-        let tmp = self
-            .repo
-            .lock()
-            .expect("repo mutex")
-            .path()
-            .join("rgit-am.mbox");
-        if let Some(data) = mbox {
-            std::fs::write(&tmp, data)?;
-            argv.push(tmp.to_string_lossy().into_owned());
-        }
-        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-        // --interactive asks on the terminal, so it keeps git's stdio.
-        let interactive = args.iter().any(|a| a == "--interactive");
-        let out = self.logged("am", || {
-            if !interactive {
-                return self.run_git(&argv, &[("GIT_EDITOR", "true")]);
-            }
-            let status = std::process::Command::new("git")
-                .args(&argv)
-                .current_dir(&self.workdir)
-                .status()?;
-            if status.success() {
-                Ok(String::new())
-            } else {
-                Err(GitError::Cli("git am stopped".to_owned()))
-            }
-        });
-        if mbox.is_some() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        out
+        self.logged("am", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            crate::am::am(&repo, args, mbox)
+        })
     }
 
     fn archive(&self, o: &crate::ArchiveOpts) -> Result<Vec<u8>, GitError> {
@@ -2972,7 +2944,11 @@ impl GitBackend for Git2Backend {
                 let message = std::fs::read_to_string(repo.path().join("MERGE_MSG"))
                     .map(|m| strip_comments(&m))
                     .unwrap_or_else(|_| pick_message(&source, &state.opts));
-                let committer = repo.signature()?;
+                let message = match &state.opts.cleanup {
+                    Some(mode) => cleanup_message(&message, Some(mode), false)?,
+                    None => message,
+                };
+                let committer = repo.committer_from_env()?;
                 let author = if state.opts.revert {
                     committer.clone()
                 } else {
@@ -3029,17 +3005,30 @@ impl GitBackend for Git2Backend {
         opts: &crate::MergeOptions,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
-        if revs.len() > 1 {
-            return self.logged("merge", || octopus(self, revs, opts, report));
-        }
         let rev = revs.first().map(String::as_str).unwrap_or("HEAD");
         self.logged("merge", || {
             let repo = self.repo.lock().expect("repo mutex");
-            let source = repo.revparse_single(rev)?.peel_to_commit()?;
+            let autostash = opts.autostash.unwrap_or_else(|| {
+                repo.config()
+                    .and_then(|c| c.get_bool("merge.autoStash"))
+                    .unwrap_or(false)
+            });
+            let stash = if autostash {
+                autostash_create(&repo, report)?
+            } else {
+                None
+            };
             let before = repo.head()?.peel_to_tree()?;
-            merge_commit(&repo, &source, rev, opts, report)?;
+            let result = if revs.len() > 1 {
+                octopus(&repo, revs, opts, report)
+            } else {
+                repo.revparse_single(rev)
+                    .and_then(|o| o.peel_to_commit())
+                    .map_err(GitError::from)
+                    .and_then(|source| merge_commit(&repo, &source, rev, opts, report))
+            };
             let after = repo.head()?.peel_to_tree()?;
-            if opts.stat && after.id() != before.id() {
+            if result.is_ok() && opts.stat && after.id() != before.id() {
                 let stats = repo
                     .diff_tree_to_tree(Some(&before), Some(&after), None)?
                     .stats()?;
@@ -3049,7 +3038,17 @@ impl GitBackend for Git2Backend {
                     report(OpProgress::Line(line.to_owned()));
                 }
             }
-            Ok(())
+            if let Some(id) = stash {
+                if result.is_err() && repo.index()?.has_conflicts() {
+                    std::fs::write(repo.path().join("MERGE_AUTOSTASH"), format!("{id}\n"))?;
+                    report(OpProgress::Line(
+                        "When finished, apply stashed changes with `git stash pop`".to_owned(),
+                    ));
+                } else {
+                    report(OpProgress::Line(autostash_apply(&repo, id)?));
+                }
+            }
+            result
         })
     }
 
@@ -3061,6 +3060,9 @@ impl GitBackend for Git2Backend {
             let head = repo.head()?.peel_to_commit()?;
             repo.reset(head.as_object(), git2::ResetType::Hard, None)?;
             end_operation(&repo)?;
+            if let Some(id) = take_merge_autostash(&repo) {
+                eprintln!("{}", autostash_apply(&repo, id)?);
+            }
             Ok(())
         })
     }
@@ -3069,6 +3071,9 @@ impl GitBackend for Git2Backend {
         let repo = self.repo.lock().expect("repo mutex");
         for file in ["MERGE_HEAD", "MERGE_MODE", "MERGE_MSG", "AUTO_MERGE"] {
             let _ = std::fs::remove_file(repo.path().join(file));
+        }
+        if let Some(id) = take_merge_autostash(&repo) {
+            stash_store(&repo, id)?;
         }
         Ok(())
     }
@@ -6571,31 +6576,63 @@ fn merge_commit(
         }
         repo.merge(&[&annotated], Some(&mut merge_opts), None)?;
     }
-    let mut message = match &opts.message {
-        Some(m) => m.clone(),
-        None => merge_title(repo, name)?,
-    };
+    let strategy = if ours { "ours" } else { "ort" };
+    conclude_merge(repo, &head, &[(source, name)], true, opts, strategy, report)
+}
+
+/// The commits `tips` bring that `head` lacks, newest first.
+fn merged_commits<'r>(
+    repo: &'r Repository,
+    tips: &[Oid],
+    head: Oid,
+) -> Result<Vec<git2::Commit<'r>>, GitError> {
     let mut walk = repo.revwalk()?;
     walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
-    walk.push(source.id())?;
-    walk.hide(head.id())?;
-    let merged: Vec<git2::Commit> = walk
+    for tip in tips {
+        walk.push(*tip)?;
+    }
+    walk.hide(head)?;
+    Ok(walk
         .filter_map(|oid| repo.find_commit(oid.ok()?).ok())
-        .collect();
+        .collect())
+}
+
+/// Finish a merge whose result is in the index and MERGE_HEAD: write the
+/// message, stop for conflicts, `--squash` or `--no-commit`, else commit it
+/// with HEAD (when `with_head`) and `heads` as parents.
+fn conclude_merge(
+    repo: &Repository,
+    head: &git2::Commit<'_>,
+    heads: &[(&git2::Commit<'_>, &str)],
+    with_head: bool,
+    opts: &crate::MergeOptions,
+    strategy: &str,
+    report: &dyn Fn(OpProgress),
+) -> Result<(), GitError> {
+    let names: Vec<&str> = heads.iter().map(|(_, n)| *n).collect();
+    let mut message = match &opts.message {
+        Some(m) => m.clone(),
+        None => merge_title(repo, &names, opts.into_name.as_deref())?,
+    };
     if let Some(limit) = opts.log.filter(|n| *n > 0) {
-        let more = if merged.len() > limit {
-            format!(" ({} commits)", merged.len())
-        } else {
-            String::new()
-        };
-        message.push_str(&format!("\n\n* {name}:{more}"));
-        for c in merged.iter().take(limit) {
-            message.push_str(&format!("\n  {}", c.summary().ok().flatten().unwrap_or("")));
-        }
-        if merged.len() > limit {
-            message.push_str("\n  ...");
+        for (source, name) in heads {
+            let merged = merged_commits(repo, &[source.id()], head.id())?;
+            let more = if merged.len() > limit {
+                format!(" ({} commits)", merged.len())
+            } else {
+                String::new()
+            };
+            message.push_str(&format!("\n\n* {name}:{more}"));
+            for c in merged.iter().take(limit) {
+                message.push_str(&format!("\n  {}", c.summary().ok().flatten().unwrap_or("")));
+            }
+            if merged.len() > limit {
+                message.push_str("\n  ...");
+            }
         }
     }
+    let tips: Vec<Oid> = heads.iter().map(|(c, _)| c.id()).collect();
+    let merged = merged_commits(repo, &tips, head.id())?;
     if opts.squash {
         // A squash stages the result as an ordinary change: no MERGE_HEAD, and
         // SQUASH_MSG for the commit that follows.
@@ -6620,6 +6657,23 @@ fn merge_commit(
         std::fs::write(repo.path().join("MERGE_MSG"), format!("{message}\n"))?;
     }
     let index = repo.index()?;
+    if index.has_conflicts() && !opts.squash {
+        let mut hint = format!("{message}\n");
+        if opts.cleanup.as_deref() == Some("scissors") {
+            hint.push_str("\n# ------------------------ >8 ------------------------\n#");
+        }
+        hint.push_str("\n# Conflicts:\n");
+        let mut paths: Vec<String> = index
+            .iter()
+            .filter(|e| (e.flags >> 12) & 3 != 0)
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+            .collect();
+        paths.dedup();
+        for p in paths {
+            hint.push_str(&format!("#\t{p}\n"));
+        }
+        std::fs::write(repo.path().join("MERGE_MSG"), hint)?;
+    }
     if index.has_conflicts() {
         for entry in index.conflicts()?.flatten() {
             if let Some(path) = entry
@@ -6654,9 +6708,9 @@ fn merge_commit(
         ));
         return Ok(());
     }
-    let sig = repo.signature()?;
+    let sig = repo.committer_from_env()?;
     if !opts.no_verify {
-        run_hook_file(repo, "pre-merge-commit")?;
+        run_hook_file(repo, "pre-merge-commit", &[])?;
     }
     if opts.signoff {
         message = signoff(&message, &sig);
@@ -6670,32 +6724,83 @@ fn merge_commit(
             git2_hooks::hooks_commit_msg(repo, None, &mut message),
         )?;
     }
-    let message = git2::message_prettify(&message, None)?;
+    let message = cleanup_message(&message, opts.cleanup.as_deref(), opts.edit)?;
     let tree = repo.find_tree(repo.index()?.write_tree()?)?;
-    repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&head, source])?;
+    let parents: Vec<&git2::Commit> = with_head
+        .then_some(head)
+        .into_iter()
+        .chain(heads.iter().map(|(c, _)| *c))
+        .collect();
+    let id = repo.commit(None, &sig, &sig, &message, &tree, &parents)?;
+    let log = format!(
+        "merge {}: Merge made by the '{strategy}' strategy.",
+        names.join(" ")
+    );
+    repo.head()?.resolve()?.set_target(id, &log)?;
     end_operation(repo)?;
     report(OpProgress::Line(format!(
-        "Merge made by the '{}' strategy.",
-        if ours { "ours" } else { "ort" }
+        "Merge made by the '{strategy}' strategy."
     )));
     Ok(())
 }
 
-/// git's default merge title for `name`: `Merge branch 'x'`, `Merge
-/// remote-tracking branch 'origin/x'`, `Merge tag 'v1'` or `Merge commit 'x'`,
-/// with `into <branch>` unless merging into main or master.
-fn merge_title(repo: &Repository, name: &str) -> Result<String, GitError> {
-    let kind = match repo.resolve_reference_from_short_name(name) {
-        Ok(r) if r.is_branch() => "branch ",
-        Ok(r) if r.is_remote() => "remote-tracking branch ",
-        Ok(r) if r.is_tag() => "tag ",
-        _ => "commit ",
+/// A commit message cleaned up as git's `--cleanup=<mode>` does; `default` is
+/// `strip` for an edited message and `whitespace` otherwise.
+fn cleanup_message(msg: &str, mode: Option<&str>, edited: bool) -> Result<String, GitError> {
+    const SCISSORS: &str = "# ------------------------ >8 ------------------------\n";
+    Ok(match mode.unwrap_or("default") {
+        "verbatim" => msg.to_owned(),
+        "strip" => git2::message_prettify(msg, Some(b'#'))?,
+        "default" if edited => git2::message_prettify(msg, Some(b'#'))?,
+        "whitespace" | "default" => git2::message_prettify(msg, None)?,
+        "scissors" => {
+            let cut = std::iter::once(0)
+                .chain(msg.match_indices('\n').map(|(i, _)| i + 1))
+                .find(|&i| msg[i..].starts_with(SCISSORS))
+                .unwrap_or(msg.len());
+            git2::message_prettify(&msg[..cut], None)?
+        }
+        other => return Err(GitError::Other(format!("Invalid cleanup mode {other}"))),
+    })
+}
+
+/// git's default merge title for `names`, grouped by kind as fmt-merge-msg
+/// does: `Merge branch 'x'`, `Merge branches 'a' and 'b', tag 'v1'`, with
+/// `into <branch>` (or `into`'s name) unless that is main or master.
+fn merge_title(repo: &Repository, names: &[&str], into: Option<&str>) -> Result<String, GitError> {
+    let mut kinds: [(&str, &str, Vec<String>); 4] = [
+        ("branch", "branches", Vec::new()),
+        (
+            "remote-tracking branch",
+            "remote-tracking branches",
+            Vec::new(),
+        ),
+        ("tag", "tags", Vec::new()),
+        ("commit", "commits", Vec::new()),
+    ];
+    for name in names {
+        let kind = match repo.resolve_reference_from_short_name(name) {
+            Ok(r) if r.is_branch() => 0,
+            Ok(r) if r.is_remote() => 1,
+            Ok(r) if r.is_tag() => 2,
+            _ => 3,
+        };
+        kinds[kind].2.push(format!("'{name}'"));
+    }
+    let parts: Vec<String> = kinds
+        .iter()
+        .filter_map(|(one, many, list)| match list.split_last()? {
+            (last, []) => Some(format!("{one} {last}")),
+            (last, rest) => Some(format!("{many} {} and {last}", rest.join(", "))),
+        })
+        .collect();
+    let mut title = format!("Merge {}", parts.join(", "));
+    let branch = match into {
+        Some(b) => b.to_owned(),
+        None if repo.head_detached().unwrap_or(false) => "HEAD".to_owned(),
+        None => current_branch(repo).unwrap_or_default(),
     };
-    let mut title = format!("Merge {kind}'{name}'");
-    if let Ok(branch) = current_branch(repo)
-        && branch != "main"
-        && branch != "master"
-    {
+    if !matches!(branch.as_str(), "" | "main" | "master") {
         title.push_str(&format!(" into {branch}"));
     }
     Ok(title)
@@ -6752,11 +6857,13 @@ pub fn run_hook(
     Ok(Some(child.wait_with_output()?))
 }
 
-/// Run a hook git2_hooks has no helper for (`pre-merge-commit`), if the hooks
-/// directory has it as an executable file.
-fn run_hook_file(repo: &Repository, name: &str) -> Result<(), GitError> {
+/// Run a hook git2_hooks has no helper for (`pre-merge-commit`, am's), with
+/// `args`, if the hooks directory has it as an executable file.
+pub(crate) fn run_hook_file(repo: &Repository, name: &str, args: &[&Path]) -> Result<(), GitError> {
     let workdir = repo.workdir().unwrap_or(repo.path());
-    let Some(out) = run_hook(&hooks_dir(repo), workdir, name, &[], None)? else {
+    let args: Vec<String> = args.iter().map(|a| a.display().to_string()).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let Some(out) = run_hook(&hooks_dir(repo), workdir, name, &args, None)? else {
         return Ok(());
     };
     if out.status.success() {
@@ -7974,11 +8081,77 @@ fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(
     ] {
         let _ = std::fs::remove_file(repo.path().join(file));
     }
+    if merging && let Some(id) = take_merge_autostash(repo) {
+        eprintln!("{}", autostash_apply(repo, id)?);
+    }
 
     if !o.no_verify {
         let _ = git2_hooks::hooks_post_commit(repo, None);
     }
     Ok(())
+}
+
+/// Stash local changes to tracked files for `--autostash`, off the stash list
+/// as git keeps it, and reset them away.
+fn autostash_create(
+    repo: &Repository,
+    report: &dyn Fn(OpProgress),
+) -> Result<Option<Oid>, GitError> {
+    let mut status = StatusOptions::new();
+    status.include_untracked(false);
+    if repo
+        .statuses(Some(&mut status))?
+        .iter()
+        .all(|e| e.status() == Status::CURRENT)
+    {
+        return Ok(None);
+    }
+    let mut own = Repository::open(repo.path())?;
+    let sig = own.signature()?;
+    let id = own.stash_save2(&sig, Some("autostash"), None)?;
+    own.stash_drop(0)?;
+    sync_index(repo)?;
+    report(OpProgress::Line(format!(
+        "Created autostash: {}",
+        short7(id)
+    )));
+    Ok(Some(id))
+}
+
+/// Reapply an autostash; when it conflicts it goes to the stash list instead,
+/// as git does. Returns git's report line.
+fn autostash_apply(repo: &Repository, id: Oid) -> Result<String, GitError> {
+    stash_store(repo, id)?;
+    let mut own = Repository::open(repo.path())?;
+    let applied = own.stash_pop(0, None);
+    sync_index(repo)?;
+    Ok(match applied {
+        Ok(()) => "Applied autostash.".to_owned(),
+        Err(_) => {
+            "Applying autostash resulted in conflicts.\nYour changes are safe in the stash.\n\
+                   You can run \"git stash pop\" or \"git stash drop\" at any time."
+                .to_owned()
+        }
+    })
+}
+
+/// Put stash commit `id` on top of the stash list (git's `stash store`).
+fn stash_store(repo: &Repository, id: Oid) -> Result<(), GitError> {
+    repo.reference("refs/stash", id, true, "autostash")?;
+    let mut log = repo.reflog("refs/stash")?;
+    if log.get(0).map(|e| e.id_new()) != Some(id) {
+        log.append(id, &repo.signature()?, Some("autostash"))?;
+        log.write()?;
+    }
+    Ok(())
+}
+
+/// The autostash a stopped merge keeps in MERGE_AUTOSTASH, removing the file.
+fn take_merge_autostash(repo: &Repository) -> Option<Oid> {
+    let path = repo.path().join("MERGE_AUTOSTASH");
+    let id = Oid::from_str(std::fs::read_to_string(&path).ok()?.trim()).ok()?;
+    let _ = std::fs::remove_file(path);
+    Some(id)
 }
 
 /// The tree for `commit <paths>`: HEAD's tree with `paths` as they are in the
@@ -9316,6 +9489,8 @@ fn read_pick_state(repo: &Repository) -> Result<PickState, GitError> {
         opts.record_origin = cfg.get_bool("options.record-origin").unwrap_or(false);
         opts.mainline = cfg.get_i32("options.mainline").ok().map(|m| m as u32);
         opts.strategy_option = cfg.get_string("options.strategy-option").ok();
+        opts.strategy = cfg.get_string("options.strategy").ok();
+        opts.cleanup = cfg.get_string("options.default-msg-cleanup").ok();
         let flag = |key: &str| cfg.get_bool(&format!("options.{key}")).unwrap_or(false);
         opts.edit = flag("edit");
         opts.signoff = flag("signoff");
@@ -9383,6 +9558,12 @@ fn write_pick_state(
     if let Some(side) = &opts.strategy_option {
         cfg.set_str("options.strategy-option", side)?;
     }
+    if let Some(s) = &opts.strategy {
+        cfg.set_str("options.strategy", s)?;
+    }
+    if let Some(mode) = &opts.cleanup {
+        cfg.set_str("options.default-msg-cleanup", mode)?;
+    }
     for (on, key) in [
         (opts.edit, "edit"),
         (opts.signoff, "signoff"),
@@ -9434,7 +9615,7 @@ fn run_picks(
         let mut merged = pick_index(repo, &commit, &ours, opts)?;
         let mut message = pick_message(&commit, opts);
         if opts.signoff {
-            message = signoff(&message, &repo.signature()?);
+            message = signoff(&message, &repo.committer_from_env()?);
         }
         let subject = commit.summary().ok().flatten().unwrap_or("").to_owned();
         // With -n the index on disk still holds the starting tree.
@@ -9459,6 +9640,7 @@ fn run_picks(
         let was_empty =
             commit.parent_count() == 1 && commit.parent(0)?.tree_id() == commit.tree_id();
         if empty && !was_empty && opts.empty == crate::EmptyCommit::Drop {
+            eprintln!("dropping {oid} {subject} -- patch contents already upstream");
             continue;
         }
         let keep = if was_empty {
@@ -9486,8 +9668,11 @@ fn run_picks(
         if opts.edit {
             message = edit_message(repo, "COMMIT_EDITMSG", &message)?;
         }
+        if opts.cleanup.is_some() {
+            message = cleanup_message(&message, opts.cleanup.as_deref(), opts.edit)?;
+        }
         repo.checkout_tree(tree.as_object(), Some(CheckoutBuilder::new().safe()))?;
-        let committer = repo.signature()?;
+        let committer = repo.committer_from_env()?;
         let author = if opts.revert {
             committer.clone()
         } else {
@@ -9626,6 +9811,20 @@ fn pick_index(
         Some(p) => p.tree()?,
         None => repo.find_tree(repo.treebuilder(None)?.write()?)?,
     };
+    match opts.strategy.as_deref() {
+        None | Some("ort" | "recursive" | "resolve") => {}
+        // `-s ours` keeps HEAD's tree, so the pick comes out empty.
+        Some("ours") => {
+            let mut index = git2::Index::new()?;
+            index.read_tree(ours)?;
+            return Ok(index);
+        }
+        Some(other) => {
+            return Err(GitError::Other(format!(
+                "unknown merge strategy '{other}'; use ort, recursive, resolve or ours"
+            )));
+        }
+    }
     let tree = commit.tree()?;
     let (base, theirs) = if opts.revert {
         (&tree, &parent_tree)
@@ -9706,45 +9905,148 @@ fn strip_comments(msg: &str) -> String {
     format!("{}\n", kept.join("\n").trim_end())
 }
 
-/// Merge several heads at once. libgit2 merges only a single head, so this
-/// runs git's octopus strategy.
+/// Merge several heads at once with git's octopus strategy: each head is merged
+/// in turn onto the result so far, and only the last one may leave conflicts.
 fn octopus(
-    backend: &Git2Backend,
+    repo: &Repository,
     revs: &[String],
     opts: &crate::MergeOptions,
     report: &dyn Fn(OpProgress),
 ) -> Result<(), GitError> {
-    let stat = if opts.stat { "--stat" } else { "--no-stat" };
-    let mut args = vec!["merge", "--no-edit", stat];
-    for (on, flag) in [
-        (opts.no_ff, "--no-ff"),
-        (opts.ff_only, "--ff-only"),
-        (opts.squash, "--squash"),
-        (opts.no_commit, "--no-commit"),
-        (opts.allow_unrelated, "--allow-unrelated-histories"),
-        (opts.no_verify, "--no-verify"),
-        (opts.signoff, "--signoff"),
-    ] {
-        if on {
-            args.push(flag);
+    let strategy = opts.strategy.as_deref().unwrap_or("octopus");
+    if !matches!(strategy, "octopus" | "ours") {
+        return Err(GitError::Other(
+            "Not handling anything other than two heads merge.".into(),
+        ));
+    }
+    let head = repo.head()?.peel_to_commit()?;
+    let mut given = Vec::new();
+    for rev in revs {
+        given.push((repo.revparse_single(rev)?.peel_to_commit()?, rev.as_str()));
+    }
+    // Like git's reduce_heads: drop heads another head (or HEAD) contains; HEAD
+    // is a parent only when no head contains it, or with --no-ff.
+    let contains = |tip: Oid, c: Oid| tip == c || repo.graph_descendant_of(tip, c).unwrap_or(false);
+    let mut kept: Vec<(&git2::Commit, &str)> = Vec::new();
+    for (i, (c, name)) in given.iter().enumerate() {
+        let redundant = contains(head.id(), c.id())
+            || given[..i].iter().any(|(o, _)| o.id() == c.id())
+            || given
+                .iter()
+                .any(|(o, _)| o.id() != c.id() && contains(o.id(), c.id()));
+        if !redundant {
+            kept.push((c, name));
         }
     }
-    if let Some(message) = &opts.message {
-        args.extend(["-m", message]);
+    let subsumed = kept.iter().any(|(c, _)| contains(c.id(), head.id()));
+    match kept.as_slice() {
+        [] => {
+            report(OpProgress::Line("Already up to date.".to_owned()));
+            return Ok(());
+        }
+        [(one, name)] => {
+            return merge_commit(repo, one, name, opts, report);
+        }
+        _ => {}
     }
+    if opts.ff_only {
+        return Err(GitError::Other(
+            "Not possible to fast-forward, aborting.".into(),
+        ));
+    }
+    for (c, _) in &kept {
+        if !opts.allow_unrelated && repo.merge_base(head.id(), c.id()).is_err() {
+            return Err(GitError::Other(
+                "refusing to merge unrelated histories".into(),
+            ));
+        }
+    }
+    let head_tree = head.tree()?;
+    let staged = repo.diff_tree_to_index(Some(&head_tree), None, None)?;
+    if staged.deltas().len() > 0 {
+        let files: Vec<String> = staged
+            .deltas()
+            .filter_map(|d| Some(format!("\t{}", d.new_file().path()?.display())))
+            .collect();
+        return Err(GitError::Conflict(format!(
+            "Your local changes to the following files would be overwritten by merge:\n{}",
+            files.join("\n")
+        )));
+    }
+    let mut merge_opts = git2::MergeOptions::new();
     if let Some(side) = &opts.strategy_option {
-        args.extend(["-X", side]);
+        merge_opts.file_favor(file_favor(side)?);
     }
-    if let Some(strategy) = &opts.strategy {
-        args.extend(["-s", strategy]);
+    let empty = repo.find_tree(repo.treebuilder(None)?.write()?)?;
+    let mut done: Vec<Oid> = vec![head.id()];
+    let mut tree = head_tree.clone();
+    let mut conflicted = None;
+    let mut fast_forward = true;
+    for (i, (c, name)) in kept.iter().enumerate().filter(|_| strategy == "octopus") {
+        let bases: Vec<Oid> = match repo.merge_bases_many(&[&[c.id()], &done[..]].concat()) {
+            Ok(b) => b.iter().copied().collect(),
+            Err(e) if e.code() == ErrorCode::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        if bases.contains(&c.id()) {
+            report(OpProgress::Line(format!("Already up to date with {name}")));
+            continue;
+        }
+        if fast_forward && bases == done {
+            report(OpProgress::Line(format!("Fast-forwarding to: {name}")));
+            done = vec![c.id()];
+            tree = c.tree()?;
+            continue;
+        }
+        fast_forward = false;
+        report(OpProgress::Line(format!("Trying simple merge with {name}")));
+        // ponytail: one merge base; git's read-tree takes them all.
+        let base = match bases.first() {
+            Some(b) => repo.find_commit(*b)?.tree()?,
+            None => empty.clone(),
+        };
+        let mut merged = repo.merge_trees(&base, &tree, &c.tree()?, Some(&merge_opts))?;
+        if merged.has_conflicts() {
+            report(OpProgress::Line(
+                "Simple merge did not work, trying automatic merge.".to_owned(),
+            ));
+            if i + 1 < kept.len() {
+                report(OpProgress::Line("Automated merge did not work.".to_owned()));
+                report(OpProgress::Line(
+                    "Should not be doing an octopus.".to_owned(),
+                ));
+                return Err(GitError::Other(
+                    "Merge with strategy octopus failed.".into(),
+                ));
+            }
+            conflicted = Some(merged);
+            break;
+        }
+        done.push(c.id());
+        tree = repo.find_tree(merged.write_tree_to(repo)?)?;
     }
-    let log = opts.log.map(|n| format!("--log={n}"));
-    args.extend(log.as_deref());
-    args.extend(revs.iter().map(String::as_str));
-    for line in backend.run_git(&args, &[])?.lines() {
-        report(OpProgress::Line(line.to_owned()));
-    }
-    Ok(())
+    let mut index = match conflicted {
+        Some(index) => index,
+        None => {
+            let mut index = git2::Index::new()?;
+            index.read_tree(&tree)?;
+            index
+        }
+    };
+    checkout_merged(repo, &mut index, &head_tree, "merge")?;
+    let heads: String = kept.iter().map(|(c, _)| format!("{}\n", c.id())).collect();
+    std::fs::write(repo.path().join("MERGE_HEAD"), heads)?;
+    let mode = if opts.no_ff { "no-ff" } else { "" };
+    std::fs::write(repo.path().join("MERGE_MODE"), mode)?;
+    conclude_merge(
+        repo,
+        &head,
+        &kept,
+        !subsumed || opts.no_ff,
+        opts,
+        strategy,
+        report,
+    )
 }
 
 /// A short relative age (`5s`, `12m`, `3h`, `9d`) from a commit time to now.

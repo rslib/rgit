@@ -7,6 +7,17 @@ use std::process::Command;
 
 const DATE: &str = "2020-01-01T00:00:00Z";
 
+/// Environment that keeps the user's own git config out of git and rgit.
+fn isolated() -> [(&'static str, PathBuf); 3] {
+    let home = std::env::temp_dir().join(format!("rgit-seq-{}-home", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    [
+        ("HOME", home.clone()),
+        ("XDG_CONFIG_HOME", home),
+        ("GIT_CONFIG_GLOBAL", PathBuf::from("/dev/null")),
+    ]
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
@@ -16,6 +27,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .env("GIT_COMMITTER_DATE", DATE)
         .env("GIT_EDITOR", "true")
         .env("GIT_SEQUENCE_EDITOR", "true")
+        .envs(isolated())
         .output()
         .unwrap();
     assert!(
@@ -34,6 +46,9 @@ fn rgit(dir: &Path, args: &[&str]) -> (String, bool) {
         .env("GIT_AUTHOR_DATE", DATE)
         .env("GIT_COMMITTER_DATE", DATE)
         .env("GIT_EDITOR", "true")
+        .env("GIT_AUTHOR_DATE", DATE)
+        .env("GIT_COMMITTER_DATE", DATE)
+        .envs(isolated())
         .output()
         .unwrap();
     (
@@ -355,6 +370,227 @@ fn merge_strategy_option_and_octopus() {
     );
 }
 
+/// main: base, m; a, b: a new file each; c: changes `f`.
+fn heads(dir: &Path) {
+    commit(dir, "f", "base\n", "base");
+    for (branch, file, text) in [("a", "a", "a\n"), ("b", "b", "b\n"), ("c", "f", "c\n")] {
+        git(dir, &["checkout", "-qb", branch, "main"]);
+        commit(dir, file, text, branch);
+    }
+    git(dir, &["checkout", "-q", "main"]);
+    commit(dir, "m", "m\n", "m");
+}
+
+/// git's exit status and output, for runs that may fail.
+fn git_try(dir: &Path, args: &[&str]) -> (String, bool) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_AUTHOR_DATE", DATE)
+        .env("GIT_COMMITTER_DATE", DATE)
+        .env("GIT_EDITOR", "true")
+        .envs(isolated())
+        .output()
+        .unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
+#[test]
+fn octopus_merges_like_git() {
+    let (a, b) = twins("octopus-git", heads);
+    let theirs = git(&a, &["merge", "a", "b"]);
+    let ours = ok(&b, &["--human", "merge", "a", "b"]);
+    assert_eq!(head(&a), head(&b));
+    assert!(theirs.starts_with("Trying simple merge with a\nTrying simple merge with b\n"));
+    assert!(
+        ours.contains("Merge made by the 'octopus' strategy."),
+        "{ours}"
+    );
+
+    for d in [&a, &b] {
+        git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+    }
+    git(
+        &a,
+        &[
+            "merge",
+            "--log",
+            "--into-name=feature",
+            "--no-stat",
+            "a",
+            "b",
+        ],
+    );
+    ok(&b, &["merge", "--log", "--into-name=feature", "a", "b"]);
+    assert_eq!(head(&a), head(&b));
+
+    // HEAD is contained in a, so it is no parent; a is fast-forwarded to.
+    for d in [&a, &b] {
+        git(d, &["checkout", "-q", "-b", "ff", "main~2"]);
+    }
+    git(&a, &["merge", "a", "b"]);
+    ok(&b, &["merge", "a", "b"]);
+    assert_eq!(head(&a), head(&b));
+    assert_eq!(git(&b, &["log", "-1", "--format=%P"]).split(' ').count(), 2);
+
+    // Only the last head may conflict; it stops with both heads recorded.
+    for d in [&a, &b] {
+        git(d, &["checkout", "-q", "main"]);
+        git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+        commit(d, "f", "x\n", "x");
+    }
+    assert!(!git_try(&a, &["merge", "a", "c"]).1);
+    fails(&b, &["merge", "a", "c"]);
+    for file in ["MERGE_HEAD", "MERGE_MSG"] {
+        let read = |d: &Path| std::fs::read_to_string(d.join(".git").join(file)).unwrap();
+        assert_eq!(read(&a), read(&b), "{file}");
+    }
+    assert_eq!(
+        git(&a, &["status", "--short"]),
+        git(&b, &["status", "--short"])
+    );
+    std::fs::write(b.join("f"), "resolved\n").unwrap();
+    git(&b, &["add", "f"]);
+    ok(&b, &["merge", "--continue"]);
+    assert_eq!(git(&b, &["log", "-1", "--format=%P"]).split(' ').count(), 3);
+
+    // A conflict before the last head fails and leaves the tree alone.
+    for d in [&a, &b] {
+        git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+    }
+    let before = head(&b);
+    let out = fails(&b, &["merge", "c", "a"]);
+    assert!(out.contains("octopus failed"), "{out}");
+    assert_eq!(head(&b), before);
+    assert_eq!(git(&b, &["status", "--short"]), "");
+}
+
+#[test]
+fn octopus_edit_opens_the_editor() {
+    let dir = repo("octopus-edit");
+    heads(&dir);
+    let editor = dir.join(".git/edit.sh");
+    std::fs::write(&editor, "#!/bin/sh\necho edited > \"$1\"\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(["merge", "-e", "a", "b"])
+        .current_dir(&dir)
+        .env("RGIT_OPLOG", "0")
+        .env("GIT_EDITOR", format!("sh {}", editor.display()))
+        .envs(isolated())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(git(&dir, &["log", "-1", "--format=%B"]), "edited\n\n");
+}
+
+#[test]
+fn merge_autostash_into_name_and_cleanup_match_git() {
+    let (a, b) = twins("autostash", heads);
+    for d in [&a, &b] {
+        std::fs::write(d.join("m"), "m\ndirty\n").unwrap();
+    }
+    git(&a, &["merge", "--autostash", "--no-edit", "b"]);
+    let out = ok(&b, &["--human", "merge", "--autostash", "b"]);
+    assert!(out.contains("Applied autostash."), "{out}");
+    assert_eq!(head(&a), head(&b));
+    assert_eq!(std::fs::read_to_string(b.join("m")).unwrap(), "m\ndirty\n");
+    assert_eq!(git(&b, &["stash", "list"]), "");
+
+    // A conflicted merge keeps the stash in MERGE_AUTOSTASH until --abort.
+    git(&b, &["reset", "-q", "--hard", "HEAD~1"]);
+    commit(&b, "b", "zz\n", "zz");
+    std::fs::write(b.join("m"), "m\ndirty\n").unwrap();
+    git(&b, &["config", "merge.autoStash", "true"]);
+    fails(&b, &["merge", "b"]);
+    assert!(state_file(&b, "MERGE_AUTOSTASH"));
+    ok(&b, &["merge", "--abort"]);
+    assert!(!state_file(&b, "MERGE_AUTOSTASH"));
+    assert_eq!(std::fs::read_to_string(b.join("m")).unwrap(), "m\ndirty\n");
+
+    // --into-name and --cleanup shape the message as in git.
+    let (a, b) = twins("into-name", heads);
+    let args = [
+        "merge",
+        "--into-name=release",
+        "--cleanup=verbatim",
+        "-m",
+        "x  \n\n\n# kept",
+        "c",
+    ];
+    git(&a, &args);
+    ok(&b, &args);
+    assert_eq!(head(&a), head(&b));
+    for d in [&a, &b] {
+        git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+    }
+    git(&a, &["merge", "--no-edit", "--into-name=release", "c"]);
+    ok(&b, &["merge", "--into-name=release", "c"]);
+    assert_eq!(head(&a), head(&b));
+}
+
+#[test]
+fn cherry_pick_strategy_cleanup_and_drop_match_git() {
+    let (a, b) = twins("pick-more", heads);
+    for d in [&a, &b] {
+        git(d, &["cherry-pick", "c"]);
+    }
+    let out = ok(&b, &["--human", "cherry-pick", "--empty=drop", "c"]);
+    let c = git(&b, &["rev-parse", "c"]);
+    assert!(
+        out.contains(&format!(
+            "dropping {} c -- patch contents already upstream",
+            c.trim()
+        )),
+        "{out}"
+    );
+
+    let out = fails(&b, &["cherry-pick", "--strategy=ours", "a"]);
+    assert!(out.contains("now empty"), "{out}");
+    ok(&b, &["cherry-pick", "--abort"]);
+
+    for d in [&a, &b] {
+        git(
+            d,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "--cleanup=verbatim",
+                "-m",
+                "s  \n\n\n# c",
+            ],
+        );
+    }
+    git(
+        &a,
+        &["cherry-pick", "--cleanup=strip", "--allow-empty", "HEAD"],
+    );
+    ok(
+        &b,
+        &["cherry-pick", "--cleanup=strip", "--allow-empty", "HEAD"],
+    );
+    assert_eq!(head(&a), head(&b));
+    git(
+        &a,
+        &[
+            "revert",
+            "--no-edit",
+            "--strategy=resolve",
+            "--rerere-autoupdate",
+            "c",
+        ],
+    );
+    ok(
+        &b,
+        &["revert", "--strategy=resolve", "--rerere-autoupdate", "c"],
+    );
+    assert_eq!(result(&a, 1), result(&b, 1));
+}
+
 /// main: base; work: a, b, "fixup! a".
 fn fixups(dir: &Path) {
     commit(dir, "base", "base\n", "base");
@@ -673,6 +909,230 @@ fn merge_during_bisect_keeps_the_bisect_log() {
     assert!(state_file(&dir, "BISECT_LOG"));
 }
 
+/// Run bisect steps with git in one twin and rgit in the other (or git in
+/// both for steps starting with `git`); after each, the report, the commit
+/// under test and the bisect state must match.
+fn bisect_twins(tag: &str, build: fn(&Path), steps: &[&[&str]]) {
+    let (a, b) = twins(tag, build);
+    for step in steps {
+        let by_git = step.first() == Some(&"git");
+        let args = if by_git { &step[1..] } else { step };
+        let (want, git_ok) = git_try(&a, args);
+        let (got, ok) = if by_git {
+            git_try(&b, args)
+        } else {
+            rgit(&b, &[&["--human"], args].concat())
+        };
+        assert_eq!(git_ok, ok, "{step:?}\ngit: {want}\nrgit: {got}");
+        if ok && !want.is_empty() {
+            assert_eq!(want.trim_end(), got.trim_end(), "{step:?}");
+        }
+        for file in [
+            "HEAD",
+            "BISECT_HEAD",
+            "BISECT_LOG",
+            "BISECT_TERMS",
+            "BISECT_NAMES",
+        ] {
+            let read = |d: &Path| std::fs::read_to_string(d.join(".git").join(file)).ok();
+            assert_eq!(read(&a), read(&b), "{file} after {step:?}");
+        }
+    }
+}
+
+/// main: n1..n20, each writing its number to n.
+fn twenty(dir: &Path) {
+    for i in 1..=20 {
+        commit(dir, "n", &format!("{i}\n"), &format!("n{i}"));
+    }
+}
+
+type Build = fn(&Path);
+
+/// Two side branches merged into main; `dated` gives each commit its own
+/// committer date, else they all share one.
+fn branchy(dir: &Path, dated: bool) {
+    let mut n = 0;
+    let mut at = |path: &str, text: &str| {
+        n += 1;
+        std::fs::write(dir.join(path), text).unwrap();
+        git(dir, &["add", path]);
+        let date = if dated {
+            format!("2020-01-01T{:02}:00:00Z", n % 24)
+        } else {
+            DATE.to_owned()
+        };
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["commit", "-qm", &format!("{path}{text}")])
+            .env("GIT_AUTHOR_DATE", DATE)
+            .env("GIT_COMMITTER_DATE", date)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    };
+    for i in 1..=3 {
+        at("n", &i.to_string());
+    }
+    git(dir, &["checkout", "-qb", "side", "HEAD~1"]);
+    for i in 1..=4 {
+        at("s", &i.to_string());
+    }
+    git(dir, &["checkout", "-q", "main"]);
+    for i in 4..=6 {
+        at("n", &i.to_string());
+    }
+    git(dir, &["merge", "-q", "--no-edit", "side"]);
+    git(dir, &["checkout", "-qb", "other", "HEAD~2"]);
+    for i in 1..=3 {
+        at("o", &i.to_string());
+    }
+    git(dir, &["checkout", "-q", "main"]);
+    at("n", "7");
+    at("n", "8");
+    git(dir, &["merge", "-q", "--no-edit", "other"]);
+    at("n", "9");
+    at("p", "1");
+    at("n", "10");
+}
+
+#[test]
+fn bisect_steps_and_skips_match_git() {
+    bisect_twins(
+        "bisect-linear",
+        twenty,
+        &[
+            &["bisect", "start", "HEAD", "HEAD~19"],
+            &["bisect", "skip"],
+            &["bisect", "skip"],
+            &["bisect", "good"],
+            &["bisect", "skip", "HEAD~3..HEAD"],
+            &["bisect", "bad"],
+            &["bisect", "skip"],
+            &["bisect", "good"],
+            &["bisect", "bad"],
+            &["bisect", "good"],
+            &["bisect", "log"],
+            &["bisect", "reset"],
+        ],
+    );
+}
+
+#[test]
+fn bisect_across_merges_matches_git() {
+    let builds: [(&str, Build); 2] = [
+        ("bisect-merges", |d| branchy(d, false)),
+        ("bisect-dated", |d| branchy(d, true)),
+    ];
+    for (tag, build) in builds {
+        bisect_twins(
+            tag,
+            build,
+            &[
+                &["bisect", "start", "HEAD", "side"],
+                &["bisect", "good"],
+                &["bisect", "bad"],
+                &["bisect", "skip"],
+                &["bisect", "good"],
+                &["bisect", "reset"],
+                &["bisect", "start", "--first-parent", "HEAD", "main~6"],
+                &["bisect", "good"],
+                &["bisect", "bad"],
+                &["bisect", "reset"],
+                &["bisect", "start", "HEAD", "main~6", "--", "s", "o"],
+                &["bisect", "good"],
+                &["bisect", "bad"],
+                &["bisect", "reset"],
+                // n6 is off side's history, so their merge base goes first.
+                &["bisect", "start", "side", "main~7"],
+                &["bisect", "good"],
+                &["bisect", "bad"],
+                &["bisect", "reset"],
+                &["bisect", "start", "main~6", "main~7", "side"],
+                &["bisect", "reset"],
+                &["bisect", "start", "HEAD", "side", "other"],
+                &["bisect", "skip"],
+                &["bisect", "skip"],
+                &["bisect", "skip"],
+                &["bisect", "skip"],
+                &["bisect", "skip"],
+                &["bisect", "skip"],
+                &["bisect", "skip"],
+            ],
+        );
+    }
+}
+
+#[test]
+fn bisect_terms_no_checkout_and_run_match_git() {
+    bisect_twins(
+        "bisect-run",
+        twenty,
+        &[
+            &[
+                "bisect",
+                "start",
+                "--term-new=fixed",
+                "--term-old=broken",
+                "--no-checkout",
+            ],
+            &["bisect", "fixed"],
+            &["bisect", "broken", "HEAD~12"],
+            &["bisect", "terms"],
+            &["bisect", "bad"],
+            &[
+                "bisect",
+                "run",
+                "sh",
+                "-c",
+                "n=$(git cat-file -p BISECT_HEAD:n); test $n = 13 && exit 125; test $n -lt 15",
+            ],
+            &["bisect", "log"],
+            &["bisect", "reset"],
+            &["bisect", "start", "HEAD", "HEAD~19"],
+            &["bisect", "run", "sh", "-c", "exit 129"],
+            &["bisect", "run", "./missing-script"],
+            &["bisect", "run", "sh", "-c", "test $(cat n) -lt 7"],
+        ],
+    );
+}
+
+#[test]
+fn bisect_replays_and_hands_over_between_git_and_rgit() {
+    bisect_twins(
+        "bisect-interop",
+        |d| branchy(d, false),
+        &[
+            &["git", "bisect", "start", "HEAD", "side"],
+            &["bisect", "good"],
+            &["git", "bisect", "bad"],
+            &["bisect", "skip"],
+            &["git", "bisect", "log"],
+            &["git", "bisect", "reset"],
+            &["bisect", "start", "HEAD", "side"],
+            &["git", "bisect", "good"],
+            &["bisect", "bad"],
+            &["git", "bisect", "good"],
+            &["bisect", "reset"],
+        ],
+    );
+    let (a, b) = twins("bisect-replay", |d| branchy(d, false));
+    for dir in [&a, &b] {
+        git(dir, &["bisect", "start", "HEAD", "side"]);
+        git(dir, &["bisect", "good"]);
+        git(dir, &["bisect", "bad"]);
+        std::fs::write(dir.join(".git/saved"), git(dir, &["bisect", "log"])).unwrap();
+        git(dir, &["bisect", "reset"]);
+    }
+    let (want, _) = git_try(&a, &["bisect", "replay", ".git/saved"]);
+    let got = ok(&b, &["--human", "bisect", "replay", ".git/saved"]);
+    assert_eq!(want.trim_end(), got.trim_end());
+    assert_eq!(head(&a), head(&b));
+    let log = |d: &Path| std::fs::read_to_string(d.join(".git/BISECT_LOG")).unwrap();
+    assert_eq!(log(&a), log(&b));
+}
+
 fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, bool) {
     let out = Command::new("git")
         .arg("-C")
@@ -681,6 +1141,7 @@ fn git_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, bool) {
         .env("GIT_AUTHOR_DATE", DATE)
         .env("GIT_COMMITTER_DATE", DATE)
         .env("GIT_EDITOR", "true")
+        .envs(isolated())
         .env("GIT_SEQUENCE_EDITOR", "true")
         .envs(env.iter().copied())
         .output()
@@ -703,6 +1164,7 @@ fn rgit_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, bool) {
         .env("GIT_AUTHOR_DATE", DATE)
         .env("GIT_COMMITTER_DATE", DATE)
         .env("GIT_EDITOR", "true")
+        .envs(isolated())
         .envs(env.iter().copied())
         .output()
         .unwrap();

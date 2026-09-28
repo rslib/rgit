@@ -17,8 +17,8 @@ use serde_json::{Map, Value, json};
 use crate::cli::{
     AmArgs, ApplyArgs, ArchiveArgs, BisectCmd, BlameFormat, BranchCmd, BranchOpts, BundleCmd,
     CliError, Command, ConfigArgs, DiffFormat, FlowCmd, FormatPatchArgs, HashObjectArgs, IndexCmd,
-    LanesCmd, MaintenanceCmd, NoteMessage, NotesCmd, Plumbing, PrettyArgs, RebaseFlags, RemoteCmd,
-    StackCmd, StashCmd, StashPush, SubmoduleCmd, TagOpts, WorkspaceCmd, WorktreeCmd,
+    LanesCmd, MaintenanceCmd, NoteMessage, NotesCmd, PickFlags, Plumbing, PrettyArgs, RebaseFlags,
+    RemoteCmd, StackCmd, StashCmd, StashPush, SubmoduleCmd, TagOpts, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::toon::{Node, Obj};
@@ -1149,7 +1149,10 @@ fn tools() -> Vec<Tool> {
              `strategy` (ort|recursive|resolve|octopus|ours; ours keeps HEAD's tree), \
              `allow_unrelated_histories` merges histories with no common commit, `log` adds up \
              to N merged subjects to the message, `signoff` adds Signed-off-by, `no_verify` \
-             skips the pre-merge-commit and commit-msg hooks, `no_stat` drops the diffstat. \
+             skips the pre-merge-commit and commit-msg hooks, `no_stat` drops the diffstat, \
+             `autostash` (or `no_autostash`) stashes local changes around the merge, `into_name` \
+             words the message as merging into that branch, `cleanup` \
+             (strip|whitespace|verbatim|scissors|default) cleans the message. \
              `continue` commits a resolved merge, `abort` cancels a conflicted one, `quit` \
              forgets it and keeps the index and working tree.",
             &[
@@ -1166,6 +1169,10 @@ fn tools() -> Vec<Tool> {
                 ("signoff", "boolean", false),
                 ("no_verify", "boolean", false),
                 ("no_stat", "boolean", false),
+                ("autostash", "boolean", false),
+                ("no_autostash", "boolean", false),
+                ("into_name", "string", false),
+                ("cleanup", "string", false),
                 ("continue", "boolean", false),
                 ("abort", "boolean", false),
                 ("quit", "boolean", false),
@@ -1232,7 +1239,8 @@ fn tools() -> Vec<Tool> {
              parent (from 1) of a merge commit, `strategy_option` (ours|theirs) settles \
              conflicting hunks, `signoff` adds Signed-off-by, `ff` fast-forwards over a commit \
              whose parent is HEAD, `allow_empty` keeps commits that were empty, `empty` \
-             (stop|drop|keep) handles commits already in HEAD. After a conflict: `continue`, \
+             (stop|drop|keep) handles commits already in HEAD, `strategy` (ort|recursive|resolve|ours) \
+             picks the merge strategy, `cleanup` cleans each message. After a conflict: `continue`, \
              `skip`, `abort` or `quit` (forget the sequence, keep the files).",
             &[
                 ("rev", "paths", false),
@@ -1240,6 +1248,8 @@ fn tools() -> Vec<Tool> {
                 ("record_origin", "boolean", false),
                 ("mainline", "integer", false),
                 ("strategy_option", "string", false),
+                ("strategy", "string", false),
+                ("cleanup", "string", false),
                 ("signoff", "boolean", false),
                 ("ff", "boolean", false),
                 ("allow_empty", "boolean", false),
@@ -1255,13 +1265,16 @@ fn tools() -> Vec<Tool> {
             "Revert commits on HEAD; `rev` is a commit, a range `A..B` (newest first), or a list. \
              `mainline` picks the parent (from 1) of a merge commit, `strategy_option` \
              (ours|theirs) settles conflicting hunks, `signoff` adds Signed-off-by, `reference` \
-             names the commit as `abbrev (subject, date)`. After a conflict: `continue`, `skip`, \
+             names the commit as `abbrev (subject, date)`, `strategy` (ort|recursive|resolve|ours) \
+             picks the merge strategy, `cleanup` cleans each message. After a conflict: `continue`, `skip`, \
              `abort` or `quit`.",
             &[
                 ("rev", "paths", false),
                 ("no_commit", "boolean", false),
                 ("mainline", "integer", false),
                 ("strategy_option", "string", false),
+                ("strategy", "string", false),
+                ("cleanup", "string", false),
                 ("signoff", "boolean", false),
                 ("reference", "boolean", false),
                 ("continue", "boolean", false),
@@ -1488,7 +1501,7 @@ fn tools() -> Vec<Tool> {
             "Find the commit that introduced a change by binary search. `command`: start (revs: \
              bad then good ones; paths, term_new, term_old, no_checkout, first_parent), \
              good|bad|new|old|skip (revs, HEAD by default), reset (revs: where to end up), log, \
-             replay (file), run (cmd: the test command and its arguments), visualize (the \
+             next, replay (file), run (cmd: the test command and its arguments), visualize (the \
              commits left), terms. Returns the step: remaining, steps, current, or first_bad.",
             &[
                 ("command", "string", true),
@@ -2993,6 +3006,10 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             no_verify: a.flag("no_verify"),
             verify: false,
             signoff: a.flag("signoff"),
+            autostash: a.flag("autostash"),
+            no_autostash: a.flag("no_autostash"),
+            into_name: a.str("into_name"),
+            cleanup: a.str("cleanup"),
             quiet: false,
             cont: a.flag("continue"),
             abort: a.flag("abort"),
@@ -3042,6 +3059,11 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             record_origin: a.flag("record_origin"),
             mainline: a.num("mainline")?.map(|m| m as u32),
             strategy_option: a.str("strategy_option"),
+            more: PickFlags {
+                strategy: a.str("strategy"),
+                cleanup: a.str("cleanup"),
+                ..Default::default()
+            },
             edit: false,
             no_edit: false,
             signoff: a.flag("signoff"),
@@ -3059,6 +3081,11 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             no_commit: a.flag("no_commit"),
             mainline: a.num("mainline")?.map(|m| m as u32),
             strategy_option: a.str("strategy_option"),
+            more: PickFlags {
+                strategy: a.str("strategy"),
+                cleanup: a.str("cleanup"),
+                ..Default::default()
+            },
             edit: false,
             no_edit: false,
             signoff: a.flag("signoff"),
@@ -3214,6 +3241,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                     cmd: a.req_strings("cmd")?,
                 },
                 "visualize" | "view" => BisectCmd::Visualize,
+                "next" => BisectCmd::Next,
                 "terms" => BisectCmd::Terms {
                     good: false,
                     bad: false,
