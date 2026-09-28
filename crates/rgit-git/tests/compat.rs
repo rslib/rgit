@@ -139,14 +139,14 @@ fn clean_dry_run_lists_without_deleting() {
     std::fs::write(dir.join("junk.txt"), "trash\n").unwrap();
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    let out = backend.clean(true).unwrap();
+    let out = backend.clean(true, &[]).unwrap();
     assert!(
         out.contains("junk.txt"),
         "dry run should mention the file: {out}"
     );
     assert!(dir.join("junk.txt").exists(), "dry run must not delete");
 
-    backend.clean(false).unwrap();
+    backend.clean(false, &[]).unwrap();
     assert!(!dir.join("junk.txt").exists(), "real clean removes it");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -444,7 +444,7 @@ fn remove_path_cached_keeps_the_worktree_file() {
     commit(&dir, "f.txt", "v1\n", "seed");
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    backend.remove_path("f.txt", true).unwrap();
+    backend.remove_path("f.txt", true, false).unwrap();
 
     assert!(
         dir.join("f.txt").exists(),

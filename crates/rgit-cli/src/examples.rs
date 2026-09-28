@@ -36,6 +36,7 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit stage src/lib.rs",
             "rgit stage src/lib.rs --hunk 42",
+            "rgit stage src/lib.rs --hunk 10,42",
             "rgit stage src/lib.rs --hunk 42 --lines 0,2",
         ],
     ),

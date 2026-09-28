@@ -120,6 +120,7 @@ pub enum StatusCode {
     TypeChanged,
     Unmerged,
     Untracked,
+    Ignored,
 }
 
 impl StatusCode {
@@ -133,6 +134,7 @@ impl StatusCode {
             b'T' => Self::TypeChanged,
             b'U' => Self::Unmerged,
             b'?' => Self::Untracked,
+            b'!' => Self::Ignored,
             _ => Self::Unmodified,
         }
     }
@@ -149,6 +151,7 @@ impl StatusCode {
             Self::TypeChanged => Some("typechange"),
             Self::Unmerged => Some("unmerged"),
             Self::Untracked => Some("untracked"),
+            Self::Ignored => Some("ignored"),
         }
     }
 
@@ -164,6 +167,7 @@ impl StatusCode {
             Self::TypeChanged => "T",
             Self::Unmerged => "U",
             Self::Untracked => "?",
+            Self::Ignored => "!",
         }
     }
 }

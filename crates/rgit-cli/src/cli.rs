@@ -5,7 +5,7 @@
 //! missing value is prompted for (our own widgets); with `--no-input` or a non-TTY
 //! (an agent, a pipe, CI) it errors instead, so scripted use stays predictable.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -104,6 +104,21 @@ pub enum Command {
         /// Terminate entries with NUL (`git status -z`).
         #[arg(short = 'z')]
         z: bool,
+        /// Show untracked files: `no`, `normal` or `all` (git's -u, default all).
+        #[arg(
+            short = 'u',
+            long = "untracked-files",
+            value_name = "MODE",
+            num_args = 0..=1,
+            value_parser = ["no", "normal", "all"],
+            default_missing_value = "all"
+        )]
+        untracked: Option<String>,
+        /// Also list ignored files (git's --ignored).
+        #[arg(long)]
+        ignored: bool,
+        /// Limit to these paths: files, folders or globs.
+        paths: Vec<String>,
     },
     /// Recent commits as `sha subject` lines.
     Log {
@@ -179,25 +194,27 @@ pub enum Command {
     },
     /// All refs (local branches, remotes, tags).
     Refs,
-    /// Stage a path, or one hunk / specific lines of it.
+    /// Stage paths, some hunks of one path, or specific lines of one hunk.
     Stage {
-        /// The path to stage.
-        path: String,
-        /// Stage only the hunk at this new-side start line.
-        #[arg(long)]
-        hunk: Option<u32>,
-        /// Stage only these line indices within --hunk (comma-separated).
+        /// The paths to stage: files, folders or globs.
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Stage only the hunks at these new-side start lines (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        hunk: Vec<u32>,
+        /// Stage only these line indices within one --hunk (comma-separated).
         #[arg(long, value_delimiter = ',', requires = "hunk")]
         lines: Vec<usize>,
     },
-    /// Unstage a path, or one hunk / specific lines of it.
+    /// Unstage paths, some hunks of one path, or specific lines of one hunk.
     Unstage {
-        /// The path to unstage.
-        path: String,
-        /// Unstage only the hunk at this new-side start line.
-        #[arg(long)]
-        hunk: Option<u32>,
-        /// Unstage only these line indices within --hunk (comma-separated).
+        /// The paths to unstage: files, folders or globs.
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Unstage only the hunks at these new-side start lines (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        hunk: Vec<u32>,
+        /// Unstage only these line indices within one --hunk (comma-separated).
         #[arg(long, value_delimiter = ',', requires = "hunk")]
         lines: Vec<usize>,
     },
@@ -205,14 +222,15 @@ pub enum Command {
     StageAll,
     /// Unstage everything.
     UnstageAll,
-    /// Discard a path's unstaged changes, or one hunk / specific lines.
+    /// Discard unstaged changes to paths, some hunks of one path, or specific lines.
     Discard {
-        /// The path to discard (prompted for if omitted on a terminal).
-        path: Option<String>,
-        /// Discard only the hunk at this new-side start line.
-        #[arg(long)]
-        hunk: Option<u32>,
-        /// Discard only these line indices within --hunk (comma-separated).
+        /// The paths to discard: files, folders or globs (prompted for if
+        /// omitted on a terminal).
+        paths: Vec<String>,
+        /// Discard only the hunks at these new-side start lines (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        hunk: Vec<u32>,
+        /// Discard only these line indices within one --hunk (comma-separated).
         #[arg(long, value_delimiter = ',', requires = "hunk")]
         lines: Vec<usize>,
     },
@@ -520,26 +538,49 @@ pub enum Command {
     /// Fold each pending change into the stacked commit that last touched those
     /// lines (blame-routed fixups + autosquash).
     Absorb,
-    /// Remove all untracked files and directories.
+    /// Remove untracked files and directories.
     Clean {
         /// List what would be removed without deleting (git's -n).
         #[arg(short = 'n', long = "dry-run")]
         dry_run: bool,
+        /// Also remove ignored files (git's -x).
+        #[arg(short = 'x')]
+        ignored_too: bool,
+        /// Remove only ignored files (git's -X).
+        #[arg(short = 'X', conflicts_with = "ignored_too")]
+        only_ignored: bool,
+        /// Keep files matching this pattern (git's -e).
+        #[arg(short = 'e', long = "exclude", value_name = "PATTERN")]
+        exclude: Vec<String>,
+        /// Accepted for git compatibility: rgit always removes folders.
+        #[arg(short = 'd', hide = true)]
+        dirs: bool,
+        /// Accepted for git compatibility: rgit needs no -f.
+        #[arg(short = 'f', long, hide = true)]
+        force: bool,
+        /// Limit to these paths.
+        paths: Vec<String>,
     },
-    /// Remove a tracked path from the index and working tree.
+    /// Remove tracked paths from the index and working tree.
     Rm {
-        /// The path to remove (prompted for if omitted on a terminal).
-        path: Option<String>,
+        /// The paths to remove: files, folders (with -r) or globs (prompted for
+        /// if omitted on a terminal).
+        paths: Vec<String>,
         /// Remove only from the index, keeping the working-tree file (--cached).
         #[arg(long)]
         cached: bool,
+        /// Remove folders recursively (git's -r).
+        #[arg(short = 'r')]
+        recursive: bool,
+        /// Accepted for git compatibility.
+        #[arg(short = 'f', long, hide = true)]
+        force: bool,
     },
-    /// Rename/move a tracked path.
+    /// Rename/move tracked files or folders.
     Mv {
-        /// The current path.
-        from: String,
-        /// The new path.
-        to: String,
+        /// The paths to move, then the destination (a folder when moving several).
+        #[arg(required = true, num_args = 2.., value_name = "PATH")]
+        paths: Vec<String>,
         /// Overwrite the destination if it exists (git's -f).
         #[arg(short = 'f', long)]
         force: bool,
@@ -1840,7 +1881,17 @@ pub fn run(
     Ok(match command {
         Command::Index { action } => index_cmd(backend, action)?,
         Command::Skills { .. } | Command::Hooks { .. } => unreachable!("handled before dispatch"),
-        Command::Status { .. } => render::status(&backend.status()?),
+        Command::Status {
+            untracked,
+            ignored,
+            paths,
+            ..
+        } => render::status(&status_view(
+            backend,
+            &paths,
+            untracked.as_deref(),
+            ignored,
+        )?),
         Command::Log {
             limit,
             all,
@@ -1917,27 +1968,40 @@ pub fn run(
             render::blame(&selected)
         }
         Command::Refs => render::refs(&backend.refs()?),
-        Command::Stage { path, hunk, lines } => ok(match (hunk, lines.as_slice()) {
-            (Some(h), l) if !l.is_empty() => backend.stage_lines(&path, h, l),
-            (Some(h), _) => backend.stage_hunk(&path, h),
-            (None, _) => backend.stage_file(&path),
-        })?,
-        Command::Unstage { path, hunk, lines } => ok(match (hunk, lines.as_slice()) {
-            (Some(h), l) if !l.is_empty() => backend.unstage_lines(&path, h, l),
-            (Some(h), _) => backend.unstage_hunk(&path, h),
-            (None, _) => backend.unstage_file(&path),
-        })?,
+        Command::Stage { paths, hunk, lines } => partial(
+            &paths,
+            hunk,
+            &lines,
+            |p| backend.stage_file(p),
+            |p, h| backend.stage_hunk(p, h),
+            |p, h, l| backend.stage_lines(p, h, l),
+        )?,
+        Command::Unstage { paths, hunk, lines } => partial(
+            &paths,
+            hunk,
+            &lines,
+            |p| backend.unstage_file(p),
+            |p, h| backend.unstage_hunk(p, h),
+            |p, h, l| backend.unstage_lines(p, h, l),
+        )?,
         Command::StageAll => ok(backend.stage_all())?,
         Command::UnstageAll => ok(backend.unstage_all())?,
-        Command::Discard { path, hunk, lines } => {
-            let path = resolve(path, "a path", &|| {
-                crate::interactive::pick_file(backend, "Discard which file?")
-            })?;
-            ok(match (hunk, lines.as_slice()) {
-                (Some(h), l) if !l.is_empty() => backend.discard_lines(&path, h, l),
-                (Some(h), _) => backend.discard_hunk(&path, h),
-                (None, _) => backend.discard_file(&path),
-            })?
+        Command::Discard { paths, hunk, lines } => {
+            let paths = if paths.is_empty() {
+                vec![resolve(None, "a path", &|| {
+                    crate::interactive::pick_file(backend, "Discard which file?")
+                })?]
+            } else {
+                paths
+            };
+            partial(
+                &paths,
+                hunk,
+                &lines,
+                |p| backend.discard_file(p),
+                |p, h| backend.discard_hunk(p, h),
+                |p, h, l| backend.discard_lines(p, h, l),
+            )?
         }
         Command::Resolve { path, ours, theirs } => {
             if !ours && !theirs {
@@ -2379,9 +2443,26 @@ pub fn run(
                 }
             }
         },
-        Command::Clean { dry_run } => {
+        Command::Clean {
+            dry_run,
+            ignored_too,
+            only_ignored,
+            exclude,
+            paths,
+            ..
+        } => {
+            let mut args: Vec<String> = Vec::new();
+            args.extend(ignored_too.then(|| "-x".to_owned()));
+            args.extend(only_ignored.then(|| "-X".to_owned()));
+            for e in exclude {
+                args.extend(["-e".to_owned(), e]);
+            }
+            if !paths.is_empty() {
+                args.push("--".to_owned());
+                args.extend(paths);
+            }
             if dry_run {
-                let out = backend.clean(true)?;
+                let out = backend.clean(true, &args)?;
                 if out.trim().is_empty() {
                     "nothing to clean".to_owned()
                 } else {
@@ -2392,17 +2473,38 @@ pub fn run(
             {
                 "cancelled".to_owned()
             } else {
-                backend.clean(false)?;
+                backend.clean(false, &args)?;
                 "ok".to_owned()
             }
         }
-        Command::Rm { path, cached } => {
-            let path = resolve(path, "a path", &|| {
-                crate::interactive::pick_file(backend, "Remove which file?")
-            })?;
-            ok(backend.remove_path(&path, cached))?
+        Command::Rm {
+            paths,
+            cached,
+            recursive,
+            ..
+        } => {
+            let paths = if paths.is_empty() {
+                vec![resolve(None, "a path", &|| {
+                    crate::interactive::pick_file(backend, "Remove which file?")
+                })?]
+            } else {
+                paths
+            };
+            for p in &paths {
+                backend.remove_path(p, cached, recursive)?;
+            }
+            "ok".to_owned()
         }
-        Command::Mv { from, to, force } => ok(backend.move_path(&from, &to, force))?,
+        Command::Mv { paths, force } => {
+            let (to, from) = paths.split_last().expect("clap requires two paths");
+            if from.len() > 1 && !backend.workdir().join(to).is_dir() {
+                anyhow::bail!("destination '{to}' is not a directory");
+            }
+            for f in from {
+                backend.move_path(f, to, force)?;
+            }
+            "ok".to_owned()
+        }
         Command::Describe {
             rev,
             tags,
@@ -2435,6 +2537,136 @@ fn stash_index(
         None if interactive => crate::interactive::pick_stash(backend, prompt),
         None => Ok(0),
     }
+}
+
+/// Status limited to `paths`, with untracked files per git's `-u` mode and
+/// ignored files when asked.
+pub(crate) fn status_view(
+    backend: &Arc<dyn GitBackend>,
+    paths: &[String],
+    untracked: Option<&str>,
+    ignored: bool,
+) -> anyhow::Result<rgit_git::RepoStatus> {
+    let mut s = backend.status()?;
+    if untracked == Some("no") {
+        let gone: Vec<String> = s
+            .entries
+            .iter()
+            .filter(|e| e.is_untracked())
+            .map(|e| e.path.clone())
+            .collect();
+        s.entries.retain(|e| !e.is_untracked());
+        s.unstaged.retain(|d| !gone.contains(&d.path));
+    }
+    if ignored {
+        s.entries.extend(backend.ignored()?);
+    }
+    if !paths.is_empty() {
+        let keep = |p: &str| rgit_git::pathspec_matches(paths, p);
+        s.entries.retain(|e| keep(&e.path));
+        s.unstaged.retain(|d| keep(&d.path));
+        s.staged.retain(|d| keep(&d.path));
+    }
+    Ok(s)
+}
+
+/// Rewrite path arguments typed in a subfolder of the repo into repo-root
+/// paths, since git reads pathspecs relative to the current folder.
+pub fn from_cwd(mut command: Command, workdir: &Path) -> Command {
+    let Some((root, prefix)) = std::env::current_dir()
+        .and_then(|cwd| cwd.canonicalize())
+        .ok()
+        .zip(workdir.canonicalize().ok())
+        .and_then(|(cwd, root)| {
+            let prefix = cwd.strip_prefix(&root).ok()?.to_path_buf();
+            Some((root, prefix))
+        })
+    else {
+        return command;
+    };
+    let fix = |p: &mut String| *p = repo_path(&root, &prefix, p);
+    match &mut command {
+        Command::Status { paths, .. }
+        | Command::Stage { paths, .. }
+        | Command::Unstage { paths, .. }
+        | Command::Discard { paths, .. }
+        | Command::Split { paths, .. }
+        | Command::Reset { paths, .. }
+        | Command::Clean { paths, .. }
+        | Command::Rm { paths, .. }
+        | Command::Mv { paths, .. } => paths.iter_mut().for_each(fix),
+        Command::Blame { path, .. } | Command::Resolve { path, .. } => fix(path),
+        Command::Log { path: Some(p), .. } => fix(p),
+        _ => {}
+    }
+    command
+}
+
+/// `p` typed in the repo subfolder `prefix`, as a path from the repo `root`.
+/// `:/x` names `x` at the root, as in git.
+fn repo_path(root: &Path, prefix: &Path, p: &str) -> String {
+    if let Some(top) = p.strip_prefix(":/") {
+        return top.to_owned();
+    }
+    let full = prefix.join(p);
+    let rel = if full.is_absolute() {
+        match full.strip_prefix(root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => return p.to_owned(),
+        }
+    } else {
+        full
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for c in rel.components() {
+        match c {
+            std::path::Component::Normal(n) => parts.push(n.to_string_lossy().into_owned()),
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        ".".to_owned()
+    } else {
+        parts.join("/")
+    }
+}
+
+/// Run a stage/unstage/discard on whole paths, on each hunk of one path, or
+/// on some lines of one hunk. Hunks go last first, so changing one never moves
+/// the start line of a hunk before it.
+fn partial(
+    paths: &[String],
+    mut hunks: Vec<u32>,
+    lines: &[usize],
+    file: impl Fn(&str) -> Result<(), GitError>,
+    hunk: impl Fn(&str, u32) -> Result<(), GitError>,
+    some: impl Fn(&str, u32, &[usize]) -> Result<(), GitError>,
+) -> anyhow::Result<String> {
+    if hunks.is_empty() {
+        for p in paths {
+            file(p)?;
+        }
+        return Ok("ok".to_owned());
+    }
+    let [path] = paths else {
+        anyhow::bail!("--hunk needs exactly one path");
+    };
+    if !lines.is_empty() {
+        let [h] = hunks[..] else {
+            anyhow::bail!("--lines needs exactly one --hunk");
+        };
+        some(path, h, lines)?;
+        return Ok("ok".to_owned());
+    }
+    hunks.sort_unstable_by(|a, b| b.cmp(a));
+    hunks.dedup();
+    for h in hunks {
+        hunk(path, h)?;
+    }
+    Ok("ok".to_owned())
 }
 
 fn ok(r: Result<(), GitError>) -> anyhow::Result<String> {

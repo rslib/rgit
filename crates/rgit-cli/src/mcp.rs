@@ -482,6 +482,10 @@ fn schema(props: &[(&str, &str, bool)]) -> Map<String, Value> {
         let mut field_schema = match *ty {
             "string[]" => json!({ "type": "array", "items": { "type": "string" } }),
             "integer[]" => json!({ "type": "array", "items": { "type": "integer" } }),
+            "paths" => json!({ "anyOf": [
+                { "type": "string" },
+                { "type": "array", "items": { "type": "string" } },
+            ] }),
             t => json!({ "type": t }),
         };
         let about = match *field {
@@ -579,8 +583,15 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_status",
             "Working-tree status: branch, upstream ahead/behind, change counts, and a files table \
-             (path, staged, unstaged) that says so when the tree is clean. Ends with next-step help.",
-            &[FIELDS],
+             (path, staged, unstaged) that says so when the tree is clean. Ends with next-step help. \
+             `paths` limits it to files, folders or globs; `untracked` is no/normal/all; \
+             `ignored` also lists ignored files.",
+            &[
+                FIELDS,
+                ("paths", "paths", false),
+                ("untracked", "string", false),
+                ("ignored", "boolean", false),
+            ],
         ),
         tool(
             "git_log",
@@ -744,19 +755,19 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_stage",
-            "Stage a path, one hunk (`hunk` = new-side start line), or `lines` within that hunk.",
+            "Stage paths (files, folders, globs), some hunks of one path (`hunk` = new-side start lines), or `lines` within one hunk.",
             &[
-                ("path", "string", true),
-                ("hunk", "integer", false),
+                ("path", "paths", true),
+                ("hunk", "integer[]", false),
                 ("lines", "integer[]", false),
             ],
         ),
         tool(
             "git_unstage",
-            "Unstage a path, one hunk, or specific lines within that hunk.",
+            "Unstage paths (files, folders, globs), some hunks of one path, or specific lines within one hunk.",
             &[
-                ("path", "string", true),
-                ("hunk", "integer", false),
+                ("path", "paths", true),
+                ("hunk", "integer[]", false),
                 ("lines", "integer[]", false),
             ],
         ),
@@ -768,11 +779,11 @@ fn tools() -> Vec<Tool> {
         tool("git_unstage_all", "Unstage everything back to HEAD.", none),
         tool(
             "git_discard",
-            "Discard a path's unstaged changes (or a hunk/lines). Destructive; git_undo restores \
+            "Discard a path's unstaged changes (or some hunks, or lines of one). Destructive; git_undo restores \
              them.",
             &[
-                ("path", "string", true),
-                ("hunk", "integer", false),
+                ("path", "paths", true),
+                ("hunk", "integer[]", false),
                 ("lines", "integer[]", false),
             ],
         ),
@@ -1173,21 +1184,33 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_clean",
-            "Remove every untracked file and directory. Destructive. `dry_run` lists what would be \
-             removed without deleting.",
-            &[("dry_run", "boolean", false)],
+            "Remove untracked files and directories. Destructive. `dry_run` lists what would be \
+             removed without deleting. `paths` limits it; `ignored` also removes ignored files \
+             (-x); `only_ignored` removes only those (-X); `exclude` keeps matching patterns.",
+            &[
+                ("dry_run", "boolean", false),
+                ("paths", "paths", false),
+                ("ignored", "boolean", false),
+                ("only_ignored", "boolean", false),
+                ("exclude", "string[]", false),
+            ],
         ),
         tool(
             "git_rm",
-            "Remove a tracked path from the index and the working tree. `cached` removes it from \
-             the index only.",
-            &[("path", "string", true), ("cached", "boolean", false)],
+            "Remove tracked paths (files, folders, globs) from the index and the working tree. \
+             `cached` removes them from the index only; `recursive` is needed for a folder.",
+            &[
+                ("path", "paths", true),
+                ("cached", "boolean", false),
+                ("recursive", "boolean", false),
+            ],
         ),
         tool(
             "git_mv",
-            "Rename/move a tracked path. `force` overwrites an existing destination.",
+            "Rename/move tracked files or folders. `from` may list several paths when `to` is a \
+             folder. `force` overwrites an existing destination.",
             &[
-                ("from", "string", true),
+                ("from", "paths", true),
                 ("to", "string", true),
                 ("force", "boolean", false),
             ],
@@ -1389,6 +1412,20 @@ impl Args<'_> {
         self.str(key).ok_or_else(|| self.missing(key))
     }
 
+    /// One string or an array of strings; required.
+    fn strs(&self, key: &str) -> anyhow::Result<Vec<String>> {
+        match self.get(key) {
+            Some(Value::String(s)) => Ok(vec![s.clone()]),
+            Some(Value::Array(items)) if !items.is_empty() => items
+                .iter()
+                .map(|v| v.as_str().map(str::to_owned))
+                .collect::<Option<_>>()
+                .ok_or_else(|| self.invalid(key, "a string or an array of strings")),
+            Some(_) => Err(self.invalid(key, "a string or an array of strings")),
+            None => Err(self.missing(key)),
+        }
+    }
+
     fn flag(&self, key: &str) -> bool {
         self.get(key).and_then(Value::as_bool).unwrap_or(false)
     }
@@ -1414,7 +1451,15 @@ impl Args<'_> {
                         .ok_or_else(|| self.invalid(key, "an array of integers"))
                 })
                 .collect(),
-            Some(_) => Err(self.invalid(key, "an array of integers")),
+            Some(Value::String(s)) => s
+                .split(',')
+                .map(|n| n.trim().parse())
+                .collect::<Result<_, _>>()
+                .map_err(|_| self.invalid(key, "an array of integers")),
+            Some(v) => v
+                .as_u64()
+                .map(|n| vec![n as usize])
+                .ok_or_else(|| self.invalid(key, "an array of integers")),
         }
     }
 
@@ -1503,6 +1548,9 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             short: false,
             branch: false,
             z: false,
+            untracked: a.str("untracked"),
+            ignored: a.flag("ignored"),
+            paths: a.strs("paths").unwrap_or_default(),
         },
         "git_log" => Command::Log {
             limit: a.num("limit")?.map_or(20, |n| n as usize),
@@ -1563,20 +1611,20 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         }),
 
         "git_stage" => Command::Stage {
-            path: a.req("path")?,
-            hunk: a.num("hunk")?.map(|n| n as u32),
+            paths: a.strs("path")?,
+            hunk: a.nums("hunk")?.into_iter().map(|n| n as u32).collect(),
             lines: a.nums("lines")?,
         },
         "git_unstage" => Command::Unstage {
-            path: a.req("path")?,
-            hunk: a.num("hunk")?.map(|n| n as u32),
+            paths: a.strs("path")?,
+            hunk: a.nums("hunk")?.into_iter().map(|n| n as u32).collect(),
             lines: a.nums("lines")?,
         },
         "git_stage_all" => Command::StageAll,
         "git_unstage_all" => Command::UnstageAll,
         "git_discard" => Command::Discard {
-            path: Some(a.req("path")?),
-            hunk: a.num("hunk")?.map(|n| n as u32),
+            paths: a.strs("path")?,
+            hunk: a.nums("hunk")?.into_iter().map(|n| n as u32).collect(),
             lines: a.nums("lines")?,
         },
         "git_resolve" => Command::Resolve {
@@ -1803,14 +1851,21 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
 
         "git_clean" => Command::Clean {
             dry_run: a.flag("dry_run"),
+            ignored_too: a.flag("ignored"),
+            only_ignored: a.flag("only_ignored"),
+            exclude: a.strs("exclude").unwrap_or_default(),
+            dirs: true,
+            force: true,
+            paths: a.strs("paths").unwrap_or_default(),
         },
         "git_rm" => Command::Rm {
-            path: Some(a.req("path")?),
+            paths: a.strs("path")?,
             cached: a.flag("cached"),
+            recursive: a.flag("recursive"),
+            force: false,
         },
         "git_mv" => Command::Mv {
-            from: a.req("from")?,
-            to: a.req("to")?,
+            paths: [a.strs("from")?, vec![a.req("to")?]].concat(),
             force: a.flag("force"),
         },
         "git_run" => Command::Git {
@@ -2082,6 +2137,9 @@ mod tests {
                 short: false,
                 branch: false,
                 z: false,
+                untracked: None,
+                ignored: false,
+                paths: Vec::new(),
             })
         );
         assert_eq!(

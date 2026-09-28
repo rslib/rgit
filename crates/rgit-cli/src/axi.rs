@@ -34,7 +34,17 @@ pub fn run(
         })
     };
     Ok(match command {
-        Command::Status { .. } => run_status(&backend.status()?),
+        Command::Status {
+            untracked,
+            ignored,
+            paths,
+            ..
+        } => run_status(&crate::cli::status_view(
+            backend,
+            &paths,
+            untracked.as_deref(),
+            ignored,
+        )?),
         Command::Log {
             limit,
             all,
@@ -925,19 +935,19 @@ fn done_message(c: &Command) -> Option<String> {
         None => format!("{verb} the newest stash"),
     };
     Some(match c {
-        Command::Stage {
-            path, hunk: None, ..
-        } => format!("staged {path}"),
-        Command::Stage { path, .. } => format!("staged part of {path}"),
-        Command::Unstage {
-            path, hunk: None, ..
-        } => format!("unstaged {path}"),
-        Command::Unstage { path, .. } => format!("unstaged part of {path}"),
+        Command::Stage { paths, hunk, .. } if hunk.is_empty() => {
+            format!("staged {}", paths.join(" "))
+        }
+        Command::Stage { paths, .. } => format!("staged part of {}", paths.join(" ")),
+        Command::Unstage { paths, hunk, .. } if hunk.is_empty() => {
+            format!("unstaged {}", paths.join(" "))
+        }
+        Command::Unstage { paths, .. } => format!("unstaged part of {}", paths.join(" ")),
         Command::StageAll => "staged all changes".to_owned(),
         Command::UnstageAll => "unstaged all changes".to_owned(),
-        Command::Discard {
-            path: Some(path), ..
-        } => format!("discarded unstaged changes to {path}"),
+        Command::Discard { paths, .. } if !paths.is_empty() => {
+            format!("discarded unstaged changes to {}", paths.join(" "))
+        }
         Command::Resolve { path, ours, .. } => {
             format!(
                 "resolved {path} with {}",
@@ -1006,11 +1016,14 @@ fn done_message(c: &Command) -> Option<String> {
         Command::Fetch { .. } => "fetched".to_owned(),
         Command::Pull { .. } => "pulled".to_owned(),
         Command::Push { .. } => "pushed".to_owned(),
-        Command::Clean { dry_run: false } => "removed untracked files".to_owned(),
-        Command::Rm {
-            path: Some(path), ..
-        } => format!("removed {path}"),
-        Command::Mv { from, to, .. } => format!("moved {from} to {to}"),
+        Command::Clean { dry_run: false, .. } => "removed untracked files".to_owned(),
+        Command::Rm { paths, .. } if !paths.is_empty() => {
+            format!("removed {}", paths.join(" "))
+        }
+        Command::Mv { paths, .. } => match paths.split_last() {
+            Some((to, from)) => format!("moved {} to {to}", from.join(" ")),
+            None => return None,
+        },
         _ => return None,
     })
 }

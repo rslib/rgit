@@ -15,15 +15,15 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 
 ## Stage and discard
 
-- `stage`: Stage a path, or one hunk / specific lines of it. e.g. `rgit stage src/lib.rs`, `rgit stage src/lib.rs --hunk 42`, `rgit stage src/lib.rs --hunk 42 --lines 0,2`
-- `unstage`: Unstage a path, or one hunk / specific lines of it. e.g. `rgit unstage src/lib.rs`, `rgit unstage src/lib.rs --hunk 42`
+- `stage`: Stage paths, some hunks of one path, or specific lines of one hunk. e.g. `rgit stage src/lib.rs`, `rgit stage src/lib.rs --hunk 42`, `rgit stage src/lib.rs --hunk 10,42`, `rgit stage src/lib.rs --hunk 42 --lines 0,2`
+- `unstage`: Unstage paths, some hunks of one path, or specific lines of one hunk. e.g. `rgit unstage src/lib.rs`, `rgit unstage src/lib.rs --hunk 42`
 - `stage-all`: Stage every change. e.g. `rgit stage-all`
 - `unstage-all`: Unstage everything. e.g. `rgit unstage-all`
-- `discard`: Discard a path's unstaged changes, or one hunk / specific lines. e.g. `rgit discard src/lib.rs`, `rgit discard src/lib.rs --hunk 10`
+- `discard`: Discard unstaged changes to paths, some hunks of one path, or specific lines. e.g. `rgit discard src/lib.rs`, `rgit discard src/lib.rs --hunk 10`
 - `resolve`: Resolve a conflicted path by taking ours or theirs. e.g. `rgit resolve src/lib.rs --ours`, `rgit resolve src/lib.rs --theirs`
-- `rm`: Remove a tracked path from the index and working tree. e.g. `rgit rm src/lib.rs`, `rgit rm src/lib.rs --cached`
-- `mv`: Rename/move a tracked path. e.g. `rgit mv src/old.rs src/new.rs`
-- `clean`: Remove all untracked files and directories. e.g. `rgit clean`, `rgit clean --dry-run`
+- `rm`: Remove tracked paths from the index and working tree. e.g. `rgit rm src/lib.rs`, `rgit rm src/lib.rs --cached`
+- `mv`: Rename/move tracked files or folders. e.g. `rgit mv src/old.rs src/new.rs`
+- `clean`: Remove untracked files and directories. e.g. `rgit clean`, `rgit clean --dry-run`
 
 ## Commit and rewrite history
 

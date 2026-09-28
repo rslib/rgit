@@ -1497,12 +1497,12 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
         Mutation::Reword { rev, message } => backend.reword(rev, message),
         Mutation::Squash(rev) => backend.squash(rev),
         Mutation::Uncommit(n) => backend.uncommit(*n),
-        Mutation::Clean => backend.clean(false).map(drop),
+        Mutation::Clean => backend.clean(false, &[]).map(drop),
         Mutation::StackNext => stack_move(backend, true),
         Mutation::StackPrev => stack_move(backend, false),
         Mutation::Reorder { rev, target } => backend.reorder(rev, target, true),
         Mutation::Split { rev, paths } => backend.split(rev, paths),
-        Mutation::RemovePath(path) => backend.remove_path(path, false),
+        Mutation::RemovePath(path) => backend.remove_path(path, false, true),
         Mutation::MovePath { from, to } => backend.move_path(from, to, false),
     }
 }

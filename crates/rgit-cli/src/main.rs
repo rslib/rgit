@@ -203,21 +203,24 @@ fn main() -> ! {
             short,
             branch,
             z,
+            untracked,
+            ignored,
+            paths,
         }) if porcelain.is_some() || short || branch || z => {
-            let backend = match discover_or_init(false) {
-                Ok(backend) => backend,
-                Err(error) => die(error, &emit),
-            };
+            if let Err(error) = discover_or_init(false) {
+                die(error, &emit);
+            }
             let mut args = vec!["status".to_owned()];
             args.extend(porcelain.map(|v| format!("--porcelain={v}")));
             args.extend(short.then(|| "--short".to_owned()));
             args.extend(branch.then(|| "--branch".to_owned()));
             args.extend(z.then(|| "-z".to_owned()));
-            match std::process::Command::new("git")
-                .args(&args)
-                .current_dir(backend.workdir())
-                .status()
-            {
+            args.extend(untracked.map(|m| format!("--untracked-files={m}")));
+            args.extend(ignored.then(|| "--ignored".to_owned()));
+            args.push("--".to_owned());
+            args.extend(paths);
+            // Run in the current folder so paths read and print as git's do.
+            match std::process::Command::new("git").args(&args).status() {
                 Ok(s) => exit(s.code().unwrap_or(1)),
                 Err(e) => die(anyhow::anyhow!("could not run git: {e}"), &emit),
             }
@@ -267,6 +270,7 @@ fn main() -> ! {
                 Ok(backend) => backend,
                 Err(error) => die(error, &emit),
             };
+            let command = cli::from_cwd(command, backend.workdir());
             let result = if structured_output {
                 axi::run(&backend, command, can_prompt)
             } else {

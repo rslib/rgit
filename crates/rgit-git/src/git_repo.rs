@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use git2::build::CheckoutBuilder;
 use git2::{
     ApplyLocation, ApplyOptions, BranchType, Cred, CredentialType, Delta, Diff, DiffFindOptions,
-    DiffOptions, ErrorCode, FetchOptions, ObjectType, Oid, Patch, PushOptions, RemoteCallbacks,
-    Repository, ResetType, Status, StatusOptions,
+    DiffOptions, ErrorCode, FetchOptions, ObjectType, Oid, Patch, Pathspec, PathspecFlags,
+    PushOptions, RemoteCallbacks, Repository, ResetType, Status, StatusOptions,
 };
 
 use crate::model::{RepoState, ResetMode};
@@ -646,6 +646,24 @@ impl GitBackend for Git2Backend {
         Ok(lines)
     }
 
+    fn ignored(&self) -> Result<Vec<StatusEntry>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let mut opts = StatusOptions::new();
+        opts.include_ignored(true).include_untracked(false);
+        Ok(repo
+            .statuses(Some(&mut opts))?
+            .iter()
+            .filter(|e| e.status().contains(Status::IGNORED))
+            .filter_map(|e| e.path().ok().map(str::to_owned))
+            .map(|path| StatusEntry {
+                path,
+                orig_path: None,
+                index: StatusCode::Unmodified,
+                worktree: StatusCode::Ignored,
+            })
+            .collect())
+    }
+
     fn stage_all(&self) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         sync_index(&repo)?;
@@ -676,12 +694,14 @@ impl GitBackend for Git2Backend {
     fn stage_file(&self, path: &str) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         sync_index(&repo)?;
+        no_match(&repo, path)?;
         let mut index = repo.index()?;
-        let rel = Path::new(path);
-        if self.workdir.join(path).exists() {
-            index.add_path(rel)?;
+        if self.workdir.join(path).is_file() {
+            index.add_path(Path::new(path))?;
         } else {
-            index.remove_path(rel)?;
+            // A folder, glob or deleted path: add what is there, drop what is gone.
+            index.add_all([path], git2::IndexAddOption::DEFAULT, None)?;
+            index.update_all([path], None)?;
         }
         index.write()?;
         Ok(())
@@ -690,6 +710,7 @@ impl GitBackend for Git2Backend {
     fn unstage_file(&self, path: &str) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         sync_index(&repo)?;
+        no_match(&repo, path)?;
         match repo.head() {
             Ok(head_ref) => {
                 let target = head_ref.peel(ObjectType::Commit)?;
@@ -1529,27 +1550,48 @@ impl GitBackend for Git2Backend {
         self.run_git(&argv, &[])
     }
 
-    fn clean(&self, dry_run: bool) -> Result<String, GitError> {
+    fn clean(&self, dry_run: bool, args: &[String]) -> Result<String, GitError> {
         // libgit2 has no clean; -nd lists, -fd removes (files and directories).
+        let mut argv = vec!["clean", if dry_run { "-nd" } else { "-fd" }];
+        argv.extend(args.iter().map(String::as_str));
         if dry_run {
-            return self.run_git(&["clean", "-nd"], &[]);
+            return self.run_git(&argv, &[]);
         }
-        self.logged("clean", || self.run_git(&["clean", "-fd"], &[]))
+        self.logged("clean", || self.run_git(&argv, &[]))
     }
 
-    fn remove_path(&self, path: &str, cached: bool) -> Result<(), GitError> {
+    fn remove_path(&self, path: &str, cached: bool, recursive: bool) -> Result<(), GitError> {
         self.logged("rm", || {
             let repo = self.repo.lock().expect("repo mutex");
             sync_index(&repo)?;
             let mut index = repo.index()?;
-            index.remove_path(Path::new(path))?;
-            index.write()?;
-            if !cached {
-                let full = self.workdir.join(path);
-                if full.exists() {
-                    std::fs::remove_file(full)?;
+            let hits = index_matches(&index, path)?;
+            if hits.is_empty() {
+                return Err(did_not_match(path));
+            }
+            if !recursive && hits.iter().any(|h| h != path) && !path.contains(['*', '?', '[']) {
+                return Err(GitError::Other(format!(
+                    "not removing '{path}' recursively without -r"
+                )));
+            }
+            for hit in &hits {
+                index.remove_path(Path::new(hit))?;
+                if !cached {
+                    let full = self.workdir.join(hit);
+                    if full.is_file() || full.is_symlink() {
+                        std::fs::remove_file(&full)?;
+                    }
+                    // Drop folders left empty, like git does.
+                    let mut dir = full.parent();
+                    while let Some(d) = dir.filter(|d| *d != self.workdir) {
+                        if std::fs::remove_dir(d).is_err() {
+                            break;
+                        }
+                        dir = d.parent();
+                    }
                 }
             }
+            index.write()?;
             Ok(())
         })
     }
@@ -1558,15 +1600,41 @@ impl GitBackend for Git2Backend {
         self.logged("mv", || {
             let repo = self.repo.lock().expect("repo mutex");
             sync_index(&repo)?;
-            if !force && self.workdir.join(to).exists() {
+            let from = from.trim_end_matches('/');
+            let mut to = to.trim_end_matches('/').to_owned();
+            if self.workdir.join(&to).is_dir() {
+                let name = Path::new(from).file_name().unwrap_or_default();
+                to = Path::new(&to).join(name).to_string_lossy().into_owned();
+            }
+            let mut index = repo.index()?;
+            let prefix = format!("{from}/");
+            let tracked: Vec<String> = index
+                .iter()
+                .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+                .filter(|p| p == from || p.starts_with(&prefix))
+                .collect();
+            if tracked.is_empty() {
                 return Err(GitError::Other(format!(
-                    "destination {to} already exists; use --force to overwrite"
+                    "not under version control: {from}"
                 )));
             }
-            std::fs::rename(self.workdir.join(from), self.workdir.join(to))?;
-            let mut index = repo.index()?;
-            index.remove_path(Path::new(from))?;
-            index.add_path(Path::new(to))?;
+            let dest = self.workdir.join(&to);
+            if dest.exists() {
+                if !force || dest.is_dir() {
+                    return Err(GitError::Other(format!(
+                        "destination {to} already exists; use --force to overwrite"
+                    )));
+                }
+                index.remove_path(Path::new(&to))?;
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(self.workdir.join(from), &dest)?;
+            for old in &tracked {
+                index.remove_path(Path::new(old))?;
+                index.add_path(Path::new(&format!("{to}{}", &old[from.len()..])))?;
+            }
             index.write()?;
             Ok(())
         })
@@ -2164,8 +2232,9 @@ impl GitBackend for Git2Backend {
         self.logged("discard", || {
             let repo = self.repo.lock().expect("repo mutex");
             sync_index(&repo)?;
-            let status = repo.status_file(Path::new(path))?;
-            if status.contains(Status::WT_NEW) {
+            no_match(&repo, path)?;
+            let file = self.workdir.join(path).is_file();
+            if file && repo.status_file(Path::new(path))?.contains(Status::WT_NEW) {
                 std::fs::remove_file(self.workdir.join(path))?;
             } else {
                 // Restore the worktree file to its index (staged) content.
@@ -3428,6 +3497,45 @@ fn run_hook(
 
 /// Apply a single hunk (selected by its new-side start line) of `diff` to the
 /// index, using libgit2's own patch machinery.
+/// Whether a pathspec (file, folder or glob) matches `path`, as git matches it.
+pub fn pathspec_matches(specs: &[String], path: &str) -> bool {
+    Pathspec::new(specs.iter())
+        .is_ok_and(|spec| spec.matches_path(Path::new(path), PathspecFlags::DEFAULT))
+}
+
+fn did_not_match(path: &str) -> GitError {
+    GitError::Other(format!("pathspec '{path}' did not match any files"))
+}
+
+/// Index paths a pathspec matches.
+fn index_matches(index: &git2::Index, path: &str) -> Result<Vec<String>, GitError> {
+    let spec = Pathspec::new([path])?;
+    let list = spec.match_index(index, PathspecFlags::DEFAULT)?;
+    Ok(list
+        .entries()
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
+}
+
+/// Fail like git when a pathspec names nothing in the working tree, the index
+/// or HEAD.
+fn no_match(repo: &Repository, path: &str) -> Result<(), GitError> {
+    let spec = Pathspec::new([path])?;
+    let flags = PathspecFlags::DEFAULT;
+    let hit = spec.match_workdir(repo, flags)?.entries().len() > 0
+        || spec.match_index(&repo.index()?, flags)?.entries().len() > 0
+        || repo
+            .head()
+            .and_then(|h| h.peel_to_tree())
+            .and_then(|t| spec.match_tree(&t, flags))
+            .is_ok_and(|m| m.entries().len() > 0);
+    if hit {
+        Ok(())
+    } else {
+        Err(did_not_match(path))
+    }
+}
+
 fn apply_one_hunk(
     repo: &Repository,
     diff: &Diff,
@@ -3634,11 +3742,14 @@ fn reverse_hunk_patch(diff: &Diff, path: &str, new_start: u32) -> Result<String,
                 continue;
             }
             let mut out = format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n");
+            // The patch holds only this hunk, so it lands where it sits in the
+            // index, not at its HEAD line (other staged hunks shift that). An
+            // empty side names the line before it, hence the +1.
             out.push_str(&format!(
                 "@@ -{},{} +{},{} @@\n",
                 hunk.new_start(),
                 hunk.new_lines(),
-                hunk.old_start(),
+                hunk.new_start() + u32::from(hunk.new_lines() == 0),
                 hunk.old_lines(),
             ));
             for l in 0..patch.num_lines_in_hunk(h)? {

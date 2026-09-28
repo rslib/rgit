@@ -1,5 +1,5 @@
 use crate::error::GitError;
-use crate::model::RepoStatus;
+use crate::model::{RepoStatus, StatusEntry};
 
 /// The read/mutation surface the TUI drives, kept abstract so a gix-native or
 /// libgit2 implementation can back each operation independently.
@@ -13,16 +13,19 @@ pub trait GitBackend: Send + Sync {
     /// per-file diffs, and recent commits.
     fn status(&self) -> Result<RepoStatus, GitError>;
 
+    /// Ignored files and folders in the working tree (`git status --ignored`).
+    fn ignored(&self) -> Result<Vec<StatusEntry>, GitError>;
+
     /// Stage every change in the working tree.
     fn stage_all(&self) -> Result<(), GitError>;
 
     /// Unstage everything back to HEAD.
     fn unstage_all(&self) -> Result<(), GitError>;
 
-    /// Stage a whole path (add to the index, or record its deletion).
+    /// Stage a whole path, folder or glob (add what exists, record deletions).
     fn stage_file(&self, path: &str) -> Result<(), GitError>;
 
-    /// Unstage a whole path (reset its index entry to HEAD).
+    /// Unstage a whole path, folder or glob (reset its index entries to HEAD).
     fn unstage_file(&self, path: &str) -> Result<(), GitError>;
 
     /// Stage one hunk of a path, identified by its new-side start line.
@@ -37,8 +40,8 @@ pub trait GitBackend: Send + Sync {
     /// Unstage only the given line indices (within the hunk at `new_start`).
     fn unstage_lines(&self, path: &str, new_start: u32, lines: &[usize]) -> Result<(), GitError>;
 
-    /// Discard a path's unstaged changes: restore a tracked file from the index,
-    /// or delete an untracked file.
+    /// Discard a path's unstaged changes: restore tracked files from the index,
+    /// or delete an untracked file. Untracked files in a folder stay.
     fn discard_file(&self, path: &str) -> Result<(), GitError>;
 
     /// Discard one unstaged hunk from the working tree.
@@ -360,19 +363,20 @@ pub trait GitBackend: Send + Sync {
     /// `reset`, ...). Shells out to `git` (libgit2 has no bisect).
     fn bisect(&self, args: &[String]) -> Result<String, GitError>;
 
-    /// Remove every untracked file and directory (`git clean -fd`).
-    /// Remove untracked files and directories. With `dry_run` (git's `-n`),
-    /// report what would be removed without deleting. Returns git's output.
-    fn clean(&self, dry_run: bool) -> Result<String, GitError>;
+    /// Remove untracked files and directories (`git clean -fd`). With `dry_run`
+    /// (git's `-n`), report what would be removed without deleting. `args` are
+    /// extra `git clean` arguments (`-x`, `-X`, `-e <pattern>`, `--`, paths).
+    /// Returns git's output.
+    fn clean(&self, dry_run: bool, args: &[String]) -> Result<String, GitError>;
 
-    /// Remove a tracked path from the index and the working tree (`git rm`).
-    /// Remove `path` from the index. With `cached` (git's `--cached`), leave the
-    /// working-tree file in place; otherwise delete it too.
-    fn remove_path(&self, path: &str, cached: bool) -> Result<(), GitError>;
+    /// Remove tracked paths matching `path` (a file, folder or glob) from the
+    /// index (`git rm`). With `cached` (git's `--cached`), leave the working-tree
+    /// files in place; otherwise delete them too. A folder needs `recursive`.
+    fn remove_path(&self, path: &str, cached: bool, recursive: bool) -> Result<(), GitError>;
 
-    /// Rename/move a tracked path (`git mv`).
-    /// Rename a tracked path. Without `force`, refuse to overwrite an existing
-    /// destination (git's default); `force` (git's `-f`) overwrites it.
+    /// Rename a tracked file or folder (`git mv`). An existing folder as `to`
+    /// receives `from` inside it. Without `force`, refuse to overwrite an
+    /// existing destination (git's default); `force` (git's `-f`) overwrites it.
     fn move_path(&self, from: &str, to: &str, force: bool) -> Result<(), GitError>;
 
     /// Describe a revision relative to the nearest tag (`git describe`).

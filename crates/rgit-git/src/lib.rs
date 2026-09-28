@@ -33,7 +33,7 @@ pub use backend::GitBackend;
 pub use creds::CredentialPrompt;
 pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 pub use error::GitError;
-pub use git_repo::{Git2Backend, clone, init};
+pub use git_repo::{Git2Backend, clone, init, pathspec_matches};
 pub use model::{
     BlameLine, Blob, Commit, CommitDetails, CommitFile, CommitOverview, CommitRef, Deco,
     FileActivity, GrepMatch, GrepQuery, Head, HunkRef, Lane, LanesState, LastCommit, LogEntry,
