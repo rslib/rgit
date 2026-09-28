@@ -500,17 +500,6 @@ pub(crate) fn rev_walk(repo: &Repository, opts: &RevWalk) -> Result<Vec<WalkComm
             push(&mut walk, commit_id(repo, rev)?)?;
         }
     }
-    let mut diff_opts = git2::DiffOptions::new();
-    for p in &opts.paths {
-        diff_opts.pathspec(p);
-    }
-    // Whether `commit` matches its parent `n` (or the empty tree) on the paths.
-    let mut same_as = |commit: &git2::Commit, n: Option<usize>| -> Result<bool, GitError> {
-        let old = n.map(|n| commit.parent(n)?.tree()).transpose()?;
-        let diff =
-            repo.diff_tree_to_tree(old.as_ref(), Some(&commit.tree()?), Some(&mut diff_opts))?;
-        Ok(diff.deltas().len() == 0)
-    };
     // With paths, a commit is walked only from a starting commit or through
     // a parent its child follows.
     let mut wanted = tips;
@@ -525,27 +514,9 @@ pub(crate) fn rev_walk(repo: &Repository, opts: &RevWalk) -> Result<Vec<WalkComm
             if !wanted.contains(&commit.id()) {
                 continue;
             }
-            let parents = if opts.first_parent {
-                commit.parent_count().min(1)
-            } else {
-                commit.parent_count()
-            };
-            let same = (0..parents)
-                .map(|n| same_as(&commit, Some(n)).map(|same| same.then_some(n)))
-                .find_map(Result::transpose)
-                .transpose()?;
-            let show = match same {
-                // A commit that matches a parent follows only that parent.
-                Some(n) => {
-                    wanted.insert(commit.parent_id(n)?);
-                    false
-                }
-                None if parents == 0 => !same_as(&commit, None)?,
-                None => {
-                    wanted.extend(commit.parent_ids().take(parents));
-                    true
-                }
-            };
+            let (show, parents) =
+                crate::git_repo::simplify_parents(repo, &commit, &opts.paths, opts.first_parent);
+            wanted.extend(parents);
             if !show {
                 continue;
             }
@@ -1078,4 +1049,227 @@ pub(crate) fn count_objects(repo: &Repository) -> Result<ObjectCounts, GitError>
         size_pack: size_pack / 1024,
         prune_packable,
     })
+}
+
+/// `git hash-object`: the id of `data` as a `kind` object, in the repository at
+/// `git_dir` or outside one. A blob with a `path` (relative to the working tree)
+/// goes through git's clean filters first: a `filter=` driver, then
+/// autocrlf/`text`/`eol` and `ident`. `write` stores the object; `literally`
+/// skips the format check of trees, commits and tags.
+pub fn hash_object(
+    git_dir: Option<&Path>,
+    kind: &str,
+    data: &[u8],
+    path: Option<&str>,
+    write: bool,
+    literally: bool,
+) -> Result<String, GitError> {
+    let kind = ObjectType::from_str(kind)
+        .filter(|k| {
+            matches!(
+                k,
+                ObjectType::Blob | ObjectType::Tree | ObjectType::Commit | ObjectType::Tag
+            )
+        })
+        .ok_or_else(|| GitError::Other(format!("invalid object type \"{kind}\"")))?;
+    if !literally {
+        check_object(kind, data)?;
+    }
+    let repo = git_dir.map(Repository::open).transpose()?;
+    let filtered;
+    let data = match (&repo, path) {
+        (Some(repo), Some(path)) if kind == ObjectType::Blob && repo.workdir().is_some() => {
+            filtered = clean(repo, path, data)?;
+            &filtered[..]
+        }
+        _ => data,
+    };
+    let oid = match (&repo, write) {
+        (Some(repo), true) => repo.odb()?.write(kind, data)?,
+        (None, true) => return Err(GitError::Other("not in a git directory".to_owned())),
+        _ => Oid::hash_object(kind, data)?,
+    };
+    Ok(oid.to_string())
+}
+
+/// `data` as git would store the file `path`: its clean filter driver, then
+/// libgit2's crlf/eol and ident filters.
+fn clean(repo: &Repository, path: &str, data: &[u8]) -> Result<Vec<u8>, GitError> {
+    use std::ffi::{CString, c_char, c_int, c_void};
+    unsafe extern "C" {
+        fn git_filter_list_load(
+            filters: *mut *mut c_void,
+            repo: *mut libgit2_sys::git_repository,
+            blob: *mut libgit2_sys::git_blob,
+            path: *const c_char,
+            mode: c_int,
+            flags: u32,
+        ) -> c_int;
+        fn git_filter_list_apply_to_buffer(
+            out: *mut libgit2_sys::git_buf,
+            filters: *mut c_void,
+            data: *const c_char,
+            len: usize,
+        ) -> c_int;
+        fn git_filter_list_free(filters: *mut c_void);
+    }
+    const TO_ODB: c_int = 1;
+    const ALLOW_UNSAFE: u32 = 1;
+    let mut data = data.to_vec();
+    let driver = repo
+        .get_attr(Path::new(path), "filter", git2::AttrCheckFlags::default())?
+        .map(str::to_owned);
+    if let Some(name) = driver {
+        let config = repo.config()?;
+        let required = config
+            .get_bool(&format!("filter.{name}.required"))
+            .unwrap_or(false);
+        match config.get_string(&format!("filter.{name}.clean")) {
+            Ok(cmd) => {
+                let quoted = format!("'{}'", path.replace('\'', "'\\''"));
+                let workdir = repo.workdir().unwrap_or(repo.path());
+                match run_filter(&cmd.replace("%f", &quoted), workdir, &data) {
+                    Ok(out) => data = out,
+                    Err(e) if required => return Err(e),
+                    Err(_) => {}
+                }
+            }
+            Err(_) if required => {
+                return Err(GitError::Other(format!(
+                    "{path}: clean filter '{name}' failed"
+                )));
+            }
+            Err(_) => {}
+        }
+    }
+    let cpath = CString::new(path).map_err(|_| GitError::Other(format!("bad path {path:?}")))?;
+    let mut filters = std::ptr::null_mut();
+    // SAFETY: the repo outlives the call; libgit2 owns `filters` until freed,
+    // and `out` until disposed.
+    unsafe {
+        let rc = git_filter_list_load(
+            &mut filters,
+            git2::Binding::raw(repo),
+            std::ptr::null_mut(),
+            cpath.as_ptr(),
+            TO_ODB,
+            ALLOW_UNSAFE,
+        );
+        if rc < 0 {
+            return Err(git2::Error::last_error(rc).into());
+        }
+        if filters.is_null() {
+            return Ok(data);
+        }
+        let mut out = libgit2_sys::git_buf {
+            ptr: std::ptr::null_mut(),
+            reserved: 0,
+            size: 0,
+        };
+        let rc =
+            git_filter_list_apply_to_buffer(&mut out, filters, data.as_ptr().cast(), data.len());
+        git_filter_list_free(filters);
+        if rc < 0 {
+            libgit2_sys::git_buf_dispose(&mut out);
+            return Err(git2::Error::last_error(rc).into());
+        }
+        let bytes = if out.ptr.is_null() {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(out.ptr as *const u8, out.size).to_vec()
+        };
+        libgit2_sys::git_buf_dispose(&mut out);
+        Ok(bytes)
+    }
+}
+
+/// Run a filter driver command through the shell, feeding it `data`.
+fn run_filter(cmd: &str, dir: &Path, data: &[u8]) -> Result<Vec<u8>, GitError> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", cmd])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let input = data.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let out = child.wait_with_output()?;
+    let _ = writer.join();
+    if !out.status.success() {
+        return Err(GitError::Other(format!("filter '{cmd}' failed")));
+    }
+    Ok(out.stdout)
+}
+
+/// git's format check for `hash-object -t tree|commit|tag`.
+fn check_object(kind: ObjectType, data: &[u8]) -> Result<(), GitError> {
+    let bad = |why: &str| Err(GitError::Other(format!("object fails fsck: {why}")));
+    let hex = |s: &str| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    match kind {
+        ObjectType::Tree => {
+            let mut rest = data;
+            while !rest.is_empty() {
+                let Some(nul) = rest.iter().position(|b| *b == 0) else {
+                    return bad("badTree: truncated entry");
+                };
+                let head = String::from_utf8_lossy(&rest[..nul]);
+                let ok = head.split_once(' ').is_some_and(|(mode, name)| {
+                    !name.is_empty() && mode.bytes().all(|b| (b'0'..=b'7').contains(&b))
+                });
+                if !ok || rest.len() < nul + 21 {
+                    return bad("badTree: malformed entry");
+                }
+                rest = &rest[nul + 21..];
+            }
+            Ok(())
+        }
+        ObjectType::Commit | ObjectType::Tag => {
+            let text = String::from_utf8_lossy(data);
+            let header = text.split("\n\n").next().unwrap_or_default();
+            let mut lines = header.lines();
+            let mut field = |name: &str| {
+                lines
+                    .next()
+                    .and_then(|l| l.strip_prefix(name))
+                    .and_then(|l| l.strip_prefix(' '))
+                    .map(str::to_owned)
+            };
+            if kind == ObjectType::Commit {
+                if !field("tree").is_some_and(|t| hex(&t)) {
+                    return bad("missingTree: invalid format - expected 'tree' line");
+                }
+                let rest: Vec<&str> = header.lines().skip(1).collect();
+                let after_parents = rest
+                    .iter()
+                    .skip_while(|l| l.strip_prefix("parent ").is_some_and(hex))
+                    .collect::<Vec<_>>();
+                if !after_parents
+                    .first()
+                    .is_some_and(|l| l.starts_with("author "))
+                {
+                    return bad("missingAuthor: invalid format - expected 'author' line");
+                }
+                if !after_parents
+                    .get(1)
+                    .is_some_and(|l| l.starts_with("committer "))
+                {
+                    return bad("missingCommitter: invalid format - expected 'committer' line");
+                }
+            } else {
+                if !field("object").is_some_and(|o| hex(&o)) {
+                    return bad("missingObject: invalid format - expected 'object' line");
+                }
+                if field("type").is_none() {
+                    return bad("missingTypeEntry: invalid format - expected 'type' line");
+                }
+                if field("tag").is_none() {
+                    return bad("missingTagEntry: invalid format - expected 'tag' line");
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }

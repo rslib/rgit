@@ -11,6 +11,9 @@ const EXAMPLES: &[Entry] = &[
             "rgit log --author alice --since 2024-01-01",
             "rgit log --grep fix --no-merges -p",
             "rgit log --follow --stat -- src/lib.rs",
+            "rgit log --oneline --graph --all",
+            "rgit log --oneline -S parse_date -- src",
+            "rgit log -3 --format='%h %an %ar %s' --date=iso",
         ],
     ),
     (
@@ -20,6 +23,9 @@ const EXAMPLES: &[Entry] = &[
             "rgit diff --cached -- src",
             "rgit diff main...HEAD --name-status",
             "rgit diff v1 HEAD --patch -U1 -w -- src",
+            "rgit diff --quiet && echo clean",
+            "rgit diff main --name-only --diff-filter=A",
+            "rgit diff --no-index a.txt b.txt --patch",
         ],
     ),
     (
@@ -28,6 +34,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit show HEAD",
             "rgit show <rev> --patch",
             "rgit show <rev> --name-only",
+            "rgit show <rev> --pretty=fuller --stat",
             "rgit show HEAD~1:src/lib.rs",
         ],
     ),
@@ -37,6 +44,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit blame src/lib.rs",
             "rgit blame src/lib.rs -L 10,20",
             "rgit blame v1 -- src/lib.rs",
+            "rgit blame --porcelain -L 10,20 src/lib.rs",
         ],
     ),
     ("refs", &["rgit refs"]),
@@ -450,7 +458,13 @@ const EXAMPLES: &[Entry] = &[
             "rgit config user.email me@example.com",
             "rgit config --global pull.rebase true",
             "rgit config --unset core.pager",
-            "rgit config --list",
+            "rgit config --list --show-origin",
+            "rgit config --get-regexp '^remote\\.'",
+            "rgit config --type=bool --default false core.bare",
+            "rgit config --file .gitmodules --list",
+            "rgit config --rename-section branch.old branch.new",
+            "rgit config get --all --show-names remote.origin.fetch",
+            "rgit config set --all core.pager less",
         ],
     ),
     (
@@ -460,6 +474,9 @@ const EXAMPLES: &[Entry] = &[
             "rgit apply --check fix.patch",
             "rgit apply --cached fix.patch",
             "rgit apply -R fix.patch",
+            "rgit apply --3way fix.patch",
+            "rgit apply --reject -p2 --directory=vendor/lib fix.patch",
+            "rgit apply --stat --summary --numstat fix.patch",
         ],
     ),
     ("notes", &["rgit notes", "rgit notes show HEAD"]),
@@ -470,21 +487,40 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit notes add -m \"<note>\"",
             "rgit notes add <rev> -m \"<note>\" --force",
+            "rgit notes add -F notes.txt <rev>",
         ],
     ),
     ("notes append", &["rgit notes append -m \"<more>\""]),
-    ("notes remove", &["rgit notes remove <rev>"]),
+    (
+        "notes remove",
+        &[
+            "rgit notes remove <rev>",
+            "rgit notes remove --ignore-missing a b",
+        ],
+    ),
+    ("notes copy", &["rgit notes copy <from> <to>"]),
+    ("notes edit", &["rgit notes edit <rev>"]),
+    ("notes prune", &["rgit notes prune -n"]),
+    ("notes merge", &["rgit notes merge -s union origin"]),
+    ("notes get-ref", &["rgit notes --ref review get-ref"]),
     (
         "update-ref",
         &[
             "rgit update-ref refs/heads/topic <rev>",
             "rgit update-ref refs/heads/topic <new> <old>",
             "rgit update-ref -d refs/heads/topic",
+            "printf 'start\\nupdate refs/heads/a <new> <old>\\ncommit\\n' | rgit update-ref --stdin",
+            "rgit update-ref --create-reflog refs/backup/main main",
         ],
     ),
     (
         "hash-object",
-        &["rgit hash-object src/lib.rs", "rgit hash-object -w --stdin"],
+        &[
+            "rgit hash-object src/lib.rs",
+            "rgit hash-object -w --stdin",
+            "rgit hash-object --stdin --path src/lib.rs",
+            "rgit hash-object --no-filters -t blob file.bin",
+        ],
     ),
     (
         "format-patch",
@@ -492,6 +528,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit format-patch -1",
             "rgit format-patch main -o patches",
             "rgit format-patch main..topic --stdout",
+            "rgit format-patch main --cover-letter --thread -v2 --to list@example.com",
+            "rgit format-patch -3 --rfc --base=auto --subject-prefix=\"PATCH net\"",
         ],
     ),
     (
@@ -500,6 +538,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit am patches/*.patch",
             "rgit am --continue",
             "rgit am --abort",
+            "rgit am -3 -s --committer-date-is-author-date series.mbox",
+            "rgit am --show-current-patch=diff",
         ],
     ),
     (
@@ -508,10 +548,99 @@ const EXAMPLES: &[Entry] = &[
             "rgit archive -o release.tar.gz",
             "rgit archive v1.0 --prefix project/ -o project.zip",
             "rgit archive HEAD src > src.tar",
+            "rgit archive -9 --add-file=VERSION --format=tar.gz -o dist.tgz v1.0",
+            "rgit archive --remote ../other -o other.zip",
+            "rgit archive -l",
         ],
     ),
-    ("gc", &["rgit gc", "rgit gc --prune=now"]),
-    ("fsck", &["rgit fsck", "rgit fsck --unreachable"]),
+    (
+        "gc",
+        &[
+            "rgit gc",
+            "rgit gc --prune=now",
+            "rgit gc --aggressive --cruft",
+        ],
+    ),
+    (
+        "fsck",
+        &[
+            "rgit fsck",
+            "rgit fsck --unreachable --no-reflogs",
+            "rgit fsck --lost-found",
+            "rgit fsck --name-objects --full",
+        ],
+    ),
+    (
+        "repack",
+        &["rgit repack -a -d", "rgit repack -a -d -b --cruft"],
+    ),
+    (
+        "cherry",
+        &["rgit cherry", "rgit cherry -v origin/main topic"],
+    ),
+    (
+        "bundle",
+        &[
+            "rgit bundle create repo.bundle --all",
+            "rgit bundle verify repo.bundle",
+        ],
+    ),
+    (
+        "bundle create",
+        &[
+            "rgit bundle create repo.bundle --all",
+            "rgit bundle create update.bundle v1.0..main",
+        ],
+    ),
+    ("bundle verify", &["rgit bundle verify update.bundle"]),
+    (
+        "difftool",
+        &[
+            "rgit difftool -y -t meld",
+            "rgit difftool --cached",
+            "rgit difftool -d main topic",
+        ],
+    ),
+    (
+        "mergetool",
+        &["rgit mergetool", "rgit mergetool -t vimdiff -- src/lib.rs"],
+    ),
+    (
+        "range-diff",
+        &[
+            "rgit range-diff main topic-v1 topic-v2",
+            "rgit range-diff -s main..topic@{1} main..topic",
+            "rgit range-diff topic@{u}...topic",
+        ],
+    ),
+    (
+        "request-pull",
+        &[
+            "rgit request-pull origin/main https://example.com/me/repo.git topic",
+            "rgit request-pull -p v1.0 origin",
+        ],
+    ),
+    ("bundle list-heads", &["rgit bundle list-heads repo.bundle"]),
+    ("bundle unbundle", &["rgit bundle unbundle update.bundle"]),
+    ("pack-refs", &["rgit pack-refs --all"]),
+    (
+        "maintenance",
+        &["rgit maintenance run --task=gc", "rgit maintenance start"],
+    ),
+    (
+        "maintenance run",
+        &[
+            "rgit maintenance run",
+            "rgit maintenance run --task=commit-graph --task=loose-objects",
+        ],
+    ),
+    ("maintenance start", &["rgit maintenance start"]),
+    ("maintenance stop", &["rgit maintenance stop"]),
+    ("maintenance register", &["rgit maintenance register"]),
+    (
+        "maintenance unregister",
+        &["rgit maintenance unregister --force"],
+    ),
     ("clean", &["rgit clean", "rgit clean --dry-run"]),
     (
         "rm",
@@ -534,6 +663,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit describe",
             "rgit describe HEAD --tags",
             "rgit describe --tags --abbrev=0",
+            "rgit describe --contains <rev>",
         ],
     ),
     (

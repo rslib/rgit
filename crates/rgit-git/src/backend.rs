@@ -563,20 +563,14 @@ pub trait GitBackend: Send + Sync {
         all: bool,
     ) -> Result<(), GitError>;
 
-    /// Apply a unified diff (`git apply`) to the working tree, the index
-    /// (`cached`), or both (`index`). `reverse` undoes the patch; `check` only
-    /// tests that it applies.
+    /// Apply parsed patches (`git apply`) as `opts` say, returning git's
+    /// progress lines. Rejected hunks and three-way conflicts are a
+    /// `Conflict` error carrying them.
     fn apply_patch(
         &self,
-        patch: &[u8],
-        cached: bool,
-        index: bool,
-        reverse: bool,
-        check: bool,
-    ) -> Result<(), GitError>;
-
-    /// A patch's diffstat (`git apply --stat`), without applying it.
-    fn patch_stat(&self, patch: &[u8]) -> Result<String, GitError>;
+        files: &[crate::FilePatch],
+        opts: &crate::ApplyOpts,
+    ) -> Result<String, GitError>;
 
     /// Notes under `notes_ref` (default `refs/notes/commits`) as
     /// `(note blob id, annotated object id)`.
@@ -599,6 +593,29 @@ pub trait GitBackend: Send + Sync {
     /// Remove the note of `rev`.
     fn note_remove(&self, notes_ref: Option<&str>, rev: &str) -> Result<(), GitError>;
 
+    /// Copy the note of `from` to `to`; an existing note on `to` needs `force`.
+    fn note_copy(
+        &self,
+        notes_ref: Option<&str>,
+        from: &str,
+        to: &str,
+        force: bool,
+    ) -> Result<(), GitError>;
+
+    /// Remove the notes of objects that no longer exist; returns their ids.
+    /// `dry_run` only lists them.
+    fn notes_prune(&self, notes_ref: Option<&str>, dry_run: bool) -> Result<Vec<String>, GitError>;
+
+    /// Merge the notes of ref `other` into `notes_ref` (`git notes merge`).
+    /// `strategy` is manual (conflicts fail), ours, theirs, union or
+    /// cat_sort_uniq.
+    fn notes_merge(
+        &self,
+        notes_ref: Option<&str>,
+        other: &str,
+        strategy: &str,
+    ) -> Result<String, GitError>;
+
     /// Point ref `name` at revision `new`, or delete it when `new` is `None`
     /// (`git update-ref`). With `old`, only if the ref now holds `old` (all
     /// zeros: only if it does not exist). A symbolic ref is followed unless
@@ -610,36 +627,82 @@ pub trait GitBackend: Send + Sync {
         old: Option<&str>,
         no_deref: bool,
         message: Option<&str>,
+    ) -> Result<(), GitError> {
+        let update = crate::RefUpdate {
+            name: name.to_owned(),
+            new: new.map(str::to_owned),
+            old: old.map(str::to_owned),
+            verify: false,
+        };
+        self.update_refs(&[update], message, no_deref, false, false)
+    }
+
+    /// Change refs all or nothing (`git update-ref`, also its `--stdin`
+    /// transactions): each update is checked against its expected old value
+    /// first. A symbolic ref is followed unless `no_deref`; `create_reflog`
+    /// writes a reflog even outside the namespaces that keep one. With
+    /// `check_only`, only verify.
+    fn update_refs(
+        &self,
+        updates: &[crate::RefUpdate],
+        message: Option<&str>,
+        no_deref: bool,
+        create_reflog: bool,
+        check_only: bool,
     ) -> Result<(), GitError>;
 
-    /// The object id of `data` as a `kind` object (blob, tree, commit, tag);
-    /// `write` stores it in the object database (`git hash-object`).
-    fn hash_object(&self, kind: &str, data: &[u8], write: bool) -> Result<String, GitError>;
+    /// `git cherry`: the commits of `head` (after `limit`) missing from
+    /// `upstream`, oldest first, each marked by whether upstream already has
+    /// an equivalent change.
+    fn cherry(
+        &self,
+        upstream: &str,
+        head: &str,
+        limit: Option<&str>,
+    ) -> Result<Vec<crate::CherryCommit>, GitError>;
 
-    /// Commits as mbox patches (`git format-patch`), oldest first, as
-    /// `(file name, email)`. `range` is `<a>..<b>`, or `<rev>` for
-    /// `<rev>..HEAD`; `count` keeps the newest `count` commits ending at
-    /// `range` (or HEAD). Merge commits are skipped.
+    /// Write a bundle of what `args` select (rev-list style); returns how
+    /// many refs it records.
+    fn bundle_create(&self, path: &std::path::Path, args: &[String]) -> Result<usize, GitError>;
+
+    /// A bundle's header and the prerequisite commits this repository lacks.
+    fn bundle_verify(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<(crate::BundleHeader, Vec<(String, String)>), GitError>;
+
+    /// Store a bundle's objects (refs are left alone); returns its refs.
+    fn bundle_unbundle(&self, path: &std::path::Path) -> Result<Vec<(String, String)>, GitError>;
+
+    /// `git request-pull`: the summary asking `url`'s owner to pull `end`
+    /// (default HEAD) since `start`, and git's warnings when `url` lacks it.
+    fn request_pull(
+        &self,
+        start: &str,
+        url: &str,
+        end: Option<&str>,
+        patch: bool,
+    ) -> Result<(String, Vec<String>), GitError>;
+
+    /// `git range-diff`: the commits of two ranges paired up, with how each
+    /// pair's patch changed.
+    fn range_diff(&self, opts: &crate::RangeDiffOpts) -> Result<String, GitError>;
+
+    /// Commits as mbox emails (`git format-patch`), oldest first, the cover
+    /// letter (if asked for) first.
     fn format_patch(
         &self,
-        range: Option<&str>,
-        count: Option<usize>,
-    ) -> Result<Vec<(String, String)>, GitError>;
+        opts: &crate::FormatPatchOpts,
+    ) -> Result<Vec<crate::PatchMail>, GitError>;
 
     /// Apply mbox patches as commits (`git am`). `args` are `git am` arguments
     /// (mbox paths, `--abort`, `--continue`, `--skip`, ...); `mbox` is patch
     /// text to apply instead of files. Shells out to `git` (libgit2 has no am).
     fn am(&self, args: &[String], mbox: Option<&[u8]>) -> Result<String, GitError>;
 
-    /// The tree of `rev` as an archive; `format` is tar, tar.gz/tgz or zip.
-    /// Entries are named under `prefix`; `paths` limits them.
-    fn archive(
-        &self,
-        rev: &str,
-        format: &str,
-        prefix: &str,
-        paths: &[String],
-    ) -> Result<Vec<u8>, GitError>;
+    /// A revision's tree as an archive (`git archive`), honouring the
+    /// export-ignore and export-subst attributes.
+    fn archive(&self, opts: &crate::ArchiveOpts) -> Result<Vec<u8>, GitError>;
 
     /// Pack and prune the object database (`git gc` with `args`). Shells out
     /// to `git` (libgit2 has no gc).

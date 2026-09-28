@@ -15,9 +15,10 @@ use rgit_git::{Git2Backend, GitBackend, GrepQuery};
 use serde_json::{Map, Value, json};
 
 use crate::cli::{
-    BisectCmd, BranchCmd, BranchOpts, CliError, Command, DiffFormat, FlowCmd, IndexCmd, LanesCmd,
-    NotesCmd, Plumbing, RebaseFlags, RemoteCmd, StackCmd, StashCmd, StashPush, SubmoduleCmd,
-    TagOpts, WorkspaceCmd, WorktreeCmd,
+    AmArgs, ApplyArgs, ArchiveArgs, BisectCmd, BlameFormat, BranchCmd, BranchOpts, BundleCmd,
+    CliError, Command, ConfigArgs, DiffFormat, FlowCmd, FormatPatchArgs, HashObjectArgs, IndexCmd,
+    LanesCmd, MaintenanceCmd, NoteMessage, NotesCmd, Plumbing, PrettyArgs, RebaseFlags, RemoteCmd,
+    StackCmd, StashCmd, StashPush, SubmoduleCmd, TagOpts, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::toon::{Node, Obj};
@@ -92,6 +93,8 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "git_var",
     "git_symbolic_ref",
     "git_count_objects",
+    "git_cherry",
+    "git_range_diff",
 ];
 
 /// Whether a tool only reads (may be served over the read-only HTTP endpoint).
@@ -621,15 +624,22 @@ fn tools() -> Vec<Tool> {
             "Commits newest first (limit, default 20; skip pages): a table of id, summary, \
              author, when, with a count when more exist. Filter with author, since, until, path \
              (one or many), grep \
-             (message regex; ignore_case), merges/no_merges; rev (one or many: `main`, `^main`, \
+             (message regex; ignore_case), committer, pickaxe (commits changing how often a \
+             string occurs, git -S), changes_matching (diff lines matching a regex, git -G), \
+             merges/no_merges; rev (one or many: `main`, `^main`, \
              `A..B`, `A...B`) or all picks the start; first_parent, reverse, follow (one path \
              across renames). patch, stat, name_only, name_status or numstat add each commit's \
-             changes as text. Extra fields: oid, parents, refs, unpushed.",
+             changes as text. format (git pretty format: oneline, medium, `format:%h %s`...), \
+             date (date style) and graph print git's own text. Extra fields: oid, parents, refs, \
+             unpushed.",
             &[
                 ("limit", "integer", false),
                 ("skip", "integer", false),
                 ("all", "boolean", false),
                 ("author", "string", false),
+                ("committer", "string", false),
+                ("pickaxe", "string", false),
+                ("changes_matching", "string", false),
                 ("since", "string", false),
                 ("until", "string", false),
                 ("rev", "paths", false),
@@ -646,6 +656,9 @@ fn tools() -> Vec<Tool> {
                 ("name_only", "boolean", false),
                 ("name_status", "boolean", false),
                 ("numstat", "boolean", false),
+                ("format", "string", false),
+                ("date", "string", false),
+                ("graph", "boolean", false),
                 FIELDS,
             ],
         ),
@@ -656,7 +669,8 @@ fn tools() -> Vec<Tool> {
              tree (the index with cached), or takes a range `A..B` / `A...B` (from the merge \
              base); from+to diffs two revisions. paths limits to files, folders or globs. \
              patch=true returns the unified patch (truncated unless full), with `unified` context \
-             lines and ignore_all_space; name_only, name_status and numstat list files.",
+             lines and ignore_all_space; name_only, name_status and numstat list files; shortstat gives the totals line; \
+             diff_filter keeps status letters (`AM`) or drops lowercase ones (`d`).",
             &[
                 ("from", "string", false),
                 ("to", "string", false),
@@ -666,8 +680,10 @@ fn tools() -> Vec<Tool> {
                 ("name_only", "boolean", false),
                 ("name_status", "boolean", false),
                 ("numstat", "boolean", false),
+                ("shortstat", "boolean", false),
                 ("unified", "integer", false),
                 ("ignore_all_space", "boolean", false),
+                ("diff_filter", "string", false),
                 FIELDS,
                 FULL,
             ],
@@ -678,7 +694,7 @@ fn tools() -> Vec<Tool> {
              changed-files table (paths limits it; no_patch drops it). patch=true returns its \
              patch instead (truncated unless full); name_only/name_status/numstat list files. \
              rev `<rev>:<path>` prints a file (or folder) at a revision, `:<path>` the staged \
-             file; several revs print each.",
+             file; several revs print each. format (a git pretty format) prints git's show text.",
             &[
                 ("rev", "paths", false),
                 ("paths", "paths", false),
@@ -687,6 +703,7 @@ fn tools() -> Vec<Tool> {
                 ("name_status", "boolean", false),
                 ("numstat", "boolean", false),
                 ("no_patch", "boolean", false),
+                ("format", "string", false),
                 FIELDS,
                 FULL,
             ],
@@ -826,7 +843,8 @@ fn tools() -> Vec<Tool> {
             "Describe a revision relative to the nearest tag (default HEAD). `tags` uses \
              lightweight tags too, `dirty` appends -dirty, `long` forces long format, `abbrev` \
              sets the oid length (0: the tag only), `match` limits tags to a glob, `exact_match` \
-             fails unless a tag points at the revision.",
+             fails unless a tag points at the revision, `contains` names it from the oldest tag \
+             that contains it (`v1~2`).",
             &[
                 ("rev", "string", false),
                 ("tags", "boolean", false),
@@ -835,6 +853,7 @@ fn tools() -> Vec<Tool> {
                 ("abbrev", "integer", false),
                 ("match", "string", false),
                 ("exact_match", "boolean", false),
+                ("contains", "boolean", false),
             ],
         ),
         tool(
@@ -1677,13 +1696,21 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_config",
-            "Read config: the value of `key` (`all` returns every value of a multi-valued key), or \
-             every key=value when no key is given. `global` or `local` reads only that file.",
+            "Read config: the value of `key` (`all` returns every value of a multi-valued key; \
+             `regexp` treats `key` as a regex and returns `key value` lines), or every key=value \
+             when no key is given. `global`, `local` or `file` reads only that file. \
+             `show_origin` prefixes each with its file; `type` is bool, int, bool-or-int, path, \
+             expiry-date or color; `default` is returned when the key is not set.",
             &[
                 ("key", "string", false),
                 ("all", "boolean", false),
+                ("regexp", "boolean", false),
                 ("global", "boolean", false),
                 ("local", "boolean", false),
+                ("file", "string", false),
+                ("show_origin", "boolean", false),
+                ("type", "string", false),
+                ("default", "string", false),
             ],
         ),
         tool(
@@ -1702,7 +1729,11 @@ fn tools() -> Vec<Tool> {
             "git_apply",
             "Apply patch files (unified diffs) to the working tree; `cached` applies to the index \
              only, `index` to both. `reverse` undoes a patch, `check` only tests that it applies, \
-             `stat` returns its diffstat without applying. Undo with git_undo.",
+             `stat`/`numstat`/`summary` describe it without applying. `three_way` merges with the \
+             preimage when it does not apply (conflicts are left in the index); `reject` applies \
+             the hunks that fit and writes the rest to <file>.rej. `strip` drops leading path \
+             components (default 1), `directory` prepends a folder, `include`/`exclude` filter \
+             paths by glob. Undo with git_undo.",
             &[
                 ("patch", "paths", true),
                 ("cached", "boolean", false),
@@ -1710,6 +1741,14 @@ fn tools() -> Vec<Tool> {
                 ("reverse", "boolean", false),
                 ("check", "boolean", false),
                 ("stat", "boolean", false),
+                ("numstat", "boolean", false),
+                ("summary", "boolean", false),
+                ("three_way", "boolean", false),
+                ("reject", "boolean", false),
+                ("strip", "integer", false),
+                ("directory", "string", false),
+                ("include", "paths", false),
+                ("exclude", "paths", false),
             ],
         ),
         tool(
@@ -1727,6 +1766,7 @@ fn tools() -> Vec<Tool> {
                 ("rev", "string", false),
                 ("force", "boolean", false),
                 ("append", "boolean", false),
+                ("allow_empty", "boolean", false),
                 ("ref", "string", false),
             ],
         ),
@@ -1734,6 +1774,34 @@ fn tools() -> Vec<Tool> {
             "git_note_remove",
             "Remove the note of `rev` (default HEAD).",
             &[("rev", "string", false), ("ref", "string", false)],
+        ),
+        tool(
+            "git_note_copy",
+            "Copy the note of object `from` to `rev` (default HEAD); `force` replaces an existing \
+             note.",
+            &[
+                ("from", "string", true),
+                ("rev", "string", false),
+                ("force", "boolean", false),
+                ("ref", "string", false),
+            ],
+        ),
+        tool(
+            "git_notes_prune",
+            "Remove the notes of objects that no longer exist and return their ids; `dry_run` only \
+             lists them.",
+            &[("dry_run", "boolean", false), ("ref", "string", false)],
+        ),
+        tool(
+            "git_notes_merge",
+            "Merge notes ref `from` (e.g. origin for refs/notes/origin) into the current notes \
+             ref. Conflicting notes fail unless `strategy` is ours, theirs, union or \
+             cat_sort_uniq.",
+            &[
+                ("from", "string", true),
+                ("strategy", "string", false),
+                ("ref", "string", false),
+            ],
         ),
         tool(
             "git_update_ref",
@@ -1748,16 +1816,20 @@ fn tools() -> Vec<Tool> {
                 ("delete", "boolean", false),
                 ("no_deref", "boolean", false),
                 ("message", "string", false),
+                ("create_reflog", "boolean", false),
             ],
         ),
         tool(
             "git_hash_object",
-            "Object ids of files, one per line; `write` stores them in the repository. `type` is \
-             blob (default), tree, commit or tag.",
+            "Object ids of files, one per line, after git's clean filters (autocrlf, text/eol, \
+             filter drivers; `no_filters` skips them); `write` stores them in the repository. \
+             `type` is blob (default), tree, commit or tag, checked unless `literally`.",
             &[
                 ("path", "paths", true),
                 ("write", "boolean", false),
                 ("type", "string", false),
+                ("literally", "boolean", false),
+                ("no_filters", "boolean", false),
             ],
         ),
         tool(
@@ -1765,20 +1837,32 @@ fn tools() -> Vec<Tool> {
             "Write commits as mbox patch files, oldest first, and return their paths. `range` is \
              `<a>..<b>`, or a base revision for the commits after it up to HEAD; `count` takes the \
              newest n (ending at `range` when given). `output_dir` is the folder (default the \
-             current one); `stdout` returns the patches instead of writing files.",
+             current one); `stdout` returns the patches instead of writing files. \
+             `cover_letter` adds a 0000 cover letter; `subject_prefix` replaces PATCH, \
+             `reroll_count` marks version n; `thread` adds Message-ID/In-Reply-To; `to`/`cc` add \
+             headers; `base` records the base commit (`auto`: the upstream's merge base).",
             &[
                 ("range", "string", false),
                 ("count", "integer", false),
                 ("output_dir", "string", false),
                 ("stdout", "boolean", false),
+                ("cover_letter", "boolean", false),
+                ("subject_prefix", "string", false),
+                ("reroll_count", "integer", false),
+                ("thread", "boolean", false),
+                ("to", "paths", false),
+                ("cc", "paths", false),
+                ("base", "string", false),
             ],
         ),
         tool(
             "git_am",
             "Apply mbox patch files (from git_format_patch) as commits. When a patch does not \
              apply, resolve it and call with `continue`, or `skip` it, or `abort` to restore the \
-             branch. `three_way` falls back to a three-way merge; `signoff` adds Signed-off-by. \
-             Undo with git_undo.",
+             branch, or `quit` to stop where it is; `show_current_patch` returns the patch it \
+             stopped at. `three_way` falls back to a three-way merge; `signoff` adds \
+             Signed-off-by; `keep` keeps the subject as is; `committer_date_is_author_date` \
+             copies the author date. Undo with git_undo.",
             &[
                 ("mbox", "paths", false),
                 ("continue", "boolean", false),
@@ -1786,19 +1870,27 @@ fn tools() -> Vec<Tool> {
                 ("abort", "boolean", false),
                 ("three_way", "boolean", false),
                 ("signoff", "boolean", false),
+                ("quit", "boolean", false),
+                ("show_current_patch", "boolean", false),
+                ("keep", "boolean", false),
+                ("committer_date_is_author_date", "boolean", false),
             ],
         ),
         tool(
             "git_archive",
             "Write the files of `rev` (default HEAD) to the archive file `output`: tar, tgz or zip \
              (`format`, else from output's extension). `paths` limits it; `prefix` puts every \
-             entry under a folder (e.g. project/).",
+             entry under a folder (e.g. project/); `add_file` adds untracked files. Paths marked \
+             export-ignore are left out and export-subst files expanded, as in git \
+             (`worktree_attributes` also reads the working tree's .gitattributes).",
             &[
                 ("output", "string", true),
                 ("rev", "string", false),
                 ("paths", "paths", false),
                 ("format", "string", false),
                 ("prefix", "string", false),
+                ("add_file", "paths", false),
+                ("worktree_attributes", "boolean", false),
             ],
         ),
         tool(
@@ -1806,19 +1898,97 @@ fn tools() -> Vec<Tool> {
             "Pack the object database and prune unreachable loose objects (git gc). Destructive: \
              pruned objects are gone for good (rgit's undo history is kept). `prune` is the age \
              cutoff (e.g. now; default 2 weeks ago); `aggressive` repacks thoroughly (slow).",
-            &[("prune", "string", false), ("aggressive", "boolean", false)],
+            &[
+                ("prune", "string", false),
+                ("aggressive", "boolean", false),
+                ("cruft", "boolean", false),
+            ],
         ),
         tool(
             "git_fsck",
             "Check the object database for corruption; returns problems and dangling objects. \
              `full` checks packed objects too, `unreachable` lists unreachable objects, \
-             `no_dangling` hides dangling ones.",
+             `no_dangling` hides dangling ones, `name_objects` says how each object is reached.",
             &[
                 ("full", "boolean", false),
                 ("strict", "boolean", false),
                 ("unreachable", "boolean", false),
                 ("no_dangling", "boolean", false),
+                ("name_objects", "boolean", false),
             ],
+        ),
+        tool(
+            "git_cherry",
+            "Commits of `head` (default HEAD) not in `upstream` (default HEAD's upstream), oldest \
+             first, each marked by whether upstream already has an equivalent change (same patch \
+             id); `limit` leaves out the commits up to it.",
+            &[
+                ("upstream", "string", false),
+                ("head", "string", false),
+                ("limit", "string", false),
+            ],
+        ),
+        tool(
+            "git_bundle",
+            "History as one file (git bundle). `action` create writes `file` from `revs` \
+             (rev-list style: --all, main, v1..main); verify checks it applies here; list_heads \
+             returns its refs; unbundle stores its objects here and returns its refs (refs are \
+             not changed).",
+            &[
+                ("action", "string", true),
+                ("file", "string", true),
+                ("revs", "paths", false),
+            ],
+        ),
+        tool(
+            "git_request_pull",
+            "A pull request summary for mail (git request-pull): what `url` holds beyond `start` \
+             as `end` (a branch or tag pushed there, default HEAD): commit range, shortlog and \
+             diffstat (`patch` adds the diff). Warns when `url` does not have `end`.",
+            &[
+                ("start", "string", true),
+                ("url", "string", true),
+                ("end", "string", false),
+                ("patch", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_range_diff",
+            "Compare two versions of a patch series (git range-diff): `old` and `new` are ranges \
+             (a..b), or revisions on top of `base`. Returns each commit pairing (= same, ! \
+             changed with the patch's diff, < dropped, > added); `no_patch` leaves out the diffs.",
+            &[
+                ("old", "string", true),
+                ("new", "string", true),
+                ("base", "string", false),
+                ("no_patch", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_repack",
+            "Pack the repository's objects (git repack). `all` puts everything in one pack, \
+             `delete` removes what that makes redundant, `cruft` keeps unreachable objects in a \
+             cruft pack, `bitmap` writes a reachability bitmap.",
+            &[
+                ("all", "boolean", false),
+                ("delete", "boolean", false),
+                ("cruft", "boolean", false),
+                ("bitmap", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_pack_refs",
+            "Move loose refs into packed-refs; `all` packs every ref, not only tags and refs \
+             already packed.",
+            &[("all", "boolean", false)],
+        ),
+        tool(
+            "git_maintenance",
+            "Repository upkeep: `action` run (the tasks now, `task` limits them: gc, \
+             commit-graph, prefetch, loose-objects, incremental-repack, pack-refs), start or stop \
+             (the hourly/daily/weekly schedule), register or unregister (this repository in the \
+             global maintenance.repo list).",
+            &[("action", "string", true), ("task", "paths", false)],
         ),
         tool(
             "git_clean",
@@ -2117,6 +2287,9 @@ const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
     ("flow finish", "git_flow_finish", &[]),
     ("notes add", "git_note_add", &["rev"]),
     ("notes remove", "git_note_remove", &["rev"]),
+    ("notes copy", "git_note_copy", &["from", "rev"]),
+    ("notes prune", "git_notes_prune", &[]),
+    ("notes merge", "git_notes_merge", &["from"]),
     ("notes show", "git_notes", &["rev"]),
     ("ls-files", "git_ls_files", &["paths"]),
     ("status", "git_status", &[]),
@@ -2160,6 +2333,13 @@ const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
     ("update-ref", "git_update_ref", &["name", "new", "old"]),
     ("gc", "git_gc", &[]),
     ("fsck", "git_fsck", &[]),
+    ("repack", "git_repack", &[]),
+    ("cherry", "git_cherry", &["upstream", "head", "limit"]),
+    ("bundle", "git_bundle", &["action", "file"]),
+    ("request-pull", "git_request_pull", &["start", "url", "end"]),
+    ("range-diff", "git_range_diff", &["old", "new"]),
+    ("pack-refs", "git_pack_refs", &[]),
+    ("maintenance", "git_maintenance", &["action"]),
 ];
 
 /// CLI flags that take a value, and the tool parameter they set.
@@ -2427,6 +2607,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         name_only: a.flag("name_only"),
         name_status: a.flag("name_status"),
         numstat: a.flag("numstat"),
+        shortstat: a.flag("shortstat"),
     };
     Ok(Some(match a.tool {
         "git_status" => Command::Status {
@@ -2442,13 +2623,21 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             paths: a.strs("paths").unwrap_or_default(),
         },
         "git_log" => Command::Log {
-            limit: a.num("limit")?.map_or(20, |n| n as usize),
+            limit: a.num("limit")?.map(|n| n as usize),
             skip: a.num("skip")?.map_or(0, |n| n as usize),
             all: a.flag("all"),
             author: a.str("author"),
+            committer: a.str("committer"),
+            occurrences: a.str("pickaxe"),
+            changes_matching: a.str("changes_matching"),
             since: a.str("since"),
             until: a.str("until"),
-            oneline: false,
+            pretty: PrettyArgs {
+                format: a.str("format"),
+                date: a.str("date"),
+                graph: a.flag("graph"),
+                ..PrettyArgs::default()
+            },
             grep: a.strs("grep").unwrap_or_default(),
             ignore_case: a.flag("ignore_case"),
             first_parent: a.flag("first_parent"),
@@ -2468,16 +2657,26 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             unified: a.num("unified")?.map(|n| n as u32),
             ignore_all_space: a.flag("ignore_all_space"),
             ignore_space_change: false,
+            reverse: false,
+            diff_filter: a.str("diff_filter"),
+            exit_code: false,
+            quiet: false,
+            no_index: false,
         },
         "git_show" => Command::Show {
             revs: a.strs("rev").unwrap_or_default(),
             paths: a.strs("paths").unwrap_or_default(),
             format: format(),
+            pretty: PrettyArgs {
+                format: a.str("format"),
+                ..PrettyArgs::default()
+            },
             no_patch: a.flag("no_patch"),
         },
         "git_blame" => Command::Blame {
             args: a.str("rev").into_iter().chain([a.req("path")?]).collect(),
             lines: a.str("lines"),
+            format: BlameFormat::default(),
         },
         "git_refs" => Command::Refs,
         "git_branches" => Command::Branch {
@@ -2525,6 +2724,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             always: false,
             pattern: a.str("match"),
             exact_match: a.flag("exact_match"),
+            contains: a.flag("contains"),
         },
         "index_build" => index(IndexCmd::Build {
             root: a.str("root"),
@@ -3166,7 +3366,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         "git_config" | "git_config_set" => {
             let set = a.tool == "git_config_set";
             let unset = set && a.flag("unset");
-            Command::Config {
+            Command::Config(ConfigArgs {
                 key: if set {
                     Some(a.req("key")?)
                 } else {
@@ -3179,39 +3379,75 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                 },
                 global: a.flag("global"),
                 local: a.flag("local"),
-                get: false,
+                file: a.str("file"),
                 get_all: a.flag("all"),
+                get_regexp: !set && a.flag("regexp"),
                 unset,
-                unset_all: false,
                 list: !set && a.str("key").is_none(),
                 add: a.flag("add"),
-                as_bool: false,
-                as_int: false,
-            }
+                show_origin: a.flag("show_origin"),
+                kind: a.str("type"),
+                default: a.str("default"),
+                ..Default::default()
+            })
         }
-        "git_apply" => Command::Apply {
+        "git_apply" => Command::Apply(ApplyArgs {
             patches: a.strs("patch")?,
             cached: a.flag("cached"),
             index: a.flag("index"),
             check: a.flag("check"),
             reverse: a.flag("reverse"),
             stat: a.flag("stat"),
-        },
-        "git_notes" | "git_note_add" | "git_note_remove" => Command::Notes {
+            numstat: a.flag("numstat"),
+            summary: a.flag("summary"),
+            three_way: a.flag("three_way"),
+            reject: a.flag("reject"),
+            strip: a.num("strip")?.map(|n| n as usize),
+            directory: a.str("directory"),
+            include: a.strs("include").unwrap_or_default(),
+            exclude: a.strs("exclude").unwrap_or_default(),
+            ..Default::default()
+        }),
+        "git_notes" | "git_note_add" | "git_note_remove" | "git_note_copy" | "git_notes_prune"
+        | "git_notes_merge" => Command::Notes {
             notes_ref: a.str("ref"),
             cmd: Some(match a.tool {
                 "git_notes" => match a.str("rev") {
                     Some(rev) => NotesCmd::Show { rev: Some(rev) },
                     None => NotesCmd::List { rev: None },
                 },
-                "git_note_remove" => NotesCmd::Remove { rev: a.str("rev") },
+                "git_note_remove" => NotesCmd::Remove {
+                    revs: a.str("rev").into_iter().collect(),
+                    ignore_missing: false,
+                },
+                "git_note_copy" => NotesCmd::Copy {
+                    from: a.req("from")?,
+                    to: a.str("rev"),
+                    force: a.flag("force"),
+                },
+                "git_notes_prune" => NotesCmd::Prune {
+                    dry_run: a.flag("dry_run"),
+                    verbose: true,
+                },
+                "git_notes_merge" => NotesCmd::Merge {
+                    notes_ref: a.req("from")?,
+                    strategy: a.or("strategy", "manual"),
+                },
                 _ if a.flag("append") => NotesCmd::Append {
                     rev: a.str("rev"),
-                    message: vec![a.req("message")?],
+                    text: NoteMessage {
+                        message: vec![a.req("message")?],
+                        allow_empty: a.flag("allow_empty"),
+                        ..Default::default()
+                    },
                 },
                 _ => NotesCmd::Add {
                     rev: a.str("rev"),
-                    message: vec![a.req("message")?],
+                    text: NoteMessage {
+                        message: vec![a.req("message")?],
+                        allow_empty: a.flag("allow_empty"),
+                        ..Default::default()
+                    },
                     force: a.flag("force"),
                 },
             }),
@@ -3219,7 +3455,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         "git_update_ref" => {
             let delete = a.flag("delete");
             Command::UpdateRef {
-                name: a.req("name")?,
+                name: Some(a.req("name")?),
                 new: if delete {
                     a.str("old")
                 } else {
@@ -3229,15 +3465,20 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                 delete,
                 no_deref: a.flag("no_deref"),
                 message: a.str("message"),
+                create_reflog: a.flag("create_reflog"),
+                stdin: false,
+                z: false,
             }
         }
-        "git_hash_object" => Command::HashObject {
+        "git_hash_object" => Command::HashObject(HashObjectArgs {
             paths: a.strs("path")?,
             write: a.flag("write"),
-            stdin: false,
-            kind: a.or("type", "blob"),
-        },
-        "git_format_patch" => Command::FormatPatch {
+            kind: a.str("type"),
+            literally: a.flag("literally"),
+            no_filters: a.flag("no_filters"),
+            ..Default::default()
+        }),
+        "git_format_patch" => Command::FormatPatch(FormatPatchArgs {
             revs: a
                 .num("count")?
                 .map(|n| format!("-{n}"))
@@ -3246,12 +3487,22 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                 .collect(),
             output_dir: a.str("output_dir"),
             stdout: a.flag("stdout"),
-        },
+            cover_letter: a.flag("cover_letter"),
+            subject_prefix: a.str("subject_prefix"),
+            reroll: a.num("reroll_count")?.map(|n| n.to_string()),
+            thread: a.flag("thread").then(|| "shallow".to_owned()),
+            to: a.strs("to").unwrap_or_default(),
+            cc: a.strs("cc").unwrap_or_default(),
+            base: a.str("base"),
+            ..Default::default()
+        }),
         "git_am" => {
             let (abort, cont, skip) = (a.flag("abort"), a.flag("continue"), a.flag("skip"));
-            Command::Am {
+            let quit = a.flag("quit");
+            let show = a.flag("show_current_patch").then(|| "raw".to_owned());
+            Command::Am(AmArgs {
                 // Never read stdin: it carries the MCP protocol.
-                mbox: if abort || cont || skip {
+                mbox: if abort || cont || skip || quit || show.is_some() {
                     Vec::new()
                 } else {
                     a.strs("mbox")?
@@ -3259,21 +3510,119 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                 abort,
                 cont,
                 skip,
+                quit,
+                show_current_patch: show,
                 three_way: a.flag("three_way"),
                 signoff: a.flag("signoff"),
-            }
+                keep: a.flag("keep"),
+                committer_date_is_author_date: a.flag("committer_date_is_author_date"),
+                ..Default::default()
+            })
         }
-        "git_archive" => Command::Archive {
+        "git_archive" => Command::Archive(ArchiveArgs {
             rev: a.str("rev"),
             paths: a.strs("paths").unwrap_or_default(),
             format: a.str("format"),
             output: Some(a.req("output")?),
             prefix: a.str("prefix"),
-        },
+            add_file: a.strs("add_file").unwrap_or_default(),
+            worktree_attributes: a.flag("worktree_attributes"),
+            ..Default::default()
+        }),
         "git_gc" => Command::Gc {
             prune: a.str("prune"),
+            no_prune: false,
             aggressive: a.flag("aggressive"),
             auto: false,
+            force: false,
+            keep_largest_pack: false,
+            cruft: a.flag("cruft"),
+        },
+        "git_cherry" => Command::Cherry {
+            upstream: a.str("upstream"),
+            head: a.str("head"),
+            limit: a.str("limit"),
+            verbose: true,
+        },
+        "git_bundle" => Command::Bundle {
+            cmd: match a.req("action")?.as_str() {
+                "create" => BundleCmd::Create {
+                    file: a.req("file")?,
+                    revs: a.strs("revs")?,
+                    quiet: true,
+                },
+                "verify" => BundleCmd::Verify {
+                    file: a.req("file")?,
+                    quiet: false,
+                },
+                "list_heads" | "list-heads" => BundleCmd::ListHeads {
+                    file: a.req("file")?,
+                    refnames: Vec::new(),
+                },
+                "unbundle" => BundleCmd::Unbundle {
+                    file: a.req("file")?,
+                },
+                other => {
+                    return Err(CliError::usage(format!(
+                        "action must be create, verify, list_heads or unbundle, not {other}"
+                    )));
+                }
+            },
+        },
+        "git_request_pull" => Command::RequestPull {
+            start: a.req("start")?,
+            url: a.req("url")?,
+            end: a.str("end"),
+            patch: a.flag("patch"),
+        },
+        "git_range_diff" => Command::RangeDiff {
+            revs: a
+                .str("base")
+                .into_iter()
+                .chain([a.req("old")?, a.req("new")?])
+                .collect(),
+            creation_factor: 60,
+            no_patch: a.flag("no_patch"),
+            left_only: false,
+            right_only: false,
+            no_dual_color: true,
+        },
+        "git_repack" => Command::Repack {
+            all: a.flag("all"),
+            all_loosen: false,
+            delete: a.flag("delete"),
+            no_reuse_delta: false,
+            no_reuse_object: false,
+            local: false,
+            keep_unreachable: false,
+            write_bitmap_index: a.flag("bitmap"),
+            cruft: a.flag("cruft"),
+            geometric: None,
+            window: None,
+            depth: None,
+        },
+        "git_pack_refs" => Command::PackRefs {
+            all: a.flag("all"),
+            no_prune: false,
+            auto: false,
+        },
+        "git_maintenance" => Command::Maintenance {
+            cmd: match a.req("action")?.as_str() {
+                "run" => MaintenanceCmd::Run {
+                    task: a.strs("task").unwrap_or_default(),
+                    auto: false,
+                    schedule: None,
+                },
+                "start" => MaintenanceCmd::Start,
+                "stop" => MaintenanceCmd::Stop,
+                "register" => MaintenanceCmd::Register,
+                "unregister" => MaintenanceCmd::Unregister { force: false },
+                other => {
+                    return Err(CliError::usage(format!(
+                        "action must be run, start, stop, register or unregister, not {other}"
+                    )));
+                }
+            },
         },
         "git_fsck" => Command::Fsck {
             full: a.flag("full"),
@@ -3281,6 +3630,13 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             unreachable: a.flag("unreachable"),
             no_dangling: a.flag("no_dangling"),
             connectivity_only: false,
+            lost_found: false,
+            name_objects: a.flag("name_objects"),
+            root: false,
+            tags: false,
+            cache: false,
+            no_reflogs: false,
+            objects: Vec::new(),
         },
         "git_clean" => Command::Clean {
             dry_run: a.flag("dry_run"),

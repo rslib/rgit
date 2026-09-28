@@ -124,6 +124,18 @@ pub struct CommitOptions {
     pub paths: Vec<String>,
 }
 
+/// One ref change of an `update-ref` transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefUpdate {
+    pub name: String,
+    /// The new value; `None` (or all zeros) deletes the ref, unless `verify`.
+    pub new: Option<String>,
+    /// The value the ref must hold first; all zeros: it must not exist.
+    pub old: Option<String>,
+    /// Only check `old`, change nothing.
+    pub verify: bool,
+}
+
 /// Options for a cherry-pick or revert of one or more commits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PickOptions {
@@ -215,15 +227,6 @@ pub struct RebaseOptions {
     pub branch: Option<String>,
     /// Further git rebase flags the CLI has checked (`--keep-empty`, `-f`, ...).
     pub flags: Vec<String>,
-}
-
-/// Which config file a `config` command reads or writes. `Any` reads the
-/// merged config and writes the repository's own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigScope {
-    Any,
-    Local,
-    Global,
 }
 
 impl RepoStatus {
@@ -452,9 +455,9 @@ pub struct LogOptions {
     /// Start the walk from these revisions instead of HEAD: a branch/tag/sha,
     /// `^rev` to exclude, or a range `A..B` / `A...B`.
     pub revs: Vec<String>,
-    /// Keep only commits at or after this author time (unix seconds).
+    /// Keep only commits at or after this committer time (unix seconds).
     pub since: Option<i64>,
-    /// Keep only commits at or before this author time (unix seconds).
+    /// Keep only commits at or before this committer time (unix seconds).
     pub until: Option<i64>,
     /// Keep only commits that touched one of these pathspecs.
     pub paths: Vec<String>,
@@ -470,6 +473,15 @@ pub struct LogOptions {
     pub reverse: bool,
     /// Follow the single path in `paths` across renames.
     pub follow: bool,
+    /// With `paths`, name each commit's parents as its nearest shown
+    /// ancestors, as git does for `--graph`.
+    pub rewrite_parents: bool,
+    /// Keep only commits whose committer name/email contains this (case-insensitive).
+    pub committer: Option<String>,
+    /// Keep only commits that change how often this string occurs (git's -S).
+    pub occurrences: Option<String>,
+    /// Keep only commits adding or removing a line that matches this regex (git's -G).
+    pub changes_matching: Option<String>,
 }
 
 /// Which two sides [`crate::GitBackend::diff`] compares, and how.
@@ -490,6 +502,8 @@ pub struct DiffSpec {
     pub ignore_all_space: bool,
     /// Ignore changes in amount of whitespace (git's -b).
     pub ignore_space_change: bool,
+    /// Swap the two sides (git's -R).
+    pub reverse: bool,
 }
 
 impl Default for LogOptions {
@@ -509,6 +523,10 @@ impl Default for LogOptions {
             merges: None,
             reverse: false,
             follow: false,
+            rewrite_parents: false,
+            committer: None,
+            occurrences: None,
+            changes_matching: None,
         }
     }
 }
@@ -836,6 +854,14 @@ pub struct BlameLine {
     pub short_id: String,
     pub author: String,
     pub line: String,
+    /// The full commit id; empty for a line not committed yet.
+    pub id: String,
+    pub email: String,
+    /// The line's number, and the file's path, in that commit.
+    pub orig_line: usize,
+    pub orig_path: String,
+    /// The commit is where blame stopped: a root commit, as git marks with `^`.
+    pub boundary: bool,
 }
 
 /// A commit's metadata and its diff against its first parent.

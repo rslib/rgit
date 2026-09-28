@@ -85,6 +85,9 @@ mod tests {
                 old_path: None,
                 status: StatusCode::Modified,
                 binary: false,
+                header: String::new(),
+                similarity: 0,
+                sizes: (0, 0),
                 hunks: vec![Hunk {
                     header: "@@ -1,2 +1,2 @@".into(),
                     new_start: 1,
@@ -139,6 +142,9 @@ mod tests {
                 old_path: None,
                 status: StatusCode::Modified,
                 binary: false,
+                header: String::new(),
+                similarity: 0,
+                sizes: (0, 0),
                 hunks: vec![Hunk {
                     header: "@@ -0,0 +1,2 @@".into(),
                     new_start: 1,

@@ -17,9 +17,13 @@ pub fn set_color(on: bool) {
     COLOR.store(on, Ordering::Relaxed);
 }
 
+pub fn color_on() -> bool {
+    COLOR.load(Ordering::Relaxed)
+}
+
 /// Wrap `s` in an SGR code when color is on, otherwise return it unchanged.
 fn paint(s: &str, code: &str) -> String {
-    if COLOR.load(Ordering::Relaxed) {
+    if !s.is_empty() && COLOR.load(Ordering::Relaxed) {
         format!("\x1b[{code}m{s}\x1b[0m")
     } else {
         s.to_owned()
@@ -441,20 +445,20 @@ pub fn commit_details(c: &CommitDetails) -> String {
     out
 }
 
-/// Blame as `sha author line` per line.
-pub fn blame(lines: &[BlameLine]) -> String {
+/// Blame as `sha author line` per line, or `sha line` without `author`.
+pub fn blame(lines: &[BlameLine], author: bool) -> String {
     if lines.is_empty() {
         return "no lines".to_owned();
     }
     lines
         .iter()
         .map(|b| {
-            format!(
-                "{} {} {}",
-                paint(&b.short_id, YELLOW),
-                paint(&b.author, DIM),
-                b.line
-            )
+            let sha = paint(&b.short_id, YELLOW);
+            if author {
+                format!("{sha} {} {}", paint(&b.author, DIM), b.line)
+            } else {
+                format!("{sha} {}", b.line)
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -466,7 +470,14 @@ pub fn patch(files: &[FileDiff]) -> String {
     use rgit_git::LineOrigin;
     let mut out = String::new();
     for f in files {
-        out.push_str(&paint(&format!("--- a/{p}\n+++ b/{p}\n", p = f.path), BOLD));
+        if f.header.is_empty() {
+            out.push_str(&paint(&format!("--- a/{p}\n+++ b/{p}\n", p = f.path), BOLD));
+        } else {
+            for line in f.header.lines() {
+                out.push_str(&paint(line, BOLD));
+                out.push('\n');
+            }
+        }
         for h in &f.hunks {
             out.push_str(&paint(&h.header, CYAN));
             out.push('\n');
@@ -477,7 +488,7 @@ pub fn patch(files: &[FileDiff]) -> String {
                     LineOrigin::Context => (" ", ""),
                     LineOrigin::Meta => ("", DIM),
                 };
-                let line = format!("{prefix}{}", l.text.trim_end_matches('\n'));
+                let line = format!("{prefix}{}", l.text.trim_matches('\n'));
                 out.push_str(&if color.is_empty() {
                     line
                 } else {
@@ -487,5 +498,197 @@ pub fn patch(files: &[FileDiff]) -> String {
             }
         }
     }
+    out
+}
+
+/// `old => new` as git's diffstat prints a rename, with the shared leading and
+/// trailing folders outside braces: `dir/{a => b}/f`.
+pub fn rename_name(a: &str, b: &str) -> String {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let mut pfx = 0;
+    for (i, (x, y)) in ab.iter().zip(bb).enumerate() {
+        if x != y {
+            break;
+        }
+        if *x == b'/' {
+            pfx = i + 1;
+        }
+    }
+    let mut sfx = 0;
+    let (mut i, mut j) = (ab.len() as isize, bb.len() as isize);
+    let low = pfx as isize - isize::from(pfx > 0);
+    // As in git, the walk starts one past the end, where both "match".
+    while i >= low && j >= low {
+        let x = ab.get(i as usize);
+        if x != bb.get(j as usize) {
+            break;
+        }
+        if x == Some(&b'/') {
+            sfx = ab.len() - i as usize;
+        }
+        i -= 1;
+        j -= 1;
+    }
+    let amid = &a[pfx..(ab.len().saturating_sub(sfx)).max(pfx)];
+    let bmid = &b[pfx..(bb.len().saturating_sub(sfx)).max(pfx)];
+    if pfx + sfx > 0 {
+        format!("{}{{{amid} => {bmid}}}{}", &a[..pfx], &a[ab.len() - sfx..])
+    } else {
+        format!("{amid} => {bmid}")
+    }
+}
+
+/// git's ` N files changed, X insertions(+), Y deletions(-)` line.
+pub fn stat_summary(files: &[FileDiff]) -> String {
+    let (mut add, mut del) = (0, 0);
+    for f in files {
+        let (a, d) = crate::axi::line_counts(f);
+        add += a;
+        del += d;
+    }
+    let s = |n: usize| if n == 1 { "" } else { "s" };
+    let mut out = format!(" {} file{} changed", files.len(), s(files.len()));
+    if files.is_empty() {
+        return out;
+    }
+    if add > 0 || del == 0 {
+        out.push_str(&format!(", {add} insertion{}(+)", s(add)));
+    }
+    if del > 0 || add == 0 {
+        out.push_str(&format!(", {del} deletion{}(-)", s(del)));
+    }
+    out
+}
+
+/// git's `--stat`: ` name | count +++--` per file, scaled to the terminal
+/// width (80 when piped), then the summary line.
+pub fn stat(files: &[FileDiff], indent: usize) -> String {
+    use std::io::IsTerminal;
+    let width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.parse::<usize>().ok())
+        .or_else(|| {
+            std::io::stdout()
+                .is_terminal()
+                .then(|| crossterm::terminal::size().ok())
+                .flatten()
+                .map(|(w, _)| usize::from(w))
+        })
+        .unwrap_or(80)
+        .saturating_sub(indent);
+    let rows: Vec<(String, usize, usize, bool)> = files
+        .iter()
+        .map(|f| {
+            let name = match &f.old_path {
+                Some(old) => rename_name(old, &f.path),
+                None => f.path.clone(),
+            };
+            // A binary file counts bytes, new then old, as git's does.
+            let (a, d) = if f.binary {
+                (f.sizes.1 as usize, f.sizes.0 as usize)
+            } else {
+                crate::axi::line_counts(f)
+            };
+            (name, a, d, f.binary)
+        })
+        .collect();
+    let max_change = rows
+        .iter()
+        .filter(|r| !r.3)
+        .map(|r| r.1 + r.2)
+        .max()
+        .unwrap_or(0);
+    let bin_width = rows
+        .iter()
+        .filter(|r| r.3)
+        .map(|r| 14 + r.1.to_string().len() + r.2.to_string().len())
+        .max()
+        .unwrap_or(0);
+    let max_len = rows.iter().map(|r| r.0.chars().count()).max().unwrap_or(0);
+    let mut number_width = max_change.to_string().len();
+    if bin_width > 0 {
+        number_width = number_width.max(3);
+    }
+    let width = width.max(16 + 6 + number_width);
+    let mut graph_width = if max_change + 4 > bin_width {
+        max_change
+    } else {
+        bin_width - 4
+    };
+    let mut name_width = max_len;
+    if name_width + number_width + 6 + graph_width > width {
+        let cap = (width * 3 / 8).saturating_sub(number_width + 6);
+        if graph_width > cap {
+            graph_width = cap.max(6);
+        }
+        if name_width > width.saturating_sub(number_width + 6 + graph_width) {
+            name_width = width.saturating_sub(number_width + 6 + graph_width);
+        } else {
+            graph_width = width - number_width - 6 - name_width;
+        }
+    }
+    let scale = |n: usize| {
+        if n == 0 {
+            0
+        } else {
+            1 + n * (graph_width - 1) / max_change
+        }
+    };
+    let mut out = String::new();
+    for (name, a, d, binary) in &rows {
+        let (mut name, mut prefix, mut len) = (name.as_str(), "", name_width);
+        let chars = name.chars().count();
+        if chars > name_width {
+            prefix = "...";
+            len = len.saturating_sub(3);
+            let skip = name
+                .char_indices()
+                .nth(chars - len)
+                .map_or(name.len(), |(i, _)| i);
+            name = &name[skip..];
+            if let Some(i) = name.find('/') {
+                name = &name[i..];
+            }
+        }
+        let pad = len.saturating_sub(name.chars().count());
+        if *binary {
+            out.push_str(&format!(
+                " {prefix}{name}{:pad$} | {:>number_width$}",
+                "", "Bin"
+            ));
+            if a + d > 0 {
+                out.push_str(&format!(
+                    " {} -> {} bytes",
+                    paint(&d.to_string(), RED),
+                    paint(&a.to_string(), GREEN)
+                ));
+            }
+            out.push('\n');
+            continue;
+        }
+        let (mut add, mut del) = (*a, *d);
+        if graph_width <= max_change {
+            let mut total = scale(a + d);
+            if total < 2 && *a > 0 && *d > 0 {
+                total = 2;
+            }
+            if a < d {
+                add = scale(*a);
+                del = total - add;
+            } else {
+                del = scale(*d);
+                add = total - del;
+            }
+        }
+        out.push_str(&format!(
+            " {prefix}{name}{:pad$} | {:>number_width$}{}{}{}\n",
+            "",
+            a + d,
+            if a + d > 0 { " " } else { "" },
+            paint(&"+".repeat(add), GREEN),
+            paint(&"-".repeat(del), RED),
+        ));
+    }
+    out.push_str(&stat_summary(files));
     out
 }

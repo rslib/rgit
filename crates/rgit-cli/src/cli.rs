@@ -97,11 +97,89 @@ pub struct DiffFormat {
     /// Added and removed line counts per file, tab-separated.
     #[arg(long)]
     pub numstat: bool,
+    /// Only the diffstat's last line: files changed, insertions, deletions.
+    #[arg(long)]
+    pub shortstat: bool,
 }
 
 impl DiffFormat {
     pub(crate) fn any(self) -> bool {
-        self.patch || self.stat || self.name_only || self.name_status || self.numstat
+        self.patch
+            || self.stat
+            || self.name_only
+            || self.name_status
+            || self.numstat
+            || self.shortstat
+    }
+}
+
+/// How `blame` prints each line.
+#[derive(clap::Args, Clone, Copy, Default)]
+pub struct BlameFormat {
+    /// git's machine-readable format, each commit's details given once.
+    #[arg(short = 'p', long, conflicts_with = "line_porcelain")]
+    pub porcelain: bool,
+    /// git's machine-readable format with the details on every line.
+    #[arg(long)]
+    pub line_porcelain: bool,
+    /// The author's email instead of the name (git's -e).
+    #[arg(short = 'e', long)]
+    pub show_email: bool,
+    /// Leave out the author (git's -s).
+    #[arg(short = 's')]
+    pub no_author: bool,
+    /// Full commit ids (git's -l).
+    #[arg(short = 'l')]
+    pub long_ids: bool,
+}
+
+/// git's commit formats for `log` and `show`, printed byte for byte as git does.
+#[derive(clap::Args, Clone, Default)]
+pub struct PrettyArgs {
+    /// Print commits in git's format: oneline, short, medium, full, fuller,
+    /// raw, reference, or `format:<string>` / `tformat:<string>` with
+    /// placeholders such as %H %h %s %b %an %ae %ad %ar %d %n.
+    #[arg(long, value_name = "FORMAT")]
+    pub format: Option<String>,
+    /// The same as --format; a bare `--pretty` is medium.
+    #[arg(
+        long,
+        value_name = "FORMAT",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "medium"
+    )]
+    pub pretty: Option<String>,
+    /// git's `<short sha> <subject>` lines.
+    #[arg(long)]
+    pub oneline: bool,
+    /// Dates in the formats: default, relative, local, iso, iso-strict, rfc,
+    /// short, raw, unix or format:<strftime> (`-local` for local time).
+    #[arg(long, value_name = "STYLE")]
+    pub date: Option<String>,
+    /// Draw the commit graph in ASCII, as git does.
+    #[arg(long)]
+    pub graph: bool,
+    /// Name the refs at each commit (default: only on a terminal).
+    #[arg(
+        long,
+        value_name = "STYLE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "short"
+    )]
+    pub decorate: Option<String>,
+    /// Never name refs at commits.
+    #[arg(long)]
+    pub no_decorate: bool,
+    /// Abbreviate the commit ids in the format's header.
+    #[arg(long)]
+    pub abbrev_commit: bool,
+}
+
+impl PrettyArgs {
+    pub(crate) fn any(&self) -> bool {
+        self.format.is_some() || self.pretty.is_some() || self.oneline || self.graph
     }
 }
 
@@ -155,17 +233,19 @@ pub enum Command {
         /// Limit to these paths: files, folders or globs.
         paths: Vec<String>,
     },
-    /// Recent commits as `sha subject` lines.
+    /// Recent commits as `sha subject` lines, or in git's formats with
+    /// `--oneline`, `--format`, `--pretty` or `--graph`.
+    #[command(visible_alias = "whatchanged")]
     Log {
-        /// Maximum number of commits to show (git's -n).
+        /// Maximum number of commits to show (git's -n or -<n>; default 20, or
+        /// all in a git format).
         #[arg(
             short = 'n',
             short_alias = 'l',
             long = "max-count",
-            visible_alias = "limit",
-            default_value_t = 20
+            visible_alias = "limit"
         )]
-        limit: usize,
+        limit: Option<usize>,
         /// Skip this many commits before showing any.
         #[arg(long, value_name = "N", default_value_t = 0)]
         skip: usize,
@@ -175,15 +255,21 @@ pub enum Command {
         /// Keep only commits whose author name/email contains this.
         #[arg(long)]
         author: Option<String>,
+        /// Keep only commits whose committer name/email contains this.
+        #[arg(long)]
+        committer: Option<String>,
+        /// Keep only commits that change how often this string occurs (git's -S).
+        #[arg(short = 'S', value_name = "STRING")]
+        occurrences: Option<String>,
+        /// Keep only commits that add or remove a line matching this regex (git's -G).
+        #[arg(short = 'G', value_name = "REGEX")]
+        changes_matching: Option<String>,
         /// Only commits at or after this date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS).
         #[arg(long, visible_alias = "after")]
         since: Option<String>,
         /// Only commits at or before this date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS).
         #[arg(long, visible_alias = "before")]
         until: Option<String>,
-        /// Accepted for git compatibility (rgit's log is already one line each).
-        #[arg(long)]
-        oneline: bool,
         /// Keep only commits whose message matches this regex (repeat for any of several).
         #[arg(long, value_name = "REGEX")]
         grep: Vec<String>,
@@ -207,6 +293,8 @@ pub enum Command {
         follow: bool,
         #[command(flatten)]
         format: DiffFormat,
+        #[command(flatten)]
+        pretty: PrettyArgs,
         /// Revisions to walk (`main`, `^main`, `A..B`, `A...B`; default HEAD),
         /// then paths: `rgit log <rev>...` or `rgit log <rev> -- <path>...`.
         #[arg(value_name = "REV_OR_PATH")]
@@ -240,6 +328,22 @@ pub enum Command {
         /// Ignore changes in the amount of whitespace.
         #[arg(short = 'b', long = "ignore-space-change")]
         ignore_space_change: bool,
+        /// Exit 1 when there are differences, 0 when there are none.
+        #[arg(long)]
+        exit_code: bool,
+        /// Print nothing; only exit 1 when there are differences.
+        #[arg(long)]
+        quiet: bool,
+        /// Compare two files on disk (`--no-index <a> <b>`); exits 1 when they differ.
+        #[arg(long)]
+        no_index: bool,
+        /// Swap the two sides (git's -R).
+        #[arg(short = 'R')]
+        reverse: bool,
+        /// Only files whose status letter is in this set (`AM`); lowercase
+        /// letters leave those out (`d`), as git's --diff-filter.
+        #[arg(long, value_name = "ACDMRT")]
+        diff_filter: Option<String>,
     },
     /// A commit's header and diffstat, or a file (`rev:path`) or folder at a revision.
     Show {
@@ -252,11 +356,14 @@ pub enum Command {
         paths: Vec<String>,
         #[command(flatten)]
         format: DiffFormat,
+        #[command(flatten)]
+        pretty: PrettyArgs,
         /// Only the header, no changed files (git's -s).
         #[arg(short = 's', long = "no-patch")]
         no_patch: bool,
     },
     /// Blame a file: `sha author line` per line.
+    #[command(visible_alias = "annotate")]
     Blame {
         /// `[REV] PATH`: the file to annotate, as it is in the working tree or
         /// at REV (`rgit blame <rev> -- <path>` also works).
@@ -265,6 +372,8 @@ pub enum Command {
         /// Limit to a 1-based line range `START,END` or `START,+COUNT` (git's -L).
         #[arg(short = 'L', value_name = "START,END")]
         lines: Option<String>,
+        #[command(flatten)]
+        format: BlameFormat,
     },
     #[command(flatten)]
     Plumbing(Plumbing),
@@ -1168,62 +1277,9 @@ pub enum Command {
     Absorb,
     /// Get, set, unset or list config values: `config <key>` reads,
     /// `config <key> <value>` writes.
-    Config {
-        /// The key (`section.name`).
-        key: Option<String>,
-        /// The value to set.
-        value: Option<String>,
-        /// Use the user's global config (~/.gitconfig or $GIT_CONFIG_GLOBAL).
-        #[arg(long)]
-        global: bool,
-        /// Use only the repository's config.
-        #[arg(long, conflicts_with = "global")]
-        local: bool,
-        /// Print the key's value (the default with just a key).
-        #[arg(long)]
-        get: bool,
-        /// Print every value of a multi-valued key.
-        #[arg(long)]
-        get_all: bool,
-        /// Remove the key.
-        #[arg(long)]
-        unset: bool,
-        /// Remove every value of a multi-valued key.
-        #[arg(long)]
-        unset_all: bool,
-        /// List every `key=value`.
-        #[arg(short = 'l', long)]
-        list: bool,
-        /// Add a value to a multi-valued key instead of replacing it.
-        #[arg(long)]
-        add: bool,
-        /// Read and write the value as a boolean (true/false).
-        #[arg(long = "bool")]
-        as_bool: bool,
-        /// Read and write the value as an integer (k/m/g suffixes allowed).
-        #[arg(long = "int", conflicts_with = "as_bool")]
-        as_int: bool,
-    },
+    Config(ConfigArgs),
     /// Apply a patch to the working tree, the index, or both.
-    Apply {
-        /// Patch files (reads stdin when none or `-`).
-        patches: Vec<String>,
-        /// Apply to the index only, leaving the working tree as it is.
-        #[arg(long)]
-        cached: bool,
-        /// Apply to both the index and the working tree.
-        #[arg(long, conflicts_with = "cached")]
-        index: bool,
-        /// Only check that the patch applies.
-        #[arg(long)]
-        check: bool,
-        /// Undo the patch (apply it in reverse).
-        #[arg(short = 'R', long)]
-        reverse: bool,
-        /// Print the patch's diffstat instead of applying it.
-        #[arg(long)]
-        stat: bool,
-    },
+    Apply(ApplyArgs),
     /// Notes attached to commits (no subcommand lists them).
     Notes {
         /// The notes ref (default refs/notes/commits).
@@ -1236,7 +1292,8 @@ pub enum Command {
     /// expected value.
     UpdateRef {
         /// The ref (e.g. refs/heads/main).
-        name: String,
+        #[arg(required_unless_present = "stdin")]
+        name: Option<String>,
         /// The new value (with -d: the expected old value).
         new: Option<String>,
         /// Only update if the ref holds this value (all zeros: does not exist).
@@ -1250,82 +1307,50 @@ pub enum Command {
         /// The reflog message.
         #[arg(short = 'm', value_name = "REASON")]
         message: Option<String>,
+        /// Write a reflog even for refs outside refs/heads, remotes and notes.
+        #[arg(long)]
+        create_reflog: bool,
+        /// Read `update`, `create`, `delete`, `verify` and
+        /// `start`/`prepare`/`commit`/`abort` lines from stdin, applied all or
+        /// nothing.
+        #[arg(long, conflicts_with_all = ["name", "delete"])]
+        stdin: bool,
+        /// With --stdin, NUL-separated fields and commands.
+        #[arg(short = 'z', requires = "stdin")]
+        z: bool,
     },
     /// Print the object id of files or stdin; -w stores them.
-    HashObject {
-        /// Files to hash.
-        paths: Vec<String>,
-        /// Store the objects in the repository.
-        #[arg(short = 'w')]
-        write: bool,
-        /// Hash stdin (before any files).
-        #[arg(long)]
-        stdin: bool,
-        /// The object type.
-        #[arg(short = 't', default_value = "blob", value_name = "TYPE")]
-        kind: String,
-    },
+    HashObject(HashObjectArgs),
     /// Write commits as mbox patch files (`-<n>`, `<since>` or `<a>..<b>`).
-    FormatPatch {
-        /// `-<n>` for the newest n commits, `<rev>` for the commits after it
-        /// up to HEAD, or a range `<a>..<b>`.
-        #[arg(allow_negative_numbers = true)]
-        revs: Vec<String>,
-        /// Write the files to this folder.
-        #[arg(short = 'o', long = "output-directory", value_name = "DIR")]
-        output_dir: Option<String>,
-        /// Print the patches instead of writing files.
-        #[arg(long)]
-        stdout: bool,
-    },
+    FormatPatch(FormatPatchArgs),
     /// Apply mbox patches (from format-patch) as commits.
-    Am {
-        /// mbox files (reads stdin when none).
-        mbox: Vec<String>,
-        /// Give up and restore the branch as it was.
-        #[arg(long, conflicts_with_all = ["cont", "skip"])]
-        abort: bool,
-        /// Commit the resolved patch and go on.
-        #[arg(long = "continue", conflicts_with = "skip")]
-        cont: bool,
-        /// Skip the current patch.
-        #[arg(long)]
-        skip: bool,
-        /// Fall back to a three-way merge.
-        #[arg(short = '3', long)]
-        three_way: bool,
-        /// Add a Signed-off-by trailer.
-        #[arg(short = 's', long)]
-        signoff: bool,
-    },
+    Am(AmArgs),
     /// Write a tar or zip of a revision's files.
-    Archive {
-        /// The revision (default HEAD).
-        rev: Option<String>,
-        /// Limit to these paths.
-        paths: Vec<String>,
-        /// tar, tgz (tar.gz) or zip (default: from -o's extension, else tar).
-        #[arg(long, value_parser = ["tar", "tgz", "tar.gz", "zip"])]
-        format: Option<String>,
-        /// Write to this file instead of stdout.
-        #[arg(short = 'o', long)]
-        output: Option<String>,
-        /// Put every entry under this folder (e.g. `project/`).
-        #[arg(long)]
-        prefix: Option<String>,
-    },
+    Archive(ArchiveArgs),
     /// Pack the object database and prune unreachable objects.
     Gc {
         /// Prune loose objects older than this date (default 2 weeks ago).
         #[arg(long, value_name = "DATE", num_args = 0..=1, require_equals = true,
               default_missing_value = "")]
         prune: Option<String>,
+        /// Keep every loose object.
+        #[arg(long, conflicts_with = "prune")]
+        no_prune: bool,
         /// Repack more thoroughly (slow).
         #[arg(long)]
         aggressive: bool,
         /// Only run when enough loose objects have piled up.
         #[arg(long)]
         auto: bool,
+        /// Run even if another gc may be running.
+        #[arg(long)]
+        force: bool,
+        /// Leave the largest pack as it is.
+        #[arg(long)]
+        keep_largest_pack: bool,
+        /// Put unreachable objects in a cruft pack instead of loose files.
+        #[arg(long)]
+        cruft: bool,
     },
     /// Check the object database for corruption and dangling objects.
     Fsck {
@@ -1344,7 +1369,145 @@ pub enum Command {
         /// Check only that objects are connected.
         #[arg(long)]
         connectivity_only: bool,
+        /// Write dangling objects to .git/lost-found/{commit,other}.
+        #[arg(long)]
+        lost_found: bool,
+        /// Name each object by how it is reached (e.g. `HEAD~2^{tree}`).
+        #[arg(long)]
+        name_objects: bool,
+        /// Report root commits.
+        #[arg(long)]
+        root: bool,
+        /// Report tags.
+        #[arg(long)]
+        tags: bool,
+        /// Also check the index.
+        #[arg(long)]
+        cache: bool,
+        /// Do not treat reflog entries as reachable.
+        #[arg(long)]
+        no_reflogs: bool,
+        /// Only these objects (default: the refs, index and reflogs).
+        objects: Vec<String>,
     },
+    /// Pack the repository's objects (`git repack`).
+    Repack {
+        /// Put everything in one pack.
+        #[arg(short = 'a')]
+        all: bool,
+        /// Like -a, but loosen unreachable objects instead of dropping them.
+        #[arg(short = 'A', conflicts_with = "all")]
+        all_loosen: bool,
+        /// Delete the packs and loose objects made redundant.
+        #[arg(short = 'd')]
+        delete: bool,
+        /// Recompute deltas (git's -f).
+        #[arg(short = 'f')]
+        no_reuse_delta: bool,
+        /// Recompress every object (git's -F).
+        #[arg(short = 'F')]
+        no_reuse_object: bool,
+        /// Only local objects, not those of alternates.
+        #[arg(short = 'l', long)]
+        local: bool,
+        /// Keep unreachable objects in the pack.
+        #[arg(short = 'k', long)]
+        keep_unreachable: bool,
+        /// Write a reachability bitmap.
+        #[arg(short = 'b', long)]
+        write_bitmap_index: bool,
+        /// Put unreachable objects in a cruft pack.
+        #[arg(long)]
+        cruft: bool,
+        /// Keep a geometric progression of pack sizes with this factor.
+        #[arg(short = 'g', long, value_name = "FACTOR")]
+        geometric: Option<u32>,
+        /// Delta window size.
+        #[arg(long, value_name = "N")]
+        window: Option<u32>,
+        /// Maximum delta depth.
+        #[arg(long, value_name = "N")]
+        depth: Option<u32>,
+    },
+    /// Move loose refs into packed-refs (`git pack-refs`).
+    PackRefs {
+        /// Pack every ref, not only tags and refs already packed.
+        #[arg(long)]
+        all: bool,
+        /// Keep the loose ref files.
+        #[arg(long)]
+        no_prune: bool,
+        /// Only when enough loose refs have piled up.
+        #[arg(long)]
+        auto: bool,
+    },
+    /// Background upkeep (`git maintenance`): run tasks now, schedule them,
+    /// or (un)register this repository.
+    Maintenance {
+        #[command(subcommand)]
+        cmd: MaintenanceCmd,
+    },
+    /// Commits not yet upstream (`git cherry`): `+ <id>` for each, `- <id>`
+    /// when upstream already has an equivalent change.
+    Cherry {
+        /// The branch to compare with (default: the upstream of HEAD).
+        upstream: Option<String>,
+        /// The commits to look at (default HEAD).
+        head: Option<String>,
+        /// Leave out the commits up to this one.
+        limit: Option<String>,
+        /// Add each commit's subject.
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Move history as one file (`git bundle`): create, verify, list-heads,
+    /// unbundle.
+    Bundle {
+        #[command(subcommand)]
+        cmd: BundleCmd,
+    },
+    /// Summarize changes for a pull request by mail (`git request-pull`):
+    /// what `url` holds beyond `start`.
+    RequestPull {
+        /// Where the changes start (e.g. origin/main).
+        start: String,
+        /// The repository to pull from.
+        url: String,
+        /// What to pull: a branch or tag pushed to `url` (default HEAD);
+        /// `local:remote` when the names differ.
+        end: Option<String>,
+        /// Add the patch after the diffstat.
+        #[arg(short = 'p')]
+        patch: bool,
+    },
+    /// Compare two versions of a series (`git range-diff`): `<base> <old>
+    /// <new>`, `<old-range> <new-range>` or `<old>...<new>`.
+    RangeDiff {
+        /// The ranges or revisions.
+        #[arg(required = true, num_args = 1..=3)]
+        revs: Vec<String>,
+        /// Percent of a patch that may change for it still to pair (default 60).
+        #[arg(long, value_name = "N", default_value_t = 60)]
+        creation_factor: usize,
+        /// Only list the pairs, without their diffs.
+        #[arg(short = 's', long)]
+        no_patch: bool,
+        /// Only the commits of the first range (and pairs).
+        #[arg(long, conflicts_with = "right_only")]
+        left_only: bool,
+        /// Only the commits of the second range (and pairs).
+        #[arg(long)]
+        right_only: bool,
+        /// Accepted for git compatibility (rgit prints no color here).
+        #[arg(long, hide = true)]
+        no_dual_color: bool,
+    },
+    /// Show changes in the configured diff tool (`git difftool`): diff.tool,
+    /// difftool.<tool>.cmd or a known tool (vimdiff, meld, code, ...).
+    Difftool(ToolArgs),
+    /// Resolve conflicts in the configured merge tool (`git mergetool`):
+    /// merge.tool, mergetool.<tool>.cmd or a known tool.
+    Mergetool(ToolArgs),
     /// Remove untracked files and directories.
     Clean {
         /// List what would be removed without deleting (git's -n).
@@ -1438,6 +1601,10 @@ pub enum Command {
         /// Print the tag only when it points at the revision itself; else fail.
         #[arg(long)]
         exact_match: bool,
+        /// Name the revision after the oldest tag that contains it, as
+        /// `v1~2` or `v1~1^2` (git's --contains).
+        #[arg(long)]
+        contains: bool,
     },
     /// Create a new repository in the current directory (or PATH).
     Init {
@@ -2832,6 +2999,505 @@ impl RebaseFlags {
     }
 }
 
+/// `rgit config`'s arguments, as git's.
+#[derive(clap::Args, Default)]
+pub struct ConfigArgs {
+    /// The key (`section.name`); the section for --rename-section and
+    /// --remove-section, a regex for --get-regexp.
+    pub key: Option<String>,
+    /// The value to set; a value pattern with --get, --get-all, --get-regexp
+    /// and --unset; the new name for --rename-section.
+    pub value: Option<String>,
+    /// Only values matching this regex (`!` negates) are replaced.
+    pub value_pattern: Option<String>,
+    /// Use the user's global config (~/.gitconfig or $GIT_CONFIG_GLOBAL).
+    #[arg(long)]
+    pub global: bool,
+    /// Use the system config (/etc/gitconfig or $GIT_CONFIG_SYSTEM).
+    #[arg(long)]
+    pub system: bool,
+    /// Use only the repository's config.
+    #[arg(long)]
+    pub local: bool,
+    /// Use the worktree's config (config.worktree when enabled).
+    #[arg(long)]
+    pub worktree: bool,
+    /// Use this config file.
+    #[arg(short = 'f', long = "file", value_name = "FILE")]
+    pub file: Option<String>,
+    /// Print the key's value (the default with just a key).
+    #[arg(long)]
+    pub get: bool,
+    /// Print every value of a multi-valued key.
+    #[arg(long)]
+    pub get_all: bool,
+    /// Print every `key value` whose key matches the regex.
+    #[arg(long)]
+    pub get_regexp: bool,
+    /// Replace every value of a multi-valued key with one.
+    #[arg(long)]
+    pub replace_all: bool,
+    /// Add a value to a multi-valued key instead of replacing it.
+    #[arg(long)]
+    pub add: bool,
+    /// Remove the key.
+    #[arg(long)]
+    pub unset: bool,
+    /// Remove every value of a multi-valued key.
+    #[arg(long)]
+    pub unset_all: bool,
+    /// Rename a section: `--rename-section <old> <new>`.
+    #[arg(long)]
+    pub rename_section: bool,
+    /// Remove a section and every key in it.
+    #[arg(long)]
+    pub remove_section: bool,
+    /// List every `key=value`.
+    #[arg(short = 'l', long)]
+    pub list: bool,
+    /// Open the config file in the editor.
+    #[arg(short = 'e', long)]
+    pub edit: bool,
+    /// Read and write values as this type.
+    #[arg(long = "type", value_name = "TYPE",
+          value_parser = ["bool", "int", "bool-or-int", "path", "expiry-date", "color"])]
+    pub kind: Option<String>,
+    /// Same as --type=bool.
+    #[arg(long = "bool")]
+    pub as_bool: bool,
+    /// Same as --type=int (k/m/g suffixes allowed).
+    #[arg(long = "int")]
+    pub as_int: bool,
+    /// Same as --type=bool-or-int.
+    #[arg(long = "bool-or-int")]
+    pub as_bool_or_int: bool,
+    /// Same as --type=path (expands `~/`).
+    #[arg(long = "path")]
+    pub as_path: bool,
+    /// Same as --type=expiry-date.
+    #[arg(long = "expiry-date")]
+    pub as_expiry_date: bool,
+    /// Match the value pattern as a literal string, not a regex.
+    #[arg(long)]
+    pub fixed_value: bool,
+    /// Prefix each value with the file it came from.
+    #[arg(long)]
+    pub show_origin: bool,
+    /// Prefix each value with its scope (system, global, local, worktree).
+    #[arg(long)]
+    pub show_scope: bool,
+    /// Print only the key names (--list, --get-regexp).
+    #[arg(long)]
+    pub name_only: bool,
+    /// End each value with NUL and put a newline between key and value.
+    #[arg(short = 'z', long)]
+    pub null: bool,
+    /// The value to print when the key is not set.
+    #[arg(long, value_name = "VALUE")]
+    pub default: Option<String>,
+    /// Follow include.path and includeIf in reads (default only without a scope).
+    #[arg(long, overrides_with = "no_includes")]
+    pub includes: bool,
+    /// Do not follow include.path and includeIf in reads.
+    #[arg(long)]
+    pub no_includes: bool,
+    /// With the `get`/`set`/`unset` forms: every value (git's --all).
+    #[arg(long)]
+    pub all: bool,
+    /// With `get`: the key is a regex (git's --regexp).
+    #[arg(long)]
+    pub regexp: bool,
+    /// With `get`: print each key before its value.
+    #[arg(long)]
+    pub show_names: bool,
+    /// With the `get`/`set`/`unset` forms: only values matching this pattern.
+    #[arg(long = "value", value_name = "PATTERN")]
+    pub value_filter: Option<String>,
+}
+
+/// `rgit hash-object`'s arguments, as git's.
+#[derive(clap::Args, Default)]
+pub struct HashObjectArgs {
+    /// Files to hash.
+    pub paths: Vec<String>,
+    /// Store the objects in the repository.
+    #[arg(short = 'w')]
+    pub write: bool,
+    /// Hash stdin (before any files).
+    #[arg(long)]
+    pub stdin: bool,
+    /// Read the paths of the files to hash from stdin, one per line.
+    #[arg(long, conflicts_with = "stdin")]
+    pub stdin_paths: bool,
+    /// The object type: blob (default), tree, commit or tag.
+    #[arg(short = 't', value_name = "TYPE")]
+    pub kind: Option<String>,
+    /// Skip the format check of trees, commits and tags.
+    #[arg(long)]
+    pub literally: bool,
+    /// Filter as if the content were at this path (e.g. for --stdin).
+    #[arg(long, value_name = "PATH", conflicts_with = "no_filters")]
+    pub path: Option<String>,
+    /// Hash the content as is, without the clean filters (crlf, filter drivers).
+    #[arg(long)]
+    pub no_filters: bool,
+}
+
+/// `rgit apply`'s arguments, as git's.
+#[derive(clap::Args, Default)]
+pub struct ApplyArgs {
+    /// Patch files (reads stdin when none or `-`).
+    pub patches: Vec<String>,
+    /// Apply to the index only, leaving the working tree as it is.
+    #[arg(long)]
+    pub cached: bool,
+    /// Apply to both the index and the working tree.
+    #[arg(long, conflicts_with = "cached")]
+    pub index: bool,
+    /// Only check that the patch applies.
+    #[arg(long)]
+    pub check: bool,
+    /// Undo the patch (apply it in reverse).
+    #[arg(short = 'R', long)]
+    pub reverse: bool,
+    /// Print the patch's diffstat instead of applying it.
+    #[arg(long)]
+    pub stat: bool,
+    /// Print added and deleted line counts per file instead of applying it.
+    #[arg(long)]
+    pub numstat: bool,
+    /// Print created, deleted, renamed and mode-changed files instead of
+    /// applying it.
+    #[arg(long)]
+    pub summary: bool,
+    /// Apply even with --stat, --numstat or --summary.
+    #[arg(long)]
+    pub apply: bool,
+    /// Fall back to a three-way merge with the patch's preimage blobs.
+    #[arg(short = '3', long = "3way")]
+    pub three_way: bool,
+    /// Apply the hunks that fit and write the others to `<file>.rej`.
+    #[arg(long, conflicts_with = "three_way")]
+    pub reject: bool,
+    /// Strip this many leading path components (default 1).
+    #[arg(short = 'p', value_name = "N")]
+    pub strip: Option<usize>,
+    /// Prepend this folder to every path in the patch.
+    #[arg(long, value_name = "ROOT")]
+    pub directory: Option<String>,
+    /// Apply only to paths matching this glob.
+    #[arg(long, value_name = "GLOB")]
+    pub include: Vec<String>,
+    /// Skip paths matching this glob.
+    #[arg(long, value_name = "GLOB")]
+    pub exclude: Vec<String>,
+    /// On trailing whitespace in added lines: nowarn, warn, fix, error or
+    /// error-all.
+    #[arg(long, value_name = "ACTION",
+          value_parser = ["nowarn", "warn", "fix", "strip", "error", "error-all"])]
+    pub whitespace: Option<String>,
+    /// Report each file as it is checked and applied.
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+    /// A patch that changes no files is not an error.
+    #[arg(long)]
+    pub allow_empty: bool,
+    /// With --3way, resolve conflicts to our side.
+    #[arg(long, requires = "three_way", conflicts_with_all = ["theirs", "union"])]
+    pub ours: bool,
+    /// With --3way, resolve conflicts to their side.
+    #[arg(long, requires = "three_way", conflicts_with = "union")]
+    pub theirs: bool,
+    /// With --3way, keep both sides of conflicts.
+    #[arg(long, requires = "three_way")]
+    pub union: bool,
+    /// Count hunk lines instead of trusting the `@@` headers (hand-edited
+    /// patches).
+    #[arg(long)]
+    pub recount: bool,
+    /// Print no progress.
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+}
+
+/// `rgit format-patch`'s arguments, as git's.
+#[derive(clap::Args, Default)]
+pub struct FormatPatchArgs {
+    /// `-<n>` for the newest n commits, `<rev>` for the commits after it
+    /// up to HEAD, or a range `<a>..<b>`.
+    #[arg(allow_negative_numbers = true)]
+    pub revs: Vec<String>,
+    /// Write the files to this folder.
+    #[arg(short = 'o', long = "output-directory", value_name = "DIR")]
+    pub output_dir: Option<String>,
+    /// Print the patches instead of writing files.
+    #[arg(long)]
+    pub stdout: bool,
+    /// Number the subjects `[PATCH n/m]` even for one patch.
+    #[arg(short = 'n', long, conflicts_with = "no_numbered")]
+    pub numbered: bool,
+    /// Never number the subjects.
+    #[arg(short = 'N', long)]
+    pub no_numbered: bool,
+    /// Number the first patch this (default 1).
+    #[arg(long, value_name = "N")]
+    pub start_number: Option<usize>,
+    /// Name the files 1, 2, ... without a suffix.
+    #[arg(long)]
+    pub numbered_files: bool,
+    /// The file suffix (default .patch).
+    #[arg(long, value_name = "SFX")]
+    pub suffix: Option<String>,
+    /// Keep the subject as is, without `[PATCH]`.
+    #[arg(short = 'k', long, conflicts_with = "numbered")]
+    pub keep_subject: bool,
+    /// Leave out the diffstat.
+    #[arg(short = 'p', long)]
+    pub no_stat: bool,
+    /// The subject prefix instead of PATCH.
+    #[arg(long, value_name = "PREFIX")]
+    pub subject_prefix: Option<String>,
+    /// Prefix the subject with RFC (or this text; `-text` goes after).
+    #[arg(long, value_name = "TEXT", num_args = 0..=1, require_equals = true,
+          default_missing_value = "RFC")]
+    pub rfc: Option<String>,
+    /// Add a Signed-off-by trailer for you.
+    #[arg(short = 's', long)]
+    pub signoff: bool,
+    /// Send as this ident (default you), keeping the author in the body.
+    #[arg(long, value_name = "IDENT", num_args = 0..=1, require_equals = true,
+          default_missing_value = "")]
+    pub from: Option<String>,
+    /// The longest file name, suffix included (default 64).
+    #[arg(long, value_name = "N")]
+    pub filename_max_length: Option<usize>,
+    /// Show binary files as "Binary files ... differ".
+    #[arg(long)]
+    pub no_binary: bool,
+    /// Leave out commits whose change upstream already has.
+    #[arg(long)]
+    pub ignore_if_in_upstream: bool,
+    /// How the cover letter uses the branch description: message, subject,
+    /// auto or none.
+    #[arg(long, value_name = "MODE", value_parser = ["message", "subject", "auto", "none"])]
+    pub cover_from_description: Option<String>,
+    /// Use this file as the branch description.
+    #[arg(long, value_name = "FILE")]
+    pub description_file: Option<String>,
+    /// Add an interdiff against this previous version to the cover letter.
+    #[arg(long, value_name = "REV")]
+    pub interdiff: Option<String>,
+    /// Add a range-diff against this previous version to the cover letter.
+    #[arg(long, value_name = "REV")]
+    pub range_diff: Option<String>,
+    /// Percent for pairing commits in --range-diff (default 60).
+    #[arg(long, value_name = "N")]
+    pub creation_factor: Option<usize>,
+    /// Accepted for git compatibility.
+    #[arg(long, hide = true)]
+    pub progress: bool,
+    /// Mark the series as version N (`[PATCH vN]`, `vN-` file names).
+    #[arg(short = 'v', long = "reroll-count", value_name = "N")]
+    pub reroll: Option<String>,
+    /// Add a cover letter (0000-cover-letter.patch) to fill in.
+    #[arg(long)]
+    pub cover_letter: bool,
+    /// Add Message-ID and In-Reply-To headers: shallow (reply to the first)
+    /// or deep (reply to the previous).
+    #[arg(long, value_name = "STYLE", num_args = 0..=1, require_equals = true,
+          default_missing_value = "shallow", value_parser = ["shallow", "deep"])]
+    pub thread: Option<String>,
+    /// Make the first mail a reply to this Message-ID.
+    #[arg(long, value_name = "ID")]
+    pub in_reply_to: Option<String>,
+    /// Add a To: header.
+    #[arg(long, value_name = "ADDR")]
+    pub to: Vec<String>,
+    /// Add a Cc: header.
+    #[arg(long, value_name = "ADDR")]
+    pub cc: Vec<String>,
+    /// Add this header line.
+    #[arg(long, value_name = "HEADER")]
+    pub add_header: Vec<String>,
+    /// Record the base commit (`auto`: the upstream's merge base).
+    #[arg(long, value_name = "COMMIT")]
+    pub base: Option<String>,
+    /// Put all zeros in the `From <commit>` line.
+    #[arg(long)]
+    pub zero_commit: bool,
+    /// The signature after `-- ` (default: git's version).
+    #[arg(long, value_name = "TEXT", conflicts_with = "no_signature")]
+    pub signature: Option<String>,
+    /// Read the signature from this file.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["signature", "no_signature"])]
+    pub signature_file: Option<String>,
+    /// Leave out the signature.
+    #[arg(long)]
+    pub no_signature: bool,
+    /// With one revision, format every commit up to it, from the root.
+    #[arg(long)]
+    pub root: bool,
+    /// Do not print the names of the files written.
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+}
+
+/// `rgit am`'s arguments, as git's.
+#[derive(clap::Args, Default)]
+pub struct AmArgs {
+    /// mbox files (reads stdin when none).
+    pub mbox: Vec<String>,
+    /// Give up and restore the branch as it was.
+    #[arg(long, conflicts_with_all = ["cont", "skip", "quit"])]
+    pub abort: bool,
+    /// Commit the resolved patch and go on.
+    #[arg(
+        long = "continue",
+        visible_alias = "resolved",
+        short = 'r',
+        conflicts_with = "skip"
+    )]
+    pub cont: bool,
+    /// Skip the current patch.
+    #[arg(long)]
+    pub skip: bool,
+    /// Stop, keeping the branch and index as they are.
+    #[arg(long, conflicts_with_all = ["cont", "skip"])]
+    pub quit: bool,
+    /// Print the patch am stopped at (`diff`: only its diff, `raw`: the mail).
+    #[arg(long, value_name = "PART", num_args = 0..=1, require_equals = true,
+          default_missing_value = "raw", value_parser = ["diff", "raw"])]
+    pub show_current_patch: Option<String>,
+    /// Fall back to a three-way merge.
+    #[arg(short = '3', long = "3way")]
+    pub three_way: bool,
+    /// Add a Signed-off-by trailer.
+    #[arg(short = 's', long)]
+    pub signoff: bool,
+    /// Keep the subject as is (no stripping of `[PATCH]`).
+    #[arg(short = 'k', long)]
+    pub keep: bool,
+    /// Keep a `[...]` that is not `[PATCH ...]` in the subject.
+    #[arg(long)]
+    pub keep_non_patch: bool,
+    /// Add the Message-ID to the commit message.
+    #[arg(short = 'm', long)]
+    pub message_id: bool,
+    /// Drop everything above a `-- >8 --` scissors line.
+    #[arg(short = 'c', long)]
+    pub scissors: bool,
+    /// Use the author date as the committer date.
+    #[arg(long)]
+    pub committer_date_is_author_date: bool,
+    /// Use the committer date as the author date.
+    #[arg(long)]
+    pub ignore_date: bool,
+    /// Confirm each patch on the terminal before applying it.
+    #[arg(short = 'i', long)]
+    pub interactive: bool,
+    /// Skip the pre-applypatch and applypatch-msg hooks.
+    #[arg(short = 'n', long)]
+    pub no_verify: bool,
+    /// On a patch with no changes: stop, drop or keep.
+    #[arg(long, value_name = "ACTION", value_parser = ["stop", "drop", "keep"])]
+    pub empty: Option<String>,
+    /// Strip this many leading path components (as apply's -p).
+    #[arg(short = 'p', value_name = "N")]
+    pub strip: Option<usize>,
+    /// Prepend this folder to every path.
+    #[arg(long, value_name = "ROOT")]
+    pub directory: Option<String>,
+    /// Skip paths matching this glob.
+    #[arg(long, value_name = "GLOB")]
+    pub exclude: Vec<String>,
+    /// Apply only paths matching this glob.
+    #[arg(long, value_name = "GLOB")]
+    pub include: Vec<String>,
+    /// Leave the hunks that do not apply in `.rej` files.
+    #[arg(long)]
+    pub reject: bool,
+    /// On trailing whitespace: nowarn, warn, fix, error or error-all.
+    #[arg(long, value_name = "ACTION")]
+    pub whitespace: Option<String>,
+    /// Print nothing but errors.
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+}
+
+/// `rgit archive`'s arguments, as git's.
+#[derive(clap::Args, Default)]
+pub struct ArchiveArgs {
+    /// The revision (default HEAD); `-0` to `-9` set the compression level.
+    #[arg(allow_negative_numbers = true)]
+    pub rev: Option<String>,
+    /// Limit to these paths.
+    #[arg(allow_negative_numbers = true)]
+    pub paths: Vec<String>,
+    /// tar, tgz (tar.gz) or zip (default: from -o's extension, else tar).
+    #[arg(long, value_parser = ["tar", "tgz", "tar.gz", "zip"])]
+    pub format: Option<String>,
+    /// Write to this file instead of stdout.
+    #[arg(short = 'o', long)]
+    pub output: Option<String>,
+    /// Put every entry under this folder (e.g. `project/`).
+    #[arg(long)]
+    pub prefix: Option<String>,
+    /// Add this untracked file (under the prefix).
+    #[arg(long, value_name = "FILE")]
+    pub add_file: Vec<String>,
+    /// Add a file with this content: `<path>:<content>`.
+    #[arg(long, value_name = "PATH:CONTENT")]
+    pub add_virtual_file: Vec<String>,
+    /// Also honour the working tree's .gitattributes (export-ignore,
+    /// export-subst).
+    #[arg(long)]
+    pub worktree_attributes: bool,
+    /// List the formats.
+    #[arg(short = 'l', long)]
+    pub list: bool,
+    /// Archive from this repository (a local path) instead.
+    #[arg(long, value_name = "REPO")]
+    pub remote: Option<String>,
+    /// The entries' modification time (a date, `now`, `2.weeks.ago`, ...).
+    #[arg(long, value_name = "TIME")]
+    pub mtime: Option<String>,
+}
+
+/// `rgit difftool` and `rgit mergetool` arguments, as git's.
+#[derive(clap::Args, Default)]
+pub struct ToolArgs {
+    /// difftool: up to two revisions to compare (default: the index against
+    /// the working tree). mergetool: the conflicted paths.
+    pub revs: Vec<String>,
+    /// Limit to these paths.
+    #[arg(last = true)]
+    pub paths: Vec<String>,
+    /// The tool (default diff.tool / merge.tool).
+    #[arg(short = 't', long)]
+    pub tool: Option<String>,
+    /// difftool: run this command with the two files instead of a tool.
+    #[arg(short = 'x', long = "extcmd", value_name = "COMMAND")]
+    pub extcmd: Option<String>,
+    /// Do not ask before each file.
+    #[arg(short = 'y', long = "no-prompt")]
+    pub no_prompt: bool,
+    /// Ask before each file even if configured not to.
+    #[arg(long, conflicts_with = "no_prompt")]
+    pub prompt: bool,
+    /// difftool: compare the index with HEAD (or the revision).
+    #[arg(long, alias = "staged")]
+    pub cached: bool,
+    /// difftool: compare whole folders at once.
+    #[arg(short = 'd', long)]
+    pub dir_diff: bool,
+    /// Stop when the tool exits with an error.
+    #[arg(long)]
+    pub trust_exit_code: bool,
+    /// List the known tools.
+    #[arg(long)]
+    pub tool_help: bool,
+}
+
 /// A stash as git names it: `N` or `stash@{N}`.
 pub(crate) fn stash_ref(s: &str) -> Result<usize, String> {
     s.strip_prefix("stash@{")
@@ -2839,6 +3505,46 @@ pub(crate) fn stash_ref(s: &str) -> Result<usize, String> {
         .unwrap_or(s)
         .parse()
         .map_err(|_| format!("expected N or stash@{{N}}, got {s:?}"))
+}
+
+/// Where a note's text comes from, as in git's `notes add`.
+#[derive(clap::Args, Default, Clone)]
+pub struct NoteMessage {
+    /// The note text; several -m become paragraphs.
+    #[arg(short, long)]
+    pub message: Vec<String>,
+    /// Read the note text from this file (`-` for stdin).
+    #[arg(short = 'F', long = "file", value_name = "FILE")]
+    pub file: Vec<String>,
+    /// Reuse this blob (e.g. another note) as the note.
+    #[arg(short = 'C', long = "reuse-message", value_name = "OBJECT")]
+    pub reuse: Option<String>,
+    /// Like -C, then edit it.
+    #[arg(short = 'c', long = "reedit-message", value_name = "OBJECT")]
+    pub reedit: Option<String>,
+    /// Keep an empty note instead of removing it.
+    #[arg(long)]
+    pub allow_empty: bool,
+    /// Edit the text in the editor before saving.
+    #[arg(short = 'e', long)]
+    pub edit: bool,
+    /// Put this line between paragraphs instead of a blank line.
+    #[arg(long, value_name = "TEXT", conflicts_with = "no_separator")]
+    pub separator: Option<String>,
+    /// Put nothing between paragraphs.
+    #[arg(long)]
+    pub no_separator: bool,
+}
+
+impl NoteMessage {
+    /// What goes between two paragraphs, as git's --separator says.
+    fn joiner(&self) -> String {
+        match (&self.separator, self.no_separator) {
+            (_, true) => "\n".to_owned(),
+            (Some(s), _) => format!("\n{}\n", s.trim_end_matches('\n')),
+            (None, _) => "\n\n".to_owned(),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -2853,13 +3559,23 @@ pub enum NotesCmd {
         /// The annotated object.
         rev: Option<String>,
     },
-    /// Attach a note to an object (default HEAD).
+    /// Attach a note to an object (default HEAD); opens the editor without
+    /// -m, -F or -C.
     Add {
         /// The annotated object.
         rev: Option<String>,
-        /// The note text; several -m become paragraphs.
-        #[arg(short, long, required = true)]
-        message: Vec<String>,
+        #[command(flatten)]
+        text: NoteMessage,
+        /// Replace an existing note.
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Copy the note of one object to another (default HEAD).
+    Copy {
+        /// The object whose note is copied.
+        from: String,
+        /// The object that gets it (default HEAD).
+        to: Option<String>,
         /// Replace an existing note.
         #[arg(short, long)]
         force: bool,
@@ -2868,14 +3584,112 @@ pub enum NotesCmd {
     Append {
         /// The annotated object.
         rev: Option<String>,
-        /// The text to add; several -m become paragraphs.
-        #[arg(short, long, required = true)]
-        message: Vec<String>,
+        #[command(flatten)]
+        text: NoteMessage,
     },
-    /// Remove an object's note (default HEAD).
-    Remove {
+    /// Edit an object's note in the editor (default HEAD).
+    Edit {
         /// The annotated object.
         rev: Option<String>,
+        /// Keep an empty note instead of removing it.
+        #[arg(long)]
+        allow_empty: bool,
+    },
+    /// Remove the notes of objects (default HEAD).
+    #[command(alias = "rm")]
+    Remove {
+        /// The annotated objects.
+        revs: Vec<String>,
+        /// Do not fail on an object without a note.
+        #[arg(long)]
+        ignore_missing: bool,
+    },
+    /// Remove the notes of objects that no longer exist.
+    Prune {
+        /// List them without removing (git's -n).
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// Name each removed note's object.
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Merge another notes ref into the current one.
+    Merge {
+        /// The notes ref to merge (e.g. `origin` for refs/notes/origin).
+        notes_ref: String,
+        /// On conflicting notes: manual (stop), ours, theirs, union or
+        /// cat_sort_uniq.
+        #[arg(short, long, default_value = "manual",
+              value_parser = ["manual", "ours", "theirs", "union", "cat_sort_uniq"])]
+        strategy: String,
+    },
+    /// Print the notes ref in use.
+    GetRef,
+}
+
+#[derive(Subcommand)]
+pub enum MaintenanceCmd {
+    /// Run maintenance tasks now.
+    Run {
+        /// Only this task (gc, commit-graph, prefetch, loose-objects,
+        /// incremental-repack, pack-refs); repeatable.
+        #[arg(long, value_name = "TASK")]
+        task: Vec<String>,
+        /// Only the tasks whose auto conditions are met.
+        #[arg(long)]
+        auto: bool,
+        /// Run the tasks of this schedule (hourly, daily, weekly).
+        #[arg(long, value_name = "FREQ")]
+        schedule: Option<String>,
+    },
+    /// Register this repository and schedule hourly/daily/weekly runs.
+    Start,
+    /// Remove the schedule (the repositories stay registered).
+    Stop,
+    /// Add this repository to the global maintenance.repo list.
+    Register,
+    /// Remove this repository from the global maintenance.repo list.
+    Unregister {
+        /// Do not fail when it is not registered.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BundleCmd {
+    /// Write a bundle of the refs and ranges given (`--all`, `main`,
+    /// `v1..main`, `^old main`).
+    Create {
+        /// The bundle file.
+        file: String,
+        /// What to bundle, as for rev-list.
+        #[arg(required = true, allow_hyphen_values = true, num_args = 1..)]
+        revs: Vec<String>,
+        /// Print nothing.
+        #[arg(short, long)]
+        quiet: bool,
+    },
+    /// Check that a bundle is valid and applies to this repository.
+    Verify {
+        /// The bundle file.
+        file: String,
+        /// Only say whether it is okay.
+        #[arg(short, long)]
+        quiet: bool,
+    },
+    /// List the refs in a bundle.
+    ListHeads {
+        /// The bundle file.
+        file: String,
+        /// Only these refs.
+        refnames: Vec<String>,
+    },
+    /// Store a bundle's objects here and print its refs (refs are not
+    /// changed).
+    Unbundle {
+        /// The bundle file.
+        file: String,
     },
 }
 
@@ -3830,34 +4644,84 @@ pub(crate) fn index_build(
     Ok(out.trim_end().to_owned())
 }
 
-/// Parse an ISO date (`YYYY-MM-DD`, optionally with `THH:MM:SS` or a space and a
-/// time) into a unix timestamp in UTC. A bare date is midnight UTC. Uses the
-/// days-from-civil algorithm rather than pulling in a date crate.
+/// Parse a `--since`/`--until` date as git does: `YYYY-MM-DD` (at the current
+/// time of day), `YYYY-MM-DD[T ]HH:MM[:SS]` with an optional `Z`, `+HHMM` or
+/// `+HH:MM` zone (local time without one), `@<unix>`, `now`, `yesterday`, or
+/// `<n> <unit>s ago`.
 pub(crate) fn parse_date(s: &str) -> anyhow::Result<i64> {
-    let err = || anyhow::anyhow!("bad date {s:?}; use YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS");
-    let (date, time) = match s.split_once(['T', ' ']) {
-        Some((d, t)) => (d, Some(t)),
-        None => (s, None),
-    };
+    use crate::pretty::{local_parts, local_time};
+    let err =
+        || anyhow::anyhow!("bad date {s:?}; use YYYY-MM-DD, YYYY-MM-DD HH:MM:SS or `2 weeks ago`");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let s = s.trim();
+    if let Some(t) = s.strip_prefix('@') {
+        return t.parse().map_err(|_| err());
+    }
+    let words: Vec<&str> = s
+        .split(|c: char| c.is_whitespace() || c == '.')
+        .filter(|w| !w.is_empty())
+        .collect();
+    match words[..] {
+        ["now"] => return Ok(now),
+        ["yesterday"] => return Ok(now - 86400),
+        [n, unit, "ago"] => {
+            let n: i64 = n.parse().map_err(|_| err())?;
+            let unit = unit.trim_end_matches('s');
+            let step = match unit {
+                "second" => 1,
+                "minute" => 60,
+                "hour" => 3600,
+                "day" => 86400,
+                "week" => 7 * 86400,
+                "month" | "year" => 0,
+                _ => return Err(err()),
+            };
+            if step > 0 {
+                return Ok(now - n * step);
+            }
+            let (y, m, d, h, mi, sec) = local_parts(now);
+            let months = if unit == "month" { n } else { 12 * n };
+            return Ok(local_time(y, m - months, d, h, mi, sec));
+        }
+        _ => {}
+    }
+    let (date, rest) = s.split_once(['T', ' ']).unwrap_or((s, ""));
     let mut dp = date.split('-');
     let mut next = || dp.next().ok_or_else(err)?.parse::<i64>().map_err(|_| err());
     let (y, m, d) = (next()?, next()?, next()?);
     if dp.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return Err(err());
     }
-    // days_from_civil (Howard Hinnant, public domain): days since 1970-01-01.
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let mut secs = (era * 146097 + doe - 719468) * 86400;
-    if let Some(t) = time {
-        let mut tp = t.split(':');
-        let mut part = || tp.next().unwrap_or("0").parse::<i64>().map_err(|_| err());
-        secs += part()? * 3600 + part()? * 60 + part()?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        let (_, _, _, h, mi, sec) = local_parts(now);
+        return Ok(local_time(y, m, d, h, mi, sec));
     }
-    Ok(secs)
+    let (time, zone) = match rest.find(['+', '-', 'Z', ' ']) {
+        Some(i) => (&rest[..i], rest[i..].trim()),
+        None => (rest, ""),
+    };
+    let mut tp = time.split(':').filter(|p| !p.is_empty());
+    let mut part = || tp.next().unwrap_or("0").parse::<i64>().map_err(|_| err());
+    let (h, mi, sec) = (part()?, part()?, part()?);
+    let utc = (crate::pretty::days_from_civil(y, m, d) * 24 + h) * 3600 + mi * 60 + sec;
+    match zone {
+        "" => Ok(local_time(y, m, d, h, mi, sec)),
+        "Z" => Ok(utc),
+        z => {
+            let digits = z.get(1..).ok_or_else(err)?.replace(':', "");
+            let hhmm: i64 = digits.parse().map_err(|_| err())?;
+            let minutes = hhmm / 100 * 60 + hhmm % 100;
+            Ok(utc
+                - if z.starts_with('-') {
+                    -minutes
+                } else {
+                    minutes
+                } * 60)
+        }
+    }
 }
 
 /// A commit `--date`: `@<unix>`, `<unix>` or an ISO date, each with an
@@ -3888,7 +4752,10 @@ pub(crate) fn parse_git_date(s: &str) -> anyhow::Result<(i64, i32)> {
     if let Ok(secs) = unix.parse::<i64>() {
         return Ok((secs, offset));
     }
-    Ok((parse_date(rest)? - i64::from(offset) * 60, offset))
+    Ok((
+        parse_date(&format!("{rest} +0000"))? - i64::from(offset) * 60,
+        offset,
+    ))
 }
 
 /// One-line identity shared by the home view and the installed skill.
@@ -4034,6 +4901,15 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
             "hash-object",
             "gc",
             "fsck",
+            "repack",
+            "pack-refs",
+            "maintenance",
+            "cherry",
+            "bundle",
+            "request-pull",
+            "range-diff",
+            "difftool",
+            "mergetool",
         ],
     ),
     (
@@ -4247,6 +5123,41 @@ pub(crate) fn parse_line_range(spec: &str) -> anyhow::Result<(usize, usize)> {
     Ok((start, end))
 }
 
+impl Command {
+    /// Whether the command also works outside a repository, as git's does.
+    pub fn runs_without_repo(&self) -> bool {
+        match self {
+            Command::Config(a) => !a.local && !a.worktree,
+            Command::HashObject(a) => !a.write,
+            Command::Apply(a) => !a.cached && !a.index && !a.three_way,
+            Command::Archive(a) => a.list || a.remote.is_some(),
+            Command::LsRemote { .. } => true,
+            Command::Bundle {
+                cmd: BundleCmd::ListHeads { .. },
+            } => true,
+            _ => false,
+        }
+    }
+}
+
+/// Run a command that needs no repository, outside one; `raw` is git's
+/// text output rather than the agent form.
+pub fn run_without_repo(command: Command, raw: bool) -> anyhow::Result<crate::output::Output> {
+    let text = match command {
+        command @ Command::LsRemote { .. } => {
+            let cwd = std::env::current_dir().ok();
+            return crate::plumbing::ls_remote(cwd.as_deref(), command, raw);
+        }
+        Command::Config(a) => config(None, a),
+        Command::HashObject(a) => hash_object(None, a),
+        Command::Apply(a) => apply(None, a),
+        Command::Archive(a) => archive_cmd(None, a),
+        Command::Bundle { cmd } => bundle(None, cmd),
+        _ => Err(CliError::not_a_repo()),
+    };
+    text.map(Into::into)
+}
+
 /// Run a subcommand and return its compact output. When `interactive`, a
 /// missing required argument is prompted for; otherwise it errors. `Mcp` is
 /// handled by the caller (it takes over the process), so it is unreachable here.
@@ -4285,28 +5196,76 @@ pub fn run(
             untracked.as_deref(),
             ignored,
         )?),
+        Command::Log {
+            ref pretty, format, ..
+        } if pretty.any() => {
+            let graph = pretty.graph;
+            let opts = log_options(backend, &command)?;
+            let (entries, shown) = if graph {
+                if opts.reverse {
+                    return Err(CliError {
+                        message: "options '--reverse' and '--graph' cannot be used together"
+                            .to_owned(),
+                        help: None,
+                        code: 128,
+                    }
+                    .into());
+                }
+                // git draws the graph in topological order and counts -n and
+                // --skip after sorting; parents outside the log end their line.
+                let all = backend.log(&LogOptions {
+                    limit: usize::MAX,
+                    offset: 0,
+                    ..opts.clone()
+                })?;
+                let shown: std::collections::HashSet<String> =
+                    all.iter().map(|e| e.oid.clone()).collect();
+                let entries = topo_order(all)
+                    .into_iter()
+                    .skip(opts.offset)
+                    .take(opts.limit)
+                    .collect();
+                (entries, shown)
+            } else {
+                (backend.log(&opts)?, Default::default())
+            };
+            let diffs: Vec<_> = log_diffs(backend, &opts, &entries, format)?
+                .into_iter()
+                .map(|d| (!d.is_empty()).then_some(d))
+                .collect();
+            let pretty = crate::pretty::Pretty::new(backend, pretty, None)?.expect("a format");
+            let mut commits = Vec::new();
+            for e in &entries {
+                commits.push(crate::pretty::parse(&backend.read_object(&e.oid)?));
+            }
+            if graph {
+                let parents: Vec<Vec<String>> = entries
+                    .iter()
+                    .map(|e| {
+                        let take = if opts.first_parent { 1 } else { usize::MAX };
+                        e.parents
+                            .iter()
+                            .take(take)
+                            .filter(|p| shown.contains(*p))
+                            .cloned()
+                            .collect()
+                    })
+                    .collect();
+                graph_log(&pretty, &commits, &parents, &diffs, format)
+            } else {
+                pretty_log(&pretty, &commits, &diffs, format)
+            }
+        }
         Command::Log { format, .. } if format.any() => {
             let opts = log_options(backend, &command)?;
-            let paths = if opts.follow {
-                Vec::new()
-            } else {
-                opts.paths.clone()
-            };
+            let entries = backend.log(&opts)?;
+            let diffs = log_diffs(backend, &opts, &entries, format)?;
             let mut out = Vec::new();
-            for e in backend.log(&opts)? {
-                let mut text = render::log(std::slice::from_ref(&e));
-                // git shows no diff for a merge unless asked for a combined one.
-                if e.parents.len() <= 1 {
-                    let files = backend.diff(&rgit_git::DiffSpec {
-                        from: e.parents.first().cloned(),
-                        to: Some(e.oid.clone()),
-                        paths: paths.clone(),
-                        ..Default::default()
-                    })?;
-                    if !files.is_empty() {
-                        text.push('\n');
-                        text.push_str(diff_out(&files, format).trim_end());
-                    }
+            for (e, files) in entries.iter().zip(&diffs) {
+                let mut text = render::log(std::slice::from_ref(e));
+                if !files.is_empty() {
+                    text.push('\n');
+                    text.push_str(diff_out(files, format).trim_end());
                 }
                 out.push(text);
             }
@@ -4317,11 +5276,16 @@ pub fn run(
             }
         }
         Command::Log { .. } => render::log(&backend.log(&log_options(backend, &command)?)?),
+        Command::Diff { quiet: true, .. } => {
+            diff_files(backend, &command)?;
+            String::new()
+        }
         Command::Diff { format, .. } => diff_out(&diff_files(backend, &command)?.0, format),
         Command::Show {
             revs,
             paths,
             format,
+            pretty,
             no_patch,
         } => {
             let revs = if revs.is_empty() {
@@ -4329,26 +5293,91 @@ pub fn run(
             } else {
                 revs
             };
+            if let Some(pretty) = crate::pretty::Pretty::new(backend, &pretty, None)?
+                && !revs.iter().any(|r| r.contains(':'))
+            {
+                // git's show: each commit in the format, then its patch.
+                let format = if format.any() {
+                    format
+                } else {
+                    DiffFormat {
+                        patch: true,
+                        ..DiffFormat::default()
+                    }
+                };
+                let mut out = String::new();
+                for rev in &revs {
+                    // An annotated tag shows first, as git does.
+                    let mut obj = backend.read_object(rev)?;
+                    while obj.kind == "tag" {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        out.push_str(&pretty.tag(&obj));
+                        obj = backend.read_object(&format!("{}^{{}}", obj.id))?;
+                    }
+                    let id = backend.rev_parse(&format!("{rev}^{{commit}}"))?;
+                    let c = crate::pretty::parse(&backend.read_object(&id)?);
+                    // A merge shows git's combined diff: empty for a clean
+                    // merge, though its stat is against the first parent.
+                    let merge = c.parents.len() > 1;
+                    let diff = if no_patch {
+                        None
+                    } else if merge && !(format.stat || format.numstat || format.shortstat) {
+                        Some(Vec::new())
+                    } else {
+                        let files = backend.diff(&rgit_git::DiffSpec {
+                            from: c.parents.first().cloned(),
+                            to: Some(id),
+                            paths: paths.clone(),
+                            ..Default::default()
+                        })?;
+                        (merge || !files.is_empty()).then_some(files)
+                    };
+                    if !out.is_empty() && !pretty.terminator {
+                        out.push('\n');
+                    }
+                    out.push_str(&pretty_log(&pretty, &[c], &[diff], format));
+                }
+                return Ok(out);
+            }
             let mut out = Vec::new();
             for rev in &revs {
                 out.push(show_one(backend, rev, &paths, format, no_patch)?);
             }
             out.join("\n\n")
         }
-        Command::Blame { args, lines } => {
+        Command::Blame {
+            args,
+            lines,
+            format,
+        } => {
             let all = blame(backend, &args)?;
-            let selected = match lines {
+            let (lo, mut selected) = match lines {
                 Some(spec) => {
                     let (start, end) = parse_line_range(&spec)?;
                     let lo = start.saturating_sub(1);
-                    all.into_iter()
+                    let lines = all
+                        .into_iter()
                         .skip(lo)
                         .take(end.saturating_sub(lo))
-                        .collect()
+                        .collect();
+                    (lo, lines)
                 }
-                None => all,
+                None => (0, all),
             };
-            render::blame(&selected)
+            if format.porcelain || format.line_porcelain {
+                return blame_porcelain(backend, &selected, lo, format.line_porcelain);
+            }
+            for b in &mut selected {
+                if format.long_ids && !b.id.is_empty() {
+                    b.short_id = b.id.clone();
+                }
+                if format.show_email && !b.id.is_empty() {
+                    b.author = format!("<{}>", b.email);
+                }
+            }
+            render::blame(&selected, !format.no_author)
         }
         Command::Plumbing(c) => crate::plumbing::run(backend, c, true)?.text,
         Command::Refs => render::refs(&backend.refs()?),
@@ -5352,6 +6381,7 @@ pub fn run(
                     name_status,
                     numstat,
                     stat,
+                    shortstat: false,
                 },
             ),
             Some(StashCmd::Create { message }) => {
@@ -5701,86 +6731,10 @@ pub fn run(
                 }
             }
         },
-        Command::Config {
-            key,
-            value,
-            global,
-            local,
-            get,
-            get_all,
-            unset,
-            unset_all,
-            list,
-            add,
-            as_bool,
-            as_int,
-        } => {
-            use rgit_git::ConfigScope;
-            let scope = match (global, local) {
-                (true, _) => ConfigScope::Global,
-                (_, true) => ConfigScope::Local,
-                _ => ConfigScope::Any,
-            };
-            let typed = |v: &str| rgit_git::config_value(v, as_bool, as_int);
-            if list {
-                return Ok(backend
-                    .config_entries(scope, None)?
-                    .into_iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"));
-            }
-            let key = key.ok_or_else(|| CliError::usage("a config key required"))?;
-            if unset || unset_all {
-                backend.config_unset(scope, &key, unset_all)?;
-                "ok".to_owned()
-            } else if let Some(value) = value.filter(|_| !get && !get_all) {
-                backend.config_write(scope, &key, &typed(&value)?, add)?;
-                "ok".to_owned()
-            } else {
-                let mut values = backend.config_entries(scope, Some(&key))?;
-                if values.is_empty() {
-                    return Err(GitError::Other(format!("{key} is not set")).into());
-                }
-                if !get_all {
-                    values.drain(..values.len() - 1);
-                }
-                values
-                    .iter()
-                    .map(|(_, v)| typed(v))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .join("\n")
-            }
-        }
-        Command::Apply {
-            patches,
-            cached,
-            index,
-            check,
-            reverse,
-            stat,
-        } => {
-            let patches = if patches.is_empty() {
-                vec!["-".to_owned()]
-            } else {
-                patches
-            };
-            let mut stats = Vec::new();
-            for p in &patches {
-                let patch = read_input(p)?;
-                if stat {
-                    stats.push(backend.patch_stat(&patch)?);
-                } else {
-                    backend.apply_patch(&patch, cached, index, reverse, check)?;
-                }
-            }
-            if stat {
-                stats.join("\n")
-            } else {
-                "ok".to_owned()
-            }
-        }
+        Command::Config(args) => config(Some(&backend.git_dir()), args)?,
+        Command::Apply(a) => apply(Some(backend.as_ref()), a)?,
         Command::Notes { notes_ref, cmd } => {
+            let notes_ref = notes_ref.map(|r| notes_ref_name(&r));
             let r = notes_ref.as_deref();
             let head = |rev: Option<String>| rev.unwrap_or_else(|| "HEAD".to_owned());
             match cmd.unwrap_or(NotesCmd::List { rev: None }) {
@@ -5806,15 +6760,84 @@ pub fn run(
                     }
                 }
                 NotesCmd::Show { rev } => backend.note_show(r, &head(rev))?,
-                NotesCmd::Add {
-                    rev,
-                    message,
-                    force,
-                } => ok(backend.note_add(r, &head(rev), &message.join("\n\n"), force, false))?,
-                NotesCmd::Append { rev, message } => {
-                    ok(backend.note_add(r, &head(rev), &message.join("\n\n"), false, true))?
+                NotesCmd::Add { rev, text, force } => {
+                    let rev = head(rev);
+                    let existing = backend.note_show(r, &rev).ok();
+                    if existing.is_some() && !force {
+                        return Err(GitError::Other(format!(
+                            "Cannot add notes. Found existing notes for object {}. Use '-f' to overwrite existing notes",
+                            backend.rev_parse(&rev)?
+                        ))
+                        .into());
+                    }
+                    let note = note_text(backend, &text, None, interactive)?;
+                    write_note(backend, r, &rev, &note, text.allow_empty, false)?
                 }
-                NotesCmd::Remove { rev } => ok(backend.note_remove(r, &head(rev)))?,
+                NotesCmd::Append { rev, text } => {
+                    let rev = head(rev);
+                    let note = note_text(backend, &text, None, interactive)?;
+                    match backend
+                        .note_show(r, &rev)
+                        .ok()
+                        .filter(|_| !note.trim().is_empty())
+                    {
+                        Some(old) => {
+                            let joined = format!("{}{}{note}", old.trim_end(), text.joiner());
+                            write_note(backend, r, &rev, &joined, text.allow_empty, false)?
+                        }
+                        None => write_note(backend, r, &rev, &note, text.allow_empty, true)?,
+                    }
+                }
+                NotesCmd::Edit { rev, allow_empty } => {
+                    let rev = head(rev);
+                    let text = NoteMessage {
+                        reedit: Some(String::new()),
+                        ..Default::default()
+                    };
+                    let current = backend.note_show(r, &rev).unwrap_or_default();
+                    let note = note_text(backend, &text, Some(current), interactive)?;
+                    write_note(backend, r, &rev, &note, allow_empty, false)?
+                }
+                NotesCmd::Copy { from, to, force } => {
+                    ok(backend.note_copy(r, &from, &head(to), force))?
+                }
+                NotesCmd::Remove {
+                    revs,
+                    ignore_missing,
+                } => {
+                    let revs = if revs.is_empty() {
+                        vec!["HEAD".to_owned()]
+                    } else {
+                        revs
+                    };
+                    for rev in &revs {
+                        match backend.note_remove(r, rev) {
+                            Err(GitError::Other(_)) if ignore_missing => {}
+                            other => other?,
+                        }
+                    }
+                    "ok".to_owned()
+                }
+                NotesCmd::Prune { dry_run, verbose } => {
+                    let gone = backend.notes_prune(r, dry_run)?;
+                    if dry_run || verbose {
+                        gone.iter().map(|g| format!("{g}\n")).collect()
+                    } else {
+                        "ok".to_owned()
+                    }
+                }
+                NotesCmd::Merge {
+                    notes_ref: other,
+                    strategy,
+                } => backend.notes_merge(r, &notes_ref_name(&other), &strategy)?,
+                NotesCmd::GetRef => match r {
+                    Some(r) => r.to_owned(),
+                    None => std::env::var("GIT_NOTES_REF")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .or_else(|| backend.config_get("core.notesRef").ok().flatten())
+                        .unwrap_or_else(|| "refs/notes/commits".to_owned()),
+                },
             }
         }
         Command::UpdateRef {
@@ -5824,52 +6847,45 @@ pub fn run(
             delete,
             no_deref,
             message,
+            create_reflog,
+            stdin,
+            z,
         } => {
-            let (new, old) = if delete {
+            if stdin {
+                return update_ref_stdin(backend, z, message.as_deref(), no_deref, create_reflog);
+            }
+            let name = name.ok_or_else(|| CliError::usage("a ref name required"))?;
+            let update = if delete {
                 if old.is_some() {
                     return Err(CliError::usage("-d takes a ref and an optional old value"));
                 }
-                (None, new)
+                rgit_git::RefUpdate {
+                    name,
+                    new: None,
+                    old: new,
+                    verify: false,
+                }
             } else {
                 let new = new.ok_or_else(|| CliError::usage("a new value required"))?;
-                (Some(new), old)
+                rgit_git::RefUpdate {
+                    name,
+                    new: Some(new),
+                    old,
+                    verify: false,
+                }
             };
-            ok(backend.update_ref(
-                &name,
-                new.as_deref(),
-                old.as_deref(),
-                no_deref,
+            backend.update_refs(
+                &[update],
                 message.as_deref(),
-            ))?
+                no_deref,
+                create_reflog,
+                false,
+            )?;
+            "ok".to_owned()
         }
-        Command::HashObject {
-            paths,
-            write,
-            stdin,
-            kind,
-        } => {
-            let mut inputs = Vec::new();
-            if stdin {
-                inputs.push(read_input("-")?);
-            }
-            for p in &paths {
-                inputs.push(read_input(p)?);
-            }
-            if inputs.is_empty() {
-                return Err(CliError::usage("a file or --stdin required"));
-            }
-            inputs
-                .iter()
-                .map(|data| backend.hash_object(&kind, data, write))
-                .collect::<Result<Vec<_>, _>>()?
-                .join("\n")
-        }
-        Command::FormatPatch {
-            revs,
-            output_dir,
-            stdout,
-        } => {
-            let (counts, ranges): (Vec<&String>, Vec<&String>) = revs.iter().partition(|r| {
+        Command::HashObject(a) => hash_object(Some(backend.as_ref()), a)?,
+        Command::FormatPatch(a) => {
+            let (counts, ranges): (Vec<&String>, Vec<&String>) = a.revs.iter().partition(|r| {
                 r.strip_prefix('-')
                     .is_some_and(|n| n.parse::<usize>().is_ok())
             });
@@ -5879,73 +6895,132 @@ pub fn run(
                     "give `-<n>`, a `<since>` revision, or one `<a>..<b>` range",
                 ));
             }
-            let patches = backend.format_patch(ranges.first().map(|r| r.as_str()), count)?;
-            if patches.is_empty() {
+            let signature = match (&a.signature_file, a.no_signature) {
+                (_, true) => Some(String::new()),
+                (Some(f), _) => Some(String::from_utf8(read_input(f)?)?),
+                _ => a.signature.clone(),
+            };
+            let opts = rgit_git::FormatPatchOpts {
+                range: ranges.first().map(|r| r.to_string()),
+                count,
+                numbered: (a.numbered || a.no_numbered).then_some(a.numbered),
+                subject_prefix: a.subject_prefix,
+                reroll: a.reroll,
+                rfc: a.rfc,
+                keep_subject: a.keep_subject,
+                cover_letter: a.cover_letter,
+                thread: a.thread.as_deref().map(|t| match t {
+                    "deep" => rgit_git::Thread::Deep,
+                    _ => rgit_git::Thread::Shallow,
+                }),
+                in_reply_to: a.in_reply_to,
+                to: a.to,
+                cc: a.cc,
+                headers: a.add_header,
+                base: a.base,
+                zero_commit: a.zero_commit,
+                start_number: a.start_number,
+                signature,
+                no_stat: a.no_stat,
+                numbered_files: a.numbered_files,
+                suffix: a.suffix,
+                root: a.root,
+                signoff: a.signoff,
+                from: a.from,
+                filename_max_length: a.filename_max_length,
+                no_binary: a.no_binary,
+                ignore_if_in_upstream: a.ignore_if_in_upstream,
+                cover_from_description: a.cover_from_description,
+                description: match &a.description_file {
+                    Some(f) => Some(String::from_utf8(read_input(f)?)?),
+                    None => None,
+                },
+                interdiff: a.interdiff,
+                range_diff: a.range_diff,
+                creation_factor: a.creation_factor,
+            };
+            let mails = backend.format_patch(&opts)?;
+            if mails.is_empty() && a.stdout {
+                return Ok(String::new());
+            }
+            if mails.is_empty() {
                 return Ok("no commits to format".to_owned());
             }
-            if stdout {
-                return Ok(patches
-                    .into_iter()
-                    .map(|(_, email)| email)
-                    .collect::<Vec<_>>()
-                    .join("\n"));
+            if a.stdout {
+                return Ok(rgit_git::mbox(&mails));
             }
-            let dir = PathBuf::from(output_dir.unwrap_or_default());
+            let dir = PathBuf::from(a.output_dir.unwrap_or_default());
             if !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(&dir)?;
             }
-            let mut written = Vec::new();
-            for (name, email) in patches {
-                let path = dir.join(name);
-                std::fs::write(&path, email)?;
-                written.push(path.display().to_string());
+            let mut written = String::new();
+            for m in mails {
+                let path = dir.join(&m.name);
+                std::fs::write(&path, m.text)?;
+                written.push_str(&format!("{}\n", path.display()));
             }
-            written.join("\n")
+            if a.quiet { String::new() } else { written }
         }
-        Command::Am {
-            mbox,
-            abort,
-            cont,
-            skip,
-            three_way,
-            signoff,
-        } => {
-            let mut args: Vec<String> = Vec::new();
-            args.extend(abort.then(|| "--abort".to_owned()));
-            args.extend(cont.then(|| "--continue".to_owned()));
-            args.extend(skip.then(|| "--skip".to_owned()));
-            args.extend(three_way.then(|| "--3way".to_owned()));
-            args.extend(signoff.then(|| "--signoff".to_owned()));
-            let resume = abort || cont || skip;
-            let input = if !resume && mbox.is_empty() {
+        Command::Am(a) => {
+            let resume = a.abort || a.cont || a.skip || a.quit || a.show_current_patch.is_some();
+            let mut args: Vec<String> = a.strip.map(|n| format!("-p{n}")).into_iter().collect();
+            for (on, flag) in [
+                (a.abort, "--abort"),
+                (a.cont, "--continue"),
+                (a.skip, "--skip"),
+                (a.quit, "--quit"),
+                (a.three_way, "--3way"),
+                (a.signoff, "--signoff"),
+                (a.keep, "--keep"),
+                (a.keep_non_patch, "--keep-non-patch"),
+                (a.message_id, "--message-id"),
+                (a.scissors, "--scissors"),
+                (
+                    a.committer_date_is_author_date,
+                    "--committer-date-is-author-date",
+                ),
+                (a.ignore_date, "--ignore-date"),
+                (a.interactive, "--interactive"),
+                (a.no_verify, "--no-verify"),
+                (a.reject, "--reject"),
+                (a.quiet, "--quiet"),
+            ] {
+                args.extend(on.then(|| flag.to_owned()));
+            }
+            for (flag, value) in [
+                ("--show-current-patch", a.show_current_patch),
+                ("--empty", a.empty),
+                ("--directory", a.directory),
+                ("--whitespace", a.whitespace),
+            ] {
+                args.extend(value.map(|v| format!("{flag}={v}")));
+            }
+            for g in a.exclude {
+                args.push(format!("--exclude={g}"));
+            }
+            for g in a.include {
+                args.push(format!("--include={g}"));
+            }
+            let input = if !resume && a.mbox.is_empty() {
                 Some(read_input("-")?)
             } else {
                 None
             };
-            for m in &mbox {
+            for m in &a.mbox {
                 args.push(std::path::absolute(m)?.display().to_string());
             }
             let out = backend.am(&args, input.as_deref())?;
             if out.is_empty() { "ok".to_owned() } else { out }
         }
-        Command::Archive {
-            rev,
-            paths,
-            format,
-            output,
-            prefix,
-        } => {
-            let Some(output) = output.filter(|o| o != "-") else {
-                return Err(CliError::usage("-o <file> required"));
-            };
-            let bytes = archive(backend, rev, &paths, format, Some(&output), prefix)?;
-            std::fs::write(&output, bytes)?;
-            format!("wrote {output}")
-        }
+        Command::Archive(a) => archive_cmd(Some(backend), a)?,
         Command::Gc {
             prune,
+            no_prune,
             aggressive,
             auto,
+            force,
+            keep_largest_pack,
+            cruft,
         } => {
             let mut args: Vec<String> = Vec::new();
             args.extend(prune.map(|p| {
@@ -5955,8 +7030,16 @@ pub fn run(
                     format!("--prune={p}")
                 }
             }));
-            args.extend(aggressive.then(|| "--aggressive".to_owned()));
-            args.extend(auto.then(|| "--auto".to_owned()));
+            for (on, flag) in [
+                (no_prune, "--no-prune"),
+                (aggressive, "--aggressive"),
+                (auto, "--auto"),
+                (force, "--force"),
+                (keep_largest_pack, "--keep-largest-pack"),
+                (cruft, "--cruft"),
+            ] {
+                args.extend(on.then(|| flag.to_owned()));
+            }
             args.push("--quiet".to_owned());
             backend.gc(&args)?;
             "ok".to_owned()
@@ -5967,6 +7050,13 @@ pub fn run(
             unreachable,
             no_dangling,
             connectivity_only,
+            lost_found,
+            name_objects,
+            root,
+            tags,
+            cache,
+            no_reflogs,
+            objects,
         } => {
             let mut args: Vec<String> = Vec::new();
             for (on, flag) in [
@@ -5975,9 +7065,16 @@ pub fn run(
                 (unreachable, "--unreachable"),
                 (no_dangling, "--no-dangling"),
                 (connectivity_only, "--connectivity-only"),
+                (lost_found, "--lost-found"),
+                (name_objects, "--name-objects"),
+                (root, "--root"),
+                (tags, "--tags"),
+                (cache, "--cache"),
+                (no_reflogs, "--no-reflogs"),
             ] {
                 args.extend(on.then(|| flag.to_owned()));
             }
+            args.extend(objects);
             let out = backend.fsck(&args)?;
             if out.is_empty() {
                 "no problems found".to_owned()
@@ -5985,6 +7082,139 @@ pub fn run(
                 out
             }
         }
+        Command::Repack {
+            all,
+            all_loosen,
+            delete,
+            no_reuse_delta,
+            no_reuse_object,
+            local,
+            keep_unreachable,
+            write_bitmap_index,
+            cruft,
+            geometric,
+            window,
+            depth,
+        } => {
+            // libgit2 has no repack; git does the packing.
+            let mut args = vec!["repack".to_owned(), "-q".to_owned()];
+            for (on, flag) in [
+                (all, "-a"),
+                (all_loosen, "-A"),
+                (delete, "-d"),
+                (no_reuse_delta, "-f"),
+                (no_reuse_object, "-F"),
+                (local, "-l"),
+                (keep_unreachable, "-k"),
+                (write_bitmap_index, "-b"),
+                (cruft, "--cruft"),
+            ] {
+                args.extend(on.then(|| flag.to_owned()));
+            }
+            for (flag, value) in [
+                ("--geometric", geometric),
+                ("--window", window),
+                ("--depth", depth),
+            ] {
+                args.extend(value.map(|v| format!("{flag}={v}")));
+            }
+            backend.git(&args)?;
+            "ok".to_owned()
+        }
+        Command::PackRefs {
+            all,
+            no_prune,
+            auto,
+        } => {
+            let mut args = vec!["pack-refs".to_owned()];
+            for (on, flag) in [(all, "--all"), (no_prune, "--no-prune"), (auto, "--auto")] {
+                args.extend(on.then(|| flag.to_owned()));
+            }
+            backend.git(&args)?;
+            "ok".to_owned()
+        }
+        Command::Maintenance { cmd } => maintenance(backend, cmd)?,
+        Command::Cherry {
+            upstream,
+            head,
+            limit,
+            verbose,
+        } => {
+            let upstream = upstream.unwrap_or_else(|| "@{upstream}".to_owned());
+            let head = head.unwrap_or_else(|| "HEAD".to_owned());
+            backend
+                .cherry(&upstream, &head, limit.as_deref())?
+                .iter()
+                .map(|c| {
+                    let sign = if c.upstream_has_it { '-' } else { '+' };
+                    if verbose {
+                        format!("{sign} {} {}\n", c.id, c.subject)
+                    } else {
+                        format!("{sign} {}\n", c.id)
+                    }
+                })
+                .collect()
+        }
+        Command::Bundle { cmd } => bundle(Some(backend), cmd)?,
+        Command::RequestPull {
+            start,
+            url,
+            end,
+            patch,
+        } => {
+            let (text, warnings) = backend.request_pull(&start, &url, end.as_deref(), patch)?;
+            if warnings.is_empty() {
+                text
+            } else {
+                // As git: the summary still prints, the warnings go to stderr
+                // and the status is 1.
+                for w in &warnings {
+                    eprintln!("{w}");
+                }
+                print!("{text}");
+                return Err(anyhow::Error::new(CliError {
+                    message: String::new(),
+                    help: None,
+                    code: 1,
+                }));
+            }
+        }
+        Command::RangeDiff {
+            revs,
+            creation_factor,
+            no_patch,
+            left_only,
+            right_only,
+            ..
+        } => {
+            let (range1, range2) = match revs.as_slice() {
+                [base, old, new] => (format!("{base}..{old}"), format!("{base}..{new}")),
+                [r1, r2] if r1.contains("..") && r2.contains("..") => (r1.clone(), r2.clone()),
+                [sym] if sym.contains("...") => {
+                    let (l, r) = sym.split_once("...").unwrap_or_default();
+                    let (l, r) = (
+                        if l.is_empty() { "HEAD" } else { l },
+                        if r.is_empty() { "HEAD" } else { r },
+                    );
+                    (format!("{r}..{l}"), format!("{l}..{r}"))
+                }
+                _ => {
+                    return Err(CliError::usage(
+                        "give <base> <old> <new>, two ranges, or <old>...<new>",
+                    ));
+                }
+            };
+            backend.range_diff(&rgit_git::RangeDiffOpts {
+                range1,
+                range2,
+                creation_factor,
+                patches: !no_patch,
+                left_only,
+                right_only,
+            })?
+        }
+        Command::Difftool(a) => difftool(backend, a, interactive)?,
+        Command::Mergetool(a) => mergetool(backend, a, interactive)?,
         Command::Clean {
             dry_run,
             ignored_too,
@@ -6096,12 +7326,29 @@ pub fn run(
             dirty,
             long,
             abbrev,
-            always: _,
+            always,
             pattern,
             exact_match,
+            contains,
         } => {
             let rev = rev.as_deref().unwrap_or("HEAD");
-            if exact_match {
+            if contains {
+                let id = backend.rev_parse(&format!("{rev}^{{commit}}"))?;
+                match describe_contains(backend, &id, pattern.as_deref())? {
+                    Some(name) => name,
+                    None if always => backend.abbrev_id(&id, 0)?,
+                    None => {
+                        return Err(CliError {
+                            message: format!("cannot describe '{id}'"),
+                            help: Some(
+                                "Run `rgit describe --contains --always` for its id".to_owned(),
+                            ),
+                            code: 128,
+                        }
+                        .into());
+                    }
+                }
+            } else if exact_match {
                 let tag = backend.describe(rev, tags, false, false, Some(0), pattern.as_deref())?;
                 let oid = backend.rev_parse(rev)?;
                 if oid.starts_with(&tag) || backend.rev_parse(&tag).ok() != Some(oid) {
@@ -6419,6 +7666,1082 @@ fn pick(
 }
 
 /// The bytes of a file, or of stdin for `-`.
+/// `rgit config`, in a repository (`git_dir`) or outside one.
+pub fn config(git_dir: Option<&Path>, mut a: ConfigArgs) -> anyhow::Result<String> {
+    use rgit_git::{ConfigScope, SetMode};
+    // git 2.46's verb forms: `config get|set|unset|list|edit|rename-section|
+    // remove-section ...` map onto the flag forms (keys always have a dot).
+    let mut verb_get = false;
+    if let Some(verb) = a.key.clone().filter(|k| !k.contains('.')) {
+        let args = [a.value.take(), a.value_pattern.take()];
+        let [first, second] = args;
+        let known = matches!(
+            verb.as_str(),
+            "get" | "set" | "unset" | "list" | "edit" | "rename-section" | "remove-section"
+        );
+        if known {
+            a.key = first;
+            a.value = second;
+            match verb.as_str() {
+                "list" => a.list = true,
+                "edit" => a.edit = true,
+                "rename-section" => a.rename_section = true,
+                "remove-section" => a.remove_section = true,
+                "get" => {
+                    a.get = true;
+                    verb_get = true;
+                    a.value = a.value_filter.take();
+                }
+                "set" => {
+                    a.replace_all = a.all;
+                    a.value_pattern = a.value_filter.take();
+                }
+                _ => {
+                    a.unset_all = a.all;
+                    a.unset = !a.all;
+                    a.value = a.value_filter.take();
+                }
+            }
+        } else {
+            a.value = first;
+            a.value_pattern = second;
+        }
+    }
+    let mut scopes: Vec<ConfigScope> = [
+        (a.system, ConfigScope::System),
+        (a.global, ConfigScope::Global),
+        (a.local, ConfigScope::Local),
+        (a.worktree, ConfigScope::Worktree),
+    ]
+    .into_iter()
+    .filter_map(|(on, s)| on.then_some(s))
+    .chain(a.file.map(|f| ConfigScope::File(f.into())))
+    .collect();
+    if scopes.len() > 1 {
+        return Err(CliError::usage("only one config file at a time"));
+    }
+    let scope = scopes.pop().unwrap_or_default();
+    let includes = if a.no_includes {
+        false
+    } else {
+        a.includes || scope == ConfigScope::Any
+    };
+    let kind = a.kind.as_deref().or_else(|| {
+        [
+            (a.as_bool, "bool"),
+            (a.as_int, "int"),
+            (a.as_bool_or_int, "bool-or-int"),
+            (a.as_path, "path"),
+            (a.as_expiry_date, "expiry-date"),
+        ]
+        .into_iter()
+        .find_map(|(on, k)| on.then_some(k))
+    });
+    let typed = |v: Option<&str>| -> anyhow::Result<String> {
+        Ok(match kind {
+            Some(k) => rgit_git::config_typed(v, k)?,
+            None => v.unwrap_or_default().to_owned(),
+        })
+    };
+    let fixed = |p: String| {
+        if a.fixed_value {
+            rgit_git::config_fixed_value(&p)
+        } else {
+            p
+        }
+    };
+    let (end, sep) = if a.null { ('\0', '\0') } else { ('\n', '\t') };
+    let prefix = |e: &rgit_git::ConfigEntry| {
+        let mut s = String::new();
+        if a.show_scope {
+            s.push_str(e.scope);
+            s.push(sep);
+        }
+        if a.show_origin {
+            s.push_str(&format!("file:{}", e.origin));
+            s.push(sep);
+        }
+        s
+    };
+    let key_required = || {
+        a.key
+            .clone()
+            .ok_or_else(|| CliError::usage("a config key required"))
+    };
+    let write_scope = || match &scope {
+        ConfigScope::Any => ConfigScope::Local,
+        s => s.clone(),
+    };
+    if a.edit {
+        run_editor(git_dir, &rgit_git::config_file(git_dir, &write_scope())?)?;
+        return Ok(String::new());
+    }
+    if a.rename_section || a.remove_section {
+        let section = key_required()?;
+        let new = if a.rename_section {
+            Some(
+                a.value
+                    .ok_or_else(|| CliError::usage("--rename-section <old> <new>"))?,
+            )
+        } else {
+            None
+        };
+        rgit_git::config_section(git_dir, &write_scope(), &section, new.as_deref())?;
+        return Ok("ok".to_owned());
+    }
+    if a.list || (a.key.is_none() && !a.get && !a.get_all && !a.get_regexp) {
+        if !a.list {
+            return Err(CliError::usage("a config key required (or --list)"));
+        }
+        let mut out = String::new();
+        for e in rgit_git::config_list(git_dir, &scope, includes)? {
+            out.push_str(&prefix(&e));
+            out.push_str(&e.name);
+            match &e.value {
+                Some(v) if !a.name_only => {
+                    out.push(if a.null { '\n' } else { '=' });
+                    out.push_str(v);
+                }
+                _ => {}
+            }
+            out.push(end);
+        }
+        return Ok(out);
+    }
+    let key = key_required()?;
+    if a.unset || a.unset_all {
+        rgit_git::config_unset(
+            git_dir,
+            &write_scope(),
+            &key,
+            a.value.map(fixed).as_deref(),
+            a.unset_all,
+        )?;
+        return Ok("ok".to_owned());
+    }
+    let reading = a.get || a.get_all || a.get_regexp || a.value.is_none();
+    if !reading {
+        let value = a.value.clone().unwrap_or_default();
+        let value = match kind {
+            // git stores canonical booleans and numbers.
+            Some(k @ ("bool" | "int" | "bool-or-int")) => rgit_git::config_typed(Some(&value), k)?,
+            Some(k) => {
+                rgit_git::config_typed(Some(&value), k)?;
+                value
+            }
+            None => value,
+        };
+        let mode = if a.add {
+            SetMode::Add
+        } else if a.replace_all {
+            SetMode::ReplaceAll
+        } else {
+            SetMode::Replace
+        };
+        rgit_git::config_set(
+            git_dir,
+            &write_scope(),
+            &key,
+            &value,
+            a.value_pattern.map(fixed).as_deref(),
+            mode,
+        )?;
+        return Ok("ok".to_owned());
+    }
+    // `get` prints values only unless --show-names; --get-regexp prints both.
+    let (by_regex, many, names) = if verb_get {
+        (a.regexp, a.all, a.show_names)
+    } else {
+        (a.get_regexp, a.get_all || a.get_regexp, a.get_regexp)
+    };
+    let matches_value = rgit_git::value_matcher(a.value.map(fixed).as_deref())?;
+    let entries = rgit_git::config_list(git_dir, &scope, includes)?;
+    let mut hits: Vec<&rgit_git::ConfigEntry> = if by_regex {
+        let matches = rgit_git::config_name_matcher(&key)?;
+        entries.iter().filter(|e| matches(&e.name)).collect()
+    } else {
+        let name = rgit_git::config_key(&key)?;
+        entries.iter().filter(|e| e.name == name).collect()
+    };
+    hits.retain(|e| matches_value(e.value.as_deref().unwrap_or_default()));
+    if hits.is_empty() {
+        return match a.default {
+            Some(d) => Ok(format!("{}{end}", typed(Some(&d))?)),
+            None => Err(GitError::Other(format!("{key} is not set")).into()),
+        };
+    }
+    if !many {
+        hits.drain(..hits.len() - 1);
+    }
+    let mut out = String::new();
+    for e in hits {
+        out.push_str(&prefix(e));
+        if names {
+            out.push_str(&e.name);
+            if !a.name_only && e.value.is_some() {
+                out.push(if a.null { '\n' } else { ' ' });
+                out.push_str(&typed(e.value.as_deref())?);
+            }
+        } else {
+            out.push_str(&typed(e.value.as_deref())?);
+        }
+        out.push(end);
+    }
+    Ok(out)
+}
+
+/// Open `path` in git's editor: $GIT_EDITOR, core.editor, $VISUAL, $EDITOR, vi.
+fn run_editor(git_dir: Option<&Path>, path: &Path) -> anyhow::Result<()> {
+    let editor = std::env::var("GIT_EDITOR")
+        .ok()
+        .or_else(|| {
+            rgit_git::config_list(git_dir, &rgit_git::ConfigScope::Any, true)
+                .ok()?
+                .into_iter()
+                .rfind(|e| e.name == "core.editor")?
+                .value
+        })
+        .or_else(|| std::env::var("VISUAL").ok())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| "vi".to_owned());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$@\""))
+        .arg(&editor)
+        .arg(path)
+        .status()?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("the editor exited with {status}"));
+    }
+    Ok(())
+}
+
+/// git's notes ref for `--ref`: `refs/notes/<name>` unless already a ref.
+fn notes_ref_name(name: &str) -> String {
+    if name.starts_with("refs/notes/") {
+        name.to_owned()
+    } else if name.starts_with("notes/") {
+        format!("refs/{name}")
+    } else {
+        format!("refs/notes/{name}")
+    }
+}
+
+/// A note's text from -m, -F and -C/-c, or from the editor (starting from
+/// `current`) when none is given or with -c.
+fn note_text(
+    backend: &Arc<dyn GitBackend>,
+    t: &NoteMessage,
+    current: Option<String>,
+    interactive: bool,
+) -> anyhow::Result<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for reuse in t
+        .reuse
+        .iter()
+        .chain(t.reedit.iter().filter(|r| !r.is_empty()))
+    {
+        parts.push(String::from_utf8_lossy(&backend.read_object(reuse)?.data).into_owned());
+    }
+    parts.extend(t.message.iter().cloned());
+    for f in &t.file {
+        parts.push(String::from_utf8(read_input(f)?)?);
+    }
+    let text = parts
+        .iter()
+        .map(|p| p.trim_end())
+        .collect::<Vec<_>>()
+        .join(&t.joiner());
+    if !(parts.is_empty() || t.reedit.is_some() || t.edit) {
+        return Ok(text);
+    }
+    // Like git, a set $GIT_EDITOR works without a terminal.
+    if !interactive && std::env::var_os("GIT_EDITOR").is_none() {
+        return Err(CliError::usage("a note message required (-m, -F or -C)"));
+    }
+    let seed = current.unwrap_or(text);
+    let edited = edit_file(
+        backend,
+        "NOTES_EDITMSG",
+        &format!(
+            "{seed}\n\n# Write/edit the notes for the object. Lines starting with '#' are ignored.\n"
+        ),
+    )?;
+    let _ = std::fs::remove_file(backend.git_dir().join("NOTES_EDITMSG"));
+    Ok(strip_comments(&edited).trim().to_owned())
+}
+
+/// Write (or append) a note; an empty one removes the note unless allowed.
+fn write_note(
+    backend: &Arc<dyn GitBackend>,
+    notes_ref: Option<&str>,
+    rev: &str,
+    text: &str,
+    allow_empty: bool,
+    append: bool,
+) -> anyhow::Result<String> {
+    if text.trim().is_empty() && !allow_empty {
+        if append {
+            return Ok("ok".to_owned());
+        }
+        let oid = backend.rev_parse(rev)?;
+        return match backend.note_remove(notes_ref, rev) {
+            Ok(()) => Ok(format!("Removing note for object {oid}")),
+            Err(_) => Ok("ok".to_owned()),
+        };
+    }
+    backend.note_add(notes_ref, rev, text, true, append)?;
+    Ok("ok".to_owned())
+}
+
+/// `update-ref --stdin`: git's transaction protocol, answering `start`,
+/// `prepare`, `commit` and `abort` on stdout as each arrives.
+fn update_ref_stdin(
+    backend: &Arc<dyn GitBackend>,
+    z: bool,
+    message: Option<&str>,
+    no_deref: bool,
+    create_reflog: bool,
+) -> anyhow::Result<String> {
+    use std::io::{BufRead, Write};
+    let mut input = std::io::stdin().lock();
+    let mut out = std::io::stdout();
+    let mut batch: Vec<rgit_git::RefUpdate> = Vec::new();
+    let sep = if z { 0 } else { b'\n' };
+    let read = |input: &mut std::io::StdinLock| -> anyhow::Result<Option<String>> {
+        let mut buf = Vec::new();
+        if input.read_until(sep, &mut buf)? == 0 {
+            return Ok(None);
+        }
+        if buf.last() == Some(&sep) {
+            buf.pop();
+        }
+        Ok(Some(String::from_utf8(buf)?))
+    };
+    let mut reply = |s: &str| -> anyhow::Result<()> {
+        writeln!(out, "{s}")?;
+        out.flush()?;
+        Ok(())
+    };
+    let mut open = false;
+    while let Some(line) = read(&mut input)? {
+        let (cmd, rest) = line.split_once(' ').unwrap_or((line.as_str(), ""));
+        // With -z the values follow as their own NUL-terminated fields.
+        let mut fields: Vec<String> = if z {
+            vec![rest.to_owned()]
+        } else {
+            rest.split(' ')
+                .filter(|f| !f.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        let wanted = match cmd {
+            "update" => 3,
+            "create" => 2,
+            "delete" | "verify" => 2,
+            _ => 1,
+        };
+        while z && fields.len() < wanted && !rest.is_empty() {
+            fields.push(read(&mut input)?.unwrap_or_default());
+        }
+        let field = |i: usize| fields.get(i).filter(|f| !f.is_empty()).cloned();
+        let name = || field(0).ok_or_else(|| CliError::usage(format!("{cmd}: missing <ref>")));
+        match cmd {
+            "update" => batch.push(rgit_git::RefUpdate {
+                name: name()?,
+                new: Some(field(1).ok_or_else(|| CliError::usage("update: missing <new-oid>"))?),
+                old: field(2),
+                verify: false,
+            }),
+            "create" => batch.push(rgit_git::RefUpdate {
+                name: name()?,
+                new: Some(field(1).ok_or_else(|| CliError::usage("create: missing <new-oid>"))?),
+                old: Some("0".repeat(40)),
+                verify: false,
+            }),
+            "delete" => batch.push(rgit_git::RefUpdate {
+                name: name()?,
+                new: None,
+                old: field(1),
+                verify: false,
+            }),
+            "verify" => batch.push(rgit_git::RefUpdate {
+                name: name()?,
+                new: None,
+                old: Some(field(1).unwrap_or_else(|| "0".repeat(40))),
+                verify: true,
+            }),
+            "option" => {
+                if rest.trim() != "no-deref" {
+                    return Err(CliError::usage(format!("option unknown: {rest}")));
+                }
+            }
+            "start" => {
+                open = true;
+                reply("start: ok")?;
+            }
+            "prepare" => {
+                backend.update_refs(&batch, message, no_deref, create_reflog, true)?;
+                reply("prepare: ok")?;
+            }
+            "commit" => {
+                backend.update_refs(&batch, message, no_deref, create_reflog, false)?;
+                batch.clear();
+                open = false;
+                reply("commit: ok")?;
+            }
+            "abort" => {
+                batch.clear();
+                open = false;
+                reply("abort: ok")?;
+            }
+            "" => {}
+            other => return Err(CliError::usage(format!("unknown command: {other}"))),
+        }
+    }
+    // Without an explicit transaction, everything read is one; an open
+    // transaction left at EOF is aborted, as in git.
+    if !open && !batch.is_empty() {
+        backend.update_refs(&batch, message, no_deref, create_reflog, false)?;
+    }
+    Ok(String::new())
+}
+
+/// `rgit maintenance`: (un)registering is config, done here; running and
+/// scheduling tasks (gc, commit-graph, prefetch, launchd/cron/systemd timers)
+/// is git's, which libgit2 has no counterpart for.
+fn maintenance(backend: &Arc<dyn GitBackend>, cmd: MaintenanceCmd) -> anyhow::Result<String> {
+    use rgit_git::ConfigScope::{Global, Local};
+    let repo = backend.workdir().canonicalize()?.display().to_string();
+    let git_dir = backend.git_dir();
+    let registered = || -> anyhow::Result<bool> {
+        Ok(rgit_git::config_list(Some(&git_dir), &Global, false)
+            .unwrap_or_default()
+            .iter()
+            .any(|e| e.name == "maintenance.repo" && e.value.as_deref() == Some(repo.as_str())))
+    };
+    match cmd {
+        MaintenanceCmd::Register => {
+            if !registered()? {
+                rgit_git::config_set(
+                    Some(&git_dir),
+                    &Global,
+                    "maintenance.repo",
+                    &repo,
+                    None,
+                    rgit_git::SetMode::Add,
+                )?;
+            }
+            rgit_git::config_set(
+                Some(&git_dir),
+                &Local,
+                "maintenance.auto",
+                "false",
+                None,
+                rgit_git::SetMode::Replace,
+            )?;
+            if backend.config_get("maintenance.strategy")?.is_none() {
+                rgit_git::config_set(
+                    Some(&git_dir),
+                    &Local,
+                    "maintenance.strategy",
+                    "incremental",
+                    None,
+                    rgit_git::SetMode::Replace,
+                )?;
+            }
+            Ok("ok".to_owned())
+        }
+        MaintenanceCmd::Unregister { force } => {
+            if !registered()? {
+                if force {
+                    return Ok("ok".to_owned());
+                }
+                return Err(
+                    GitError::Other(format!("repository '{repo}' is not registered")).into(),
+                );
+            }
+            rgit_git::config_unset(
+                Some(&git_dir),
+                &Global,
+                "maintenance.repo",
+                Some(&rgit_git::config_fixed_value(&repo)),
+                true,
+            )?;
+            Ok("ok".to_owned())
+        }
+        MaintenanceCmd::Run {
+            task,
+            auto,
+            schedule,
+        } => {
+            let mut args = vec![
+                "maintenance".to_owned(),
+                "run".to_owned(),
+                "--quiet".to_owned(),
+            ];
+            args.extend(task.into_iter().map(|t| format!("--task={t}")));
+            args.extend(auto.then(|| "--auto".to_owned()));
+            args.extend(schedule.map(|s| format!("--schedule={s}")));
+            backend.git(&args)?;
+            Ok("ok".to_owned())
+        }
+        MaintenanceCmd::Start | MaintenanceCmd::Stop => {
+            let verb = if matches!(cmd, MaintenanceCmd::Start) {
+                "start"
+            } else {
+                "stop"
+            };
+            backend.git(&["maintenance".to_owned(), verb.to_owned()])?;
+            Ok("ok".to_owned())
+        }
+    }
+}
+
+/// `rgit bundle`; list-heads needs no repository.
+fn bundle(backend: Option<&Arc<dyn GitBackend>>, cmd: BundleCmd) -> anyhow::Result<String> {
+    let refs = |list: &[(String, String)]| -> String {
+        list.iter()
+            .map(|(id, name)| format!("{id} {name}\n"))
+            .collect()
+    };
+    if let BundleCmd::ListHeads { file, refnames } = &cmd {
+        let header = rgit_git::bundle_header(Path::new(file))?;
+        let kept: Vec<(String, String)> = header
+            .refs
+            .into_iter()
+            .filter(|(_, name)| refnames.is_empty() || refnames.contains(name))
+            .collect();
+        return Ok(refs(&kept));
+    }
+    let backend = backend.ok_or_else(|| {
+        anyhow::anyhow!("need a repository to create, verify or unbundle a bundle")
+    })?;
+    Ok(match cmd {
+        BundleCmd::Create { file, revs, .. } => {
+            backend.bundle_create(Path::new(&file), &revs)?;
+            "ok".to_owned()
+        }
+        BundleCmd::Verify { file, quiet } => {
+            let (header, missing) = backend.bundle_verify(Path::new(&file))?;
+            if !missing.is_empty() {
+                let mut msg = String::from("Repository lacks these prerequisite commits:");
+                for (id, comment) in &missing {
+                    msg.push_str(&format!("\n{id} {comment}"));
+                }
+                return Err(GitError::Other(msg).into());
+            }
+            eprintln!("{file} is okay");
+            if quiet {
+                return Ok(String::new());
+            }
+            let count = |n: usize, one: &str, many: &str| {
+                if n == 1 {
+                    one.to_owned()
+                } else {
+                    many.replace("%d", &n.to_string())
+                }
+            };
+            let mut out = count(
+                header.refs.len(),
+                "The bundle contains this ref:\n",
+                "The bundle contains these %d refs:\n",
+            );
+            out.push_str(&refs(&header.refs));
+            if header.prerequisites.is_empty() {
+                out.push_str("The bundle records a complete history.\n");
+            } else {
+                out.push_str(&count(
+                    header.prerequisites.len(),
+                    "The bundle requires this ref:\n",
+                    "The bundle requires these %d refs:\n",
+                ));
+                for (id, _) in &header.prerequisites {
+                    out.push_str(&format!("{id} \n"));
+                }
+            }
+            out.push_str("The bundle uses this hash algorithm: sha1\n");
+            out
+        }
+        BundleCmd::Unbundle { file } => refs(&backend.bundle_unbundle(Path::new(&file))?),
+        BundleCmd::ListHeads { .. } => unreachable!(),
+    })
+}
+
+/// The tools git knows: name, the diff command and the merge command, in
+/// terms of $LOCAL, $REMOTE, $BASE and $MERGED.
+const KNOWN_TOOLS: &[(&str, &str, &str)] = &[
+    (
+        "vimdiff",
+        r#"vim -R -f -d "$LOCAL" "$REMOTE""#,
+        r#"vim -f -d -c '4wincmd w | wincmd J' "$LOCAL" "$BASE" "$REMOTE" "$MERGED""#,
+    ),
+    (
+        "nvimdiff",
+        r#"nvim -R -f -d "$LOCAL" "$REMOTE""#,
+        r#"nvim -f -d -c '4wincmd w | wincmd J' "$LOCAL" "$BASE" "$REMOTE" "$MERGED""#,
+    ),
+    (
+        "meld",
+        r#"meld "$LOCAL" "$REMOTE""#,
+        r#"meld "$LOCAL" "$MERGED" "$REMOTE" --output "$MERGED""#,
+    ),
+    (
+        "vscode",
+        r#"code --wait --diff "$LOCAL" "$REMOTE""#,
+        r#"code --wait --merge "$REMOTE" "$LOCAL" "$BASE" "$MERGED""#,
+    ),
+    (
+        "opendiff",
+        r#"opendiff "$LOCAL" "$REMOTE""#,
+        r#"opendiff "$LOCAL" "$REMOTE" -ancestor "$BASE" -merge "$MERGED""#,
+    ),
+    (
+        "kdiff3",
+        r#"kdiff3 --L1 "$MERGED (A)" --L2 "$MERGED (B)" "$LOCAL" "$REMOTE""#,
+        r#"kdiff3 --auto --L1 "$MERGED (Base)" --L2 "$MERGED (Local)" --L3 "$MERGED (Remote)" -o "$MERGED" "$BASE" "$LOCAL" "$REMOTE""#,
+    ),
+    (
+        "bc",
+        r#"bcompare "$LOCAL" "$REMOTE""#,
+        r#"bcompare "$LOCAL" "$REMOTE" "$BASE" -mergeoutput="$MERGED""#,
+    ),
+    (
+        "tkdiff",
+        r#"tkdiff "$LOCAL" "$REMOTE""#,
+        r#"tkdiff -a "$BASE" -o "$MERGED" "$LOCAL" "$REMOTE""#,
+    ),
+];
+
+/// The shell command for `tool`: its configured `<kind>tool.<tool>.cmd`, else a
+/// known tool's (with `<kind>tool.<tool>.path` as the program, if set).
+fn tool_command(backend: &Arc<dyn GitBackend>, kind: &str, tool: &str) -> anyhow::Result<String> {
+    let config = |k: String| backend.config_get(&k).ok().flatten();
+    if let Some(cmd) = config(format!("{kind}tool.{tool}.cmd")) {
+        return Ok(cmd);
+    }
+    let known = KNOWN_TOOLS.iter().find(|(name, ..)| {
+        *name == tool
+            || (tool == "code" && *name == "vscode")
+            || tool.starts_with("bc") && *name == "bc"
+    });
+    let Some((_, diff, merge)) = known else {
+        return Err(CliError::usage(format!(
+            "unknown tool {tool}; set {kind}tool.{tool}.cmd or run `rgit {kind}tool --tool-help`"
+        )));
+    };
+    let cmd = if kind == "diff" { *diff } else { *merge };
+    Ok(match config(format!("{kind}tool.{tool}.path")) {
+        Some(path) => match cmd.split_once(' ') {
+            Some((_, rest)) => format!("'{path}' {rest}"),
+            None => path,
+        },
+        None => cmd.to_owned(),
+    })
+}
+
+/// The tool to use: --tool, else the configured one (difftool falls back to
+/// merge.tool, as git does).
+fn pick_tool(
+    backend: &Arc<dyn GitBackend>,
+    kind: &str,
+    tool: Option<String>,
+) -> anyhow::Result<String> {
+    let config = |k: &str| backend.config_get(k).ok().flatten();
+    tool.or_else(|| config(&format!("{kind}.tool")))
+        .or_else(|| (kind == "diff").then(|| config("merge.tool")).flatten())
+        .ok_or_else(|| {
+            CliError::usage(format!(
+                "no {kind} tool configured; pass --tool or set {kind}.tool (`rgit {kind}tool --tool-help` lists them)"
+            ))
+        })
+}
+
+/// Run a tool command through the shell with git's variables set.
+fn run_tool(cmd: &str, vars: &[(&str, &Path)]) -> anyhow::Result<std::process::ExitStatus> {
+    let mut sh = std::process::Command::new("sh");
+    sh.arg("-c").arg(cmd);
+    for (k, v) in vars {
+        sh.env(k, v);
+    }
+    Ok(sh.status()?)
+}
+
+/// A temporary copy of a file's content, named after it as git names them.
+fn temp_file(dir: &Path, path: &str, tag: &str, data: &[u8]) -> anyhow::Result<PathBuf> {
+    let p = Path::new(path);
+    let stem = p
+        .file_stem()
+        .map_or(String::new(), |s| s.to_string_lossy().into_owned());
+    let ext = p
+        .extension()
+        .map_or(String::new(), |e| format!(".{}", e.to_string_lossy()));
+    let file = dir.join(format!("{stem}_{tag}_{}{ext}", std::process::id()));
+    std::fs::write(&file, data)?;
+    Ok(file)
+}
+
+fn tool_help(kind: &str) -> String {
+    let mut out = format!("'rgit {kind}tool --tool=<tool>' may be set to one of the following:\n");
+    for (name, ..) in KNOWN_TOOLS {
+        out.push_str(&format!("\t\t{name}\n"));
+    }
+    out.push_str(&format!("\nOr any command set as {kind}tool.<tool>.cmd.\n"));
+    out
+}
+
+/// `rgit difftool`: each changed file (or both trees with --dir-diff) in the
+/// diff tool.
+fn difftool(
+    backend: &Arc<dyn GitBackend>,
+    a: ToolArgs,
+    interactive: bool,
+) -> anyhow::Result<String> {
+    if a.tool_help {
+        return Ok(tool_help("diff"));
+    }
+    let cmd = match &a.extcmd {
+        Some(x) => format!(r#"{x} "$LOCAL" "$REMOTE""#),
+        None => tool_command(
+            backend,
+            "diff",
+            &pick_tool(backend, "diff", a.tool.clone())?,
+        )?,
+    };
+    let (from, to) = match a.revs.as_slice() {
+        [] => (None, None),
+        [r] if r.contains("..") => {
+            let (x, y) = r.split_once("..").unwrap_or_default();
+            (Some(x.trim_end_matches('.').to_owned()), Some(y.to_owned()))
+        }
+        [r] => (Some(r.clone()), None),
+        [x, y] => (Some(x.clone()), Some(y.clone())),
+        _ => return Err(CliError::usage("give at most two revisions")),
+    };
+    let files = backend.diff(&rgit_git::DiffSpec {
+        from: from.clone(),
+        to: to.clone(),
+        cached: a.cached,
+        paths: a.paths.clone(),
+        ..Default::default()
+    })?;
+    let index = backend.index_entries()?;
+    let blob = |rev: Option<&str>, path: &str| -> Vec<u8> {
+        let id = match rev {
+            Some(r) => backend
+                .read_object(&format!("{r}:{path}"))
+                .ok()
+                .map(|o| o.data),
+            None => index
+                .iter()
+                .find(|e| e.path == path && e.stage == 0)
+                .and_then(|e| backend.read_object(&e.id).ok())
+                .map(|o| o.data),
+        };
+        id.unwrap_or_default()
+    };
+    let head = || Some("HEAD");
+    // Old side: the first revision, HEAD for --cached, else the index.
+    let old_rev = from.as_deref().or(if a.cached { head() } else { None });
+    let root = backend.workdir().to_path_buf();
+    let tmp = std::env::temp_dir().join(format!("rgit-difftool-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp)?;
+    let result = (|| -> anyhow::Result<()> {
+        let new_side = |path: &str, dir: &Path| -> anyhow::Result<PathBuf> {
+            Ok(match (&to, a.cached) {
+                (Some(r), _) => temp_file(dir, path, "REMOTE", &blob(Some(r), path))?,
+                (None, true) => temp_file(dir, path, "REMOTE", &blob(None, path))?,
+                (None, false) => root.join(path),
+            })
+        };
+        if a.dir_diff {
+            let (left, right) = (tmp.join("left"), tmp.join("right"));
+            for f in &files {
+                let old = f.old_path.as_deref().unwrap_or(&f.path);
+                for (dir, path, data) in [
+                    (&left, old, blob(old_rev, old)),
+                    (
+                        &right,
+                        f.path.as_str(),
+                        std::fs::read(new_side(&f.path, &tmp)?).unwrap_or_default(),
+                    ),
+                ] {
+                    let dest = dir.join(path);
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(dest, data)?;
+                }
+            }
+            run_tool(&cmd, &[("LOCAL", &left), ("REMOTE", &right)])?;
+            return Ok(());
+        }
+        let prompt = !a.no_prompt
+            && (a.prompt
+                || backend
+                    .config_get("difftool.prompt")?
+                    .is_none_or(|v| v != "false"))
+            && interactive;
+        let trust = a.trust_exit_code
+            || backend.config_get("difftool.trustExitCode")?.as_deref() == Some("true");
+        for (i, f) in files.iter().enumerate() {
+            let old = f.old_path.as_deref().unwrap_or(&f.path);
+            if prompt {
+                eprintln!("\nViewing ({}/{}): '{}'", i + 1, files.len(), f.path);
+                let answer = crate::interactive::input("Launch the tool [Y/n]? ")?;
+                if answer.trim().eq_ignore_ascii_case("n") {
+                    continue;
+                }
+            }
+            let local = temp_file(&tmp, old, "LOCAL", &blob(old_rev, old))?;
+            let remote = new_side(&f.path, &tmp)?;
+            let merged = root.join(&f.path);
+            let status = run_tool(
+                &cmd,
+                &[
+                    ("LOCAL", &local),
+                    ("REMOTE", &remote),
+                    ("MERGED", &merged),
+                    ("BASE", &merged),
+                ],
+            )?;
+            if trust && !status.success() {
+                return Err(anyhow::anyhow!("the diff tool exited with {status}"));
+            }
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result?;
+    Ok(String::new())
+}
+
+/// `rgit mergetool`: each conflicted file in the merge tool; a resolved file
+/// is staged, as git does.
+fn mergetool(
+    backend: &Arc<dyn GitBackend>,
+    a: ToolArgs,
+    interactive: bool,
+) -> anyhow::Result<String> {
+    if a.tool_help {
+        return Ok(tool_help("merge"));
+    }
+    let tool = pick_tool(backend, "merge", a.tool.clone())?;
+    let cmd = tool_command(backend, "merge", &tool)?;
+    let config = |k: String| backend.config_get(&k).ok().flatten();
+    let index = backend.index_entries()?;
+    let wanted: Vec<String> = a.revs.iter().chain(&a.paths).cloned().collect();
+    let mut paths: Vec<String> = index
+        .iter()
+        .filter(|e| e.stage > 0)
+        .map(|e| e.path.clone())
+        .filter(|p| wanted.is_empty() || rgit_git::pathspec_matches(&wanted, p))
+        .collect();
+    paths.dedup();
+    if paths.is_empty() {
+        return Ok("No files need merging".to_owned());
+    }
+    let prompt = !a.no_prompt
+        && (a.prompt || config("mergetool.prompt".into()).is_none_or(|v| v != "false"))
+        && interactive;
+    let trust = a.trust_exit_code
+        || config(format!("mergetool.{tool}.trustExitCode")).as_deref() == Some("true");
+    let keep_backup = config("mergetool.keepBackup".into()).is_none_or(|v| v != "false");
+    let root = backend.workdir().to_path_buf();
+    let mut resolved = Vec::new();
+    for path in &paths {
+        let stage = |n: u8| {
+            index
+                .iter()
+                .find(|e| e.path == *path && e.stage == n)
+                .and_then(|e| backend.read_object(&e.id).ok())
+                .map(|o| o.data)
+        };
+        let (base, local, remote) = (stage(1), stage(2), stage(3));
+        if local.is_none() || remote.is_none() {
+            return Err(anyhow::anyhow!(
+                "{path} was deleted on one side; resolve it with `rgit add` or `rgit rm`"
+            ));
+        }
+        if prompt {
+            eprintln!("\nNormal merge conflict for '{path}':");
+            let _ = crate::interactive::input(&format!(
+                "Hit return to start merge resolution tool ({tool}): "
+            ))?;
+        }
+        let merged = root.join(path);
+        let dir = merged.parent().unwrap_or(&root).to_path_buf();
+        let before = std::fs::read(&merged).unwrap_or_default();
+        if keep_backup {
+            std::fs::write(
+                merged.with_file_name(format!(
+                    "{}.orig",
+                    merged.file_name().unwrap_or_default().to_string_lossy()
+                )),
+                &before,
+            )?;
+        }
+        let files = [
+            (
+                "BASE",
+                temp_file(&dir, path, "BASE", &base.unwrap_or_default())?,
+            ),
+            (
+                "LOCAL",
+                temp_file(&dir, path, "LOCAL", &local.unwrap_or_default())?,
+            ),
+            (
+                "REMOTE",
+                temp_file(&dir, path, "REMOTE", &remote.unwrap_or_default())?,
+            ),
+        ];
+        let mut vars: Vec<(&str, &Path)> = files.iter().map(|(k, p)| (*k, p.as_path())).collect();
+        vars.push(("MERGED", &merged));
+        let status = run_tool(&cmd, &vars);
+        for (_, f) in &files {
+            let _ = std::fs::remove_file(f);
+        }
+        let status = status?;
+        let changed = std::fs::read(&merged).unwrap_or_default() != before;
+        let ok = if trust {
+            status.success()
+        } else if changed {
+            true
+        } else if interactive {
+            eprintln!("{path} seems unchanged.");
+            crate::interactive::confirm("Was the merge successful?")?
+        } else {
+            false
+        };
+        if !ok {
+            return Err(anyhow::anyhow!("merge of {path} failed"));
+        }
+        backend.add(std::slice::from_ref(path), false, false)?;
+        resolved.push(path.clone());
+    }
+    Ok(format!("resolved {}", resolved.join(", ")))
+}
+
+/// `rgit hash-object`, in a repository or outside one.
+pub fn hash_object(backend: Option<&dyn GitBackend>, a: HashObjectArgs) -> anyhow::Result<String> {
+    let git_dir = backend.map(|b| b.git_dir());
+    let root = backend.and_then(|b| b.workdir().canonicalize().ok());
+    // Attributes are looked up by the path inside the working tree.
+    let repo_path = |p: &str| -> Option<String> {
+        let root = root.as_ref()?;
+        let abs = std::path::absolute(p).ok()?;
+        let dir = abs.parent()?.canonicalize().ok()?;
+        let rel = dir.join(abs.file_name()?);
+        Some(rel.strip_prefix(root).ok()?.to_string_lossy().into_owned())
+    };
+    let kind = a.kind.as_deref().unwrap_or("blob");
+    let hash = |data: &[u8], file: Option<&str>| -> anyhow::Result<String> {
+        let path = if a.no_filters {
+            None
+        } else {
+            a.path.as_deref().or(file).and_then(repo_path)
+        };
+        Ok(rgit_git::hash_object(
+            git_dir.as_deref(),
+            kind,
+            data,
+            path.as_deref(),
+            a.write,
+            a.literally,
+        )?)
+    };
+    let mut out = String::new();
+    if a.stdin {
+        out.push_str(&hash(&read_input("-")?, None)?);
+        out.push('\n');
+    }
+    let listed = if a.stdin_paths {
+        String::from_utf8(read_input("-")?)?
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for p in a.paths.iter().chain(&listed) {
+        out.push_str(&hash(&read_input(p)?, Some(p))?);
+        out.push('\n');
+    }
+    if out.is_empty() && !a.stdin_paths {
+        return Err(CliError::usage("a file, --stdin or --stdin-paths required"));
+    }
+    Ok(out)
+}
+
+/// `rgit apply`, in a repository or outside one.
+pub fn apply(backend: Option<&dyn GitBackend>, a: ApplyArgs) -> anyhow::Result<String> {
+    let opts = rgit_git::ApplyOpts {
+        cached: a.cached,
+        index: a.index,
+        check: a.check,
+        reverse: a.reverse,
+        three_way: a.three_way,
+        reject: a.reject,
+        verbose: a.verbose,
+        strip: a.strip,
+        directory: a.directory,
+        include: a.include,
+        exclude: a.exclude,
+        whitespace: a.whitespace.clone(),
+        allow_empty: a.allow_empty,
+        favor: [(a.ours, "ours"), (a.theirs, "theirs"), (a.union, "union")]
+            .into_iter()
+            .find_map(|(on, f)| on.then(|| f.to_owned())),
+        recount: a.recount,
+        quiet: a.quiet,
+        // As in git, a subfolder only applies the paths under it.
+        prefix: backend.and_then(|b| {
+            let root = b.workdir().canonicalize().ok()?;
+            let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+            Some(cwd.strip_prefix(root).ok()?.to_string_lossy().into_owned())
+        }),
+    };
+    let patches = if a.patches.is_empty() {
+        vec!["-".to_owned()]
+    } else {
+        a.patches
+    };
+    let mut files = Vec::new();
+    for p in &patches {
+        files.extend(rgit_git::parse_patch(&read_input(p)?, &opts)?);
+    }
+    if let Some(ws) = &a.whitespace {
+        let warning = rgit_git::check_whitespace(&mut files, ws)?;
+        if !warning.is_empty() {
+            eprintln!("{warning}");
+        }
+    }
+    let mut out = String::new();
+    if a.stat {
+        out.push_str(&rgit_git::patch_stat(&files));
+    }
+    if a.numstat {
+        out.push_str(&rgit_git::patch_numstat(&files));
+    }
+    if a.summary {
+        out.push_str(&rgit_git::patch_summary(&files));
+    }
+    if a.apply || !(a.stat || a.numstat || a.summary) {
+        let log = match backend {
+            Some(b) => b.apply_patch(&files, &opts)?,
+            None => rgit_git::apply_outside(&files, &opts)?,
+        };
+        if !log.is_empty() {
+            eprintln!("{log}");
+        }
+        if out.is_empty() {
+            out = "ok".to_owned();
+        }
+    }
+    Ok(out)
+}
+
 fn read_input(path: &str) -> anyhow::Result<Vec<u8>> {
     if path == "-" {
         let mut buf = Vec::new();
@@ -6430,16 +8753,35 @@ fn read_input(path: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// `rgit archive` output; the format defaults from `output`'s extension.
-pub fn archive(
-    backend: &Arc<dyn GitBackend>,
-    rev: Option<String>,
-    paths: &[String],
-    format: Option<String>,
-    output: Option<&str>,
-    prefix: Option<String>,
-) -> anyhow::Result<Vec<u8>> {
-    let format = format.unwrap_or_else(|| {
-        let out = output.unwrap_or_default();
+pub fn archive(backend: Option<&Arc<dyn GitBackend>>, a: &ArchiveArgs) -> anyhow::Result<Vec<u8>> {
+    let remote: Arc<dyn GitBackend>;
+    let backend = match (&a.remote, backend) {
+        (Some(url), _) => {
+            let path = url.strip_prefix("file://").unwrap_or(url);
+            if !Path::new(path).exists() {
+                return Err(anyhow::anyhow!(
+                    "rgit archive --remote reaches only local repositories, not {url}"
+                ));
+            }
+            remote = Arc::new(rgit_git::Git2Backend::discover(path)?);
+            &remote
+        }
+        (None, Some(b)) => b,
+        (None, None) => return Err(CliError::not_a_repo()),
+    };
+    // `-0` to `-9` arrive as positionals.
+    let is_level = |s: &str| s.len() == 2 && s.starts_with('-') && s.as_bytes()[1].is_ascii_digit();
+    let mut words: Vec<&String> = a.rev.iter().chain(&a.paths).collect();
+    let level = words
+        .iter()
+        .rev()
+        .find(|w| is_level(w))
+        .map(|w| u32::from(w.as_bytes()[1] - b'0'));
+    words.retain(|w| !is_level(w));
+    let rev = words.first().map_or("HEAD".to_owned(), |r| r.to_string());
+    let paths: Vec<String> = words.iter().skip(1).map(|p| p.to_string()).collect();
+    let out = a.output.clone().unwrap_or_default();
+    let format = a.format.clone().unwrap_or_else(|| {
         if out.ends_with(".zip") {
             "zip"
         } else if out.ends_with(".tgz") || out.ends_with(".tar.gz") {
@@ -6449,12 +8791,48 @@ pub fn archive(
         }
         .to_owned()
     });
-    Ok(backend.archive(
-        rev.as_deref().unwrap_or("HEAD"),
-        &format,
-        prefix.as_deref().unwrap_or_default(),
+    let mut extra = Vec::new();
+    for f in &a.add_file {
+        extra.push(rgit_git::archive_file(Path::new(f))?);
+    }
+    for v in &a.add_virtual_file {
+        let (path, content) = v
+            .split_once(':')
+            .ok_or_else(|| CliError::usage("--add-virtual-file takes <path>:<content>"))?;
+        extra.push((path.to_owned(), 0o100644, content.as_bytes().to_vec()));
+    }
+    Ok(backend.archive(&rgit_git::ArchiveOpts {
+        rev,
+        format,
+        prefix: a.prefix.clone().unwrap_or_default(),
         paths,
-    )?)
+        level,
+        extra,
+        worktree_attributes: a.worktree_attributes,
+        mtime: match &a.mtime {
+            Some(t) => Some(
+                rgit_git::expiry_date(t)
+                    .ok_or_else(|| CliError::usage(format!("bad --mtime {t:?}")))?,
+            ),
+            None => None,
+        },
+    })?)
+}
+
+/// `rgit archive` with an output file, or `--list`.
+pub fn archive_cmd(
+    backend: Option<&Arc<dyn GitBackend>>,
+    a: ArchiveArgs,
+) -> anyhow::Result<String> {
+    if a.list {
+        return Ok("tar\ntgz\ntar.gz\nzip\n".to_owned());
+    }
+    let Some(output) = a.output.clone().filter(|o| o != "-") else {
+        return Err(CliError::usage("-o <file> required"));
+    };
+    let bytes = archive(backend, &a)?;
+    std::fs::write(&output, bytes)?;
+    Ok(format!("wrote {output}"))
 }
 
 /// Resolve a stash index: the given one, a prompt, or 0 (most recent).
@@ -7421,21 +9799,7 @@ fn strip_comments(text: &str) -> String {
 fn edit_file(backend: &Arc<dyn GitBackend>, file: &str, text: &str) -> anyhow::Result<String> {
     let path = backend.git_dir().join(file);
     std::fs::write(&path, text)?;
-    let editor = std::env::var("GIT_EDITOR")
-        .ok()
-        .or_else(|| backend.config_get("core.editor").ok().flatten())
-        .or_else(|| std::env::var("VISUAL").ok())
-        .or_else(|| std::env::var("EDITOR").ok())
-        .unwrap_or_else(|| "vi".to_owned());
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$1\""))
-        .arg("sh")
-        .arg(&path)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("the editor {editor} failed");
-    }
+    run_editor(Some(&backend.git_dir()), &path)?;
     Ok(std::fs::read_to_string(&path)?)
 }
 
@@ -7512,7 +9876,7 @@ fn stash_log(
                 line.push(ch);
                 continue;
             }
-            let date = crate::plumbing::format_date;
+            let date = crate::pretty::format_date;
             let a = &c.author;
             let cm = &c.committer;
             let code: String = match chars.next() {
@@ -7596,7 +9960,7 @@ pub fn from_cwd(mut command: Command, backend: &Arc<dyn GitBackend>) -> Command 
         | Command::Unstage { paths, .. }
         | Command::Discard { paths, .. }
         | Command::Split { paths, .. }
-        | Command::Archive { paths, .. }
+        | Command::Archive(ArchiveArgs { paths, .. })
         | Command::Add { paths, .. }
         | Command::Restore { paths, .. }
         | Command::Commit { paths, .. }
@@ -7642,7 +10006,13 @@ pub fn from_cwd(mut command: Command, backend: &Arc<dyn GitBackend>) -> Command 
         Command::Resolve { path, .. } => fix(path),
         Command::Blame { args, .. } => args.last_mut().into_iter().for_each(fix),
         Command::Show { paths, .. } => paths.iter_mut().for_each(fix),
-        Command::Log { revs, paths, .. } | Command::Diff { revs, paths, .. } => {
+        Command::Log { revs, paths, .. }
+        | Command::Diff {
+            revs,
+            paths,
+            no_index: false,
+            ..
+        } => {
             // A positional that names a file here is a path, not a revision.
             revs.iter_mut()
                 .filter(|r| Path::new(r.as_str()).exists())
@@ -7750,29 +10120,33 @@ fn ok_msg(r: Result<String, GitError>) -> anyhow::Result<String> {
 }
 
 pub(crate) fn diff_out(files: &[rgit_git::FileDiff], format: DiffFormat) -> String {
+    diff_out_in(files, format, 0)
+}
+
+/// [`diff_out`] with a `--stat` `indent` columns narrower, for a graph beside it.
+fn diff_out_in(files: &[rgit_git::FileDiff], format: DiffFormat, indent: usize) -> String {
     let rows = |row: &dyn Fn(&rgit_git::FileDiff) -> String| {
         files.iter().map(row).collect::<Vec<_>>().join("\n")
-    };
-    let path = |f: &rgit_git::FileDiff| match &f.old_path {
-        Some(old) => format!("{old}\t{}", f.path),
-        None => f.path.clone(),
     };
     if format.name_only {
         rows(&|f| f.path.clone())
     } else if format.name_status {
-        rows(&|f| {
-            let mut code = f.status.letter().to_owned();
-            // git prints a similarity score; an unchanged move is 100%.
-            if f.old_path.is_some() && f.hunks.is_empty() {
-                code.push_str("100");
-            }
-            format!("{code}\t{}", path(f))
+        rows(&|f| match &f.old_path {
+            // `--no-index` pairs two names without a rename.
+            Some(old) if f.similarity == 0 => format!("{}\t{old}", f.status.letter()),
+            Some(old) => format!(
+                "{}{:03}\t{old}\t{}",
+                f.status.letter(),
+                f.similarity,
+                f.path
+            ),
+            None => format!("{}\t{}", f.status.letter(), f.path),
         })
     } else if format.numstat {
         rows(&|f| {
             let (add, del) = crate::axi::line_counts(f);
             let path = match &f.old_path {
-                Some(old) => format!("{old} => {}", f.path),
+                Some(old) => render::rename_name(old, &f.path),
                 None => f.path.clone(),
             };
             if f.binary {
@@ -7781,10 +10155,26 @@ pub(crate) fn diff_out(files: &[rgit_git::FileDiff], format: DiffFormat) -> Stri
                 format!("{add}\t{del}\t{path}")
             }
         })
+    } else if format.shortstat {
+        if files.is_empty() {
+            String::new()
+        } else {
+            render::stat_summary(files)
+        }
     } else if format.patch && format.stat {
-        format!("{}\n\n{}", render::diffstat(files), render::patch(files))
+        format!(
+            "{}\n\n{}",
+            render::stat(files, indent),
+            render::patch(files)
+        )
     } else if format.patch {
         render::patch(files)
+    } else if format.stat {
+        if files.is_empty() {
+            String::new()
+        } else {
+            render::stat(files, indent)
+        }
     } else {
         render::diffstat(files)
     }
@@ -7800,6 +10190,9 @@ pub(crate) fn log_options(
         skip,
         all,
         author,
+        committer,
+        occurrences,
+        changes_matching,
         since,
         until,
         grep,
@@ -7809,6 +10202,7 @@ pub(crate) fn log_options(
         no_merges,
         reverse,
         follow,
+        pretty,
         revs,
         paths,
         ..
@@ -7818,7 +10212,7 @@ pub(crate) fn log_options(
     };
     let (revs, paths) = split_revs(backend, revs, paths)?;
     Ok(LogOptions {
-        limit: *limit,
+        limit: limit.unwrap_or(if pretty.any() { usize::MAX } else { 20 }),
         offset: *skip,
         all: *all,
         author: author.clone(),
@@ -7832,7 +10226,182 @@ pub(crate) fn log_options(
         merges: (*merges || *no_merges).then_some(*merges),
         reverse: *reverse,
         follow: *follow,
+        rewrite_parents: pretty.graph,
+        committer: committer.clone(),
+        occurrences: occurrences.clone(),
+        changes_matching: changes_matching.clone(),
     })
+}
+
+/// Each log entry's changes against its first parent, as `log -p` or `--stat`
+/// show them: none for a merge or without a diff format, and with `--follow`
+/// only the followed file, under the name it had in that commit.
+fn log_diffs(
+    backend: &Arc<dyn GitBackend>,
+    opts: &LogOptions,
+    entries: &[rgit_git::LogEntry],
+    format: DiffFormat,
+) -> anyhow::Result<Vec<Vec<rgit_git::FileDiff>>> {
+    let mut out = vec![Vec::new(); entries.len()];
+    if !format.any() {
+        return Ok(out);
+    }
+    let mut follow = opts.paths.first().filter(|_| opts.follow).cloned();
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    if opts.reverse {
+        order.reverse();
+    }
+    for i in order {
+        let e = &entries[i];
+        if e.parents.len() > 1 {
+            continue;
+        }
+        let mut files = backend.diff(&rgit_git::DiffSpec {
+            from: e.parents.first().cloned(),
+            to: Some(e.oid.clone()),
+            paths: if follow.is_some() {
+                Vec::new()
+            } else {
+                opts.paths.clone()
+            },
+            ..Default::default()
+        })?;
+        if let Some(path) = &mut follow {
+            files.retain(|f| f.path == *path);
+            if let Some(old) = files.first().and_then(|f| f.old_path.clone()) {
+                *path = old;
+            }
+        }
+        out[i] = files;
+    }
+    Ok(out)
+}
+
+/// Commits in a git format, each followed by its changes, as `git log` prints them.
+fn pretty_log(
+    pretty: &crate::pretty::Pretty,
+    commits: &[crate::pretty::Commit],
+    diffs: &[Option<Vec<rgit_git::FileDiff>>],
+    format: DiffFormat,
+) -> String {
+    let mut out = String::new();
+    for (i, (c, files)) in commits.iter().zip(diffs).enumerate() {
+        if i > 0 && !pretty.terminator {
+            out.push('\n');
+        }
+        out.push_str(&pretty.show(c));
+        if pretty.terminator {
+            out.push('\n');
+        }
+        if let Some(files) = files {
+            if pretty.blank_before_diff(c.parents.len() > 1) {
+                out.push_str(if format.patch && format.stat {
+                    "---\n"
+                } else {
+                    "\n"
+                });
+            }
+            if !files.is_empty() {
+                out.push_str(diff_out(files, format).trim_end_matches('\n'));
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+/// git's graph order (`--topo-order`): each commit after all its children,
+/// a merge's side branch right after it.
+fn topo_order(entries: Vec<rgit_git::LogEntry>) -> Vec<rgit_git::LogEntry> {
+    let index: std::collections::HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.oid.as_str(), i))
+        .collect();
+    let parents: Vec<Vec<usize>> = entries
+        .iter()
+        .map(|e| {
+            e.parents
+                .iter()
+                .filter_map(|p| index.get(p.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    let mut indegree = vec![1usize; entries.len()];
+    for &p in parents.iter().flatten() {
+        indegree[p] += 1;
+    }
+    let mut stack: Vec<usize> = (0..entries.len()).filter(|&i| indegree[i] == 1).collect();
+    stack.reverse();
+    let mut order = Vec::with_capacity(entries.len());
+    while let Some(i) = stack.pop() {
+        for &p in &parents[i] {
+            if indegree[p] == 0 {
+                continue;
+            }
+            indegree[p] -= 1;
+            if indegree[p] == 1 {
+                stack.push(p);
+            }
+        }
+        indegree[i] = 0;
+        order.push(i);
+    }
+    let mut slots: Vec<Option<rgit_git::LogEntry>> = entries.into_iter().map(Some).collect();
+    order.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
+/// [`pretty_log`] with git's `--graph` drawn to the left of every line.
+fn graph_log(
+    pretty: &crate::pretty::Pretty,
+    commits: &[crate::pretty::Commit],
+    parents: &[Vec<String>],
+    diffs: &[Option<Vec<rgit_git::FileDiff>>],
+    format: DiffFormat,
+) -> String {
+    let mut graph = crate::graph::Graph::new();
+    let mut out = String::new();
+    let mut missing_newline = false;
+    for (i, c) in commits.iter().enumerate() {
+        graph.update(&c.id, parents[i].clone());
+        if i > 0 && !pretty.terminator {
+            if !missing_newline {
+                out.push_str(&graph.padding_line());
+            }
+            out.push('\n');
+        }
+        out.push_str(&graph.show_commit());
+        let (head, msg) = pretty.parts(c);
+        out.push_str(&head);
+        if head.ends_with('\n') {
+            out.push_str(&graph.oneline());
+        }
+        out.push_str(&graph.commit_msg(&msg));
+        missing_newline = !msg.ends_with('\n');
+        if pretty.terminator {
+            if !missing_newline {
+                out.push_str(&graph.padding_line());
+            }
+            out.push('\n');
+        }
+        if let Some(files) = &diffs[i] {
+            let prefix = graph.padding_line();
+            if pretty.blank_before_diff(c.parents.len() > 1) {
+                out.push_str(&prefix);
+                if format.patch && format.stat {
+                    out.push_str("---");
+                }
+                out.push('\n');
+            }
+            let text = diff_out_in(files, format, prefix.chars().count());
+            for line in text.trim_end_matches('\n').split('\n') {
+                out.push_str(&prefix);
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
 }
 
 /// The files a `rgit diff` command compares, and a name for that scope.
@@ -7847,11 +10416,34 @@ pub(crate) fn diff_files(
         unified,
         ignore_all_space,
         ignore_space_change,
+        exit_code,
+        quiet,
+        no_index,
+        reverse,
+        diff_filter,
         ..
     } = command
     else {
         anyhow::bail!("not a diff command");
     };
+    let spec = |from, to, paths| rgit_git::DiffSpec {
+        from,
+        to,
+        cached: *cached,
+        paths,
+        context: *unified,
+        ignore_all_space: *ignore_all_space,
+        ignore_space_change: *ignore_space_change,
+        reverse: *reverse,
+    };
+    if *no_index {
+        let [a, b] = &[&revs[..], &paths[..]].concat()[..] else {
+            return Err(CliError::usage("diff --no-index takes two paths"));
+        };
+        let files = rgit_git::diff_no_index(Path::new(a), Path::new(b), &spec(None, None, vec![]))?;
+        set_exit(!files.is_empty());
+        return Ok((files, format!("{a}..{b}")));
+    }
     let (revs, paths) = split_revs(backend, revs, paths)?;
     let side = if *cached { "index" } else { "working tree" };
     let (from, to, scope) = match &revs[..] {
@@ -7866,16 +10458,44 @@ pub(crate) fn diff_files(
         ),
         _ => return Err(CliError::usage("diff takes at most two revisions")),
     };
-    let files = backend.diff(&rgit_git::DiffSpec {
-        from,
-        to,
-        cached: *cached,
-        paths,
-        context: *unified,
-        ignore_all_space: *ignore_all_space,
-        ignore_space_change: *ignore_space_change,
-    })?;
+    let mut files = backend.diff(&spec(from, to, paths))?;
+    if let Some(filter) = diff_filter {
+        let letter = |f: &rgit_git::FileDiff| f.status.letter().chars().next().unwrap_or('M');
+        let want: Vec<char> = filter.chars().filter(char::is_ascii_uppercase).collect();
+        files.retain(|f| {
+            let l = letter(f);
+            (want.is_empty() || want.contains(&l)) && !filter.contains(l.to_ascii_lowercase())
+        });
+    }
+    if *exit_code || *quiet {
+        set_exit(!files.is_empty());
+    }
     Ok((files, scope))
+}
+
+static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Make a successful run exit 1, as `diff --exit-code` does on differences.
+fn set_exit(differs: bool) {
+    EXIT_CODE.store(i32::from(differs), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The exit status of a run that succeeded.
+pub fn exit_code() -> i32 {
+    EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static AS_IS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Print the text without the usual final newline, as `log --format=format:`
+/// does in git.
+pub(crate) fn print_as_is() {
+    AS_IS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the text is printed exactly as it is.
+pub fn text_as_is() -> bool {
+    AS_IS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Split `log`/`diff` arguments into revisions and paths as git does: the
@@ -7965,6 +10585,219 @@ pub(crate) fn blame(
         [path, ..] => backend.blame(path),
         [] => Ok(Vec::new()),
     }
+}
+
+/// `describe --contains`: the commit `id` named from the oldest tag that
+/// contains it, as git's name-rev does (`v1^0`, `v1~2`, `v1~1^2~3`).
+fn describe_contains(
+    backend: &Arc<dyn GitBackend>,
+    id: &str,
+    pattern: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    struct Name {
+        tip: String,
+        tagger_date: i64,
+        generation: usize,
+        distance: usize,
+    }
+    let mut commits: std::collections::HashMap<String, (i64, Vec<String>)> = Default::default();
+    let mut commit = |id: &str| -> anyhow::Result<(i64, Vec<String>)> {
+        if let Some(c) = commits.get(id) {
+            return Ok(c.clone());
+        }
+        let c = crate::pretty::parse(&backend.read_object(id)?);
+        let entry = (c.committer.time, c.parents);
+        commits.insert(id.to_owned(), entry.clone());
+        Ok(entry)
+    };
+    // Commits a day older than the target cannot lead to it (git's cutoff).
+    let cutoff = commit(id)?.0 - 86400;
+    let mut tips = Vec::new();
+    for r in backend.ref_details()? {
+        let Some(tag) = r.name.strip_prefix("refs/tags/") else {
+            continue;
+        };
+        if pattern.is_some_and(|p| !crate::plumbing::glob(p.as_bytes(), tag.as_bytes())) {
+            continue;
+        }
+        let (target, date, deref) = match (&r.peeled, &r.tagger) {
+            (Some(peeled), Some(tagger)) => (peeled.clone(), tagger.time, true),
+            _ => match &r.committer {
+                Some(c) => (r.id.clone(), c.time, false),
+                None => continue,
+            },
+        };
+        if backend.read_object(&target)?.kind != "commit" {
+            continue;
+        }
+        tips.push((date, tag.to_owned(), target, deref));
+    }
+    tips.sort_by_key(|t| t.0);
+    let mut names: std::collections::HashMap<String, Name> = Default::default();
+    // A name wins when its tag is older, then when it is fewer hops away.
+    let better = |n: Option<&Name>, date: i64, distance: usize| {
+        n.is_none_or(|n| n.tagger_date > date || n.tagger_date == date && n.distance > distance)
+    };
+    for (date, tag, target, deref) in tips {
+        if commit(&target)?.0 < cutoff || !better(names.get(&target), date, 0) {
+            continue;
+        }
+        let tip = if deref { format!("{tag}^0") } else { tag };
+        names.insert(
+            target.clone(),
+            Name {
+                tip,
+                tagger_date: date,
+                generation: 0,
+                distance: 0,
+            },
+        );
+        let mut stack = vec![target];
+        while let Some(c) = stack.pop() {
+            let (tip, generation, distance) = {
+                let n = &names[&c];
+                (n.tip.clone(), n.generation, n.distance)
+            };
+            let mut queue = Vec::new();
+            for (i, p) in commit(&c)?.1.into_iter().enumerate() {
+                if commit(&p)?.0 < cutoff {
+                    continue;
+                }
+                let (generation, distance, tip) = if i == 0 {
+                    (generation + 1, distance + 1, tip.clone())
+                } else {
+                    let base = tip.strip_suffix("^0").unwrap_or(&tip);
+                    let tip = if generation > 0 {
+                        format!("{base}~{generation}^{}", i + 1)
+                    } else {
+                        format!("{base}^{}", i + 1)
+                    };
+                    (0, distance + 65535, tip)
+                };
+                if better(names.get(&p), date, distance) {
+                    names.insert(
+                        p.clone(),
+                        Name {
+                            tip,
+                            tagger_date: date,
+                            generation,
+                            distance,
+                        },
+                    );
+                    queue.push(p);
+                }
+            }
+            // The first parent comes off the stack first.
+            stack.extend(queue.into_iter().rev());
+        }
+    }
+    Ok(names.get(id).map(|n| {
+        if n.generation == 0 {
+            n.tip.clone()
+        } else {
+            format!(
+                "{}~{}",
+                n.tip.strip_suffix("^0").unwrap_or(&n.tip),
+                n.generation
+            )
+        }
+    }))
+}
+
+/// `blame --porcelain` (or `--line-porcelain` with `repeat`), as git prints
+/// it; `lo` is the number of lines before `lines` in the file.
+fn blame_porcelain(
+    backend: &Arc<dyn GitBackend>,
+    lines: &[rgit_git::BlameLine],
+    lo: usize,
+    repeat: bool,
+) -> anyhow::Result<String> {
+    const ZERO: &str = "0000000000000000000000000000000000000000";
+    let mut shown = std::collections::HashSet::new();
+    let mut out = String::new();
+    for (i, b) in lines.iter().enumerate() {
+        let id = if b.id.is_empty() { ZERO } else { &b.id };
+        let starts = i == 0 || {
+            let p = &lines[i - 1];
+            p.id != b.id || p.orig_path != b.orig_path || p.orig_line + 1 != b.orig_line
+        };
+        out.push_str(&format!("{id} {} {}", b.orig_line, lo + i + 1));
+        if starts {
+            let n = lines[i..]
+                .iter()
+                .zip(i..)
+                .take_while(|(l, j)| {
+                    l.id == b.id
+                        && l.orig_path == b.orig_path
+                        && l.orig_line == b.orig_line + (j - i)
+                })
+                .count();
+            out.push_str(&format!(" {n}"));
+        }
+        out.push('\n');
+        if repeat || starts && shown.insert(id) {
+            out.push_str(&blame_details(backend, b)?);
+        }
+        out.push('\t');
+        out.push_str(&b.line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// The `author ...` to `filename ...` lines of a porcelain blame entry.
+fn blame_details(backend: &Arc<dyn GitBackend>, b: &rgit_git::BlameLine) -> anyhow::Result<String> {
+    let path = &b.orig_path;
+    if b.id.is_empty() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let tz = crate::pretty::format_date(now, crate::pretty::local_offset(now), "raw");
+        let tz = tz.split(' ').nth(1).unwrap_or("+0000");
+        let mut out = String::new();
+        for role in ["author", "committer"] {
+            out.push_str(&format!(
+                "{role} Not Committed Yet\n{role}-mail <not.committed.yet>\n\
+                 {role}-time {now}\n{role}-tz {tz}\n"
+            ));
+        }
+        out.push_str(&format!("summary Version of {path} from {path}\n"));
+        if let Ok(head) = backend.rev_parse("HEAD") {
+            out.push_str(&format!("previous {head} {path}\n"));
+        }
+        out.push_str(&format!("filename {path}\n"));
+        return Ok(out);
+    }
+    let c = crate::pretty::parse(&backend.read_object(&b.id)?);
+    let mut out = String::new();
+    for (role, who) in [("author", &c.author), ("committer", &c.committer)] {
+        let tz = crate::pretty::format_date(who.time, who.offset, "raw");
+        out.push_str(&format!(
+            "{role} {}\n{role}-mail <{}>\n{role}-time {}\n{role}-tz {}\n",
+            who.name,
+            who.email,
+            who.time,
+            tz.split(' ').nth(1).unwrap_or("+0000")
+        ));
+    }
+    let summary = c
+        .message
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("");
+    out.push_str(&format!("summary {summary}\n"));
+    if b.boundary {
+        out.push_str("boundary\n");
+    }
+    if let Some(p) = c
+        .parents
+        .iter()
+        .find(|p| backend.read_blob(p, path).is_ok())
+    {
+        out.push_str(&format!("previous {p} {path}\n"));
+    }
+    out.push_str(&format!("filename {path}\n"));
+    Ok(out)
 }
 
 /// Run a network/merge/rebase op, collecting its git-style report lines as the

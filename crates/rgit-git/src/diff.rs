@@ -9,6 +9,13 @@ pub struct FileDiff {
     pub status: crate::StatusCode,
     pub hunks: Vec<Hunk>,
     pub binary: bool,
+    /// git's file header (`diff --git ...` to `+++ b/...`, or the `Binary
+    /// files ... differ` line), each line newline-terminated.
+    pub header: String,
+    /// git's rename or copy score in percent; 0 for other changes.
+    pub similarity: u16,
+    /// Old and new sizes in bytes, for a binary file's `Bin A -> B bytes`.
+    pub sizes: (u64, u64),
 }
 
 /// One `@@ ... @@` hunk.

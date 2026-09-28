@@ -58,7 +58,17 @@ fn repo(tag: &str) -> PathBuf {
         std::fs::write(dir.join(p), format!("{p}\n")).unwrap();
     }
     git(&dir, &["add", "."]);
-    git(&dir, &["commit", "-qm", "init"]);
+    // A fixed date gives twin repos the same ids, which stash messages name.
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["commit", "-qm", "init"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+        .status()
+        .unwrap();
+    assert!(out.success());
     dir
 }
 

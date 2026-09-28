@@ -1541,7 +1541,7 @@ fn ref_matches(pattern: &str, name: &str) -> bool {
 }
 
 /// fnmatch without FNM_PATHNAME: `*` and `?` also match `/`.
-fn glob(p: &[u8], s: &[u8]) -> bool {
+pub(crate) fn glob(p: &[u8], s: &[u8]) -> bool {
     match (p.first(), s.first()) {
         (None, None) => true,
         (Some(b'*'), _) => glob(&p[1..], s) || !s.is_empty() && glob(p, &s[1..]),
@@ -1735,12 +1735,12 @@ impl<'a> RefFormat<'a> {
                     "localpart" => i.email.split('@').next().unwrap_or_default().to_owned(),
                     _ => format!("<{}>", i.email),
                 },
-                "date" => format_date(i.time, i.offset, arg),
+                "date" => crate::pretty::format_date(i.time, i.offset, arg),
                 _ => format!(
                     "{} <{}> {}",
                     i.name,
                     i.email,
-                    format_date(i.time, i.offset, "raw")
+                    crate::pretty::format_date(i.time, i.offset, "raw")
                 ),
             }
         };
@@ -1988,80 +1988,9 @@ fn strip(name: &str, arg: &str) -> anyhow::Result<String> {
     })
 }
 
-/// A date as git prints it: `default`, `short`, `iso`, `iso-strict`, `rfc`,
-/// `unix`, `raw` or `relative`.
-pub(crate) fn format_date(time: i64, offset: i32, style: &str) -> String {
-    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let sign = if offset < 0 { '-' } else { '+' };
-    let (oh, om) = (offset.abs() / 60, offset.abs() % 60);
-    let local = time + i64::from(offset) * 60;
-    let days = local.div_euclid(86400);
-    let secs = local.rem_euclid(86400);
-    let (h, mi, s) = (secs / 3600, secs / 60 % 60, secs % 60);
-    // civil_from_days (Howard Hinnant, public domain).
-    let z = days + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    let wd = DAYS[(days + 4).rem_euclid(7) as usize];
-    let mon = MONTHS[(m - 1) as usize];
-    match style {
-        "short" => format!("{y:04}-{m:02}-{d:02}"),
-        "iso" | "iso8601" => {
-            format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02} {sign}{oh:02}{om:02}")
-        }
-        "iso-strict" | "iso8601-strict" => {
-            format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}{sign}{oh:02}:{om:02}")
-        }
-        "rfc" | "rfc2822" => {
-            format!("{wd}, {d} {mon} {y} {h:02}:{mi:02}:{s:02} {sign}{oh:02}{om:02}")
-        }
-        "unix" => time.to_string(),
-        "raw" => format!("{time} {sign}{oh:02}{om:02}"),
-        "relative" => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs() as i64);
-            let ago = (now - time).max(0);
-            let (n, unit) = match ago {
-                a if a < 90 => (a, "second"),
-                a if a < 90 * 60 => (a / 60, "minute"),
-                a if a < 36 * 3600 => (a / 3600, "hour"),
-                a if a < 14 * 86400 => (a / 86400, "day"),
-                a if a < 70 * 86400 => (a / (7 * 86400), "week"),
-                a if a < 365 * 86400 => (a / (30 * 86400), "month"),
-                a => (a / (365 * 86400), "year"),
-            };
-            format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
-        }
-        _ => format!("{wd} {mon} {d} {h:02}:{mi:02}:{s:02} {y} {sign}{oh:02}{om:02}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dates_format_like_git() {
-        // 2026-09-27 14:17:29 -0500
-        let t = 1790536649;
-        assert_eq!(format_date(t, -300, ""), "Sun Sep 27 14:17:29 2026 -0500");
-        assert_eq!(format_date(t, -300, "iso"), "2026-09-27 14:17:29 -0500");
-        assert_eq!(
-            format_date(t, -300, "iso-strict"),
-            "2026-09-27T14:17:29-05:00"
-        );
-        assert_eq!(format_date(0, 0, "short"), "1970-01-01");
-    }
 
     #[test]
     fn refs_shorten_and_match() {

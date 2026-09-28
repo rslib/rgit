@@ -8,7 +8,8 @@ use git2::{
     PushOptions, RemoteCallbacks, Repository, ResetType, Status, StatusOptions,
 };
 
-use crate::model::{CommitOptions, ConfigScope, RepoState, ResetMode};
+use crate::config::{ConfigScope, open_config};
+use crate::model::{CommitOptions, RepoState, ResetMode};
 
 use crate::backend::GitBackend;
 use crate::diff::{DiffLine, FileDiff, Hunk, LineOrigin};
@@ -303,13 +304,13 @@ impl GitBackend for Git2Backend {
                 // Emit the file's lines as additions, not just a bare "new file" delta.
                 .show_untracked_content(true);
         }
-        let unstaged = extract_with_renames(repo.diff_index_to_workdir(None, Some(&mut wt_opts))?)?;
+        let unstaged =
+            extract_with_renames(&repo, repo.diff_index_to_workdir(None, Some(&mut wt_opts))?)?;
         let mut idx_opts = DiffOptions::new();
-        let staged = extract_with_renames(repo.diff_tree_to_index(
-            head_tree.as_ref(),
-            None,
-            Some(&mut idx_opts),
-        )?)?;
+        let staged = extract_with_renames(
+            &repo,
+            repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut idx_opts))?,
+        )?;
 
         Ok(RepoStatus {
             head,
@@ -545,10 +546,21 @@ impl GitBackend for Git2Backend {
         if !seeded {
             return Ok(Vec::new());
         }
-        walk.set_sorting(git2::Sort::TIME)?;
         if opts.first_parent {
             walk.simplify_first_parent()?;
         }
+        // libgit2 only decides which commits a range leaves in; the order
+        // is git's own.
+        let ranged = opts
+            .revs
+            .iter()
+            .any(|r| r.starts_with('^') || r.contains(".."));
+        let allowed = if ranged {
+            Some(walk.collect::<Result<std::collections::HashSet<_>, _>>()?)
+        } else {
+            None
+        };
+        let walk = DateWalk::new(&repo, &log_tips(&repo, opts)?, allowed, opts.first_parent);
         let grep = if opts.grep.is_empty() {
             None
         } else {
@@ -574,14 +586,55 @@ impl GitBackend for Git2Backend {
         let unpushed = unpushed_oids(&repo);
         let decorations = log_decorations(&repo);
         let author_needle = opts.author.as_ref().map(|a| a.to_lowercase());
+        let committer_needle = opts.committer.as_ref().map(|a| a.to_lowercase());
+        let changes = opts
+            .changes_matching
+            .as_deref()
+            .map(regex::Regex::new)
+            .transpose()
+            .map_err(|e| GitError::Other(format!("bad -G pattern: {e}")))?;
         let mut entries = Vec::new();
         let mut passed = 0usize;
+        // git's default history simplification for paths: a merge that matches
+        // one parent there follows only that parent, so side branches it
+        // dropped are not walked. `kept` are the parents still followed,
+        // `seen` every parent named so far.
+        let (mut kept, mut seen) = (
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        );
+        // A skipped commit's followed parent, for rewriting parents.
+        let mut skipped: std::collections::HashMap<Oid, Option<Oid>> = Default::default();
         for oid in walk {
             if entries.len() >= opts.limit {
                 break;
             }
-            let commit = repo.find_commit(oid?)?;
-            let when = commit.author().when().seconds();
+            let oid = oid?;
+            let commit = repo.find_commit(oid)?;
+            let touched = if let Some(path) = &mut follow {
+                // git's --follow prunes nothing; it shows the commits whose
+                // own diff touches the file, which leaves merges out.
+                commit.parent_count() < 2 && follow_path(&repo, &commit, path)
+            } else if opts.paths.is_empty() {
+                true
+            } else {
+                if seen.contains(&oid) && !kept.contains(&oid) {
+                    seen.extend(commit.parent_ids());
+                    continue;
+                }
+                let (touched, parents) =
+                    simplify_parents(&repo, &commit, &opts.paths, opts.first_parent);
+                seen.extend(commit.parent_ids());
+                if !touched {
+                    skipped.insert(oid, parents.first().copied());
+                }
+                kept.extend(parents);
+                touched
+            };
+            if !touched {
+                continue;
+            }
+            let when = commit.time().seconds();
             if opts.since.map(|s| when < s).unwrap_or(false)
                 || opts.until.map(|u| when > u).unwrap_or(false)
             {
@@ -598,15 +651,6 @@ impl GitBackend for Git2Backend {
             {
                 continue;
             }
-            if let Some(path) = &mut follow {
-                if !follow_path(&repo, &commit, path) {
-                    continue;
-                }
-            } else if !opts.paths.is_empty()
-                && !commit_touched_path(&repo, &commit, &opts.paths, opts.first_parent)
-            {
-                continue;
-            }
             let author = commit.author();
             let author_name = author.name().unwrap_or("?").to_owned();
             if let Some(needle) = &author_needle {
@@ -616,6 +660,19 @@ impl GitBackend for Git2Backend {
                 {
                     continue;
                 }
+            }
+            if let Some(needle) = &committer_needle {
+                let who = commit.committer();
+                let name = who.name().unwrap_or("").to_lowercase();
+                let email = who.email().unwrap_or("").to_lowercase();
+                if !name.contains(needle) && !email.contains(needle) {
+                    continue;
+                }
+            }
+            if (opts.occurrences.is_some() || changes.is_some())
+                && !pickaxe(&repo, &commit, opts, changes.as_ref())?
+            {
+                continue;
             }
             // Skip the first `offset` matches for pagination, after filtering.
             passed += 1;
@@ -642,6 +699,25 @@ impl GitBackend for Git2Backend {
                 refs: decorations.get(&commit.id()).cloned().unwrap_or_default(),
                 unpushed: unpushed.contains(&commit.id()),
             });
+        }
+        if opts.rewrite_parents && !skipped.is_empty() {
+            for e in &mut entries {
+                let mut parents: Vec<String> = Vec::new();
+                for p in &e.parents {
+                    let mut p = Oid::from_str(p)?;
+                    let kept = loop {
+                        match skipped.get(&p) {
+                            Some(Some(next)) => p = *next,
+                            Some(None) => break None,
+                            None => break Some(p.to_string()),
+                        }
+                    };
+                    if let Some(p) = kept.filter(|p| !parents.contains(p)) {
+                        parents.push(p);
+                    }
+                }
+                e.parents = parents;
+            }
         }
         if opts.reverse {
             entries.reverse();
@@ -815,7 +891,7 @@ impl GitBackend for Git2Backend {
             email: commit.author().email().unwrap_or("").to_owned(),
             when: relative_age(commit.time().seconds(), now),
             message: commit.message().unwrap_or("").trim_end().to_owned(),
-            files: extract_with_renames(diff)?,
+            files: extract_with_renames(&repo, diff)?,
         })
     }
 
@@ -900,7 +976,7 @@ impl GitBackend for Git2Backend {
         let mut opts = DiffOptions::new();
         opts.pathspec(path);
         let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
-        Ok(extract_with_renames(diff)?
+        Ok(extract_with_renames(&repo, diff)?
             .into_iter()
             .find(|f| f.path == path))
     }
@@ -911,7 +987,7 @@ impl GitBackend for Git2Backend {
         let to_tree = repo.revparse_single(to)?.peel_to_tree()?;
         let mut opts = DiffOptions::new();
         let diff = repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))?;
-        extract_with_renames(diff)
+        extract_with_renames(&repo, diff)
     }
 
     fn diff(&self, spec: &crate::DiffSpec) -> Result<Vec<crate::FileDiff>, GitError> {
@@ -926,7 +1002,9 @@ impl GitBackend for Git2Backend {
             opts.context_lines(n);
         }
         opts.ignore_whitespace(spec.ignore_all_space)
-            .ignore_whitespace_change(spec.ignore_space_change);
+            .ignore_whitespace_change(spec.ignore_space_change)
+            .indent_heuristic(true)
+            .reverse(spec.reverse);
         let tree = |rev: &str| repo.revparse_single(rev).and_then(|o| o.peel_to_tree());
         let diff = match (&spec.from, &spec.to) {
             (Some(range), None) if range.contains("..") => {
@@ -949,7 +1027,7 @@ impl GitBackend for Git2Backend {
             }
             (None, None) => repo.diff_index_to_workdir(None, Some(&mut opts))?,
         };
-        extract_with_renames(diff)
+        extract_with_renames(&repo, diff)
     }
 
     fn file_diff(&self, path: &str, staged: bool) -> Result<Option<crate::FileDiff>, GitError> {
@@ -968,7 +1046,7 @@ impl GitBackend for Git2Backend {
                 .show_untracked_content(true);
             repo.diff_index_to_workdir(None, Some(&mut opts))?
         };
-        Ok(extract_with_renames(diff)?
+        Ok(extract_with_renames(&repo, diff)?
             .into_iter()
             .find(|f| f.path == path))
     }
@@ -981,7 +1059,19 @@ impl GitBackend for Git2Backend {
         // blame and errors with "path does not exist". Match `git blame` and mark
         // every line not-yet-committed rather than failing.
         let blame = repo.blame_file(Path::new(path), None).ok();
-        Ok(blame_lines(blame.as_ref(), &content))
+        // Lines changed in the working tree blame to no commit, as in git;
+        // the rest to the line they are in HEAD.
+        let head = repo
+            .head()
+            .and_then(|h| h.peel_to_tree())
+            .and_then(|t| t.get_path(Path::new(path)))
+            .and_then(|e| e.to_object(&repo))
+            .and_then(|o| o.peel_to_blob());
+        let map = match &head {
+            Ok(blob) => Some(line_map(blob.content(), content.as_bytes())?),
+            Err(_) => None,
+        };
+        Ok(blame_lines(blame.as_ref(), &content, path, map.as_deref()))
     }
 
     fn blame_at(&self, rev: &str, path: &str) -> Result<Vec<crate::BlameLine>, GitError> {
@@ -998,6 +1088,8 @@ impl GitBackend for Git2Backend {
         Ok(blame_lines(
             Some(&blame),
             &String::from_utf8_lossy(blob.content()),
+            path,
+            None,
         ))
     }
 
@@ -1675,7 +1767,11 @@ impl GitBackend for Git2Backend {
     }
 
     fn archive_targz(&self, rev: &str) -> Result<Vec<u8>, GitError> {
-        self.archive(rev, "tgz", "", &[])
+        self.archive(&crate::ArchiveOpts {
+            rev: rev.to_owned(),
+            format: "tgz".to_owned(),
+            ..Default::default()
+        })
     }
 
     fn checkout_detached(&self, rev: &str) -> Result<(), GitError> {
@@ -2127,70 +2223,35 @@ impl GitBackend for Git2Backend {
         value: &str,
         add: bool,
     ) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
-        let mut config = open_config(&repo, scope, true)?;
-        if add {
-            // A pattern no value matches appends instead of replacing.
-            config.set_multivar(name, "$^", value)?;
+        let git_dir = self.git_dir();
+        let mode = if add {
+            crate::SetMode::Add
         } else {
-            config.set_str(name, value)?;
-        }
-        Ok(())
+            crate::SetMode::Replace
+        };
+        crate::config_set(Some(&git_dir), &scope, name, value, None, mode)
     }
 
     fn config_unset(&self, scope: ConfigScope, name: &str, all: bool) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
-        let mut config = open_config(&repo, scope, true)?;
-        if all {
-            config.remove_multivar(name, ".*")?;
-        } else {
-            config.remove(name)?;
-        }
-        Ok(())
+        let git_dir = self.git_dir();
+        crate::config_unset(Some(&git_dir), &scope, name, None, all)
     }
 
     fn apply_patch(
         &self,
-        patch: &[u8],
-        cached: bool,
-        index: bool,
-        reverse: bool,
-        check: bool,
-    ) -> Result<(), GitError> {
-        let reversed;
-        let patch = if reverse {
-            reversed = reverse_patch(&String::from_utf8_lossy(patch))?;
-            reversed.as_bytes()
-        } else {
-            patch
-        };
-        let diff = Diff::from_buffer(patch)?;
-        let location = if cached {
-            ApplyLocation::Index
-        } else if index {
-            ApplyLocation::Both
-        } else {
-            ApplyLocation::WorkDir
-        };
+        files: &[crate::FilePatch],
+        opts: &crate::ApplyOpts,
+    ) -> Result<String, GitError> {
         let run = || {
             let repo = self.repo.lock().expect("repo mutex");
             sync_index(&repo)?;
-            let mut opts = ApplyOptions::new();
-            opts.check(check);
-            repo.apply(&diff, location, Some(&mut opts))?;
-            Ok(())
+            crate::apply::apply(&repo, files, opts)
         };
-        if check {
+        if opts.check {
             run()
         } else {
             self.logged("apply", run)
         }
-    }
-
-    fn patch_stat(&self, patch: &[u8]) -> Result<String, GitError> {
-        let stats = Diff::from_buffer(patch)?.stats()?;
-        let buf = stats.to_buf(git2::DiffStatsFormat::FULL, 80)?;
-        Ok(String::from_utf8_lossy(&buf).trim_end().to_owned())
     }
 
     fn notes(&self, notes_ref: Option<&str>) -> Result<Vec<(String, String)>, GitError> {
@@ -2237,7 +2298,10 @@ impl GitBackend for Git2Backend {
                 .find_note(notes_ref, oid)
                 .ok()
                 .map(|n| String::from_utf8_lossy(n.message_bytes()).into_owned());
-            let message = format!("{}\n", message.trim_end());
+            let message = match message.trim_end() {
+                "" => String::new(),
+                m => format!("{m}\n"),
+            };
             let message = match old {
                 Some(old) if append => format!("{}\n\n{message}", old.trim_end()),
                 Some(_) if !force => {
@@ -2265,118 +2329,284 @@ impl GitBackend for Git2Backend {
         })
     }
 
-    fn update_ref(
+    fn note_copy(
         &self,
-        name: &str,
-        new: Option<&str>,
-        old: Option<&str>,
-        no_deref: bool,
-        message: Option<&str>,
+        notes_ref: Option<&str>,
+        from: &str,
+        to: &str,
+        force: bool,
     ) -> Result<(), GitError> {
-        self.logged("update-ref", || {
+        self.logged("notes", || {
             let repo = self.repo.lock().expect("repo mutex");
-            let mut name = name.to_owned();
-            while !no_deref
-                && let Some(target) = repo
-                    .find_reference(&name)
-                    .ok()
-                    .and_then(|r| r.symbolic_target().ok().flatten().map(str::to_owned))
-            {
-                name = target;
+            let from = repo.revparse_single(from)?.id();
+            let to = repo.revparse_single(to)?.id();
+            let note = repo.find_note(notes_ref, from).map_err(|_| {
+                GitError::Other(format!("missing notes on source object {from}. Cannot copy."))
+            })?;
+            if !force && repo.find_note(notes_ref, to).is_ok() {
+                return Err(GitError::Other(format!(
+                    "Cannot copy notes. Found existing notes for object {to}. Use '-f' to overwrite existing notes"
+                )));
             }
-            if let Some(old) = old {
-                let want = if old.chars().all(|c| c == '0') {
-                    None
-                } else {
-                    Some(repo.revparse_single(old)?.id())
-                };
-                let current = repo.refname_to_id(&name).ok();
-                if current != want {
-                    return Err(GitError::Other(format!(
-                        "{name} is at {}, not {old}",
-                        current.map_or("nothing".to_owned(), |c| c.to_string())
-                    )));
-                }
-            }
-            match new {
-                Some(new) => {
-                    let id = repo.revparse_single(new)?.id();
-                    repo.reference(&name, id, true, message.unwrap_or("update-ref"))?;
-                }
-                None => repo.find_reference(&name)?.delete()?,
-            }
+            let sig = repo.signature()?;
+            let message = String::from_utf8_lossy(note.message_bytes()).into_owned();
+            repo.note(&sig, &sig, notes_ref, to, &message, true)?;
             Ok(())
         })
     }
 
-    fn hash_object(&self, kind: &str, data: &[u8], write: bool) -> Result<String, GitError> {
-        let kind = ObjectType::from_str(kind)
-            .ok_or_else(|| GitError::Other(format!("invalid object type {kind:?}")))?;
-        let oid = if write {
+    fn notes_prune(&self, notes_ref: Option<&str>, dry_run: bool) -> Result<Vec<String>, GitError> {
+        let run = || {
             let repo = self.repo.lock().expect("repo mutex");
-            repo.odb()?.write(kind, data)?
-        } else {
-            Oid::hash_object(kind, data)?
+            let odb = repo.odb()?;
+            let mut gone = Vec::new();
+            if let Ok(notes) = repo.notes(notes_ref) {
+                for n in notes {
+                    let (_, obj) = n?;
+                    if !odb.exists(obj) {
+                        gone.push(obj);
+                    }
+                }
+            }
+            if !dry_run && !gone.is_empty() {
+                let sig = repo.signature()?;
+                for obj in &gone {
+                    repo.note_delete(*obj, notes_ref, &sig, &sig)?;
+                }
+            }
+            Ok(gone.iter().map(Oid::to_string).collect())
         };
-        Ok(oid.to_string())
+        if dry_run {
+            run()
+        } else {
+            self.logged("notes", run)
+        }
+    }
+
+    fn notes_merge(
+        &self,
+        notes_ref: Option<&str>,
+        other: &str,
+        strategy: &str,
+    ) -> Result<String, GitError> {
+        self.logged("notes", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let local = match notes_ref {
+                Some(r) => r.to_owned(),
+                None => repo.note_default_ref()?,
+            };
+            let theirs = repo.refname_to_id(other)?;
+            let ours = repo.refname_to_id(&local).ok();
+            let msg = format!("notes: Merged notes from {other} into {local}");
+            match ours {
+                Some(o) if o == theirs || repo.graph_descendant_of(o, theirs)? => {
+                    return Ok("Already up to date.".to_owned());
+                }
+                None => {
+                    repo.reference(&local, theirs, true, &msg)?;
+                    return Ok("Fast-forward".to_owned());
+                }
+                Some(o) if repo.graph_descendant_of(theirs, o)? => {
+                    repo.reference(&local, theirs, true, &msg)?;
+                    return Ok("Fast-forward".to_owned());
+                }
+                Some(_) => {}
+            }
+            // ponytail: a two-way merge per object (no merge base), so a note
+            // deleted on one side comes back; git's manual merge worktree is
+            // replaced by an error naming the conflicts.
+            let mut writes = Vec::new();
+            let mut conflicts = Vec::new();
+            for n in repo.notes(Some(other))? {
+                let (note, obj) = n?;
+                let new = repo.find_blob(note)?.content().to_vec();
+                let new = String::from_utf8_lossy(&new).into_owned();
+                let cur = repo
+                    .find_note(Some(&local), obj)
+                    .ok()
+                    .map(|n| String::from_utf8_lossy(n.message_bytes()).into_owned());
+                let merged = match cur {
+                    None => Some(new),
+                    Some(cur) if cur == new => None,
+                    Some(cur) => match strategy {
+                        "ours" => None,
+                        "theirs" => Some(new),
+                        "union" => Some(format!("{}\n{new}", ensure_newline(&cur))),
+                        "cat_sort_uniq" => {
+                            let mut lines: Vec<&str> = cur
+                                .lines()
+                                .chain(new.lines())
+                                .filter(|l| !l.is_empty())
+                                .collect();
+                            lines.sort_unstable();
+                            lines.dedup();
+                            Some(lines.iter().map(|l| format!("{l}\n")).collect())
+                        }
+                        _ => {
+                            conflicts.push(obj.to_string());
+                            None
+                        }
+                    },
+                };
+                if let Some(m) = merged {
+                    writes.push((obj, m));
+                }
+            }
+            if !conflicts.is_empty() {
+                return Err(GitError::Conflict(format!(
+                    "notes conflict for {}; merge with -s ours, theirs, union or cat_sort_uniq",
+                    conflicts.join(", ")
+                )));
+            }
+            let sig = repo.signature()?;
+            for (obj, m) in &writes {
+                repo.note(&sig, &sig, Some(&local), *obj, m, true)?;
+            }
+            Ok(format!("merged {} note(s) from {other}", writes.len()))
+        })
+    }
+
+    fn update_refs(
+        &self,
+        updates: &[crate::RefUpdate],
+        message: Option<&str>,
+        no_deref: bool,
+        create_reflog: bool,
+        check_only: bool,
+    ) -> Result<(), GitError> {
+        let run = || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let zero = |v: &str| v.chars().all(|c| c == '0');
+            let resolve = |v: &str| -> Result<Oid, GitError> {
+                Ok(repo
+                    .revparse_single(v)?
+                    .peel_to_commit()
+                    .map_or_else(|_| repo.revparse_single(v).map(|o| o.id()), |c| Ok(c.id()))?)
+            };
+            let mut plan = Vec::new();
+            for u in updates {
+                let mut name = u.name.clone();
+                while !no_deref
+                    && let Some(target) = repo
+                        .find_reference(&name)
+                        .ok()
+                        .and_then(|r| r.symbolic_target().ok().flatten().map(str::to_owned))
+                {
+                    name = target;
+                }
+                let current = repo.refname_to_id(&name).ok();
+                if let Some(old) = &u.old {
+                    let want = if zero(old) { None } else { Some(resolve(old)?) };
+                    if current != want {
+                        return Err(GitError::Other(match (current, want) {
+                            (Some(_), None) => {
+                                format!("cannot lock ref '{name}': reference already exists")
+                            }
+                            (None, _) => {
+                                format!(
+                                    "cannot lock ref '{name}': unable to resolve reference '{name}'"
+                                )
+                            }
+                            (Some(c), Some(w)) => {
+                                format!("cannot lock ref '{name}': is at {c} but expected {w}")
+                            }
+                        }));
+                    }
+                }
+                let new = match u.new.as_deref() {
+                    _ if u.verify => continue,
+                    Some(v) if !zero(v) => Some(resolve(v)?),
+                    _ => None,
+                };
+                if new.is_none() && current.is_none() {
+                    return Err(GitError::Other(format!(
+                        "cannot delete ref '{name}': it does not exist"
+                    )));
+                }
+                plan.push((name, new));
+            }
+            if check_only {
+                return Ok(());
+            }
+            let msg = message.unwrap_or("update-ref");
+            let sig = repo.signature()?;
+            let mut tx = repo.transaction()?;
+            for (name, _) in &plan {
+                tx.lock_ref(name)?;
+            }
+            for (name, new) in &plan {
+                match new {
+                    Some(id) => tx.set_target(name, *id, Some(&sig), msg)?,
+                    None => tx.remove(name)?,
+                }
+            }
+            tx.commit()?;
+            for (name, new) in &plan {
+                let logs = repo.path().join("logs").join(name);
+                if let (true, Some(id), false) = (create_reflog, new, logs.exists()) {
+                    let mut log = repo.reflog(name)?;
+                    log.append(*id, &sig, Some(msg))?;
+                    log.write()?;
+                }
+            }
+            Ok(())
+        };
+        if check_only {
+            run()
+        } else {
+            self.logged("update-ref", run)
+        }
+    }
+
+    fn bundle_create(&self, path: &Path, args: &[String]) -> Result<usize, GitError> {
+        crate::bundle::create(&self.repo.lock().expect("repo mutex"), path, args)
+    }
+
+    fn bundle_verify(
+        &self,
+        path: &Path,
+    ) -> Result<(crate::BundleHeader, Vec<(String, String)>), GitError> {
+        crate::bundle::verify(&self.repo.lock().expect("repo mutex"), path)
+    }
+
+    fn bundle_unbundle(&self, path: &Path) -> Result<Vec<(String, String)>, GitError> {
+        crate::bundle::unbundle(&self.repo.lock().expect("repo mutex"), path)
+    }
+
+    fn request_pull(
+        &self,
+        start: &str,
+        url: &str,
+        end: Option<&str>,
+        patch: bool,
+    ) -> Result<(String, Vec<String>), GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        crate::format_patch::request_pull(&repo, start, url, end, patch)
+    }
+
+    fn range_diff(&self, opts: &crate::RangeDiffOpts) -> Result<String, GitError> {
+        crate::range_diff::range_diff(&self.repo.lock().expect("repo mutex"), opts)
+    }
+
+    fn cherry(
+        &self,
+        upstream: &str,
+        head: &str,
+        limit: Option<&str>,
+    ) -> Result<Vec<crate::CherryCommit>, GitError> {
+        crate::format_patch::cherry(
+            &self.repo.lock().expect("repo mutex"),
+            upstream,
+            head,
+            limit,
+        )
     }
 
     fn format_patch(
         &self,
-        range: Option<&str>,
-        count: Option<usize>,
-    ) -> Result<Vec<(String, String)>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
-        let mut walk = repo.revwalk()?;
-        walk.set_sorting(git2::Sort::TOPOLOGICAL)?;
-        match range {
-            Some(r) if r.contains("..") => walk.push_range(r)?,
-            Some(r) if count.is_some() => {
-                walk.push(repo.revparse_single(r)?.peel_to_commit()?.id())?
-            }
-            Some(r) => {
-                walk.push_head()?;
-                walk.hide(repo.revparse_single(r)?.peel_to_commit()?.id())?;
-            }
-            None => walk.push_head()?,
-        }
-        let mut commits = Vec::new();
-        for oid in walk {
-            if count.is_some_and(|n| commits.len() >= n) {
-                break;
-            }
-            let commit = repo.find_commit(oid?)?;
-            if commit.parent_count() <= 1 {
-                commits.push(commit);
-            }
-        }
-        commits.reverse();
-        let total = commits.len();
-        let mut out = Vec::new();
-        for (i, c) in commits.iter().enumerate() {
-            let parent = match c.parent_count() {
-                0 => None,
-                _ => Some(c.parent(0)?.tree()?),
-            };
-            let mut diff = repo.diff_tree_to_tree(parent.as_ref(), Some(&c.tree()?), None)?;
-            diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
-            let summary = c.summary()?.unwrap_or("");
-            let email = git2::Email::from_diff(
-                &diff,
-                i + 1,
-                total,
-                &c.id(),
-                summary,
-                c.body()?.unwrap_or(""),
-                &c.author(),
-                &mut git2::EmailCreateOptions::new(),
-            )?;
-            out.push((
-                patch_file_name(i + 1, summary),
-                String::from_utf8_lossy(email.as_slice()).into_owned(),
-            ));
-        }
-        Ok(out)
+        opts: &crate::FormatPatchOpts,
+    ) -> Result<Vec<crate::PatchMail>, GitError> {
+        crate::format_patch::format_patch(&self.repo.lock().expect("repo mutex"), opts)
     }
 
     fn am(&self, args: &[String], mbox: Option<&[u8]>) -> Result<String, GitError> {
@@ -2393,31 +2623,50 @@ impl GitBackend for Git2Backend {
             argv.push(tmp.to_string_lossy().into_owned());
         }
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let out = self.logged("am", || self.run_git(&argv, &[("GIT_EDITOR", "true")]));
+        // --interactive asks on the terminal, so it keeps git's stdio.
+        let interactive = args.iter().any(|a| a == "--interactive");
+        let out = self.logged("am", || {
+            if !interactive {
+                return self.run_git(&argv, &[("GIT_EDITOR", "true")]);
+            }
+            let status = std::process::Command::new("git")
+                .args(&argv)
+                .current_dir(&self.workdir)
+                .status()?;
+            if status.success() {
+                Ok(String::new())
+            } else {
+                Err(GitError::Cli("git am stopped".to_owned()))
+            }
+        });
         if mbox.is_some() {
             let _ = std::fs::remove_file(&tmp);
         }
         out
     }
 
-    fn archive(
-        &self,
-        rev: &str,
-        format: &str,
-        prefix: &str,
-        paths: &[String],
-    ) -> Result<Vec<u8>, GitError> {
+    fn archive(&self, o: &crate::ArchiveOpts) -> Result<Vec<u8>, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
-        let obj = repo.revparse_single(rev)?;
+        let obj = repo.revparse_single(&o.rev)?;
         let tree = obj.peel_to_tree()?;
-        let mtime = obj.peel_to_commit().map_or(0, |c| c.time().seconds());
+        let commit = obj.peel_to_commit().ok();
+        let mtime = o
+            .mtime
+            .unwrap_or_else(|| commit.as_ref().map_or(0, |c| c.time().seconds()));
+        let attrs = crate::archive::Attributes::load(&repo, &tree, o.worktree_attributes)?;
         let mut found: Vec<(String, i32, Oid)> = Vec::new();
         tree.walk(git2::TreeWalkMode::PreOrder, |root, e| {
-            if let Ok(name) = e.name() {
-                found.push((format!("{root}{name}"), e.filemode(), e.id()));
+            let Ok(name) = e.name() else {
+                return git2::TreeWalkResult::Ok;
+            };
+            let path = format!("{root}{name}");
+            if attrs.is_set(&path, "export-ignore") {
+                return git2::TreeWalkResult::Skip;
             }
+            found.push((path, e.filemode(), e.id()));
             git2::TreeWalkResult::Ok
         })?;
+        let paths = &o.paths;
         if !paths.is_empty() {
             let files: Vec<String> = found
                 .iter()
@@ -2433,6 +2682,7 @@ impl GitBackend for Git2Backend {
                     .any(|f| f == p || *mode == 0o040000 && f.starts_with(&format!("{p}/")))
             });
         }
+        let prefix = &o.prefix;
         // (name, git file mode, content); folders end in `/`.
         let mut entries = Vec::new();
         if prefix.ends_with('/') {
@@ -2442,20 +2692,30 @@ impl GitBackend for Git2Backend {
             match mode {
                 0o040000 => entries.push((format!("{prefix}{path}/"), mode, Vec::new())),
                 0o160000 => {}
-                _ => entries.push((
-                    format!("{prefix}{path}"),
-                    mode,
-                    repo.find_blob(id)?.content().to_vec(),
-                )),
+                _ => {
+                    let mut data = repo.find_blob(id)?.content().to_vec();
+                    if let Some(c) = commit
+                        .as_ref()
+                        .filter(|_| attrs.is_set(&path, "export-subst"))
+                    {
+                        data = crate::archive::export_subst(&repo, c, &data);
+                    }
+                    entries.push((format!("{prefix}{path}"), mode, data));
+                }
             }
         }
-        match format {
-            "zip" => Ok(zip_archive(&entries, mtime)),
+        for (name, mode, data) in &o.extra {
+            entries.push((format!("{prefix}{name}"), *mode, data.clone()));
+        }
+        let level = o
+            .level
+            .map_or(flate2::Compression::default(), flate2::Compression::new);
+        match o.format.as_str() {
+            "zip" => Ok(zip_archive(&entries, mtime, level)),
             "tar" => tar_archive(&entries, mtime),
             "tgz" | "tar.gz" => {
                 use std::io::Write;
-                let mut gz =
-                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                let mut gz = flate2::write::GzEncoder::new(Vec::new(), level);
                 gz.write_all(&tar_archive(&entries, mtime)?)?;
                 Ok(gz.finish()?)
             }
@@ -7297,171 +7557,6 @@ pub fn pathspec_matches(specs: &[String], path: &str) -> bool {
         .is_ok_and(|spec| spec.matches_path(Path::new(path), PathspecFlags::DEFAULT))
 }
 
-/// `value` as git's `config --bool` or `--int` prints it, else unchanged.
-pub fn config_value(value: &str, as_bool: bool, as_int: bool) -> Result<String, GitError> {
-    Ok(if as_bool {
-        git2::Config::parse_bool(value)?.to_string()
-    } else if as_int {
-        git2::Config::parse_i64(value)?.to_string()
-    } else {
-        value.to_owned()
-    })
-}
-
-/// The config file(s) of `scope`. Writes without a scope go to the repository's
-/// own file.
-fn open_config(
-    repo: &Repository,
-    scope: ConfigScope,
-    write: bool,
-) -> Result<git2::Config, GitError> {
-    use git2::{Config, ConfigLevel};
-    let local = repo.commondir().join("config");
-    let env_global = std::env::var_os("GIT_CONFIG_GLOBAL").map(PathBuf::from);
-    let global = || {
-        env_global
-            .clone()
-            .or_else(|| Config::find_global().ok())
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gitconfig")))
-            .ok_or_else(|| GitError::Other("no global config file: HOME is not set".to_owned()))
-    };
-    Ok(match scope {
-        ConfigScope::Global => Config::open(&global()?)?,
-        ConfigScope::Local => Config::open(&local)?,
-        ConfigScope::Any if write => Config::open(&local)?,
-        ConfigScope::Any if env_global.is_some() => {
-            // libgit2 ignores GIT_CONFIG_GLOBAL, so stack the files as git
-            // does: it replaces both ~/.gitconfig and the XDG file.
-            let mut config = Config::new()?;
-            let system = std::env::var_os("GIT_CONFIG_SYSTEM")
-                .map(PathBuf::from)
-                .or_else(|| Config::find_system().ok())
-                .filter(|_| std::env::var_os("GIT_CONFIG_NOSYSTEM").is_none());
-            for (path, level) in [
-                (system, ConfigLevel::System),
-                (env_global.clone(), ConfigLevel::Global),
-                (Some(local), ConfigLevel::Local),
-            ] {
-                if let Some(path) = path.filter(|p| p.exists()) {
-                    config.add_file(&path, level, false)?;
-                }
-            }
-            config
-        }
-        ConfigScope::Any => repo.config()?,
-    })
-}
-
-/// `patch` with its two sides swapped, so applying it undoes the original
-/// (libgit2 cannot apply in reverse).
-fn reverse_patch(patch: &str) -> Result<String, GitError> {
-    let bad = || GitError::Other("malformed patch".to_owned());
-    let side = |p: &str, from: &str, to: &str| {
-        p.strip_prefix(from)
-            .map_or_else(|| p.to_owned(), |rest| format!("{to}{rest}"))
-    };
-    const SWAPS: &[(&str, &str)] = &[
-        ("new file mode ", "deleted file mode "),
-        ("deleted file mode ", "new file mode "),
-    ];
-    // Header pairs whose values swap while the lines keep their order.
-    const PAIRS: &[(&str, &str)] = &[("old mode ", "new mode "), ("rename from ", "rename to ")];
-    let mut out = String::with_capacity(patch.len());
-    let (mut old_left, mut new_left) = (0u32, 0u32);
-    let mut minus = String::new();
-    let mut held = String::new();
-    for line in patch.split_inclusive('\n') {
-        if old_left > 0 || new_left > 0 {
-            match line.as_bytes()[0] {
-                b'+' => {
-                    new_left = new_left.saturating_sub(1);
-                    out.push('-');
-                    out.push_str(&line[1..]);
-                }
-                b'-' => {
-                    old_left = old_left.saturating_sub(1);
-                    out.push('+');
-                    out.push_str(&line[1..]);
-                }
-                b'\\' => out.push_str(line),
-                _ => {
-                    old_left = old_left.saturating_sub(1);
-                    new_left = new_left.saturating_sub(1);
-                    out.push_str(line);
-                }
-            }
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("@@ -") {
-            let (ranges, tail) = rest.split_once(" @@").ok_or_else(bad)?;
-            let (old, new) = ranges.split_once(" +").ok_or_else(bad)?;
-            let count = |r: &str| match r.split_once(',') {
-                Some((_, n)) => n.parse::<u32>().map_err(|_| bad()),
-                None => Ok(1),
-            };
-            old_left = count(old)?;
-            new_left = count(new)?;
-            out.push_str(&format!("@@ -{new} +{old} @@{tail}"));
-        } else if let Some(p) = line.strip_prefix("--- ") {
-            minus = p.to_owned();
-        } else if let Some(p) = line.strip_prefix("+++ ") {
-            out.push_str(&format!(
-                "--- {}+++ {}",
-                side(p, "b/", "a/"),
-                side(&minus, "a/", "b/")
-            ));
-        } else if let Some(rest) = line.strip_prefix("diff --git a/") {
-            let rest = rest.trim_end_matches('\n');
-            let (a, b) = rest.rsplit_once(" b/").ok_or_else(bad)?;
-            out.push_str(&format!("diff --git a/{b} b/{a}\n"));
-        } else if line.starts_with("GIT binary patch") || line.starts_with("Binary files") {
-            return Err(GitError::Other("cannot reverse a binary patch".to_owned()));
-        } else if let Some((from, to)) = SWAPS.iter().find(|(f, _)| line.starts_with(f)) {
-            out.push_str(to);
-            out.push_str(&line[from.len()..]);
-        } else if let Some((first, _)) = PAIRS.iter().find(|(f, _)| line.starts_with(f)) {
-            held = line[first.len()..].to_owned();
-        } else if let Some((first, second)) = PAIRS.iter().find(|(_, s)| line.starts_with(s)) {
-            out.push_str(&format!("{first}{}{second}{held}", &line[second.len()..]));
-        } else if let Some((a, rest)) = line.strip_prefix("index ").and_then(|r| r.split_once(".."))
-        {
-            let end = rest.find([' ', '\n']).unwrap_or(rest.len());
-            out.push_str(&format!("index {}..{a}{}", &rest[..end], &rest[end..]));
-        } else {
-            out.push_str(line);
-        }
-    }
-    Ok(out)
-}
-
-/// git's `format-patch` file name: `0001-` and the subject with runs of other
-/// characters turned into `-`, 64 bytes at most with the suffix.
-fn patch_file_name(n: usize, subject: &str) -> String {
-    let mut name = format!("{n:04}-");
-    let start = name.len();
-    let mut gap = false;
-    let mut chars = subject.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
-            if gap && name.len() > start {
-                name.push('-');
-            }
-            gap = false;
-            name.push(c);
-            while c == '.' && chars.peek() == Some(&'.') {
-                chars.next();
-            }
-        } else {
-            gap = true;
-        }
-    }
-    while name.len() > start && name.ends_with(['.', '-']) {
-        name.pop();
-    }
-    name.truncate(57);
-    name + ".patch"
-}
-
 /// A tar of `(name, git file mode, content)` entries.
 fn tar_archive(entries: &[(String, i32, Vec<u8>)], mtime: i64) -> Result<Vec<u8>, GitError> {
     let mut builder = tar::Builder::new(Vec::new());
@@ -7495,7 +7590,11 @@ fn tar_archive(entries: &[(String, i32, Vec<u8>)], mtime: i64) -> Result<Vec<u8>
 
 /// A zip of `(name, git file mode, content)` entries, deflated where that
 /// makes them smaller.
-fn zip_archive(entries: &[(String, i32, Vec<u8>)], mtime: i64) -> Vec<u8> {
+fn zip_archive(
+    entries: &[(String, i32, Vec<u8>)],
+    mtime: i64,
+    level: flate2::Compression,
+) -> Vec<u8> {
     use std::io::Write;
     let (time, date) = dos_time(mtime);
     let mut out = Vec::new();
@@ -7503,8 +7602,7 @@ fn zip_archive(entries: &[(String, i32, Vec<u8>)], mtime: i64) -> Vec<u8> {
     for (name, mode, data) in entries {
         let mut crc = flate2::Crc::new();
         crc.update(data);
-        let mut deflate =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut deflate = flate2::write::DeflateEncoder::new(Vec::new(), level);
         let deflated = deflate
             .write_all(data)
             .and_then(|()| deflate.finish())
@@ -8843,38 +8941,109 @@ fn octopus(
 /// exact path or a directory prefix. A root commit is compared to the empty tree.
 /// Each line of `content` with the commit that last touched it; lines the
 /// blame does not cover (not yet committed) get an empty id.
-fn blame_lines(blame: Option<&git2::Blame>, content: &str) -> Vec<crate::BlameLine> {
+/// `map` gives each line's number in the blamed version, if it has one.
+fn blame_lines(
+    blame: Option<&git2::Blame>,
+    content: &str,
+    path: &str,
+    map: Option<&[Option<usize>]>,
+) -> Vec<crate::BlameLine> {
     content
         .lines()
         .enumerate()
-        .map(|(i, text)| match blame.and_then(|b| b.get_line(i + 1)) {
-            Some(hunk) => crate::BlameLine {
-                short_id: hunk.final_commit_id().to_string().chars().take(7).collect(),
-                author: hunk
-                    .final_signature()
-                    .and_then(|s| s.name().ok().map(str::to_owned))
-                    .unwrap_or_else(|| "?".to_owned()),
-                line: text.to_owned(),
-            },
+        .map(|(i, text)| {
+            let line = match map {
+                Some(map) => map.get(i).copied().flatten(),
+                None => Some(i + 1),
+            };
+            (i, line, text, line.and_then(|l| blame?.get_line(l)))
+        })
+        .map(|(n, line, text, hunk)| match hunk {
+            Some(hunk) => {
+                let i = line.expect("a blamed line") - 1;
+                let sig = hunk.final_signature();
+                let id = hunk.final_commit_id().to_string();
+                crate::BlameLine {
+                    short_id: id.chars().take(7).collect(),
+                    author: sig
+                        .as_ref()
+                        .and_then(|s| s.name().ok().map(str::to_owned))
+                        .unwrap_or_else(|| "?".to_owned()),
+                    line: text.to_owned(),
+                    email: sig
+                        .as_ref()
+                        .and_then(|s| s.email().ok().map(str::to_owned))
+                        .unwrap_or_default(),
+                    id,
+                    orig_line: hunk.orig_start_line() + i + 1 - hunk.final_start_line(),
+                    orig_path: hunk
+                        .path()
+                        .map_or_else(|| path.to_owned(), |p| p.to_string_lossy().into_owned()),
+                    boundary: hunk.is_boundary(),
+                }
+            }
             None => crate::BlameLine {
                 short_id: String::new(),
                 author: String::new(),
                 line: text.to_owned(),
+                id: String::new(),
+                email: String::new(),
+                orig_line: n + 1,
+                orig_path: path.to_owned(),
+                boundary: false,
             },
         })
         .collect()
 }
 
-/// Whether `commit` changed `paths`. Like git's default history simplification,
-/// a merge counts only when it differs from every parent it follows.
-fn commit_touched_path(
+/// For each line of `new`, its line number in `old`, or None where it was
+/// added.
+fn line_map(old: &[u8], new: &[u8]) -> Result<Vec<Option<usize>>, GitError> {
+    let mut opts = DiffOptions::new();
+    opts.context_lines(0);
+    let patch = Patch::from_buffers(old, None, new, None, Some(&mut opts))?;
+    let (mut added, mut deleted) = (
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+    );
+    for h in 0..patch.num_hunks() {
+        for l in 0..patch.num_lines_in_hunk(h)? {
+            let line = patch.line_in_hunk(h, l)?;
+            match line.origin() {
+                '+' => added.extend(line.new_lineno()),
+                '-' => deleted.extend(line.old_lineno()),
+                _ => {}
+            }
+        }
+    }
+    let total = String::from_utf8_lossy(new).lines().count();
+    let mut old_line = 1;
+    let mut map = Vec::with_capacity(total);
+    for n in 1..=total as u32 {
+        if added.contains(&n) {
+            map.push(None);
+            continue;
+        }
+        while deleted.contains(&old_line) {
+            old_line += 1;
+        }
+        map.push(Some(old_line as usize));
+        old_line += 1;
+    }
+    Ok(map)
+}
+
+/// Whether `commit` changed `paths`, and the parents the walk follows past it,
+/// as in git's default history simplification: when it matches a parent there,
+/// it is left out and only the first such parent is followed.
+pub(crate) fn simplify_parents(
     repo: &Repository,
     commit: &git2::Commit<'_>,
     paths: &[String],
     first_parent: bool,
-) -> bool {
+) -> (bool, Vec<Oid>) {
     let Ok(tree) = commit.tree() else {
-        return false;
+        return (false, Vec::new());
     };
     let mut opts = DiffOptions::new();
     for p in paths.iter().filter(|p| *p != ".") {
@@ -8890,12 +9059,15 @@ fn commit_touched_path(
         commit.parent_count()
     };
     if parents == 0 {
-        return differs(None);
+        return (differs(None), Vec::new());
     }
-    (0..parents).all(|i| {
+    for i in 0..parents {
         let old = commit.parent(i).ok().and_then(|p| p.tree().ok());
-        differs(old.as_ref())
-    })
+        if !differs(old.as_ref()) {
+            return (false, vec![commit.parent_id(i).expect("parent in range")]);
+        }
+    }
+    (true, commit.parent_ids().take(parents).collect())
 }
 
 /// Whether `commit` touched `path`; when it renamed the file, `path` moves to
@@ -8926,6 +9098,155 @@ fn follow_path(repo: &Repository, commit: &git2::Commit<'_>, path: &mut String) 
         *path = old.to_string_lossy().into_owned();
     }
     true
+}
+
+/// git's pickaxe: whether `commit`'s own diff (merges have none) changes how
+/// often `opts.occurrences` appears in a file (-S), or adds or removes a line
+/// matching `changes` (-G).
+fn pickaxe(
+    repo: &Repository,
+    commit: &git2::Commit<'_>,
+    opts: &crate::LogOptions,
+    changes: Option<&regex::Regex>,
+) -> Result<bool, GitError> {
+    if commit.parent_count() > 1 {
+        return Ok(false);
+    }
+    let old = commit.parent(0).ok().map(|p| p.tree()).transpose()?;
+    let mut dopts = DiffOptions::new();
+    for p in opts.paths.iter().filter(|p| *p != ".") {
+        dopts.pathspec(p);
+    }
+    let mut diff = repo.diff_tree_to_tree(old.as_ref(), Some(&commit.tree()?), Some(&mut dopts))?;
+    diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
+    for (i, delta) in diff.deltas().enumerate() {
+        if let Some(needle) = &opts.occurrences {
+            let count = |f: git2::DiffFile| {
+                repo.find_blob(f.id()).map_or(0, |b| {
+                    String::from_utf8_lossy(b.content())
+                        .matches(needle.as_str())
+                        .count()
+                })
+            };
+            if count(delta.old_file()) != count(delta.new_file()) {
+                return Ok(true);
+            }
+        }
+        if let Some(re) = changes
+            && let Some(patch) = Patch::from_diff(&diff, i)?
+        {
+            for h in 0..patch.num_hunks() {
+                for l in 0..patch.num_lines_in_hunk(h)? {
+                    let line = patch.line_in_hunk(h, l)?;
+                    if matches!(line.origin(), '+' | '-')
+                        && re.is_match(&String::from_utf8_lossy(line.content()))
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The commits a log starts from, in the order git queues them: every ref
+/// then HEAD for `--all`, then each revision as given.
+fn log_tips(repo: &Repository, opts: &crate::LogOptions) -> Result<Vec<Oid>, GitError> {
+    let mut tips = Vec::new();
+    if opts.all {
+        let mut refs: Vec<(String, Oid)> = repo
+            .references()?
+            .flatten()
+            .filter_map(|r| {
+                let id = r.peel_to_commit().ok()?.id();
+                Some((String::from_utf8_lossy(r.name_bytes()).into_owned(), id))
+            })
+            .collect();
+        refs.sort();
+        tips.extend(refs.into_iter().map(|(_, id)| id));
+    }
+    for rev in opts.revs.iter().filter(|r| !r.starts_with('^')) {
+        let spec = repo.revparse(rev)?;
+        let side =
+            |o: Option<&git2::Object>| o.and_then(|o| o.peel_to_commit().ok()).map(|c| c.id());
+        if spec.mode().contains(git2::RevparseMode::MERGE_BASE) {
+            tips.extend(side(spec.from()));
+        }
+        tips.extend(side(spec.to()).or(side(spec.from())));
+    }
+    if opts.all || opts.revs.is_empty() {
+        tips.extend(
+            repo.head()
+                .ok()
+                .and_then(|h| h.peel_to_commit().ok())
+                .map(|c| c.id()),
+        );
+    }
+    Ok(tips)
+}
+
+/// Commits in git's default log order: newest committer date first, ties in
+/// the order they were queued, and a commit's parents queued once it is
+/// shown. With `allowed`, only those commits are walked.
+struct DateWalk<'r> {
+    repo: &'r Repository,
+    queue: std::collections::BinaryHeap<(i64, std::cmp::Reverse<u64>, Oid)>,
+    seen: std::collections::HashSet<Oid>,
+    allowed: Option<std::collections::HashSet<Oid>>,
+    first_parent: bool,
+    queued: u64,
+}
+
+impl<'r> DateWalk<'r> {
+    fn new(
+        repo: &'r Repository,
+        tips: &[Oid],
+        allowed: Option<std::collections::HashSet<Oid>>,
+        first_parent: bool,
+    ) -> Self {
+        let mut walk = DateWalk {
+            repo,
+            queue: Default::default(),
+            seen: Default::default(),
+            allowed,
+            first_parent,
+            queued: 0,
+        };
+        for &tip in tips {
+            walk.push(tip);
+        }
+        walk
+    }
+
+    fn push(&mut self, id: Oid) {
+        if !self.seen.insert(id) || self.allowed.as_ref().is_some_and(|a| !a.contains(&id)) {
+            return;
+        }
+        let Ok(commit) = self.repo.find_commit(id) else {
+            return;
+        };
+        self.queue
+            .push((commit.time().seconds(), std::cmp::Reverse(self.queued), id));
+        self.queued += 1;
+    }
+}
+
+impl Iterator for DateWalk<'_> {
+    type Item = Result<Oid, GitError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (_, _, id) = self.queue.pop()?;
+        let parents: Vec<Oid> = match self.repo.find_commit(id) {
+            Ok(c) => c.parent_ids().collect(),
+            Err(e) => return Some(Err(e.into())),
+        };
+        let take = if self.first_parent { 1 } else { parents.len() };
+        for p in parents.into_iter().take(take) {
+            self.push(p);
+        }
+        Some(Ok(id))
+    }
 }
 
 /// Add one `git log` revision to a walk: `rev`, `^rev`, `A..B` or `A...B`.
@@ -8990,45 +9311,111 @@ fn stash_flags(include_untracked: bool) -> Option<git2::StashFlags> {
     }
 }
 
+fn ensure_newline(s: &str) -> String {
+    if s.is_empty() || s.ends_with('\n') {
+        s.to_owned()
+    } else {
+        format!("{s}\n")
+    }
+}
+
 /// A signature time in `git log`'s default form: `Thu Sep 24 23:24:06 2026 -0500`.
 fn git_date(t: git2::Time) -> String {
-    let off = i64::from(t.offset_minutes());
-    let local = t.seconds() + off * 60;
-    let days = local.div_euclid(86400);
-    let secs = local.rem_euclid(86400);
-    let (year, month, day) = civil_date(t);
-    const WD: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    const MO: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
+    let d = DateParts::of(t);
     format!(
-        "{} {} {} {:02}:{:02}:{:02} {} {}{:02}{:02}",
-        WD[days.rem_euclid(7) as usize],
-        MO[(month - 1) as usize],
-        day,
-        secs / 3600,
-        secs % 3600 / 60,
-        secs % 60,
-        year,
-        if off < 0 { '-' } else { '+' },
-        off.abs() / 60,
-        off.abs() % 60,
+        "{} {} {} {:02}:{:02}:{:02} {} {}",
+        d.weekday, d.month, d.day, d.hour, d.minute, d.second, d.year, d.zone
     )
+}
+
+/// A signature time in one of git's `--date` styles: default, iso,
+/// iso-strict or short.
+pub(crate) fn format_git_date(t: git2::Time, style: &str) -> String {
+    let d = DateParts::of(t);
+    let m = MONTHS.iter().position(|m| *m == d.month).unwrap_or(0) + 1;
+    match style {
+        "iso" => format!(
+            "{}-{m:02}-{:02} {:02}:{:02}:{:02} {}",
+            d.year, d.day, d.hour, d.minute, d.second, d.zone
+        ),
+        "iso-strict" => format!(
+            "{}-{m:02}-{:02}T{:02}:{:02}:{:02}{}:{}",
+            d.year,
+            d.day,
+            d.hour,
+            d.minute,
+            d.second,
+            &d.zone[..3],
+            &d.zone[3..]
+        ),
+        "short" => format!("{}-{m:02}-{:02}", d.year, d.day),
+        _ => git_date(t),
+    }
+}
+
+/// A signature time as an email `Date:` (RFC 2822): `Sat, 3 Jan 2026 03:04:05 -0500`.
+pub(crate) fn rfc2822_date(t: git2::Time) -> String {
+    let d = DateParts::of(t);
+    format!(
+        "{}, {} {} {} {:02}:{:02}:{:02} {}",
+        d.weekday, d.day, d.month, d.year, d.hour, d.minute, d.second, d.zone
+    )
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+struct DateParts {
+    weekday: &'static str,
+    month: &'static str,
+    day: i64,
+    year: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    zone: String,
+}
+
+impl DateParts {
+    fn of(t: git2::Time) -> Self {
+        let off = i64::from(t.offset_minutes());
+        let local = t.seconds() + off * 60;
+        let days = local.div_euclid(86400);
+        let secs = local.rem_euclid(86400);
+        // Howard Hinnant's civil_from_days.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        const WD: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+        DateParts {
+            weekday: WD[days.rem_euclid(7) as usize],
+            month: MONTHS[(month - 1) as usize],
+            day,
+            year: yoe + era * 400 + i64::from(month <= 2),
+            hour: secs / 3600,
+            minute: secs % 3600 / 60,
+            second: secs % 60,
+            zone: format!(
+                "{}{:02}{:02}",
+                if off < 0 { '-' } else { '+' },
+                off.abs() / 60,
+                off.abs() % 60
+            ),
+        }
+    }
 }
 
 /// A signature time's local (year, month, day).
 fn civil_date(t: git2::Time) -> (i64, i64, i64) {
-    let days = (t.seconds() + i64::from(t.offset_minutes()) * 60).div_euclid(86400);
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    (yoe + era * 400 + i64::from(month <= 2), month, day)
+    let d = DateParts::of(t);
+    let month = MONTHS.iter().position(|m| *m == d.month).unwrap_or(0) as i64 + 1;
+    (d.year, month, d.day)
 }
 
 fn relative_age(then: i64, now: i64) -> String {
@@ -9293,14 +9680,14 @@ fn repo_is_dirty(repo: &Repository) -> bool {
 /// file collapses from a delete+add pair into one renamed delta showing only its
 /// real content changes (none, for a pure move). Staging/patch-apply diffs skip
 /// this: they key on exact per-file paths.
-fn extract_with_renames(mut diff: Diff) -> Result<Vec<FileDiff>, GitError> {
+fn extract_with_renames(repo: &Repository, mut diff: Diff) -> Result<Vec<FileDiff>, GitError> {
     let mut fopts = DiffFindOptions::new();
     fopts.renames(true);
     diff.find_similar(Some(&mut fopts))?;
-    extract(&diff)
+    extract(repo, &diff)
 }
 
-fn extract(diff: &Diff) -> Result<Vec<FileDiff>, GitError> {
+fn extract(repo: &Repository, diff: &Diff) -> Result<Vec<FileDiff>, GitError> {
     let count = diff.deltas().len();
     let mut files = Vec::with_capacity(count);
 
@@ -9323,42 +9710,160 @@ fn extract(diff: &Diff) -> Result<Vec<FileDiff>, GitError> {
             })
             .flatten()
             .filter(|old| *old != path);
-        let binary = delta.flags().is_binary();
-
-        let mut hunks = Vec::new();
-        if let Some(patch) = Patch::from_diff(diff, idx)? {
-            for h in 0..patch.num_hunks() {
-                let (hunk, _) = patch.hunk(h)?;
-                let header = String::from_utf8_lossy(hunk.header()).trim_end().to_owned();
-                let count = patch.num_lines_in_hunk(h)?;
-                let mut lines = Vec::with_capacity(count);
-                for l in 0..count {
-                    let line = patch.line_in_hunk(h, l)?;
-                    lines.push(DiffLine {
-                        origin: line_origin(line.origin()),
-                        text: String::from_utf8_lossy(line.content())
-                            .trim_end_matches('\n')
-                            .to_owned(),
-                    });
-                }
-                hunks.push(Hunk {
-                    header,
-                    new_start: hunk.new_start(),
-                    lines,
-                });
-            }
+        let mut file = match Patch::from_diff(diff, idx)? {
+            Some(mut patch) => patch_file(&mut patch)?,
+            None => FileDiff {
+                path: String::new(),
+                old_path: None,
+                status: StatusCode::Modified,
+                hunks: Vec::new(),
+                binary: delta.flags().is_binary(),
+                header: String::new(),
+                similarity: 0,
+                sizes: (delta.old_file().size(), delta.new_file().size()),
+            },
+        };
+        if old_path.is_some() {
+            file.similarity = similarity(repo, &delta);
         }
-
-        files.push(FileDiff {
-            path,
-            old_path,
-            status: delta_status(delta.status()),
-            hunks,
-            binary,
-        });
+        // libgit2 scores renames its own way; print git's score.
+        if let Some(start) = file.header.find("similarity index ") {
+            let end = start + file.header[start..].find('\n').unwrap_or(0);
+            let line = format!("similarity index {}%", file.similarity);
+            file.header.replace_range(start..end, &line);
+        }
+        file.path = path;
+        file.old_path = old_path;
+        file.status = delta_status(delta.status());
+        files.push(file);
     }
 
     Ok(files)
+}
+
+/// A patch as a [`FileDiff`], its path and status left for the caller.
+fn patch_file(patch: &mut Patch) -> Result<FileDiff, GitError> {
+    let text = patch.to_buf()?;
+    let text = String::from_utf8_lossy(&text);
+    let end = text.find("\n@@ ").map_or(text.len(), |i| i + 1);
+    let mut hunks = Vec::new();
+    for h in 0..patch.num_hunks() {
+        let (hunk, _) = patch.hunk(h)?;
+        let header = String::from_utf8_lossy(hunk.header()).trim_end().to_owned();
+        let count = patch.num_lines_in_hunk(h)?;
+        let mut lines = Vec::with_capacity(count);
+        for l in 0..count {
+            let line = patch.line_in_hunk(h, l)?;
+            lines.push(DiffLine {
+                origin: line_origin(line.origin()),
+                text: String::from_utf8_lossy(line.content())
+                    .trim_end_matches('\n')
+                    .to_owned(),
+            });
+        }
+        hunks.push(Hunk {
+            header,
+            new_start: hunk.new_start(),
+            lines,
+        });
+    }
+    let delta = patch.delta();
+    Ok(FileDiff {
+        path: String::new(),
+        old_path: None,
+        status: StatusCode::Modified,
+        hunks,
+        binary: delta.flags().is_binary(),
+        header: text[..end].to_owned(),
+        similarity: 0,
+        sizes: (delta.old_file().size(), delta.new_file().size()),
+    })
+}
+
+/// `git diff --no-index`: two files on disk, named as given.
+pub fn diff_no_index(
+    old: &Path,
+    new: &Path,
+    spec: &crate::DiffSpec,
+) -> Result<Vec<FileDiff>, GitError> {
+    let (a, b) = (std::fs::read(old)?, std::fs::read(new)?);
+    let mut opts = DiffOptions::new();
+    if let Some(n) = spec.context {
+        opts.context_lines(n);
+    }
+    opts.ignore_whitespace(spec.ignore_all_space)
+        .ignore_whitespace_change(spec.ignore_space_change)
+        .indent_heuristic(true)
+        .reverse(spec.reverse);
+    let mut patch = Patch::from_buffers(&a, Some(old), &b, Some(new), Some(&mut opts))?;
+    if a == b {
+        return Ok(Vec::new());
+    }
+    let mut file = patch_file(&mut patch)?;
+    let (old, new) = (old.to_string_lossy(), new.to_string_lossy());
+    file.path = new.clone().into_owned();
+    file.old_path = (old != new).then(|| old.into_owned());
+    Ok(vec![file])
+}
+
+/// git's rename score for a delta in percent (diffcore-delta's span hashing):
+/// the share of the larger file's bytes that both sides have in common.
+fn similarity(repo: &Repository, delta: &git2::DiffDelta) -> u16 {
+    let (old, new) = (delta.old_file(), delta.new_file());
+    if old.id() == new.id() && !old.id().is_zero() {
+        return 100;
+    }
+    let read = |f: &git2::DiffFile| -> Vec<u8> {
+        if !f.id().is_zero()
+            && let Ok(blob) = repo.find_blob(f.id())
+        {
+            return blob.content().to_vec();
+        }
+        f.path()
+            .zip(repo.workdir())
+            .and_then(|(p, w)| std::fs::read(w.join(p)).ok())
+            .unwrap_or_default()
+    };
+    let (a, b) = (read(&old), read(&new));
+    let max = a.len().max(b.len()) as u64;
+    if max == 0 {
+        return 100;
+    }
+    let (sa, sb) = (span_hashes(&a), span_hashes(&b));
+    let copied: u64 = sa
+        .iter()
+        .map(|(h, n)| sb.get(h).map_or(0, |m| (*n).min(*m)))
+        .sum();
+    (copied * 60000 / max * 100 / 60000) as u16
+}
+
+fn span_hashes(data: &[u8]) -> std::collections::HashMap<u32, u64> {
+    let mut out = std::collections::HashMap::new();
+    let text = !data.contains(&0);
+    let (mut a1, mut a2, mut n) = (0u32, 0u32, 0u64);
+    let mut add = |a1: u32, a2: u32, n: u64| {
+        let h = a1.wrapping_add(a2.wrapping_mul(0x61)) % 107_927;
+        *out.entry(h).or_insert(0) += n;
+    };
+    for (i, &c) in data.iter().enumerate() {
+        if text && c == b'\r' && data.get(i + 1) == Some(&b'\n') {
+            continue;
+        }
+        let old = a1;
+        a1 = (a1 << 7) ^ (a2 >> 25);
+        a2 = (a2 << 7) ^ (old >> 25);
+        a1 = a1.wrapping_add(u32::from(c));
+        n += 1;
+        if n < 64 && c != b'\n' {
+            continue;
+        }
+        add(a1, a2, n);
+        (a1, a2, n) = (0, 0, 0);
+    }
+    if n > 0 {
+        add(a1, a2, n);
+    }
+    out
 }
 
 fn delta_status(d: Delta) -> StatusCode {

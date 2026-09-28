@@ -15,12 +15,14 @@ mod cli;
 mod creds;
 mod examples;
 mod forge;
+mod graph;
 mod interactive;
 mod lanes;
 mod logging;
 mod mcp;
 mod output;
 mod plumbing;
+mod pretty;
 mod prompt;
 mod render;
 mod setup;
@@ -46,7 +48,7 @@ fn main() -> ! {
     logging::init();
     let stdout_is_terminal = std::io::stdout().is_terminal();
     let parsed = examples::apply(Cli::command())
-        .try_get_matches()
+        .try_get_matches_from(std::iter::once("rgit".to_owned()).chain(count_shorthand(&args)))
         .and_then(|m| Cli::from_arg_matches(&m));
     let cli = match parsed {
         Ok(cli) => cli,
@@ -111,14 +113,6 @@ fn main() -> ! {
                 rgit_git::init(std::path::Path::new(&path), &args)
                     .map(|msg| if quiet { String::new() } else { msg })
                     .map_err(anyhow::Error::from),
-                &emit,
-            );
-        }
-        // ls-remote works outside a repository too, given a URL.
-        Some(command @ Command::LsRemote { .. }) => {
-            let cwd = std::env::current_dir().ok();
-            finish(
-                plumbing::ls_remote(cwd.as_deref(), command, emit.mode == OutputMode::Text),
                 &emit,
             );
         }
@@ -330,22 +324,20 @@ fn main() -> ! {
             }
         }
         // An archive with no output file is raw bytes on stdout, as in git.
-        Some(command @ Command::Archive { output: None, .. }) => {
+        Some(Command::Archive(a)) if a.output.is_none() && !a.list => {
             let backend = match discover_or_init(false) {
-                Ok(backend) => backend,
+                Ok(backend) => Some(backend),
+                Err(_) if a.remote.is_some() => None,
                 Err(error) => die(error, &emit),
             };
-            let Command::Archive {
-                rev,
-                paths,
-                format,
-                prefix,
-                ..
-            } = cli::from_cwd(command, &backend)
-            else {
-                unreachable!()
+            let a = match &backend {
+                Some(b) => match cli::from_cwd(Command::Archive(a), b) {
+                    Command::Archive(a) => a,
+                    _ => unreachable!(),
+                },
+                None => a,
             };
-            match cli::archive(&backend, rev, &paths, format, None, prefix) {
+            match cli::archive(backend.as_ref(), &a) {
                 Ok(bytes) => {
                     use std::io::Write;
                     let mut out = std::io::stdout().lock();
@@ -397,8 +389,12 @@ fn main() -> ! {
             render::set_color(
                 output_mode == OutputMode::Text && !cli.no_color && stdout_is_terminal,
             );
-            let backend = match discover_or_init(can_prompt) {
+            let repoless = command.runs_without_repo();
+            let backend = match discover_or_init(can_prompt && !repoless) {
                 Ok(backend) => backend,
+                Err(_) if repoless => {
+                    finish(cli::run_without_repo(command, !structured_output), &emit)
+                }
                 Err(error) => die(error, &emit),
             };
             let command = cli::from_cwd(command, &backend);
@@ -449,13 +445,13 @@ fn finish(result: anyhow::Result<impl Into<Output>>, emit: &Emit) -> ! {
     };
     if emit.mode == OutputMode::Text {
         // Plumbing text ends with its own newline, or is empty, as in git.
-        if output.text.is_empty() || output.text.ends_with(['\n', '\0']) {
+        if output.text.is_empty() || output.text.ends_with(['\n', '\0']) || cli::text_as_is() {
             print!("{}", output.text);
             let _ = std::io::Write::flush(&mut std::io::stdout());
         } else {
             println!("{}", output.text);
         }
-        exit(0);
+        exit(cli::exit_code());
     }
     let mut value = match output.finalize(&emit.fields, emit.full, &emit.rerun) {
         Ok(value) => value,
@@ -467,7 +463,7 @@ fn finish(result: anyhow::Result<impl Into<Output>>, emit: &Emit) -> ! {
     } else {
         println!("{}", toon::encode(&value));
     }
-    exit(0);
+    exit(cli::exit_code());
 }
 
 fn die(error: anyhow::Error, emit: &Emit) -> ! {
@@ -507,6 +503,29 @@ fn fail(message: String, help: Vec<String>, code: i32, mode: OutputMode) -> ! {
         }
     }
     exit(code);
+}
+
+/// git's `-<n>` count for `log`: `rgit log -3` is `rgit log -n 3`.
+fn count_shorthand(args: &[String]) -> Vec<String> {
+    let Some(log) = args.iter().position(|a| a == "log") else {
+        return args.to_vec();
+    };
+    let mut out = args[..=log].to_vec();
+    let mut rest = args[log + 1..].iter();
+    for a in rest.by_ref() {
+        if a == "--" {
+            out.push(a.clone());
+            break;
+        }
+        match a.strip_prefix('-') {
+            Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+                out.extend(["-n".to_owned(), n.to_owned()]);
+            }
+            _ => out.push(a.clone()),
+        }
+    }
+    out.extend(rest.cloned());
+    out
 }
 
 /// The current invocation as a copy-pasteable command, for `--full` hints.

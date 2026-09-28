@@ -1677,6 +1677,9 @@ mod hunk_component_tests {
             old_path: None,
             status: StatusCode::Modified,
             binary: false,
+            header: String::new(),
+            similarity: 0,
+            sizes: (0, 0),
             hunks: vec![Hunk {
                 header: "@@ -1,1 +1,2 @@".into(),
                 new_start: 1,

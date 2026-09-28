@@ -10,8 +10,9 @@ use rgit_git::{
 };
 
 use crate::cli::{
-    BranchCmd, Command, FlowCmd, IndexCmd, LanesCmd, NotesCmd, RemoteCmd, StackCmd, StashCmd,
-    SubmoduleCmd, WorkspaceCmd, WorktreeCmd,
+    ApplyArgs, BranchCmd, BundleCmd, Command, ConfigArgs, FlowCmd, IndexCmd, LanesCmd,
+    MaintenanceCmd, NotesCmd, RemoteCmd, StackCmd, StashCmd, SubmoduleCmd, WorkspaceCmd,
+    WorktreeCmd,
 };
 use crate::output::Output;
 use crate::render;
@@ -47,9 +48,14 @@ pub fn run(
             untracked.as_deref(),
             ignored,
         )?),
-        Command::Log { format, .. } if !format.any() => {
+        Command::Log {
+            format, ref pretty, ..
+        } if !format.any() && !pretty.any() => {
             let opts: LogOptions = crate::cli::log_options(backend, &command)?;
             let filtered = opts.author.is_some()
+                || opts.committer.is_some()
+                || opts.occurrences.is_some()
+                || opts.changes_matching.is_some()
                 || opts.since.is_some()
                 || opts.until.is_some()
                 || !opts.paths.is_empty()
@@ -98,7 +104,11 @@ pub fn run(
             if cached {
                 base.push_str(" --cached");
             }
-            if format.name_status || format.numstat || (format.patch && format.stat) {
+            if format.name_status
+                || format.numstat
+                || format.shortstat
+                || format.patch && format.stat
+            {
                 Output::new(crate::cli::diff_out(&files, format))
             } else {
                 diff(&files, &scope, &base, format.patch, format.name_only)
@@ -108,10 +118,11 @@ pub fn run(
             ref revs,
             ref paths,
             format,
+            ref pretty,
             no_patch,
         } if revs.len() <= 1
             && !revs.iter().any(|r| r.contains(':'))
-            && !(format.name_status || format.numstat) =>
+            && !(pretty.any() || format.name_status || format.numstat) =>
         {
             let mut c = backend.commit_details(revs.first().map_or("HEAD", String::as_str))?;
             if !paths.is_empty() {
@@ -123,7 +134,11 @@ pub fn run(
             }
             show(&c, format.patch && !no_patch, format.name_only && !no_patch)
         }
-        Command::Blame { args, lines } => {
+        Command::Blame {
+            args,
+            lines,
+            format,
+        } if !(format.porcelain || format.line_porcelain) => {
             let path = args.join(" ");
             let all = crate::cli::blame(backend, &args).map_err(|e| match e {
                 rgit_git::GitError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
@@ -725,12 +740,107 @@ pub fn run(
         Command::Stack {
             cmd: None | Some(StackCmd::List),
         } => stack(backend)?,
+        c @ Command::Fsck { .. } => fsck(crate::cli::run(backend, c, interactive)?),
+        Command::RequestPull {
+            start,
+            url,
+            end,
+            patch,
+        } => {
+            let (text, warnings) = backend.request_pull(&start, &url, end.as_deref(), patch)?;
+            let mut out = Output::new(text.clone()).long("request", text);
+            if !warnings.is_empty() {
+                out = out.with("warnings", warnings);
+            }
+            out.help(format!(
+                "Run `rgit push {url}` first if the branch is not there yet"
+            ))
+        }
+        Command::Cherry {
+            upstream,
+            head,
+            limit,
+            ..
+        } => {
+            let upstream = upstream.unwrap_or_else(|| "@{upstream}".to_owned());
+            let list = backend.cherry(
+                &upstream,
+                head.as_deref().unwrap_or("HEAD"),
+                limit.as_deref(),
+            )?;
+            let missing = list.iter().filter(|c| !c.upstream_has_it).count();
+            let rows = list
+                .iter()
+                .map(|c| {
+                    crate::obj! {
+                        "upstream" => if c.upstream_has_it { "has it" } else { "missing" },
+                        "id" => &c.id[..c.id.len().min(12)],
+                        "subject" => c.subject,
+                    }
+                })
+                .collect();
+            Output::new(String::new())
+                .with("missing_upstream", missing)
+                .list(
+                    "commits",
+                    rows,
+                    &["upstream", "id", "subject"],
+                    "0 commits: everything is upstream",
+                )
+                .help(format!(
+                    "Run `rgit log {upstream}..HEAD` for the full history"
+                ))
+        }
+        c @ (Command::Gc { .. } | Command::Repack { .. }) => {
+            crate::cli::run(backend, c, interactive)?;
+            let n = backend.count_objects()?;
+            let msg = done.unwrap_or_default();
+            Output::new(msg.clone())
+                .with("result", msg)
+                .with("loose_objects", n.count)
+                .with("packs", n.packs)
+                .with("pack_kib", n.size_pack as usize)
+                .help("Run `rgit fsck` to check the object database")
+        }
         other => {
             let mut out = finish(crate::cli::run(backend, other, interactive)?);
             out.help.extend(next);
             out
         }
     })
+}
+
+/// `git fsck`'s report as a table: `<kind> <type> <id> [(<name>)]` lines
+/// (dangling, unreachable, missing, root, tagged), anything else kept whole.
+fn fsck(text: String) -> Output {
+    let mut rows = Vec::new();
+    if text != "no problems found" {
+        for line in text.lines() {
+            let mut words = line.splitn(3, ' ');
+            let (kind, ty, rest) = (words.next(), words.next(), words.next());
+            match (kind, ty, rest) {
+                (Some(k), Some(t), Some(rest))
+                    if matches!(
+                        k,
+                        "dangling" | "unreachable" | "missing" | "root" | "tagged"
+                    ) =>
+                {
+                    let (id, name) = rest.split_once(' ').unwrap_or((rest, ""));
+                    let name = name.trim_start_matches('(').trim_end_matches(')');
+                    rows.push(crate::obj! { "kind" => k, "type" => t, "id" => id, "name" => name });
+                }
+                _ => rows.push(
+                    crate::obj! { "kind" => "error", "type" => "", "id" => "", "name" => line },
+                ),
+            }
+        }
+    }
+    Output::new(text.clone()).list(
+        "problems",
+        rows,
+        &["kind", "type", "id", "name"],
+        "no problems found",
+    )
 }
 
 /// A bisect step from git's report: the commits left and roughly how many
@@ -1074,7 +1184,7 @@ fn blame(all: &[BlameLine], path: &str, start: usize, end: usize) -> Output {
             }
         })
         .collect();
-    let mut out = Output::new(render::blame(shown));
+    let mut out = Output::new(render::blame(shown, true));
     if shown.len() < all.len() {
         out = out.with(
             "count",
@@ -1358,35 +1468,76 @@ fn done_message(c: &Command) -> Option<String> {
         Command::Fetch { .. } => "fetched".to_owned(),
         Command::Pull { .. } => "pulled".to_owned(),
         Command::Push { .. } => "pushed".to_owned(),
-        Command::Config {
+        Command::Config(ConfigArgs {
             key: Some(key),
             unset,
             unset_all,
             ..
-        } if *unset || *unset_all => format!("unset {key}"),
-        Command::Config {
+        }) if *unset || *unset_all => format!("unset {key}"),
+        Command::Config(ConfigArgs {
+            key: Some(key),
+            rename_section: true,
+            value: Some(value),
+            ..
+        }) => format!("renamed section {key} to {value}"),
+        Command::Config(ConfigArgs {
+            key: Some(key),
+            remove_section: true,
+            ..
+        }) => format!("removed section {key}"),
+        Command::Config(ConfigArgs {
             key: Some(key),
             value: Some(value),
             get: false,
             get_all: false,
+            get_regexp: false,
             ..
-        } => format!("set {key} = {value}"),
-        Command::Apply { check: true, .. } => "the patch applies cleanly".to_owned(),
-        Command::Apply { stat: false, .. } => "applied the patch".to_owned(),
+        }) => format!("set {key} = {value}"),
+        Command::Apply(ApplyArgs { check: true, .. }) => "the patch applies cleanly".to_owned(),
+        Command::Apply(ApplyArgs {
+            stat: false,
+            numstat: false,
+            summary: false,
+            ..
+        }) => "applied the patch".to_owned(),
         Command::Notes { cmd: Some(cmd), .. } => match cmd {
             NotesCmd::Add { rev, .. } | NotesCmd::Append { rev, .. } => {
                 format!("noted {}", rev.as_deref().unwrap_or("HEAD"))
             }
-            NotesCmd::Remove { rev } => {
-                format!("removed the note of {}", rev.as_deref().unwrap_or("HEAD"))
+            NotesCmd::Remove { revs, .. } if revs.is_empty() => {
+                "removed the note of HEAD".to_owned()
             }
+            NotesCmd::Remove { revs, .. } => format!("removed the notes of {}", revs.join(" ")),
+            NotesCmd::Copy { from, to, .. } => {
+                format!(
+                    "copied the note of {from} to {}",
+                    to.as_deref().unwrap_or("HEAD")
+                )
+            }
+            NotesCmd::Edit { rev, .. } => format!("noted {}", rev.as_deref().unwrap_or("HEAD")),
             _ => return None,
         },
         Command::UpdateRef {
-            name, delete: true, ..
+            name: Some(name),
+            delete: true,
+            ..
         } => format!("deleted {name}"),
-        Command::UpdateRef { name, .. } => format!("updated {name}"),
+        Command::UpdateRef {
+            name: Some(name), ..
+        } => format!("updated {name}"),
         Command::Gc { .. } => "packed the object database".to_owned(),
+        Command::Repack { .. } => "repacked the object database".to_owned(),
+        Command::Bundle {
+            cmd: BundleCmd::Create { file, .. },
+        } => format!("wrote {file}"),
+        Command::PackRefs { .. } => "packed the refs".to_owned(),
+        Command::Maintenance { cmd } => match cmd {
+            MaintenanceCmd::Run { .. } => "ran the maintenance tasks".to_owned(),
+            MaintenanceCmd::Start => "registered and scheduled maintenance".to_owned(),
+            MaintenanceCmd::Stop => "stopped scheduled maintenance".to_owned(),
+            MaintenanceCmd::Register => "registered the repository for maintenance".to_owned(),
+            MaintenanceCmd::Unregister { .. } => "unregistered the repository".to_owned(),
+        },
         Command::Clean { dry_run: false, .. } => "removed untracked files".to_owned(),
         Command::Rm { paths, .. } if !paths.is_empty() => {
             format!("removed {}", paths.join(" "))

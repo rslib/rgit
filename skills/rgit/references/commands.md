@@ -5,13 +5,13 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 ## Inspect
 
 - `status`: Compact working-tree status. Agents: add `--toon` for a structured table. `--porcelain`, `--short`, `--branch`, and `-z` print git's raw formats, exactly as `git status` does, for scripts. e.g. `rgit status`, `rgit status --toon`
-- `log`: Recent commits as `sha subject` lines. e.g. `rgit log --limit 50`, `rgit log main -- src/lib.rs`, `rgit log main..feature`, `rgit log --author alice --since 2024-01-01`, `rgit log --grep fix --no-merges -p`, `rgit log --follow --stat -- src/lib.rs`
-- `diff`: Diffstat of unstaged changes (`--cached` for staged), against a revision, or between two revisions (`A B`, `A..B`, `A...B`). e.g. `rgit diff`, `rgit diff --cached -- src`, `rgit diff main...HEAD --name-status`, `rgit diff v1 HEAD --patch -U1 -w -- src`
-- `show`: A commit's header and diffstat, or a file (`rev:path`) or folder at a revision. e.g. `rgit show HEAD`, `rgit show <rev> --patch`, `rgit show <rev> --name-only`, `rgit show HEAD~1:src/lib.rs`
-- `blame`: Blame a file: `sha author line` per line. e.g. `rgit blame src/lib.rs`, `rgit blame src/lib.rs -L 10,20`, `rgit blame v1 -- src/lib.rs`
+- `log`: Recent commits as `sha subject` lines, or in git's formats with `--oneline`, `--format`, `--pretty` or `--graph`. e.g. `rgit log --limit 50`, `rgit log main -- src/lib.rs`, `rgit log main..feature`, `rgit log --author alice --since 2024-01-01`, `rgit log --grep fix --no-merges -p`, `rgit log --follow --stat -- src/lib.rs`, `rgit log --oneline --graph --all`, `rgit log --oneline -S parse_date -- src`, `rgit log -3 --format='%h %an %ar %s' --date=iso`
+- `diff`: Diffstat of unstaged changes (`--cached` for staged), against a revision, or between two revisions (`A B`, `A..B`, `A...B`). e.g. `rgit diff`, `rgit diff --cached -- src`, `rgit diff main...HEAD --name-status`, `rgit diff v1 HEAD --patch -U1 -w -- src`, `rgit diff --quiet && echo clean`, `rgit diff main --name-only --diff-filter=A`, `rgit diff --no-index a.txt b.txt --patch`
+- `show`: A commit's header and diffstat, or a file (`rev:path`) or folder at a revision. e.g. `rgit show HEAD`, `rgit show <rev> --patch`, `rgit show <rev> --name-only`, `rgit show <rev> --pretty=fuller --stat`, `rgit show HEAD~1:src/lib.rs`
+- `blame`: Blame a file: `sha author line` per line. e.g. `rgit blame src/lib.rs`, `rgit blame src/lib.rs -L 10,20`, `rgit blame v1 -- src/lib.rs`, `rgit blame --porcelain -L 10,20 src/lib.rs`
 - `refs`: All refs (local branches, remotes, tags). e.g. `rgit refs`
 - `smartlog`: Smartlog: your local/draft commits and the trunk they branch from. e.g. `rgit smartlog`, `rgit sl`
-- `describe`: Describe a revision relative to the nearest tag (default HEAD). e.g. `rgit describe`, `rgit describe HEAD --tags`, `rgit describe --tags --abbrev=0`
+- `describe`: Describe a revision relative to the nearest tag (default HEAD). e.g. `rgit describe`, `rgit describe HEAD --tags`, `rgit describe --tags --abbrev=0`, `rgit describe --contains <rev>`
 
 ## Stage and discard
 
@@ -168,21 +168,44 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 
 ## Patches, notes, config and maintenance
 
-- `format-patch`: Write commits as mbox patch files (`-<n>`, `<since>` or `<a>..<b>`). e.g. `rgit format-patch -1`, `rgit format-patch main -o patches`, `rgit format-patch main..topic --stdout`
-- `am`: Apply mbox patches (from format-patch) as commits. e.g. `rgit am patches/*.patch`, `rgit am --continue`, `rgit am --abort`
-- `apply`: Apply a patch to the working tree, the index, or both. e.g. `rgit apply fix.patch`, `rgit apply --check fix.patch`, `rgit apply --cached fix.patch`, `rgit apply -R fix.patch`
-- `archive`: Write a tar or zip of a revision's files. e.g. `rgit archive -o release.tar.gz`, `rgit archive v1.0 --prefix project/ -o project.zip`, `rgit archive HEAD src > src.tar`
+- `format-patch`: Write commits as mbox patch files (`-<n>`, `<since>` or `<a>..<b>`). e.g. `rgit format-patch -1`, `rgit format-patch main -o patches`, `rgit format-patch main..topic --stdout`, `rgit format-patch main --cover-letter --thread -v2 --to list@example.com`, `rgit format-patch -3 --rfc --base=auto --subject-prefix="PATCH net"`
+- `am`: Apply mbox patches (from format-patch) as commits. e.g. `rgit am patches/*.patch`, `rgit am --continue`, `rgit am --abort`, `rgit am -3 -s --committer-date-is-author-date series.mbox`, `rgit am --show-current-patch=diff`
+- `apply`: Apply a patch to the working tree, the index, or both. e.g. `rgit apply fix.patch`, `rgit apply --check fix.patch`, `rgit apply --cached fix.patch`, `rgit apply -R fix.patch`, `rgit apply --3way fix.patch`, `rgit apply --reject -p2 --directory=vendor/lib fix.patch`, `rgit apply --stat --summary --numstat fix.patch`
+- `archive`: Write a tar or zip of a revision's files. e.g. `rgit archive -o release.tar.gz`, `rgit archive v1.0 --prefix project/ -o project.zip`, `rgit archive HEAD src > src.tar`, `rgit archive -9 --add-file=VERSION --format=tar.gz -o dist.tgz v1.0`, `rgit archive --remote ../other -o other.zip`, `rgit archive -l`
 - `notes`: Notes attached to commits (no subcommand lists them). e.g. `rgit notes`, `rgit notes show HEAD`
   - `notes list`: List notes as `<note id> <object id>`, or the note id of one object. e.g. `rgit notes list`
   - `notes show`: Print an object's note (default HEAD). e.g. `rgit notes show`, `rgit notes show <rev>`
-  - `notes add`: Attach a note to an object (default HEAD). e.g. `rgit notes add -m "<note>"`, `rgit notes add <rev> -m "<note>" --force`
+  - `notes add`: Attach a note to an object (default HEAD); opens the editor without -m, -F or -C. e.g. `rgit notes add -m "<note>"`, `rgit notes add <rev> -m "<note>" --force`, `rgit notes add -F notes.txt <rev>`
+  - `notes copy`: Copy the note of one object to another (default HEAD). e.g. `rgit notes copy <from> <to>`
   - `notes append`: Add a paragraph to an object's note, creating it if needed. e.g. `rgit notes append -m "<more>"`
-  - `notes remove`: Remove an object's note (default HEAD). e.g. `rgit notes remove <rev>`
-- `config`: Get, set, unset or list config values: `config <key>` reads, `config <key> <value>` writes. e.g. `rgit config user.email`, `rgit config user.email me@example.com`, `rgit config --global pull.rebase true`, `rgit config --unset core.pager`, `rgit config --list`
-- `update-ref`: Point a ref at a commit, or delete it, optionally only if it holds an expected value. e.g. `rgit update-ref refs/heads/topic <rev>`, `rgit update-ref refs/heads/topic <new> <old>`, `rgit update-ref -d refs/heads/topic`
-- `hash-object`: Print the object id of files or stdin; -w stores them. e.g. `rgit hash-object src/lib.rs`, `rgit hash-object -w --stdin`
-- `gc`: Pack the object database and prune unreachable objects. e.g. `rgit gc`, `rgit gc --prune=now`
-- `fsck`: Check the object database for corruption and dangling objects. e.g. `rgit fsck`, `rgit fsck --unreachable`
+  - `notes edit`: Edit an object's note in the editor (default HEAD). e.g. `rgit notes edit <rev>`
+  - `notes remove`: Remove the notes of objects (default HEAD). e.g. `rgit notes remove <rev>`, `rgit notes remove --ignore-missing a b`
+  - `notes prune`: Remove the notes of objects that no longer exist. e.g. `rgit notes prune -n`
+  - `notes merge`: Merge another notes ref into the current one. e.g. `rgit notes merge -s union origin`
+  - `notes get-ref`: Print the notes ref in use. e.g. `rgit notes --ref review get-ref`
+- `config`: Get, set, unset or list config values: `config <key>` reads, `config <key> <value>` writes. e.g. `rgit config user.email`, `rgit config user.email me@example.com`, `rgit config --global pull.rebase true`, `rgit config --unset core.pager`, `rgit config --list --show-origin`, `rgit config --get-regexp '^remote\.'`, `rgit config --type=bool --default false core.bare`, `rgit config --file .gitmodules --list`, `rgit config --rename-section branch.old branch.new`, `rgit config get --all --show-names remote.origin.fetch`, `rgit config set --all core.pager less`
+- `update-ref`: Point a ref at a commit, or delete it, optionally only if it holds an expected value. e.g. `rgit update-ref refs/heads/topic <rev>`, `rgit update-ref refs/heads/topic <new> <old>`, `rgit update-ref -d refs/heads/topic`, `printf 'start\nupdate refs/heads/a <new> <old>\ncommit\n' | rgit update-ref --stdin`, `rgit update-ref --create-reflog refs/backup/main main`
+- `hash-object`: Print the object id of files or stdin; -w stores them. e.g. `rgit hash-object src/lib.rs`, `rgit hash-object -w --stdin`, `rgit hash-object --stdin --path src/lib.rs`, `rgit hash-object --no-filters -t blob file.bin`
+- `gc`: Pack the object database and prune unreachable objects. e.g. `rgit gc`, `rgit gc --prune=now`, `rgit gc --aggressive --cruft`
+- `fsck`: Check the object database for corruption and dangling objects. e.g. `rgit fsck`, `rgit fsck --unreachable --no-reflogs`, `rgit fsck --lost-found`, `rgit fsck --name-objects --full`
+- `repack`: Pack the repository's objects (`git repack`). e.g. `rgit repack -a -d`, `rgit repack -a -d -b --cruft`
+- `pack-refs`: Move loose refs into packed-refs (`git pack-refs`). e.g. `rgit pack-refs --all`
+- `maintenance`: Background upkeep (`git maintenance`): run tasks now, schedule them, or (un)register this repository. e.g. `rgit maintenance run --task=gc`, `rgit maintenance start`
+  - `maintenance run`: Run maintenance tasks now. e.g. `rgit maintenance run`, `rgit maintenance run --task=commit-graph --task=loose-objects`
+  - `maintenance start`: Register this repository and schedule hourly/daily/weekly runs. e.g. `rgit maintenance start`
+  - `maintenance stop`: Remove the schedule (the repositories stay registered). e.g. `rgit maintenance stop`
+  - `maintenance register`: Add this repository to the global maintenance.repo list. e.g. `rgit maintenance register`
+  - `maintenance unregister`: Remove this repository from the global maintenance.repo list. e.g. `rgit maintenance unregister --force`
+- `cherry`: Commits not yet upstream (`git cherry`): `+ <id>` for each, `- <id>` when upstream already has an equivalent change. e.g. `rgit cherry`, `rgit cherry -v origin/main topic`
+- `bundle`: Move history as one file (`git bundle`): create, verify, list-heads, unbundle. e.g. `rgit bundle create repo.bundle --all`, `rgit bundle verify repo.bundle`
+  - `bundle create`: Write a bundle of the refs and ranges given (`--all`, `main`, `v1..main`, `^old main`). e.g. `rgit bundle create repo.bundle --all`, `rgit bundle create update.bundle v1.0..main`
+  - `bundle verify`: Check that a bundle is valid and applies to this repository. e.g. `rgit bundle verify update.bundle`
+  - `bundle list-heads`: List the refs in a bundle. e.g. `rgit bundle list-heads repo.bundle`
+  - `bundle unbundle`: Store a bundle's objects here and print its refs (refs are not changed). e.g. `rgit bundle unbundle update.bundle`
+- `request-pull`: Summarize changes for a pull request by mail (`git request-pull`): what `url` holds beyond `start`. e.g. `rgit request-pull origin/main https://example.com/me/repo.git topic`, `rgit request-pull -p v1.0 origin`
+- `range-diff`: Compare two versions of a series (`git range-diff`): `<base> <old> <new>`, `<old-range> <new-range>` or `<old>...<new>`. e.g. `rgit range-diff main topic-v1 topic-v2`, `rgit range-diff -s main..topic@{1} main..topic`, `rgit range-diff topic@{u}...topic`
+- `difftool`: Show changes in the configured diff tool (`git difftool`): diff.tool, difftool.<tool>.cmd or a known tool (vimdiff, meld, code, ...). e.g. `rgit difftool -y -t meld`, `rgit difftool --cached`, `rgit difftool -d main topic`
+- `mergetool`: Resolve conflicts in the configured merge tool (`git mergetool`): merge.tool, mergetool.<tool>.cmd or a known tool. e.g. `rgit mergetool`, `rgit mergetool -t vimdiff -- src/lib.rs`
 
 ## Plumbing (git's own output formats)
 
