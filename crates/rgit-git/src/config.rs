@@ -214,6 +214,9 @@ pub(crate) fn open_config(
             add_file(&config, &path, level, Some(repo))?;
         }
     }
+    if scope == ConfigScope::Any {
+        add_command_line(&config)?;
+    }
     Ok(config)
 }
 
@@ -289,6 +292,22 @@ pub fn config_list(
         }
         out.extend(file);
     }
+    if *scope == ConfigScope::Any {
+        let config = Config::new()?;
+        add_command_line(&config)?;
+        let mut entries = config.entries(None)?;
+        while let Some(entry) = entries.next() {
+            let entry = entry?;
+            out.push(ConfigEntry {
+                name: String::from_utf8_lossy(entry.name_bytes()).into_owned(),
+                value: entry
+                    .has_value()
+                    .then(|| String::from_utf8_lossy(entry.value_bytes()).into_owned()),
+                scope: "command",
+                origin: String::new(),
+            });
+        }
+    }
     Ok(out)
 }
 
@@ -309,6 +328,229 @@ pub fn config_key(key: &str) -> Result<String, GitError> {
         section.to_lowercase(),
         var.to_lowercase()
     ))
+}
+
+/// One `'...'` word of git's sq_quote, with `\'` and `\!` escapes between
+/// quoted runs. Returns the word and the rest.
+fn sq_dequote(s: &str) -> Option<(String, &str)> {
+    let mut rest = s.strip_prefix('\'')?;
+    let mut out = String::new();
+    loop {
+        let end = rest.find('\'')?;
+        out.push_str(&rest[..end]);
+        rest = &rest[end + 1..];
+        match rest.as_bytes() {
+            [b'\\', c @ (b'\'' | b'!'), b'\'', ..] => {
+                out.push(*c as char);
+                rest = &rest[3..];
+            }
+            _ => return Some((out, rest)),
+        }
+    }
+}
+
+/// The `-c` settings git passes down in GIT_CONFIG_PARAMETERS, then
+/// GIT_CONFIG_COUNT/GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n>, in order. A key
+/// without `=` has no value (an implicit true).
+pub fn command_line_config() -> Result<Vec<(String, Option<String>)>, GitError> {
+    let bogus = |what: &str| GitError::Other(format!("bogus format in {what}"));
+    let mut out = Vec::new();
+    let params = std::env::var("GIT_CONFIG_PARAMETERS").unwrap_or_default();
+    let mut rest = params.trim_start();
+    while !rest.is_empty() {
+        let (word, after) = sq_dequote(rest).ok_or_else(|| bogus("GIT_CONFIG_PARAMETERS"))?;
+        rest = after;
+        if let Some(after) = rest.strip_prefix('=') {
+            // New style: 'key'='value', or 'key'= for an empty value.
+            if after.is_empty() || after.starts_with(char::is_whitespace) {
+                out.push((word, Some(String::new())));
+                rest = after;
+            } else {
+                let (value, after) =
+                    sq_dequote(after).ok_or_else(|| bogus("GIT_CONFIG_PARAMETERS"))?;
+                out.push((word, Some(value)));
+                rest = after;
+            }
+        } else {
+            match word.split_once('=') {
+                Some((k, v)) => out.push((k.to_owned(), Some(v.to_owned()))),
+                None => out.push((word, None)),
+            }
+        }
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return Err(bogus("GIT_CONFIG_PARAMETERS"));
+        }
+        rest = rest.trim_start();
+    }
+    if let Ok(count) = std::env::var("GIT_CONFIG_COUNT")
+        && !count.is_empty()
+    {
+        let n: usize = count
+            .parse()
+            .map_err(|_| GitError::Other("bogus count in GIT_CONFIG_COUNT".to_owned()))?;
+        for i in 0..n {
+            let get = |what: &str| {
+                std::env::var(format!("GIT_CONFIG_{what}_{i}")).map_err(|_| {
+                    GitError::Other(format!("missing config {} {i}", what.to_lowercase()))
+                })
+            };
+            out.push((get("KEY")?, Some(get("VALUE")?)));
+        }
+    }
+    Ok(out)
+}
+
+/// The command-line settings as config file text, for libgit2's parser.
+fn command_line_text() -> Result<Option<String>, GitError> {
+    let entries = command_line_config()?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let mut text = String::new();
+    for (key, value) in entries {
+        let name = config_key(&key)?;
+        let (section, var) = (
+            &name[..name.find('.').unwrap_or(0)],
+            &name[name.rfind('.').unwrap_or(0) + 1..],
+        );
+        let sub = &name[section.len()..name.len() - var.len()].trim_matches('.');
+        let quote = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        if sub.is_empty() {
+            text.push_str(&format!("[{section}]\n"));
+        } else {
+            text.push_str(&format!("[{section} \"{}\"]\n", quote(sub)));
+        }
+        match value {
+            Some(v) => text.push_str(&format!(
+                "\t{var} = \"{}\"\n",
+                quote(&v).replace('\n', "\\n").replace('\t', "\\t")
+            )),
+            None => text.push_str(&format!("\t{var}\n")),
+        }
+    }
+    Ok(Some(text))
+}
+
+#[repr(C)]
+struct MemoryOptions {
+    version: std::ffi::c_uint,
+    backend_type: *const std::ffi::c_char,
+    origin_path: *const std::ffi::c_char,
+}
+
+unsafe extern "C" {
+    fn git_config_backend_from_string(
+        out: *mut *mut libgit2_sys::git_config_backend,
+        cfg: *const std::ffi::c_char,
+        len: usize,
+        opts: *mut MemoryOptions,
+    ) -> std::ffi::c_int;
+    fn git_config_add_backend(
+        cfg: *mut libgit2_sys::git_config,
+        backend: *mut libgit2_sys::git_config_backend,
+        level: libgit2_sys::git_config_level_t,
+        repo: *const libgit2_sys::git_repository,
+        force: std::ffi::c_int,
+    ) -> std::ffi::c_int;
+}
+
+/// Layer the command-line settings (`rgit -c`) over `config` at the highest
+/// level, as git does for every config read.
+pub fn add_command_line(config: &Config) -> Result<(), GitError> {
+    let Some(text) = command_line_text()? else {
+        return Ok(());
+    };
+    let mut opts = MemoryOptions {
+        version: 1,
+        backend_type: c"command line".as_ptr(),
+        origin_path: std::ptr::null(),
+    };
+    let mut backend: *mut libgit2_sys::git_config_backend = std::ptr::null_mut();
+    // SAFETY: libgit2 copies the text; the backend passes to the config.
+    let rc = unsafe {
+        let rc = git_config_backend_from_string(
+            &mut backend,
+            text.as_ptr().cast(),
+            text.len(),
+            &mut opts,
+        );
+        if rc < 0 {
+            rc
+        } else {
+            // Writes skip it and go to the repository's own file.
+            (*backend).readonly = 1;
+            git_config_add_backend(
+                config.raw(),
+                backend,
+                libgit2_sys::GIT_CONFIG_LEVEL_APP,
+                std::ptr::null(),
+                1,
+            )
+        }
+    };
+    if rc < 0 {
+        return Err(git2::Error::last_error(rc).into());
+    }
+    Ok(())
+}
+
+/// Point libgit2's own config lookup (`repo.config()`, other repositories
+/// opened in this process) at the files git reads: no XDG file under
+/// GIT_CONFIG_GLOBAL, no system file under GIT_CONFIG_NOSYSTEM. A file that
+/// libgit2 cannot name by folder alone is left out; the repository rgit opens
+/// reads it through the environment instead.
+pub(crate) fn env_search_paths() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        use git2::ConfigLevel;
+        let dir_of = |path: PathBuf, name: &str| match path.file_name() {
+            Some(n) if n == name => path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            _ => PathBuf::new(),
+        };
+        let mut set = Vec::new();
+        if let Some(global) = env_path("GIT_CONFIG_GLOBAL") {
+            set.push((ConfigLevel::XDG, PathBuf::new()));
+            set.push((ConfigLevel::Global, dir_of(global, ".gitconfig")));
+        }
+        match system_path() {
+            None => set.push((ConfigLevel::System, PathBuf::new())),
+            Some(_) if env_path("GIT_CONFIG_SYSTEM").is_some() => {
+                let path = env_path("GIT_CONFIG_SYSTEM").unwrap_or_default();
+                set.push((ConfigLevel::System, dir_of(path, "gitconfig")));
+            }
+            Some(_) => {}
+        }
+        for (level, dir) in set {
+            // SAFETY: once, before any config is loaded on another thread.
+            let _ = unsafe {
+                git2::opts::set_search_path(level, dir.as_os_str().to_string_lossy().as_ref())
+            };
+        }
+    });
+}
+
+/// Every config git reads outside a repository, with `-c`.
+pub(crate) fn default_config() -> Result<Config, GitError> {
+    let config = Config::new()?;
+    for (path, level) in read_paths(None, &ConfigScope::Any)? {
+        if path.exists() {
+            add_file(&config, &path, level, None)?;
+        }
+    }
+    add_command_line(&config)?;
+    Ok(config)
+}
+
+/// The last value of `key` in every config git reads here (the repository
+/// found from the current folder and the environment, if any), with `-c`.
+pub fn config_get(key: &str) -> Option<String> {
+    let name = config_key(key).ok()?;
+    let repo = crate::git_repo::open_env(Path::new(".")).ok();
+    config_list(repo.as_ref().map(Repository::path), &ConfigScope::Any, true)
+        .ok()?
+        .into_iter()
+        .rfind(|e| e.name == name)
+        .map(|e| e.value.unwrap_or_else(|| "true".to_owned()))
 }
 
 fn open_for_write(repo: Option<&Repository>, scope: &ConfigScope) -> Result<Config, GitError> {

@@ -4,7 +4,7 @@
 use std::path::Path;
 
 use git2::build::CheckoutBuilder;
-use git2::{DiffOptions, IndexEntry, IndexTime, Oid, Pathspec, PathspecFlags, Repository, Status};
+use git2::{DiffOptions, IndexEntry, IndexTime, Oid, Pathspec, Repository, Status};
 
 use crate::error::GitError;
 
@@ -18,7 +18,7 @@ pub struct Opts<'a> {
 /// Stash the changes under `paths` as git does, returning git's report line.
 pub fn push_paths(repo: &Repository, paths: &[String], o: &Opts) -> Result<String, GitError> {
     let spec = Pathspec::new(paths.iter())?;
-    let hit = |p: &str| spec.matches_path(Path::new(p), PathspecFlags::DEFAULT);
+    let hit = |p: &str| spec.matches_path(Path::new(p), crate::pathspec_flags());
     let head = repo
         .head()
         .ok()
@@ -47,7 +47,7 @@ pub fn push_paths(repo: &Repository, paths: &[String], o: &Opts) -> Result<Strin
         let one = Pathspec::new([p])?;
         if !entries
             .iter()
-            .any(|(path, _)| one.matches_path(Path::new(path), PathspecFlags::DEFAULT))
+            .any(|(path, _)| one.matches_path(Path::new(path), crate::pathspec_flags()))
         {
             return Err(GitError::Other(format!(
                 "pathspec '{p}' did not match any file(s) known to git\n\

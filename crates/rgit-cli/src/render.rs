@@ -37,14 +37,13 @@ pub fn init_color(text: bool, flag: Option<&str>) {
 /// git's want_color: the `--color` flag, else `config` (a color.* value),
 /// with `auto` or unset meaning stdout is a terminal. Never in agent output.
 pub fn want_color(config: Option<&str>) -> bool {
-    use std::io::IsTerminal;
     if !TEXT.load(Ordering::Relaxed) {
         return false;
     }
     match FLAG.get().map(String::as_str).or(config) {
         Some("always") => true,
         Some("never" | "false" | "no" | "off" | "0") => false,
-        _ => std::io::stdout().is_terminal(),
+        _ => crate::globals::stdout_tty(),
     }
 }
 
@@ -840,11 +839,10 @@ impl Colopts {
 
     /// Whether to lay out in columns, `auto` meaning stdout is a terminal.
     pub fn active(&self) -> bool {
-        use std::io::IsTerminal;
         match self.enable {
             ColEnable::Always => true,
             ColEnable::Never => false,
-            ColEnable::Auto => std::io::stdout().is_terminal(),
+            ColEnable::Auto => crate::globals::stdout_tty(),
         }
     }
 }

@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use git2::build::CheckoutBuilder;
 use git2::{
     ApplyLocation, ApplyOptions, BranchType, Cred, CredentialType, Delta, Diff, DiffFindOptions,
-    DiffOptions, ErrorCode, FetchOptions, ObjectType, Oid, Patch, Pathspec, PathspecFlags,
-    PushOptions, RemoteCallbacks, Repository, ResetType, Status, StatusOptions,
+    DiffOptions, ErrorCode, FetchOptions, ObjectType, Oid, Patch, Pathspec, PushOptions,
+    RemoteCallbacks, Repository, ResetType, Status, StatusOptions,
 };
 
 use crate::config::{ConfigScope, open_config};
@@ -35,11 +35,26 @@ impl Git2Backend {
         // Install the in-process, ssh-config-aware ssh transport (idempotent).
         #[cfg(feature = "ssh")]
         crate::ssh::register();
+        crate::config::env_search_paths();
         let start = start.as_ref();
         let repo = Repository::discover(start).map_err(|e| match e.code() {
             ErrorCode::NotFound => GitError::NotARepository(start.to_path_buf()),
             _ => GitError::Git(e),
         })?;
+        Self::from_repo(repo)
+    }
+
+    /// Open the repository as git finds it from `start`: GIT_DIR, GIT_WORK_TREE,
+    /// GIT_INDEX_FILE, GIT_CEILING_DIRECTORIES and the rest of git's
+    /// environment, with `-c` settings layered over its config.
+    pub fn open_env(start: impl AsRef<Path>) -> Result<Self, GitError> {
+        #[cfg(feature = "ssh")]
+        crate::ssh::register();
+        Self::from_repo(open_env(start.as_ref())?)
+    }
+
+    fn from_repo(repo: Repository) -> Result<Self, GitError> {
+        crate::config::add_command_line(&repo.config()?)?;
         let workdir = repo
             .workdir()
             .ok_or_else(|| GitError::Bare(repo.path().to_path_buf()))?
@@ -1019,7 +1034,7 @@ impl GitBackend for Git2Backend {
             // Overlay: only the source's own files, so the rest stay put.
             let paths: Vec<String> = match &tree {
                 Some(tree) if overlay => Pathspec::new(paths)?
-                    .match_tree(tree, PathspecFlags::DEFAULT)?
+                    .match_tree(tree, crate::pathspec_flags())?
                     .entries()
                     .map(|p| String::from_utf8_lossy(p).into_owned())
                     .collect(),
@@ -1035,7 +1050,7 @@ impl GitBackend for Git2Backend {
                     repo.index()?
                         .iter()
                         .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-                        .filter(|p| spec.matches_path(Path::new(p), PathspecFlags::DEFAULT))
+                        .filter(|p| spec.matches_path(Path::new(p), crate::pathspec_flags()))
                         .filter(|p| tree.get_path(Path::new(p)).is_err())
                         .collect()
                 }
@@ -2626,7 +2641,7 @@ impl GitBackend for Git2Backend {
             .iter()
             .filter(|e| e.status().contains(Status::WT_NEW))
             .filter_map(|e| e.path().ok().map(str::to_owned))
-            .filter(|p| spec.matches_path(Path::new(p), PathspecFlags::DEFAULT))
+            .filter(|p| spec.matches_path(Path::new(p), crate::pathspec_flags()))
             .collect();
         let empty = repo.blob(b"")?;
         let mut index = repo.index()?;
@@ -2667,7 +2682,7 @@ impl GitBackend for Git2Backend {
                     continue;
                 };
                 let path = String::from_utf8_lossy(&any.path).into_owned();
-                if !spec.matches_path(Path::new(&path), PathspecFlags::DEFAULT) {
+                if !spec.matches_path(Path::new(&path), crate::pathspec_flags()) {
                     continue;
                 }
                 let Some(side) = (if ours { c.our } else { c.their }) else {
@@ -6782,8 +6797,42 @@ pub fn init(path: &Path, args: &crate::InitArgs) -> Result<String, GitError> {
     ))
 }
 
+/// Open the repository git would use from `start`, honouring GIT_DIR and the
+/// rest of git's environment. With GIT_DIR but no work tree, the current
+/// folder is the top of the work tree, as in git.
+pub fn open_env(start: &Path) -> Result<Repository, GitError> {
+    crate::config::env_search_paths();
+    let not_found = |e: git2::Error| match e.code() {
+        ErrorCode::NotFound => GitError::NotARepository(start.to_path_buf()),
+        _ => GitError::Git(e),
+    };
+    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
+    let repo = if env("GIT_DIR").is_some() {
+        let repo = Repository::open_from_env().map_err(not_found)?;
+        let set = repo.config().is_ok_and(|c| {
+            c.get_entry("core.worktree").is_ok() || c.get_bool("core.bare").unwrap_or(false)
+        });
+        if env("GIT_WORK_TREE").is_none() && !set {
+            repo.set_workdir(&std::env::current_dir()?, false)?;
+        }
+        repo
+    } else {
+        let ceilings: Vec<PathBuf> = env("GIT_CEILING_DIRECTORIES")
+            .map(|v| {
+                std::env::split_paths(&v)
+                    .filter(|p| p.is_absolute())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Repository::open_ext(start, git2::RepositoryOpenFlags::FROM_ENV, &ceilings)
+            .map_err(not_found)?
+    };
+    crate::config::add_command_line(&repo.config()?)?;
+    Ok(repo)
+}
+
 fn default_initial_branch() -> Option<String> {
-    git2::Config::open_default()
+    crate::config::default_config()
         .ok()?
         .get_string("init.defaultBranch")
         .ok()
@@ -7719,7 +7768,7 @@ fn remote_callbacks<'a>(
             // First the git credential helper (keychain, cache, ...).
             if !helper_tried {
                 helper_tried = true;
-                if let Ok(config) = git2::Config::open_default()
+                if let Ok(config) = crate::config::default_config()
                     && let Ok(c) = Cred::credential_helper(&config, url, username)
                 {
                     return Ok(c);
@@ -8021,7 +8070,7 @@ fn only_paths_tree(
     index.write()?;
     let spec = Pathspec::new(paths)?;
     let path_of = |e: &git2::IndexEntry| PathBuf::from(String::from_utf8_lossy(&e.path).as_ref());
-    let hit = |e: &git2::IndexEntry| spec.matches_path(&path_of(e), PathspecFlags::DEFAULT);
+    let hit = |e: &git2::IndexEntry| spec.matches_path(&path_of(e), crate::pathspec_flags());
     let mut partial = git2::Index::new()?;
     if let Some(tree) = &head_tree {
         partial.read_tree(tree)?;
@@ -8426,7 +8475,7 @@ fn check_hook(
 /// Whether a pathspec (file, folder or glob) matches `path`, as git matches it.
 pub fn pathspec_matches(specs: &[String], path: &str) -> bool {
     Pathspec::new(specs.iter())
-        .is_ok_and(|spec| spec.matches_path(Path::new(path), PathspecFlags::DEFAULT))
+        .is_ok_and(|spec| spec.matches_path(Path::new(path), crate::pathspec_flags()))
 }
 
 /// A tar of `(name, git file mode, content)` entries.
@@ -8616,7 +8665,7 @@ fn rm_check(
 /// Index paths a pathspec matches.
 fn index_matches(index: &git2::Index, path: &str) -> Result<Vec<String>, GitError> {
     let spec = Pathspec::new([path])?;
-    let list = spec.match_index(index, PathspecFlags::DEFAULT)?;
+    let list = spec.match_index(index, crate::pathspec_flags())?;
     Ok(list
         .entries()
         .map(|p| String::from_utf8_lossy(p).into_owned())
@@ -8627,7 +8676,7 @@ fn index_matches(index: &git2::Index, path: &str) -> Result<Vec<String>, GitErro
 /// or HEAD.
 fn no_match(repo: &Repository, path: &str) -> Result<(), GitError> {
     let spec = Pathspec::new([path])?;
-    let flags = PathspecFlags::DEFAULT;
+    let flags = crate::pathspec_flags();
     let hit = spec.match_workdir(repo, flags)?.entries().len() > 0
         || spec.match_index(&repo.index()?, flags)?.entries().len() > 0
         || repo
@@ -8659,7 +8708,7 @@ fn known(
     path: &str,
 ) -> Result<(), GitError> {
     let spec = Pathspec::new([path])?;
-    let flags = PathspecFlags::DEFAULT;
+    let flags = crate::pathspec_flags();
     let hit = index.is_some_and(|i| {
         spec.match_index(i, flags)
             .is_ok_and(|m| m.entries().len() > 0)

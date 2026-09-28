@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use git2::{ObjectType, Oid, Pathspec, PathspecFlags, Repository, Status, StatusOptions};
+use git2::{ObjectType, Oid, Pathspec, Repository, Status, StatusOptions};
 
 use crate::error::GitError;
 
@@ -1043,7 +1043,7 @@ fn submodule_active(repo: &Repository, path: &str) -> bool {
     }
     if !specs.is_empty() {
         return Pathspec::new(specs.iter())
-            .is_ok_and(|s| s.matches_path(Path::new(path), PathspecFlags::DEFAULT));
+            .is_ok_and(|s| s.matches_path(Path::new(path), crate::pathspec_flags()));
     }
     config.get_string(&format!("submodule.{name}.url")).is_ok()
 }
@@ -1093,7 +1093,7 @@ fn keeper(q: &GitGrep) -> Result<impl Fn(&str) -> bool, GitError> {
         .transpose()?;
     Ok(move |p: &str| {
         spec.as_ref()
-            .is_none_or(|s| s.matches_path(Path::new(p), PathspecFlags::DEFAULT))
+            .is_none_or(|s| s.matches_path(Path::new(p), crate::pathspec_flags()))
     })
 }
 

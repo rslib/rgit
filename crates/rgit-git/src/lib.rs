@@ -58,9 +58,9 @@ pub use blame::{Blame, BlameOptions};
 pub use bundle::{BundleHeader, bundle_header};
 pub use combine::CombinedFile;
 pub use config::{
-    ConfigEntry, ConfigScope, SetMode, ansi_color, config_file, config_fixed_value, config_key,
-    config_list, config_name_matcher, config_section, config_set, config_typed, config_unset,
-    expiry_date, value_matcher,
+    ConfigEntry, ConfigScope, SetMode, ansi_color, command_line_config, config_file,
+    config_fixed_value, config_get, config_key, config_list, config_name_matcher, config_section,
+    config_set, config_typed, config_unset, expiry_date, value_matcher,
 };
 pub use creds::CredentialPrompt;
 pub use describe::DescribeOptions;
@@ -85,3 +85,17 @@ pub use plumbing::{
     RawObject, RefDetail, ReflogItem, TreeItem, TreeWalk, WalkCommit, grep_dir, hash_object,
 };
 pub use range_diff::RangeDiffOpts;
+
+/// Pathspec matching as git's GIT_LITERAL_PATHSPECS, GIT_NOGLOB_PATHSPECS and
+/// GIT_ICASE_PATHSPECS (`--literal-pathspecs` and friends) ask.
+pub(crate) fn pathspec_flags() -> git2::PathspecFlags {
+    let on = |k: &str| std::env::var(k).is_ok_and(|v| git2::Config::parse_bool(v).unwrap_or(false));
+    let mut flags = git2::PathspecFlags::DEFAULT;
+    if on("GIT_LITERAL_PATHSPECS") || on("GIT_NOGLOB_PATHSPECS") {
+        flags |= git2::PathspecFlags::NO_GLOB;
+    }
+    if on("GIT_ICASE_PATHSPECS") {
+        flags |= git2::PathspecFlags::IGNORE_CASE;
+    }
+    flags
+}

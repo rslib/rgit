@@ -16,6 +16,7 @@ mod creds;
 mod date;
 mod examples;
 mod forge;
+mod globals;
 mod graph;
 mod interactive;
 mod lanes;
@@ -41,11 +42,13 @@ struct Emit {
 fn main() -> ! {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let [flag] = args.as_slice()
-        && matches!(flag.as_str(), "-v" | "-V" | "--version")
+        && flag == "-V"
     {
         println!("{}", env!("CARGO_PKG_VERSION"));
         exit(0);
     }
+    let (args, paginate) = globals::apply(args);
+    let args = globals::dispatch(args);
     logging::init();
     let stdout_is_terminal = std::io::stdout().is_terminal();
     let parsed = examples::apply(Cli::command())
@@ -396,6 +399,9 @@ fn main() -> ! {
                     cli.color.as_deref()
                 },
             );
+            if output_mode == OutputMode::Text {
+                globals::start_pager(globals::command_name(&args).as_deref(), paginate);
+            }
             let repoless = command.runs_without_repo();
             let backend = match discover_or_init(can_prompt && !repoless) {
                 Ok(backend) => backend,
@@ -491,7 +497,8 @@ fn fail(message: String, help: Vec<String>, code: i32, mode: OutputMode) -> ! {
         }
         OutputMode::Text => {
             eprintln!("rgit: {message}");
-            for h in &help {
+            let advice = std::env::var("GIT_ADVICE").map_or(true, |v| v != "0" && v != "false");
+            for h in help.iter().filter(|_| advice) {
                 eprintln!("hint: {h}");
             }
         }
@@ -941,7 +948,7 @@ use output::sanitize;
 fn discover_or_exit() -> Arc<dyn GitBackend> {
     let discovered = std::env::current_dir()
         .map_err(|e| e.to_string())
-        .and_then(|cwd| Git2Backend::discover(&cwd).map_err(|e| e.to_string()));
+        .and_then(|cwd| Git2Backend::open_env(&cwd).map_err(|e| e.to_string()));
     match discovered {
         Ok(backend) => Arc::new(backend),
         Err(e) => {
@@ -963,7 +970,7 @@ fn discover_or_init_or_exit(can_prompt: bool) -> Arc<dyn GitBackend> {
 
 fn discover_or_init(can_prompt: bool) -> anyhow::Result<Arc<dyn GitBackend>> {
     let cwd = std::env::current_dir()?;
-    match Git2Backend::discover(&cwd) {
+    match Git2Backend::open_env(&cwd) {
         Ok(backend) => Ok(Arc::new(backend)),
         Err(rgit_git::GitError::NotARepository(_)) if can_prompt => {
             if !crate::interactive::confirm(&format!(
@@ -973,7 +980,7 @@ fn discover_or_init(can_prompt: bool) -> anyhow::Result<Arc<dyn GitBackend>> {
                 anyhow::bail!("cancelled");
             }
             rgit_git::init(&cwd, &Default::default())?;
-            Ok(Arc::new(Git2Backend::discover(&cwd)?))
+            Ok(Arc::new(Git2Backend::open_env(&cwd)?))
         }
         Err(rgit_git::GitError::NotARepository(_)) => Err(CliError::not_a_repo()),
         Err(e) => Err(e.into()),

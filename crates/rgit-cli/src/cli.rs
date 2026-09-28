@@ -19,7 +19,12 @@ use crate::render;
     version,
     about = "A magit-style git TUI, also usable as a CLI and an MCP server.",
     long_about = "Run with no subcommand to open the TUI. Subcommands drive the same in-process \
-                  git backend and print compact, agent-friendly output."
+                  git backend and print compact, agent-friendly output.",
+    after_help = "git's global options go before the command: -C <path>, -c <name>=<value>, \
+                  --config-env=<name>=<env>, --git-dir, --work-tree, --bare, --namespace, \
+                  -p/--paginate, -P/--no-pager, --literal/--noglob/--icase-pathspecs, \
+                  --no-optional-locks, --no-advice, --exec-path. An unknown command runs \
+                  alias.<name>, or rgit-<name>/git-<name> from PATH."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -8452,7 +8457,10 @@ pub fn config(git_dir: Option<&Path>, mut a: ConfigArgs) -> anyhow::Result<Strin
             s.push_str(e.scope);
             s.push(sep);
         }
-        if a.show_origin {
+        if a.show_origin && e.scope == "command" && e.origin.is_empty() {
+            s.push_str("command line:");
+            s.push(sep);
+        } else if a.show_origin {
             s.push_str(&format!("file:{}", e.origin));
             s.push(sep);
         }

@@ -161,8 +161,7 @@ impl Pretty {
                 _ => return Err(CliError::usage(format!("invalid --pretty format: {s}"))),
             },
         };
-        use std::io::IsTerminal;
-        let terminal = std::io::stdout().is_terminal();
+        let terminal = crate::globals::stdout_tty();
         let decorate = match (&args.decorate, args.no_decorate) {
             (_, true) => false,
             (Some(d), _) => d != "no",
