@@ -1677,7 +1677,7 @@ pub fn hash_object(
 
 /// `data` as git would store the file `path`: its clean filter driver, then
 /// libgit2's crlf/eol and ident filters.
-fn clean(repo: &Repository, path: &str, data: &[u8]) -> Result<Vec<u8>, GitError> {
+pub(crate) fn clean(repo: &Repository, path: &str, data: &[u8]) -> Result<Vec<u8>, GitError> {
     let data = filter_driver(repo, path, data.to_vec(), "clean")?;
     builtin_filters(repo, path, data, true)
 }

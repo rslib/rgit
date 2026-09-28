@@ -2039,10 +2039,6 @@ impl GitBackend for Git2Backend {
                 .find_note(notes_ref, oid)
                 .ok()
                 .map(|n| String::from_utf8_lossy(n.message_bytes()).into_owned());
-            let message = match message.trim_end() {
-                "" => String::new(),
-                m => format!("{m}\n"),
-            };
             let message = match old {
                 Some(old) if append => format!("{}\n\n{message}", old.trim_end()),
                 Some(_) if !force => {
@@ -2050,7 +2046,7 @@ impl GitBackend for Git2Backend {
                         "object {oid} already has a note; use --force to overwrite it"
                     )));
                 }
-                _ => message,
+                _ => message.to_owned(),
             };
             repo.note(&sig, &sig, notes_ref, oid, &message, true)?;
             Ok(())
@@ -2126,84 +2122,21 @@ impl GitBackend for Git2Backend {
 
     fn notes_merge(
         &self,
-        notes_ref: Option<&str>,
+        notes_ref: &str,
         other: &str,
         strategy: &str,
-    ) -> Result<String, GitError> {
+        verbosity: u8,
+    ) -> Result<(String, Option<(String, i32)>), GitError> {
         self.logged("notes", || {
             let repo = self.repo.lock().expect("repo mutex");
-            let local = match notes_ref {
-                Some(r) => r.to_owned(),
-                None => repo.note_default_ref()?,
-            };
-            let theirs = repo.refname_to_id(other)?;
-            let ours = repo.refname_to_id(&local).ok();
-            let msg = format!("notes: Merged notes from {other} into {local}");
-            match ours {
-                Some(o) if o == theirs || repo.graph_descendant_of(o, theirs)? => {
-                    return Ok("Already up to date.".to_owned());
-                }
-                None => {
-                    repo.reference(&local, theirs, true, &msg)?;
-                    return Ok("Fast-forward".to_owned());
-                }
-                Some(o) if repo.graph_descendant_of(theirs, o)? => {
-                    repo.reference(&local, theirs, true, &msg)?;
-                    return Ok("Fast-forward".to_owned());
-                }
-                Some(_) => {}
-            }
-            // ponytail: a two-way merge per object (no merge base), so a note
-            // deleted on one side comes back; git's manual merge worktree is
-            // replaced by an error naming the conflicts.
-            let mut writes = Vec::new();
-            let mut conflicts = Vec::new();
-            for n in repo.notes(Some(other))? {
-                let (note, obj) = n?;
-                let new = repo.find_blob(note)?.content().to_vec();
-                let new = String::from_utf8_lossy(&new).into_owned();
-                let cur = repo
-                    .find_note(Some(&local), obj)
-                    .ok()
-                    .map(|n| String::from_utf8_lossy(n.message_bytes()).into_owned());
-                let merged = match cur {
-                    None => Some(new),
-                    Some(cur) if cur == new => None,
-                    Some(cur) => match strategy {
-                        "ours" => None,
-                        "theirs" => Some(new),
-                        "union" => Some(format!("{}\n{new}", ensure_newline(&cur))),
-                        "cat_sort_uniq" => {
-                            let mut lines: Vec<&str> = cur
-                                .lines()
-                                .chain(new.lines())
-                                .filter(|l| !l.is_empty())
-                                .collect();
-                            lines.sort_unstable();
-                            lines.dedup();
-                            Some(lines.iter().map(|l| format!("{l}\n")).collect())
-                        }
-                        _ => {
-                            conflicts.push(obj.to_string());
-                            None
-                        }
-                    },
-                };
-                if let Some(m) = merged {
-                    writes.push((obj, m));
-                }
-            }
-            if !conflicts.is_empty() {
-                return Err(GitError::Conflict(format!(
-                    "notes conflict for {}; merge with -s ours, theirs, union or cat_sort_uniq",
-                    conflicts.join(", ")
-                )));
-            }
-            let sig = repo.signature()?;
-            for (obj, m) in &writes {
-                repo.note(&sig, &sig, Some(&local), *obj, m, true)?;
-            }
-            Ok(format!("merged {} note(s) from {other}", writes.len()))
+            crate::notes::merge(&repo, notes_ref, other, strategy, verbosity)
+        })
+    }
+
+    fn notes_merge_finish(&self, commit: bool, verbosity: u8) -> Result<String, GitError> {
+        self.logged("notes", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            crate::notes::merge_finish(&repo, commit, verbosity)
         })
     }
 
@@ -2214,83 +2147,18 @@ impl GitBackend for Git2Backend {
         no_deref: bool,
         create_reflog: bool,
         check_only: bool,
-    ) -> Result<(), GitError> {
+        batch: bool,
+    ) -> Result<Vec<String>, GitError> {
         let run = || {
-            let repo = self.repo.lock().expect("repo mutex");
-            let zero = |v: &str| v.chars().all(|c| c == '0');
-            let resolve = |v: &str| -> Result<Oid, GitError> {
-                Ok(repo
-                    .revparse_single(v)?
-                    .peel_to_commit()
-                    .map_or_else(|_| repo.revparse_single(v).map(|o| o.id()), |c| Ok(c.id()))?)
-            };
-            let mut plan = Vec::new();
-            for u in updates {
-                let mut name = u.name.clone();
-                while !no_deref
-                    && let Some(target) = repo
-                        .find_reference(&name)
-                        .ok()
-                        .and_then(|r| r.symbolic_target().ok().flatten().map(str::to_owned))
-                {
-                    name = target;
-                }
-                let current = repo.refname_to_id(&name).ok();
-                if let Some(old) = &u.old {
-                    let want = if zero(old) { None } else { Some(resolve(old)?) };
-                    if current != want {
-                        return Err(GitError::Other(match (current, want) {
-                            (Some(_), None) => {
-                                format!("cannot lock ref '{name}': reference already exists")
-                            }
-                            (None, _) => {
-                                format!(
-                                    "cannot lock ref '{name}': unable to resolve reference '{name}'"
-                                )
-                            }
-                            (Some(c), Some(w)) => {
-                                format!("cannot lock ref '{name}': is at {c} but expected {w}")
-                            }
-                        }));
-                    }
-                }
-                let new = match u.new.as_deref() {
-                    _ if u.verify => continue,
-                    Some(v) if !zero(v) => Some(resolve(v)?),
-                    _ => None,
-                };
-                if new.is_none() && current.is_none() {
-                    return Err(GitError::Other(format!(
-                        "cannot delete ref '{name}': it does not exist"
-                    )));
-                }
-                plan.push((name, new));
-            }
-            if check_only {
-                return Ok(());
-            }
-            let msg = message.unwrap_or("update-ref");
-            let sig = repo.signature()?;
-            let mut tx = repo.transaction()?;
-            for (name, _) in &plan {
-                tx.lock_ref(name)?;
-            }
-            for (name, new) in &plan {
-                match new {
-                    Some(id) => tx.set_target(name, *id, Some(&sig), msg)?,
-                    None => tx.remove(name)?,
-                }
-            }
-            tx.commit()?;
-            for (name, new) in &plan {
-                let logs = repo.path().join("logs").join(name);
-                if let (true, Some(id), false) = (create_reflog, new, logs.exists()) {
-                    let mut log = repo.reflog(name)?;
-                    log.append(*id, &sig, Some(msg))?;
-                    log.write()?;
-                }
-            }
-            Ok(())
+            crate::update_ref::update_refs(
+                &self.repo.lock().expect("repo mutex"),
+                updates,
+                message,
+                no_deref,
+                create_reflog,
+                check_only,
+                batch,
+            )
         };
         if check_only {
             run()
@@ -2409,81 +2277,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn archive(&self, o: &crate::ArchiveOpts) -> Result<Vec<u8>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
-        let obj = repo.revparse_single(&o.rev)?;
-        let tree = obj.peel_to_tree()?;
-        let commit = obj.peel_to_commit().ok();
-        let mtime = o
-            .mtime
-            .unwrap_or_else(|| commit.as_ref().map_or(0, |c| c.time().seconds()));
-        let attrs = crate::archive::Attributes::load(&repo, &tree, o.worktree_attributes)?;
-        let mut found: Vec<(String, i32, Oid)> = Vec::new();
-        tree.walk(git2::TreeWalkMode::PreOrder, |root, e| {
-            let Ok(name) = e.name() else {
-                return git2::TreeWalkResult::Ok;
-            };
-            let path = format!("{root}{name}");
-            if attrs.is_set(&path, "export-ignore") {
-                return git2::TreeWalkResult::Skip;
-            }
-            found.push((path, e.filemode(), e.id()));
-            git2::TreeWalkResult::Ok
-        })?;
-        let paths = &o.paths;
-        if !paths.is_empty() {
-            let files: Vec<String> = found
-                .iter()
-                .filter(|(p, mode, _)| *mode != 0o040000 && pathspec_matches(paths, p))
-                .map(|(p, ..)| p.clone())
-                .collect();
-            if files.is_empty() {
-                return Err(did_not_match(&paths.join(" ")));
-            }
-            found.retain(|(p, mode, _)| {
-                files
-                    .iter()
-                    .any(|f| f == p || *mode == 0o040000 && f.starts_with(&format!("{p}/")))
-            });
-        }
-        let prefix = &o.prefix;
-        // (name, git file mode, content); folders end in `/`.
-        let mut entries = Vec::new();
-        if prefix.ends_with('/') {
-            entries.push((prefix.to_owned(), 0o040000, Vec::new()));
-        }
-        for (path, mode, id) in found {
-            match mode {
-                0o040000 => entries.push((format!("{prefix}{path}/"), mode, Vec::new())),
-                0o160000 => {}
-                _ => {
-                    let mut data = repo.find_blob(id)?.content().to_vec();
-                    if let Some(c) = commit
-                        .as_ref()
-                        .filter(|_| attrs.is_set(&path, "export-subst"))
-                    {
-                        data = crate::archive::export_subst(&repo, c, &data);
-                    }
-                    entries.push((format!("{prefix}{path}"), mode, data));
-                }
-            }
-        }
-        for (name, mode, data) in &o.extra {
-            entries.push((format!("{prefix}{name}"), *mode, data.clone()));
-        }
-        let level = o
-            .level
-            .map_or(flate2::Compression::default(), flate2::Compression::new);
-        match o.format.as_str() {
-            "zip" => Ok(zip_archive(&entries, mtime, level)),
-            "tar" => tar_archive(&entries, mtime),
-            "tgz" | "tar.gz" => {
-                use std::io::Write;
-                let mut gz = flate2::write::GzEncoder::new(Vec::new(), level);
-                gz.write_all(&tar_archive(&entries, mtime)?)?;
-                Ok(gz.finish()?)
-            }
-            other => Err(GitError::Other(format!("unknown archive format {other:?}"))),
-        }
+        crate::archive::archive(&self.repo.lock().expect("repo mutex"), o)
     }
 
     fn gc(&self, args: &[String]) -> Result<String, GitError> {
@@ -7949,7 +7743,7 @@ fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(
         // Commit::amend rewrites HEAD keeping its parents, which the ref-updating
         // commit refuses ("current tip is not the first parent").
         Some(head) if o.amend => {
-            head.amend(
+            let new = head.amend(
                 Some("HEAD"),
                 author.as_ref(),
                 Some(&sig),
@@ -7957,6 +7751,7 @@ fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(
                 Some(&msg),
                 Some(&tree),
             )?;
+            crate::notes::copy_for_rewrite(repo, "amend", &[(head.id(), new)])?;
         }
         head => {
             if !o.allow_empty && !merging && head.as_ref().is_some_and(|p| p.tree_id() == tree_oid)
@@ -8476,118 +8271,6 @@ fn check_hook(
 pub fn pathspec_matches(specs: &[String], path: &str) -> bool {
     Pathspec::new(specs.iter())
         .is_ok_and(|spec| spec.matches_path(Path::new(path), crate::pathspec_flags()))
-}
-
-/// A tar of `(name, git file mode, content)` entries.
-fn tar_archive(entries: &[(String, i32, Vec<u8>)], mtime: i64) -> Result<Vec<u8>, GitError> {
-    let mut builder = tar::Builder::new(Vec::new());
-    for (name, mode, data) in entries {
-        let mut header = tar::Header::new_gnu();
-        header.set_mtime(mtime.max(0) as u64);
-        header.set_mode(match mode {
-            0o040000 | 0o100755 => 0o775,
-            0o120000 => 0o777,
-            _ => 0o664,
-        });
-        match mode {
-            0o040000 => {
-                header.set_entry_type(tar::EntryType::Directory);
-                header.set_size(0);
-                builder.append_data(&mut header, name, std::io::empty())?;
-            }
-            0o120000 => {
-                header.set_entry_type(tar::EntryType::Symlink);
-                header.set_size(0);
-                builder.append_link(&mut header, name, &*String::from_utf8_lossy(data))?;
-            }
-            _ => {
-                header.set_size(data.len() as u64);
-                builder.append_data(&mut header, name, data.as_slice())?;
-            }
-        }
-    }
-    Ok(builder.into_inner()?)
-}
-
-/// A zip of `(name, git file mode, content)` entries, deflated where that
-/// makes them smaller.
-fn zip_archive(
-    entries: &[(String, i32, Vec<u8>)],
-    mtime: i64,
-    level: flate2::Compression,
-) -> Vec<u8> {
-    use std::io::Write;
-    let (time, date) = dos_time(mtime);
-    let mut out = Vec::new();
-    let mut central = Vec::new();
-    for (name, mode, data) in entries {
-        let mut crc = flate2::Crc::new();
-        crc.update(data);
-        let mut deflate = flate2::write::DeflateEncoder::new(Vec::new(), level);
-        let deflated = deflate
-            .write_all(data)
-            .and_then(|()| deflate.finish())
-            .unwrap_or_default();
-        let (method, body) = if !data.is_empty() && deflated.len() < data.len() {
-            (8u16, &deflated)
-        } else {
-            (0u16, data)
-        };
-        let flags: u16 = if name.is_ascii() { 0 } else { 0x0800 };
-        let offset = out.len() as u32;
-        // Fields shared by the local header and the central directory entry.
-        let mut common = Vec::new();
-        for v in [20u16, flags, method, time, date] {
-            common.extend(v.to_le_bytes());
-        }
-        for v in [crc.sum(), body.len() as u32, data.len() as u32] {
-            common.extend(v.to_le_bytes());
-        }
-        common.extend((name.len() as u16).to_le_bytes());
-        common.extend(0u16.to_le_bytes());
-        out.extend(0x04034b50u32.to_le_bytes());
-        out.extend(&common);
-        out.extend(name.as_bytes());
-        out.extend(body);
-        let attrs = (*mode as u32) << 16 | u32::from(*mode == 0o040000) << 4;
-        central.extend(0x02014b50u32.to_le_bytes());
-        central.extend(0x0314u16.to_le_bytes());
-        central.extend(&common);
-        for v in [0u16, 0, 0] {
-            central.extend(v.to_le_bytes());
-        }
-        central.extend(attrs.to_le_bytes());
-        central.extend(offset.to_le_bytes());
-        central.extend(name.as_bytes());
-    }
-    let (start, size, count) = (out.len() as u32, central.len() as u32, entries.len() as u16);
-    out.extend(central);
-    out.extend(0x06054b50u32.to_le_bytes());
-    for v in [0u16, 0, count, count] {
-        out.extend(v.to_le_bytes());
-    }
-    out.extend(size.to_le_bytes());
-    out.extend(start.to_le_bytes());
-    out.extend(0u16.to_le_bytes());
-    out
-}
-
-/// A unix time as the MS-DOS (time, date) pair zip stores.
-fn dos_time(secs: i64) -> (u16, u16) {
-    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = (yoe + era * 400 + i64::from(month <= 2)).clamp(1980, 2107);
-    let time = (rem / 3600) << 11 | (rem % 3600 / 60) << 5 | ((rem % 60) / 2);
-    let date = (year - 1980) << 9 | month << 5 | day;
-    (time as u16, date as u16)
 }
 
 fn did_not_match(path: &str) -> GitError {
@@ -10054,14 +9737,6 @@ fn stash_flags(include_untracked: bool) -> Option<git2::StashFlags> {
         Some(git2::StashFlags::INCLUDE_UNTRACKED)
     } else {
         Some(git2::StashFlags::DEFAULT)
-    }
-}
-
-fn ensure_newline(s: &str) -> String {
-    if s.is_empty() || s.ends_with('\n') {
-        s.to_owned()
-    } else {
-        format!("{s}\n")
     }
 }
 

@@ -134,6 +134,13 @@ pub struct RefUpdate {
     pub old: Option<String>,
     /// Only check `old`, change nothing.
     pub verify: bool,
+    /// Change this ref itself even if it is symbolic (`option no-deref`).
+    pub no_deref: bool,
+    /// A `symref-*` command: `new_target` makes the ref symbolic, and
+    /// `old_target` is the target it must have first.
+    pub symref: bool,
+    pub new_target: Option<String>,
+    pub old_target: Option<String>,
 }
 
 /// Options for a cherry-pick or revert of one or more commits.

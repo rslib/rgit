@@ -137,6 +137,146 @@ fn apply_matches_git_apply() {
     assert_eq!(git(&dir, &["diff", "--cached"]), "");
 }
 
+/// `git apply` and `rgit apply` with `args` on copies of `dir` changed by
+/// `prep` agree: success, progress on stderr, the file `f` and the index.
+fn same_apply(dir: &Path, prep: &str, args: &[&str]) {
+    let outcome = |tool: &str| {
+        let copy = twin(dir, tool);
+        std::fs::write(copy.join("f"), prep).unwrap();
+        let mut cmd = Command::new(if tool == "git" {
+            "git"
+        } else {
+            env!("CARGO_BIN_EXE_rgit")
+        });
+        if tool != "git" {
+            cmd.arg("--human");
+        }
+        cmd.arg("apply").args(args).current_dir(&copy);
+        isolate(&mut cmd, &copy);
+        let out = cmd.output().unwrap();
+        let success = out.status.success();
+        (
+            success,
+            success.then(|| String::from_utf8_lossy(&out.stderr).into_owned()),
+            std::fs::read_to_string(copy.join("f")).unwrap_or_default(),
+            git(&copy, &["status", "--short"]),
+            git(&copy, &["ls-files", "-s"]),
+        )
+    };
+    assert_eq!(outcome("rgit"), outcome("git"), "{prep:?} {args:?}");
+}
+
+#[test]
+fn apply_places_hunks_like_git() {
+    let dir = repo("apply-fuzz");
+    let lines =
+        |n: std::ops::RangeInclusive<u32>| -> String { n.map(|i| format!("{i}\n")).collect() };
+    let base = lines(1..=20);
+    commit(&dir, "f", &base, "numbers");
+    let patch = |name: &str, text: &str, extra: &[&str]| {
+        std::fs::write(dir.join("f"), text).unwrap();
+        let mut args = vec!["diff"];
+        args.extend(extra);
+        let p = dir.with_extension(format!("{name}.diff"));
+        std::fs::write(&p, git(&dir, &args)).unwrap();
+        git(&dir, &["checkout", "-q", "f"]);
+        p.display().to_string()
+    };
+    let one = patch("one", &base.replace("\n10\n", "\nten\n"), &[]);
+    let two = patch(
+        "two",
+        &base
+            .replace("\n3\n", "\nthree\n")
+            .replace("\n15\n", "\nfifteen\n"),
+        &[],
+    );
+    let zero = patch(
+        "zero",
+        &base
+            .replace("\n3\n", "\nthree\n")
+            .replace("\n15\n", "\nfifteen\n"),
+        &["-U0"],
+    );
+    let end = patch("end", &base.replace("\n20\n", "\ntwenty\n"), &[]);
+    let shifted = format!("x\ny\n{base}");
+    let eight = base.replace("\n8\n", "\neight\n");
+    let spaced = base
+        .replace("\n9\n", "\n9  \n")
+        .replace("\n11\n", "\n11\t\n");
+    let doubled = format!("{base}{base}");
+    let no_eol = base.trim_end().to_owned();
+    for (prep, args) in [
+        (shifted.as_str(), vec!["-v", &one]),
+        (&base[8..], vec!["-v", &one]),
+        (&eight, vec!["-v", &one]),
+        (&eight, vec!["-v", "-C1", &one]),
+        (&eight, vec!["-C2", &one]),
+        (&spaced, vec![&one]),
+        (&spaced, vec!["-v", "--ignore-whitespace", &one]),
+        (&spaced, vec!["--ignore-space-change", &one]),
+        (&base, vec![&zero]),
+        (&base, vec!["-v", "--unidiff-zero", &zero]),
+        (&shifted, vec!["-v", "--unidiff-zero", &zero]),
+        (&base[4..], vec!["-v", "-R", &two]),
+        (&doubled, vec!["-v", &two]),
+        (&doubled, vec!["-v", "--allow-overlap", &two]),
+        (&no_eol, vec!["-v", &end]),
+        (&no_eol, vec!["-v", "--inaccurate-eof", &end]),
+        (&no_eol, vec!["--inaccurate-eof", &one]),
+        (&eight, vec!["--reject", &two]),
+    ] {
+        same_apply(&dir, prep, &args);
+    }
+    let (out, _) = rgit_in(&dir, &["apply", "--numstat", "-z", &two], b"");
+    assert_eq!(out, "2\t2\tf\0");
+}
+
+#[test]
+fn apply_intent_to_add_and_fake_ancestor_match_git() {
+    let dir = repo("apply-ita");
+    std::fs::write(dir.join("a.txt"), "one\n2\nthree\n").unwrap();
+    std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+    git(&dir, &["add", "-N", "new.txt"]);
+    let patch = dir.with_extension("ita.diff");
+    std::fs::write(&patch, git(&dir, &["diff"])).unwrap();
+    git(&dir, &["reset", "-q"]);
+    std::fs::remove_file(dir.join("new.txt")).unwrap();
+    git(&dir, &["checkout", "--", "a.txt"]);
+    let patch = patch.display().to_string();
+    let other = twin(&dir, "git");
+    git(&other, &["apply", "-N", &patch]);
+    ok(&dir, &["apply", "-N", &patch]);
+    // Only the patched paths: git 2.50 also drops every other entry from
+    // the index here, which rgit does not copy.
+    for args in [
+        &["status", "--short", "a.txt", "new.txt"][..],
+        &["ls-files", "-s", "a.txt", "new.txt"],
+    ] {
+        assert_eq!(git(&dir, args), git(&other, args), "{args:?}");
+    }
+    let fake = |d: &Path| d.with_extension("fake");
+    git(
+        &other,
+        &[
+            "apply",
+            &format!("--build-fake-ancestor={}", fake(&other).display()),
+            &patch,
+        ],
+    );
+    ok(
+        &dir,
+        &[
+            "apply",
+            &format!("--build-fake-ancestor={}", fake(&dir).display()),
+            &patch,
+        ],
+    );
+    assert_eq!(
+        std::fs::read(fake(&dir)).unwrap(),
+        std::fs::read(fake(&other)).unwrap()
+    );
+}
+
 #[test]
 fn apply_handles_binary_reject_three_way_and_paths_like_git() {
     let dir = repo("apply-more");
@@ -369,6 +509,253 @@ fn notes_copy_prune_merge_edit_and_message_sources() {
     assert_eq!(git(&dir, &["notes", "show", "HEAD~1"]), "ours\n\ntheirs\n");
 }
 
+/// stdout and success of `bin` (git or rgit) in `dir`, stderr dropped.
+fn stdout_of(bin: &str, dir: &Path, args: &[&str]) -> (String, bool) {
+    let mut cmd = Command::new(bin);
+    if bin != "git" {
+        cmd.arg("--human");
+    }
+    cmd.args(args).current_dir(dir);
+    isolate(&mut cmd, dir);
+    let out = cmd.output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// Every note of every notes ref with its text, and the files of a manual
+/// notes merge in progress.
+fn notes_state(dir: &Path) -> String {
+    let mut out = String::new();
+    for r in git(dir, &["for-each-ref", "--format=%(refname)", "refs/notes"]).lines() {
+        out += &format!("[{r}]\n");
+        for line in git(dir, &["notes", "--ref", r, "list"]).lines() {
+            let (note, obj) = line.split_once(' ').unwrap();
+            out += &format!("{obj}: {:?}\n", git(dir, &["cat-file", "-p", note]));
+        }
+    }
+    if let Ok(files) = std::fs::read_dir(dir.join(".git/NOTES_MERGE_WORKTREE")) {
+        let mut files: Vec<_> = files.flatten().map(|f| f.path()).collect();
+        files.sort();
+        for f in files {
+            let name = f.file_name().unwrap().to_string_lossy().into_owned();
+            out += &format!("{name}: {:?}\n", std::fs::read_to_string(&f).unwrap());
+        }
+    }
+    for f in ["NOTES_MERGE_PARTIAL", "NOTES_MERGE_REF"] {
+        out += &format!("{f}: {}\n", dir.join(".git").join(f).exists());
+    }
+    out
+}
+
+#[test]
+fn notes_merge_is_three_way_and_manual_like_git() {
+    let ours = repo("notes-merge");
+    for n in 1..=4 {
+        commit(&ours, "a.txt", &format!("{n}\n"), &format!("c{n}"));
+    }
+    for args in [
+        &["notes", "add", "-m", "base1", "HEAD~1"][..],
+        &["notes", "add", "-m", "l1\nl2\nl3", "HEAD~2"],
+        &["notes", "add", "-m", "gone", "HEAD~3"],
+        &["update-ref", "refs/notes/other", "refs/notes/commits"],
+        &["notes", "add", "-f", "-m", "local1", "HEAD~1"],
+        &["notes", "add", "-f", "-m", "l1\nL2\nl3", "HEAD~2"],
+        &["notes", "add", "-m", "localnew", "HEAD"],
+        &[
+            "notes", "--ref", "other", "add", "-f", "-m", "remote1", "HEAD~1",
+        ],
+        &[
+            "notes",
+            "--ref",
+            "other",
+            "add",
+            "-f",
+            "-m",
+            "l1\nR2\nl3",
+            "HEAD~2",
+        ],
+        &["notes", "--ref", "other", "remove", "HEAD~3"],
+        &["update-ref", "refs/notes/save", "refs/notes/commits"],
+    ] {
+        git(&ours, args);
+    }
+    let theirs = ours.with_extension("twin");
+    let _ = std::fs::remove_dir_all(&theirs);
+    let copied = Command::new("cp")
+        .arg("-R")
+        .arg(&ours)
+        .arg(&theirs)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    let reset = ["update-ref", "refs/notes/commits", "refs/notes/save"];
+    for args in [
+        &["notes", "merge", "-v", "other"][..],
+        &["notes", "merge", "--commit", "-v"],
+        &reset,
+        &["notes", "merge", "-s", "union", "other"],
+        &reset,
+        &["notes", "merge", "-s", "cat_sort_uniq", "-v", "other"],
+        &reset,
+        &["notes", "merge", "-s", "theirs", "other"],
+        &reset,
+        &["notes", "merge", "-s", "ours", "-q", "other"],
+        &reset,
+        &["notes", "merge", "-q", "other"],
+        &["notes", "merge", "--abort", "-v"],
+        &["notes", "merge", "--abort"],
+        &["notes", "merge", "--commit"],
+        &reset,
+        &["notes", "--ref", "other", "merge", "-vv", "commits"],
+        &["notes", "merge", "other"],
+        &["notes", "--ref", "fresh", "merge", "other"],
+    ] {
+        if args[0] == "update-ref" {
+            git(&ours, args);
+            git(&theirs, args);
+            continue;
+        }
+        let want = stdout_of("git", &theirs, args);
+        let got = stdout_of(env!("CARGO_BIN_EXE_rgit"), &ours, args);
+        assert_eq!(got, want, "{args:?}");
+        assert_eq!(notes_state(&ours), notes_state(&theirs), "{args:?}");
+    }
+}
+
+#[test]
+fn notes_keep_or_clean_up_text_like_git() {
+    let dir = repo("notes-stripspace");
+    std::fs::write(dir.join("n.txt"), "\n\nx  \n\n").unwrap();
+    let blob = git(&dir, &["hash-object", "-w", "n.txt"]);
+    let blob = blob.trim();
+    for args in [
+        &["notes", "add", "-f", "-m", "  a  ", "-m", "", "-m", "b   "][..],
+        &[
+            "notes",
+            "add",
+            "-f",
+            "--no-stripspace",
+            "-m",
+            "  a  ",
+            "-m",
+            "b   ",
+        ],
+        &[
+            "notes",
+            "add",
+            "-f",
+            "--no-stripspace",
+            "-F",
+            "n.txt",
+            "-m",
+            "y",
+        ],
+        &[
+            "notes",
+            "add",
+            "-f",
+            "-F",
+            "n.txt",
+            "--separator=SEP",
+            "-m",
+            "x",
+        ],
+        &["notes", "add", "-f", "-C", blob],
+        &["notes", "add", "-f", "--stripspace", "-C", blob],
+        &["notes", "add", "-f", "-m", "a", "--no-separator", "-m", "b"],
+    ] {
+        ok(&dir, args);
+        let ours = git(&dir, &["notes", "show"]);
+        git(&dir, args);
+        assert_eq!(ours, git(&dir, &["notes", "show"]), "{args:?}");
+    }
+    for args in [
+        &["notes", "append", "--no-stripspace", "-m", "  z  "][..],
+        &["notes", "append", "-m", "  q  "],
+    ] {
+        let before = git(&dir, &["notes", "show"]);
+        ok(&dir, args);
+        let ours = git(&dir, &["notes", "show"]);
+        git(
+            &dir,
+            &[
+                "notes",
+                "add",
+                "-f",
+                "--no-stripspace",
+                "-m",
+                before.as_str(),
+            ],
+        );
+        git(&dir, args);
+        assert_eq!(ours, git(&dir, &["notes", "show"]), "{args:?}");
+    }
+}
+
+#[test]
+fn log_and_show_display_notes_and_amend_copies_them_like_git() {
+    let dir = repo("notes-display");
+    commit(&dir, "a.txt", "2\n", "second");
+    git(&dir, &["notes", "add", "-m", "default note", "HEAD~1"]);
+    git(
+        &dir,
+        &["notes", "--ref", "foo", "add", "-m", "foo\n\ntwo", "HEAD"],
+    );
+    git(
+        &dir,
+        &["notes", "--ref", "bar", "add", "-m", "bar note", "HEAD"],
+    );
+    let same = |args: &[&str]| {
+        assert_eq!(
+            ok(&dir, args),
+            git(&dir, args),
+            "{args:?} with {}",
+            git(&dir, &["config", "--get-regexp", "notes|core.notes"]).trim()
+        );
+    };
+    for args in [
+        &["log", "--pretty"][..],
+        &["log", "--oneline", "--notes"],
+        &["log", "--notes=foo", "-1"],
+        &["log", "--notes=foo", "--notes"],
+        &["log", "--no-notes", "--pretty=medium"],
+        &["log", "--no-notes", "--notes=bar"],
+        &["log", "--format=[%N]"],
+        &["log", "--format=%s", "--notes=foo"],
+        &["show", "-s", "--pretty", "HEAD"],
+    ] {
+        same(args);
+    }
+    git(&dir, &["config", "notes.displayRef", "refs/notes/*"]);
+    same(&["log", "--pretty"]);
+    same(&["log", "--format=[%N]"]);
+    same(&["show", "-s", "--pretty=fuller", "HEAD"]);
+    git(&dir, &["config", "--unset", "notes.displayRef"]);
+    git(&dir, &["config", "core.notesRef", "refs/notes/foo"]);
+    same(&["log", "--pretty", "-1"]);
+    assert_eq!(ok(&dir, &["notes", "get-ref"]), "refs/notes/foo\n");
+    git(&dir, &["config", "--unset", "core.notesRef"]);
+
+    // notes.rewriteRef: amend carries the notes over, concatenated.
+    git(&dir, &["config", "notes.rewriteRef", "refs/notes/*"]);
+    git(
+        &dir,
+        &["notes", "--ref", "foo", "add", "-m", "old", "HEAD~1"],
+    );
+    ok(&dir, &["commit", "--amend", "-m", "amended"]);
+    assert_eq!(
+        git(&dir, &["notes", "--ref", "foo", "show"]),
+        "foo\n\ntwo\n"
+    );
+    assert_eq!(git(&dir, &["notes", "--ref", "bar", "show"]), "bar note\n");
+    git(&dir, &["config", "notes.rewrite.amend", "false"]);
+    ok(&dir, &["commit", "--amend", "-m", "again"]);
+    let head = git(&dir, &["rev-parse", "HEAD"]);
+    assert!(!git(&dir, &["notes", "--ref", "bar", "list"]).contains(head.trim()));
+}
+
 #[test]
 fn update_ref_creates_moves_checks_and_deletes() {
     let dir = repo("update-ref");
@@ -430,6 +817,118 @@ fn update_ref_stdin_transactions_are_all_or_nothing() {
         git(&dir, &["reflog", "show", "--format=%H", "refs/custom/x"]).trim(),
         first
     );
+}
+
+/// git's output and exit status for `args` with `stdin`.
+fn git_in(dir: &Path, args: &[&str], stdin: &[u8]) -> (String, bool) {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    isolate(&mut cmd, dir);
+    let mut child = cmd.spawn().unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), stdin).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// rgit's stdout alone and exit status for `args` with `stdin`.
+fn rgit_stdout(dir: &Path, args: &[&str], stdin: &[u8]) -> (String, bool) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rgit"));
+    cmd.arg("--human")
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    isolate(&mut cmd, dir);
+    let mut child = cmd.spawn().unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), stdin).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// A copy of `dir` (same objects and refs) to run git in beside rgit.
+fn twin(dir: &Path, ext: &str) -> PathBuf {
+    let copy = dir.with_extension(ext);
+    let _ = std::fs::remove_dir_all(&copy);
+    let status = Command::new("cp").arg("-R").arg(dir).arg(&copy).status();
+    assert!(status.unwrap().success());
+    copy
+}
+
+fn refs(dir: &Path) -> String {
+    git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(symref)",
+            "refs/heads",
+        ],
+    )
+}
+
+#[test]
+fn update_ref_symrefs_no_deref_and_batch_updates_match_git() {
+    let dir = repo("update-ref-batch");
+    for b in ["side", "y", "w"] {
+        git(&dir, &["branch", b]);
+    }
+    git(&dir, &["symbolic-ref", "refs/heads/sym", "refs/heads/side"]);
+    let ones = "1".repeat(40);
+    let zeros = "0".repeat(40);
+    let scripts = [
+        "update refs/heads/side HEAD\ndelete refs/heads/nope\n".to_owned(),
+        format!(
+            "update refs/heads/z HEAD {ones}\nverify refs/heads/w {zeros}\n\
+             update refs/heads/y/q HEAD\ncreate refs/heads/main HEAD\n\
+             delete refs/heads/y {ones}\nupdate refs/heads/ok HEAD\n\
+             option no-deref\nsymref-verify refs/heads/sym refs/heads/main\n\
+             symref-create refs/heads/sy refs/heads/main\n\
+             symref-update refs/heads/sy2 refs/heads/main ref refs/heads/foo\n\
+             symref-create refs/heads/w/x refs/heads/main\n\
+             verify refs/heads/nope2 HEAD\n\
+             symref-update refs/heads/sym2 refs/heads/main oid HEAD\n\
+             option no-deref\nsymref-verify refs/heads/w refs/heads/main\n"
+        ),
+        format!("update refs/heads/sym HEAD {ones}\ncreate refs/heads/new HEAD\n"),
+        "option no-deref\nupdate refs/heads/sym HEAD~0\noption no-deref\nsymref-update refs/heads/s3 refs/heads/w\n"
+            .to_owned(),
+        "option no-deref\nsymref-verify refs/heads/s3 refs/heads/w\n".to_owned(),
+        "option no-deref\nsymref-delete refs/heads/s3 refs/heads/w\n"
+            .to_owned(),
+        "start\nsymref-create refs/heads/s5 refs/heads/y\ncreate refs/heads/y HEAD\ncommit\n"
+            .to_owned(),
+    ];
+    for (i, script) in scripts.iter().enumerate() {
+        for batch in [true, false] {
+            let args: &[&str] = if batch {
+                &["update-ref", "--stdin", "--batch-updates"]
+            } else {
+                &["update-ref", "--stdin"]
+            };
+            let other = twin(&dir, "twin");
+            let want = git_in(&other, args, script.as_bytes());
+            let got = rgit_stdout(&dir, args, script.as_bytes());
+            assert_eq!(got, want, "script {i} batch {batch}: {script}");
+            assert_eq!(refs(&dir), refs(&other), "script {i} batch {batch}");
+        }
+    }
+    // Symref commands that must not follow the ref need `option no-deref`.
+    let (_, success) = rgit_in(
+        &dir,
+        &["update-ref", "--stdin"],
+        b"symref-verify refs/heads/sym refs/heads/side\n",
+    );
+    assert!(!success);
 }
 
 #[test]
@@ -959,10 +1458,7 @@ fn archive_lists_the_same_files_as_git() {
     let (out, success) = rgit_in(&dir.join("src"), &["archive", "HEAD", "lib.rs"], b"");
     assert!(success);
     std::fs::write(dir.join("s.tar"), out.as_bytes()).unwrap();
-    assert_eq!(
-        names(&list(&dir, "tar", &["-tf", "s.tar"])),
-        ["src", "src/lib.rs"]
-    );
+    assert_eq!(names(&list(&dir, "tar", &["-tf", "s.tar"])), ["lib.rs"]);
 }
 
 #[test]
@@ -1328,6 +1824,156 @@ fn format_patch_versions_signoff_and_descriptions_match_git() {
     );
 }
 
+#[test]
+fn format_patch_attach_notes_encoding_and_config_match_git() {
+    let dir = repo("format-patch-attach");
+    commit(&dir, "a.txt", "2\n", "second é\n\nbody line");
+    commit(&dir, "a.txt", "3\n", "third");
+    commit(&dir, "a.txt", "4\n", "fourth\n\nSigned-off-by: X <x@y>");
+    git(&dir, &["notes", "add", "-m", "a note", "HEAD~1"]);
+    git(
+        &dir,
+        &["notes", "--ref", "other", "add", "-m", "other", "HEAD~1"],
+    );
+    let same = |args: &[&str]| {
+        assert_eq!(mask(&ok(&dir, args)), mask(&git(&dir, args)), "{args:?}");
+    };
+    for args in [
+        &["format-patch", "--stdout", "-3", "--attach"][..],
+        &[
+            "format-patch",
+            "--stdout",
+            "-3",
+            "--attach=XYZ",
+            "--numbered-files",
+        ],
+        &[
+            "format-patch",
+            "--stdout",
+            "-2",
+            "--inline=XYZ",
+            "--cover-letter",
+        ],
+        &["format-patch", "--stdout", "-2", "--attach", "--no-attach"],
+        &["format-patch", "--stdout", "-1", "--inline", "--attach=Q"],
+        &["format-patch", "--stdout", "-3", "--attach", "-p"],
+        &[
+            "format-patch",
+            "--stdout",
+            "-1",
+            "--attach",
+            "-s",
+            "--base=HEAD~2",
+        ],
+        &["format-patch", "--stdout", "-3", "--notes"],
+        &["format-patch", "--stdout", "-3", "--notes=other", "--notes"],
+        &["format-patch", "--stdout", "-3", "--notes", "-p"],
+        &["format-patch", "--stdout", "-3", "--notes", "--attach"],
+        &[
+            "format-patch",
+            "--stdout",
+            "-3",
+            "--no-encode-email-headers",
+        ],
+        &[
+            "format-patch",
+            "--stdout",
+            "-2",
+            "--from=T <t@t>",
+            "--force-in-body-from",
+        ],
+        &[
+            "format-patch",
+            "--stdout",
+            "-1",
+            "--to=a@x",
+            "--add-header=To: b@x",
+            "--add-header=Cc: c@x",
+            "--add-header=X-Foo: bar",
+        ],
+    ] {
+        same(args);
+    }
+    ok(&dir, &["format-patch", "-3", "--output=r.mbox"]);
+    git(&dir, &["format-patch", "-3", "--output=g.mbox"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("r.mbox")).unwrap(),
+        std::fs::read_to_string(dir.join("g.mbox")).unwrap()
+    );
+
+    std::fs::write(dir.join("sig.txt"), "sig from file\n").unwrap();
+    for (key, value, args) in [
+        (
+            "format.headers",
+            "X-Cfg: one",
+            &["format-patch", "--stdout", "-1"][..],
+        ),
+        (
+            "format.to",
+            "cfg@x",
+            &["format-patch", "--stdout", "-1", "--to=cli@x"],
+        ),
+        (
+            "format.numbered",
+            "true",
+            &["format-patch", "--stdout", "-1"],
+        ),
+        (
+            "format.numbered",
+            "false",
+            &["format-patch", "--stdout", "-2"],
+        ),
+        ("format.thread", "deep", &["format-patch", "--stdout", "-2"]),
+        (
+            "format.coverLetter",
+            "auto",
+            &["format-patch", "--stdout", "-2"],
+        ),
+        (
+            "format.coverLetter",
+            "true",
+            &["format-patch", "--stdout", "-1", "--no-cover-letter"],
+        ),
+        (
+            "format.signOff",
+            "true",
+            &["format-patch", "--stdout", "-1"],
+        ),
+        (
+            "format.from",
+            "Cfg From <cf@x>",
+            &["format-patch", "--stdout", "-1"],
+        ),
+        (
+            "format.forceInBodyFrom",
+            "true",
+            &["format-patch", "--stdout", "-1", "--from"],
+        ),
+        (
+            "format.signatureFile",
+            "sig.txt",
+            &["format-patch", "--stdout", "-1"],
+        ),
+        ("format.attach", "BND", &["format-patch", "--stdout", "-1"]),
+        ("format.notes", "other", &["format-patch", "--stdout", "-2"]),
+        (
+            "format.encodeEmailHeaders",
+            "false",
+            &["format-patch", "--stdout", "-3"],
+        ),
+        (
+            "format.filenameMaxLength",
+            "12",
+            &["format-patch", "-3", "-o", "out"],
+        ),
+        ("format.outputDirectory", "outdir", &["format-patch", "-2"]),
+    ] {
+        git(&dir, &["config", key, value]);
+        same(args);
+        git(&dir, &["config", "--unset-all", key]);
+    }
+}
+
 fn toon(dir: &Path, args: &[&str]) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rgit"));
     cmd.arg("--toon").args(args).current_dir(dir);
@@ -1463,4 +2109,215 @@ fn config_scopes_types_sections_and_includes_match_git() {
         "[p]\n\tq = r\n"
     );
     fails(&out, &["config", "x.y", "3"]);
+}
+
+/// stdout and stderr of `bin args` in `dir`, isolated, with `env` set.
+fn raw(bin: &str, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (Vec<u8>, Vec<u8>, bool) {
+    let mut cmd = Command::new(bin);
+    if bin != "git" {
+        cmd.arg("--human");
+    }
+    cmd.args(args).current_dir(dir).envs(env.iter().copied());
+    isolate(&mut cmd, dir);
+    let out = cmd.output().unwrap();
+    (out.stdout, out.stderr, out.status.success())
+}
+
+/// rgit and git write the same bytes and agree on success for each case, and
+/// on success print the same stderr (-v's paths).
+fn same_bytes(dir: &Path, cases: &[&[&str]], env: &[(&str, &str)]) {
+    for args in cases {
+        let want = raw("git", dir, args, env);
+        let got = raw(env!("CARGO_BIN_EXE_rgit"), dir, args, env);
+        assert!(want.0 == got.0, "stdout of {args:?} differs");
+        assert_eq!(got.2, want.2, "{args:?}");
+        if want.2 {
+            assert_eq!(
+                String::from_utf8_lossy(&got.1),
+                String::from_utf8_lossy(&want.1),
+                "{args:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn archive_writes_gits_bytes() {
+    let dir = repo("archive-bytes");
+    let long = "a".repeat(62);
+    let deep = format!("d/{long}/{long}/a-longish-file-name.txt");
+    let wide = format!("e/{}/x", long.repeat(3));
+    for (path, text) in [
+        (&deep[..], "deep\n"),
+        (&wide[..], "wide\n"),
+        ("bin.dat", "bin\0ary"),
+        ("ign/a", "x\n"),
+        ("keep/empty/.gitkeep", "y\n"),
+        ("café.txt", "caf\n"),
+        ("subst.txt", "$Format:%H %s$\n"),
+        ("t.txt", "text\n"),
+        ("run.sh", "run\n"),
+    ] {
+        std::fs::create_dir_all(dir.join(path).parent().unwrap()).unwrap();
+        std::fs::write(dir.join(path), text).unwrap();
+    }
+    std::fs::write(
+        dir.join(".gitattributes"),
+        "ign export-ignore\nkeep/empty/.gitkeep export-ignore\nsubst.txt export-subst\n\
+         t.txt -diff\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("t.txt", dir.join("link")).unwrap();
+    std::os::unix::fs::symlink(&deep, dir.join("longlink")).unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["update-index", "--chmod=+x", "run.sh"]);
+    let gitlink = format!("160000,{},sub", "1".repeat(40));
+    git(&dir, &["update-index", "--add", "--cacheinfo", &gitlink]);
+    git(&dir, &["commit", "-qm", "corners"]);
+    same_bytes(
+        &dir,
+        &[
+            &["archive", "HEAD"],
+            &["archive", "-v", "--prefix=p//", "HEAD"],
+            &["archive", "--format=tgz", "HEAD"],
+            &["archive", "--format=tar.gz", "-9", "HEAD"],
+            &["archive", "--format=zip", "HEAD"],
+            &["archive", "--format=zip", "-0", "HEAD", "d", "bin.dat"],
+            &[
+                "archive",
+                "--mtime=2020-01-02 03:04:05 +0000",
+                "HEAD^{tree}",
+            ],
+            &[
+                "archive",
+                "--add-virtual-file=v.txt:hi",
+                "--prefix=q/",
+                "--add-file=t.txt",
+                "HEAD",
+                "t.txt",
+            ],
+            &["archive", "HEAD", "nope"],
+        ],
+        &[],
+    );
+    same_bytes(&dir.join("d"), &[&["archive", "-v", "HEAD"]], &[]);
+    for name in ["x.zip", "x.tar.gz", "x.tgz", ".tgz"] {
+        git(&dir, &["archive", "-o", &format!("../g{name}"), "HEAD"]);
+        ok(&dir, &["archive", "-o", &format!("../r{name}"), "HEAD"]);
+        let read = |p: String| std::fs::read(dir.join(p)).unwrap();
+        assert!(
+            read(format!("../g{name}")) == read(format!("../r{name}")),
+            "{name}"
+        );
+    }
+    git(&dir, &["config", "tar.umask", "0022"]);
+    git(&dir, &["config", "tar.tar.cat.command", "cat"]);
+    same_bytes(
+        &dir,
+        &[&["archive", "-l"], &["archive", "--format=tar.cat", "HEAD"]],
+        &[],
+    );
+}
+
+#[test]
+fn archive_remote_speaks_upload_archive() {
+    let dir = repo("archive-remote");
+    let ssh = dir.with_extension("ssh");
+    // An ssh stand-in: drop the options and host, run the command here.
+    std::fs::write(
+        &ssh,
+        "#!/bin/sh\nwhile [ \"$1\" = -p ]; do shift 2; done\nshift\n\
+         PATH=\"$(git --exec-path):$PATH\" exec sh -c \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let remote = format!("--remote=host:{}", dir.display());
+    let env = [("GIT_SSH_COMMAND", ssh.to_str().unwrap())];
+    same_bytes(
+        &dir,
+        &[
+            &["archive", &remote, "HEAD"],
+            &["archive", &remote, "--format=zip", "-v", "HEAD", "src"],
+            &["archive", &remote, "-l"],
+            &["archive", &remote, "nosuchref"],
+        ],
+        &env,
+    );
+    let url = format!("--remote=ssh://me@host:22{}", dir.display());
+    let (got, _, success) = raw(
+        env!("CARGO_BIN_EXE_rgit"),
+        &dir,
+        &["archive", &url, "HEAD"],
+        &env,
+    );
+    assert!(success);
+    assert!(got == raw("git", &dir, &["archive", "HEAD"], &[]).0);
+}
+
+#[test]
+fn range_diff_pairs_like_git() {
+    let dir = repo("range-diff-pairs");
+    let lines: String = (1..=200).map(|n| format!("{n}\n")).collect();
+    commit(&dir, "a.txt", &lines, "base");
+    let series = |branch: &str, edits: &[(usize, &str)]| {
+        git(&dir, &["checkout", "-qb", branch, "main"]);
+        let mut text: Vec<String> = lines.lines().map(str::to_owned).collect();
+        for (n, (line, word)) in edits.iter().enumerate() {
+            text[line - 1] = (*word).to_owned();
+            let body = text.join("\n") + "\n";
+            commit(
+                &dir,
+                "a.txt",
+                &body,
+                &format!("edit {line}\n\nstep {n}\n\tindented"),
+            );
+        }
+    };
+    series(
+        "v1",
+        &[
+            (10, "a"),
+            (20, "b"),
+            (30, "c"),
+            (40, "d"),
+            (50, "f"),
+            (70, "same"),
+            (90, "i"),
+        ],
+    );
+    series(
+        "v2",
+        &[
+            (20, "b"),
+            (10, "a"),
+            (30, "cc"),
+            (40, "d"),
+            (55, "new"),
+            (70, "same"),
+            (120, "k"),
+        ],
+    );
+    git(&dir, &["notes", "add", "-m", "note one\nsecond", "v1~2"]);
+    git(&dir, &["notes", "add", "-m", "note changed", "v2~2"]);
+    for args in [
+        &["range-diff", "main", "v1", "v2"][..],
+        &["range-diff", "--creation-factor=200", "main", "v2", "v1"],
+        &[
+            "range-diff",
+            "-s",
+            "--creation-factor=1000",
+            "main",
+            "v1",
+            "v2",
+        ],
+        &["range-diff", "-U1", "--no-notes", "main", "v1", "v2"],
+        &["range-diff", "--left-only", "v1...v2"],
+        &["range-diff", "main", "v1", "v2", "--", "a.txt"],
+    ] {
+        assert_eq!(
+            ok(&dir, args),
+            git(&dir, &[&["-c", "color.ui=never"][..], args].concat()),
+            "{args:?}"
+        );
+    }
 }

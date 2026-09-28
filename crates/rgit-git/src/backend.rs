@@ -609,15 +609,21 @@ pub trait GitBackend: Send + Sync {
     /// `dry_run` only lists them.
     fn notes_prune(&self, notes_ref: Option<&str>, dry_run: bool) -> Result<Vec<String>, GitError>;
 
-    /// Merge the notes of ref `other` into `notes_ref` (`git notes merge`).
-    /// `strategy` is manual (conflicts fail), ours, theirs, union or
-    /// cat_sort_uniq.
+    /// Merge the notes of ref `other` into `notes_ref` with their merge base
+    /// (`git notes merge`), printing as git does at `verbosity` (default 2).
+    /// `strategy` is manual (conflicts are left in NOTES_MERGE_WORKTREE),
+    /// ours, theirs, union or cat_sort_uniq. Returns stdout, and the stderr
+    /// message and exit code when git would stop.
     fn notes_merge(
         &self,
-        notes_ref: Option<&str>,
+        notes_ref: &str,
         other: &str,
         strategy: &str,
-    ) -> Result<String, GitError>;
+        verbosity: u8,
+    ) -> Result<(String, Option<(String, i32)>), GitError>;
+
+    /// Finish a manual notes merge: `commit` the resolved notes, or abort.
+    fn notes_merge_finish(&self, commit: bool, verbosity: u8) -> Result<String, GitError>;
 
     /// Point ref `name` at revision `new`, or delete it when `new` is `None`
     /// (`git update-ref`). With `old`, only if the ref now holds `old` (all
@@ -635,16 +641,19 @@ pub trait GitBackend: Send + Sync {
             name: name.to_owned(),
             new: new.map(str::to_owned),
             old: old.map(str::to_owned),
-            verify: false,
+            ..Default::default()
         };
-        self.update_refs(&[update], message, no_deref, false, false)
+        self.update_refs(&[update], message, no_deref, false, false, false)
+            .map(drop)
     }
 
     /// Change refs all or nothing (`git update-ref`, also its `--stdin`
     /// transactions): each update is checked against its expected old value
     /// first. A symbolic ref is followed unless `no_deref`; `create_reflog`
     /// writes a reflog even outside the namespaces that keep one. With
-    /// `check_only`, only verify.
+    /// `check_only`, only verify. With `batch` (`--batch-updates`), an update
+    /// that fails its checks is skipped and reported as git's `rejected <ref>
+    /// <new> <old> <reason>` line instead of failing them all.
     fn update_refs(
         &self,
         updates: &[crate::RefUpdate],
@@ -652,7 +661,8 @@ pub trait GitBackend: Send + Sync {
         no_deref: bool,
         create_reflog: bool,
         check_only: bool,
-    ) -> Result<(), GitError>;
+        batch: bool,
+    ) -> Result<Vec<String>, GitError>;
 
     /// `git cherry`: the commits of `head` (after `limit`) missing from
     /// `upstream`, oldest first, each marked by whether upstream already has

@@ -1123,40 +1123,15 @@ fn write_update_refs(dir: &Path, refs: &[UpdateRef]) -> Result<(), GitError> {
     write(dir, "update-refs", text)
 }
 
-/// Copy notes to the rewritten commits for the refs notes.rewriteRef names.
+/// Copy notes to the rewritten commits as notes.rewriteRef, notes.rewriteMode
+/// and notes.rewrite.rebase say.
 fn rewrite_notes(repo: &Repository, rewritten: &str) {
-    let Ok(config) = repo.config() else { return };
-    if !config.get_bool("notes.rewrite.rebase").unwrap_or(true) {
-        return;
-    }
-    let mut patterns = Vec::new();
-    if let Ok(mut entries) = config.multivar("notes.rewriteRef", None) {
-        while let Some(Ok(e)) = entries.next() {
-            patterns.extend(e.value().map(str::to_owned));
-        }
-    }
-    let Ok(sig) = committer(repo) else { return };
-    for pattern in patterns {
-        let Ok(refs) = repo.references_glob(&pattern) else {
-            continue;
-        };
-        let names: Vec<String> = refs
-            .flatten()
-            .filter_map(|r| r.name().ok().map(str::to_owned))
-            .collect();
-        for name in names {
-            for (old, new) in rewritten.lines().filter_map(|l| l.split_once(' ')) {
-                let (Ok(old), Ok(new)) = (Oid::from_str(old), Oid::from_str(new)) else {
-                    continue;
-                };
-                if let Ok(note) = repo.find_note(Some(&name), old)
-                    && let Ok(msg) = note.message()
-                {
-                    let _ = repo.note(&sig, &sig, Some(&name), new, msg, true);
-                }
-            }
-        }
-    }
+    let pairs: Vec<(Oid, Oid)> = rewritten
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter_map(|(a, b)| Some((Oid::from_str(a).ok()?, Oid::from_str(b).ok()?)))
+        .collect();
+    let _ = crate::notes::copy_for_rewrite(repo, "rebase", &pairs);
 }
 
 /// Remove the rebase state: the directory, its labels and the stop files.

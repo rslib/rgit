@@ -7,6 +7,7 @@
 mod am;
 mod apply;
 mod archive;
+mod attr;
 mod backend;
 mod bisect;
 mod blame;
@@ -19,20 +20,30 @@ mod describe;
 mod diff;
 mod error;
 mod fetch_display;
+mod fmt_merge_msg;
 mod format_patch;
 mod git_repo;
+mod index_ops;
 mod lanes;
 mod line_log;
+mod lowlevel;
+mod mail;
 mod model;
+mod name_rev;
+mod notes;
 mod oplog;
 mod plumbing;
 mod range_diff;
 mod rebase;
 mod shallow;
+mod show_branch;
 #[cfg(feature = "ssh")]
 mod ssh;
 mod stash;
 mod submodule;
+mod text;
+mod trailers;
+mod update_ref;
 mod walk;
 pub mod workflow;
 
@@ -52,7 +63,11 @@ pub use apply::{
     ApplyOpts, FilePatch, apply_outside, check_whitespace, parse_patch, patch_numstat, patch_stat,
     patch_summary, rename_label, stat_summary,
 };
-pub use archive::{ArchiveOpts, add_file as archive_file};
+pub use archive::{
+    ArchiveOpts, add_file as archive_file, format_from_filename as archive_format_from_filename,
+    format_names as archive_formats, is_local_url, remote_archive,
+};
+pub use attr::check_attr;
 pub use backend::GitBackend;
 pub use blame::{Blame, BlameOptions};
 pub use bundle::{BundleHeader, bundle_header};
@@ -66,10 +81,20 @@ pub use creds::CredentialPrompt;
 pub use describe::DescribeOptions;
 pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 pub use error::GitError;
+pub use fmt_merge_msg::{FmtMergeMsgOpts, fmt_merge_msg};
 pub use format_patch::{CherryCommit, FormatPatchOpts, PatchMail, Thread, mbox};
 pub use git_repo::{
     Git2Backend, clone, diff_no_index, init, ls_remote, pathspec_matches, run_hook,
 };
+pub use index_ops::{
+    CheckoutIndexOpts, ReadTreeOpts, Report, checkout_index, commit_tree, mktag, mktree, read_tree,
+    update_index, write_tree,
+};
+pub use lowlevel::{
+    DiffFmt, DiffMode, DiffTreeOpts, MergeFileOpts, MergeTreeOpts, diff_files, diff_index,
+    diff_tree, merge_file, merge_tree,
+};
+pub use mail::{MailinfoOpts, MailsplitOpts, mailinfo, mailsplit};
 pub use model::{
     BlameLine, Blob, CheckoutMode, CloneArgs, Commit, CommitDetails, CommitFile, CommitOptions,
     CommitOverview, CommitRef, Deco, DiffSpec, EmptyCommit, FetchArgs, FileActivity, GrepMatch,
@@ -80,11 +105,21 @@ pub use model::{
     SubmoduleOp, TagInfo, TreeEntry, Worktree, WorktreeAddArgs, activity_weights,
     group_decorations,
 };
+pub use name_rev::{NameRevOpts, name_rev};
 pub use plumbing::{
     GitGrep, GrepExpr, GrepHit, GrepSyntax, Ident, IgnoreRule, IndexItem, ObjectCounts, PathState,
     RawObject, RefDetail, ReflogItem, TreeItem, TreeWalk, WalkCommit, grep_dir, hash_object,
 };
 pub use range_diff::RangeDiffOpts;
+pub use show_branch::{ShowBranchOpts, show_branch, show_branch_defaults};
+pub use text::{
+    ColumnOpts, check_ref_format, collapse_slashes, column_finalize, column_mode, columns,
+    comment_lines, patch_ids, quote_path, stripspace,
+};
+pub use trailers::{
+    IfExists, IfMissing, NewTrailer, TrailerOpts, Where, interpret_trailers, parse_if_exists,
+    parse_if_missing, parse_where,
+};
 
 /// Pathspec matching as git's GIT_LITERAL_PATHSPECS, GIT_NOGLOB_PATHSPECS and
 /// GIT_ICASE_PATHSPECS (`--literal-pathspecs` and friends) ask.

@@ -994,7 +994,7 @@ fn looks_like_mail(data: &[u8]) -> bool {
 }
 
 /// git's `is_from_line`: `From ` and something that ends like a date.
-fn is_from_line(line: &[u8]) -> bool {
+pub(crate) fn is_from_line(line: &[u8]) -> bool {
     let len = line.len();
     if len < 20 || !line.starts_with(b"From ") {
         return false;
@@ -1027,7 +1027,7 @@ fn is_from_line(line: &[u8]) -> bool {
 
 /// Split an mbox into mails at `From ` lines (not in a `bare` mail), fixing
 /// CRLF endings unless `keep_cr` and unescaping `>From ` for mboxrd.
-fn split_mbox(data: &[u8], keep_cr: bool, mboxrd: bool, bare: bool) -> Vec<Vec<u8>> {
+pub(crate) fn split_mbox(data: &[u8], keep_cr: bool, mboxrd: bool, bare: bool) -> Vec<Vec<u8>> {
     let start = data
         .iter()
         .position(|b| !b.is_ascii_whitespace())
@@ -1064,21 +1064,21 @@ fn split_mbox(data: &[u8], keep_cr: bool, mboxrd: bool, bare: bool) -> Vec<Vec<u
 
 /// What mailinfo reads from a mail.
 #[derive(Debug, Default, PartialEq)]
-struct Mail {
-    author: String,
-    email: String,
-    subject: String,
-    date: String,
+pub(crate) struct Mail {
+    pub(crate) author: String,
+    pub(crate) email: String,
+    pub(crate) subject: String,
+    pub(crate) date: String,
     /// The message body, before the patch.
-    msg: String,
-    patch: Vec<u8>,
+    pub(crate) msg: String,
+    pub(crate) patch: Vec<u8>,
 }
 
-struct MailOpts {
-    keep_subject: bool,
-    keep_non_patch: bool,
-    message_id: bool,
-    scissors: bool,
+pub(crate) struct MailOpts {
+    pub(crate) keep_subject: bool,
+    pub(crate) keep_non_patch: bool,
+    pub(crate) message_id: bool,
+    pub(crate) scissors: bool,
 }
 
 /// The headers mailinfo keeps, primary (mail) or secondary (in-body).
@@ -1181,7 +1181,7 @@ fn is_rfc2822_header(line: &[u8]) -> bool {
 }
 
 /// Parse a mail as git's mailinfo does.
-fn mailinfo(mail: &[u8], o: &MailOpts) -> Mail {
+pub(crate) fn mailinfo(mail: &[u8], o: &MailOpts) -> Mail {
     let start = mail
         .iter()
         .position(|b| !b.is_ascii_whitespace())

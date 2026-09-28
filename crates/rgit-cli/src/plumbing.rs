@@ -5,12 +5,12 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rgit_git::{GitBackend, GitGrep, GrepExpr, GrepSyntax, Ident, PathState, RefDetail, TreeWalk};
 
-use crate::cli::{CliError, Plumbing};
+use crate::cli::{CliError, Plumbing, RawDiffArgs};
 use crate::output::Output;
 use crate::toon::Obj;
 
@@ -1097,6 +1097,28 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                 }
             }
         }
+        Plumbing::GetTarCommitId => get_tar_commit_id()?,
+        Plumbing::FmtMergeMsg {
+            message,
+            log,
+            no_log,
+            into_name,
+            file,
+            input,
+        } => {
+            let input = match (input, file.as_deref()) {
+                (Some(text), _) => text,
+                (None, Some(f)) if f != "-" => std::fs::read_to_string(f)
+                    .map_err(|e| fatal(format!("cannot open '{f}': {e}")))?,
+                _ => String::from_utf8_lossy(&stdin_or(None)?).into_owned(),
+            };
+            let o = rgit_git::FmtMergeMsgOpts {
+                message,
+                log: if no_log { Some(0) } else { log },
+                into_name,
+            };
+            lines(rgit_git::fmt_merge_msg(&backend.git_dir(), &input, &o)?)
+        }
         Plumbing::CountObjects { verbose } => {
             let c = backend.count_objects()?;
             lines(if verbose {
@@ -1108,7 +1130,787 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                 format!("{} objects, {} kilobytes\n", c.count, c.size)
             })
         }
+        Plumbing::NameRev {
+            name_only,
+            tags,
+            refs,
+            exclude,
+            all,
+            annotate_stdin,
+            no_undefined,
+            always,
+            peel_tag,
+            revs,
+            input,
+        } => {
+            if !all && !annotate_stdin && revs.is_empty() {
+                return Err(CliError::usage(
+                    "name-rev needs a commit, --all or --annotate-stdin",
+                ));
+            }
+            let annotate = if annotate_stdin {
+                Some(String::from_utf8_lossy(&stdin_or(input)?).into_owned())
+            } else {
+                None
+            };
+            let o = rgit_git::NameRevOpts {
+                name_only,
+                tags,
+                refs,
+                exclude,
+                all,
+                annotate_stdin: annotate,
+                undefined: !no_undefined,
+                always,
+                peel_tag,
+            };
+            let (text, error) = rgit_git::name_rev(&backend.git_dir(), &o, &revs)?;
+            if let Some(e) = error {
+                if raw {
+                    print!("{text}");
+                    std::io::stdout().flush()?;
+                }
+                return Err(fatal(e));
+            }
+            lines(text)
+        }
+        Plumbing::CheckAttr {
+            all,
+            cached,
+            stdin,
+            z,
+            items,
+            paths,
+        } => {
+            let (attrs, mut paths) = if all {
+                (Vec::new(), items.into_iter().chain(paths).collect())
+            } else if !paths.is_empty() {
+                (items, paths)
+            } else if stdin {
+                (items, Vec::new())
+            } else {
+                let mut it = items.into_iter();
+                (it.next().into_iter().collect(), it.collect())
+            };
+            if attrs.is_empty() && !all {
+                return Err(CliError::usage("check-attr needs an attribute or -a"));
+            }
+            if stdin {
+                let input = String::from_utf8_lossy(&stdin_or(None)?).into_owned();
+                let end = if z { '\0' } else { '\n' };
+                paths.extend(
+                    input
+                        .split(end)
+                        .filter(|p| !p.is_empty())
+                        .map(str::to_owned),
+                );
+            }
+            let (top, prefix) = top_and_prefix(backend)?;
+            let full: Vec<String> = paths
+                .iter()
+                .map(|p| crate::cli::repo_path(&top, std::path::Path::new(&prefix), p))
+                .collect();
+            let found = rgit_git::check_attr(&backend.git_dir(), &attrs, &full, cached)?;
+            let mut text = String::new();
+            let mut rows = Vec::new();
+            for (i, name, value) in found {
+                let p = &paths[i];
+                if z {
+                    text.push_str(&format!("{p}\0{name}\0{value}\0"));
+                } else {
+                    text.push_str(&format!("{}: {name}: {value}\n", rgit_git::quote_path(p)));
+                }
+                rows.push(crate::obj! { "path" => p.as_str(), "attr" => name, "value" => value });
+            }
+            table(
+                text,
+                "attributes",
+                rows,
+                &["path", "attr", "value"],
+                "0 attributes",
+            )
+        }
+        Plumbing::DiffTree {
+            format,
+            root,
+            no_commit_id,
+            stdin,
+            mut args,
+            mut paths,
+        } => {
+            let mut revs = Vec::new();
+            if !stdin {
+                while revs.len() < 2 && !args.is_empty() && backend.resolve_object(&args[0]).is_ok()
+                {
+                    revs.push(args.remove(0));
+                }
+                if revs.is_empty() {
+                    return Err(match args.first() {
+                        Some(a) => ambiguous(a),
+                        None => CliError::usage(
+                            "usage: git diff-tree [<options>] <tree-ish> [<tree-ish>] [<path>...]",
+                        ),
+                    });
+                }
+                on_disk(backend, &args)?;
+            }
+            args.append(&mut paths);
+            let input = if stdin {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+                Some(s)
+            } else {
+                None
+            };
+            let o = rgit_git::DiffTreeOpts {
+                fmt: raw_diff_fmt(backend, &format, args)?,
+                revs,
+                root,
+                no_commit_id,
+            };
+            let got = rgit_git::diff_tree(&backend.git_dir(), &o, input.as_deref())?;
+            raw_diff_done(&format, got)
+        }
+        Plumbing::DiffIndex {
+            format,
+            cached,
+            mut args,
+            mut paths,
+        } => {
+            let rev = args.remove(0);
+            if backend.resolve_object(&rev).is_err() {
+                return Err(ambiguous(&rev));
+            }
+            on_disk(backend, &args)?;
+            args.append(&mut paths);
+            let fmt = raw_diff_fmt(backend, &format, args)?;
+            let got = rgit_git::diff_index(&backend.git_dir(), &rev, cached, &fmt)?;
+            raw_diff_done(&format, got)
+        }
+        Plumbing::DiffFiles { format, paths } => {
+            let fmt = raw_diff_fmt(backend, &format, paths)?;
+            raw_diff_done(&format, rgit_git::diff_files(&backend.git_dir(), &fmt)?)
+        }
+        Plumbing::MergeTree {
+            name_only,
+            messages,
+            no_messages,
+            z,
+            allow_unrelated_histories,
+            merge_base,
+            branch1,
+            branch2,
+            ..
+        } => {
+            let o = rgit_git::MergeTreeOpts {
+                branch1,
+                branch2,
+                merge_base,
+                allow_unrelated: allow_unrelated_histories,
+                name_only,
+                messages: (messages || no_messages).then_some(messages),
+                z,
+            };
+            let (text, clean) =
+                rgit_git::merge_tree(&backend.git_dir(), &o).map_err(|e| fatal(e.to_string()))?;
+            crate::cli::set_exit(!clean);
+            lines(text)
+        }
+        m @ Plumbing::MergeFile { .. } => merge_file(Some(backend), m, raw)?,
+        Plumbing::InterpretTrailers { args, input } => {
+            interpret_trailers(Some(&backend.git_dir()), args, input)?
+        }
+        c @ Plumbing::ShowBranch { .. } => show_branch(backend, c, raw, true)?,
+        command => index_plumbing(backend, command, raw)?,
     })
+}
+
+impl Plumbing {
+    /// Whether the command also runs outside a repository, as in git.
+    pub fn runs_without_repo(&self) -> bool {
+        matches!(
+            self,
+            Plumbing::Stripspace { .. }
+                | Plumbing::Column { .. }
+                | Plumbing::CheckRefFormat { .. }
+                | Plumbing::PatchId { .. }
+                | Plumbing::Mailsplit { .. }
+                | Plumbing::Mailinfo { .. }
+        )
+    }
+}
+
+/// `input`, or all of stdin (MCP passes the text; the CLI reads it).
+fn stdin_or(input: Option<String>) -> anyhow::Result<Vec<u8>> {
+    Ok(match input {
+        Some(s) => s.into_bytes(),
+        None => {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
+            buf
+        }
+    })
+}
+
+/// The commands that work with or without a repository; `backend` supplies
+/// config when there is one.
+pub(crate) fn repoless(
+    backend: Option<&Arc<dyn GitBackend>>,
+    command: Plumbing,
+    raw: bool,
+) -> anyhow::Result<Output> {
+    let config = |key: &str| backend.and_then(|b| b.config_get(key).ok().flatten());
+    let comment = || {
+        config("core.commentChar")
+            .or_else(|| config("core.commentString"))
+            .filter(|c| c != "auto" && !c.is_empty())
+            .unwrap_or_else(|| "#".to_owned())
+    };
+    let text = |b: Vec<u8>| lines(String::from_utf8_lossy(&b).into_owned());
+    Ok(match command {
+        Plumbing::Stripspace {
+            strip_comments,
+            comment_lines,
+            input,
+        } => {
+            let input = stdin_or(input)?;
+            text(if comment_lines {
+                rgit_git::comment_lines(&input, &comment())
+            } else {
+                rgit_git::stripspace(&input, strip_comments.then(comment).as_deref())
+            })
+        }
+        Plumbing::Column {
+            command,
+            mode,
+            raw_mode,
+            width,
+            indent,
+            nl,
+            padding,
+            input,
+        } => {
+            let mut opts = 0;
+            let bad = |e: String| CliError::usage(e);
+            if let Some(ui) = config("column.ui") {
+                rgit_git::column_mode(&mut opts, &ui).map_err(bad)?;
+            }
+            if let Some(v) = command.and_then(|c| config(&format!("column.{c}"))) {
+                rgit_git::column_mode(&mut opts, &v).map_err(bad)?;
+            }
+            if let Some(m) = mode {
+                opts = opts & !0x30 | 0x10;
+                rgit_git::column_mode(&mut opts, &m).map_err(bad)?;
+            }
+            if let Some(r) = raw_mode {
+                opts = r;
+            }
+            rgit_git::column_finalize(
+                &mut opts,
+                std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            );
+            let input = String::from_utf8_lossy(&stdin_or(input)?).into_owned();
+            let items: Vec<String> = input.lines().map(str::to_owned).collect();
+            let width = width.filter(|&w| w > 0).unwrap_or_else(|| {
+                std::env::var("COLUMNS")
+                    .ok()
+                    .and_then(|c| c.parse::<usize>().ok())
+                    .filter(|&c| c > 0)
+                    .unwrap_or(80)
+                    - 1
+            });
+            let o = rgit_git::ColumnOpts {
+                width,
+                indent: indent.as_deref().unwrap_or(""),
+                nl: nl.as_deref().unwrap_or("\n"),
+                padding,
+            };
+            let out = lines(rgit_git::columns(&items, opts, &o));
+            if !out.text.is_empty() && !out.text.ends_with('\n') {
+                crate::cli::print_as_is();
+            }
+            out
+        }
+        Plumbing::CheckRefFormat {
+            normalize,
+            allow_onelevel,
+            no_allow_onelevel: _,
+            refspec_pattern,
+            branch,
+            name,
+        } => {
+            if branch {
+                let full = match name.strip_prefix("@{-").and_then(|n| n.strip_suffix('}')) {
+                    Some("1") => backend
+                        .and_then(|b| b.previous_checkout().ok())
+                        .filter(|b| !b.is_empty()),
+                    Some(_) => None,
+                    None => Some(name.clone()),
+                };
+                return match full {
+                    Some(b)
+                        if !b.starts_with('-')
+                            && b != "HEAD"
+                            && rgit_git::check_ref_format(
+                                &format!("refs/heads/{b}"),
+                                false,
+                                false,
+                            ) =>
+                    {
+                        Ok(lines(format!("{b}\n")))
+                    }
+                    _ => Err(fatal(format!("'{name}' is not a valid branch name"))),
+                };
+            }
+            let name = if normalize {
+                rgit_git::collapse_slashes(&name)
+            } else {
+                name
+            };
+            if !rgit_git::check_ref_format(&name, allow_onelevel, refspec_pattern) {
+                return Err(fail(raw, true, format!("'{name}' is not a valid ref name")));
+            }
+            if normalize {
+                lines(format!("{name}\n"))
+            } else {
+                let mut out = Output::message(format!("{name} is valid"));
+                out.text = String::new();
+                out
+            }
+        }
+        Plumbing::Mailsplit {
+            dir,
+            bare,
+            start,
+            prec,
+            keep_cr,
+            mboxrd,
+            mboxes,
+        } => {
+            let sources: Vec<Option<PathBuf>> = if mboxes.is_empty() {
+                vec![None]
+            } else {
+                mboxes
+                    .iter()
+                    .map(|m| (m != "-").then(|| PathBuf::from(m)))
+                    .collect()
+            };
+            let stdin = if sources.iter().any(Option::is_none) {
+                stdin_or(None)?
+            } else {
+                Vec::new()
+            };
+            let o = rgit_git::MailsplitOpts {
+                dir: PathBuf::from(dir),
+                start,
+                prec: usize::from(prec),
+                bare,
+                keep_cr,
+                mboxrd,
+            };
+            let n = rgit_git::mailsplit(&sources, &stdin, &o)
+                .map_err(|e| fail(false, false, e.to_string()))?;
+            lines(format!("{n}\n"))
+        }
+        Plumbing::Mailinfo {
+            keep_subject,
+            keep_non_patch,
+            utf8: _,
+            message_id,
+            scissors,
+            no_scissors,
+            msg,
+            patch,
+            input,
+        } => {
+            let scissors = scissors
+                || !no_scissors
+                    && config("mailinfo.scissors")
+                        .is_some_and(|v| matches!(v.as_str(), "true" | "yes" | "on" | "1"));
+            let o = rgit_git::MailinfoOpts {
+                keep_subject,
+                keep_non_patch,
+                message_id,
+                scissors,
+            };
+            let (info, body, diff) = rgit_git::mailinfo(&stdin_or(input)?, &o);
+            std::fs::write(&msg, body).map_err(|e| fatal(format!("could not open {msg}: {e}")))?;
+            std::fs::write(&patch, diff)
+                .map_err(|e| fatal(format!("could not open {patch}: {e}")))?;
+            lines(info)
+        }
+        Plumbing::PatchId {
+            stable,
+            unstable,
+            verbatim,
+            input,
+        } => {
+            let flag = |k: &str| {
+                config(k).is_some_and(|v| matches!(v.as_str(), "true" | "yes" | "on" | "1"))
+            };
+            let verbatim = verbatim || !unstable && !stable && flag("patchid.verbatim");
+            let stable = verbatim || stable || !unstable && flag("patchid.stable");
+            lines(rgit_git::patch_ids(&stdin_or(input)?, stable, verbatim))
+        }
+        _ => return Err(CliError::not_a_repo()),
+    })
+}
+
+/// The object and index writers: commit-tree, write-tree, read-tree,
+/// update-index, checkout-index, mktree and mktag.
+fn index_plumbing(
+    backend: &Arc<dyn GitBackend>,
+    command: Plumbing,
+    raw: bool,
+) -> anyhow::Result<Output> {
+    let git_dir = backend.git_dir();
+    let git_dir = git_dir.as_path();
+    let stdin = || -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
+        Ok(buf)
+    };
+    let fatal_of = |e: rgit_git::GitError| match e {
+        rgit_git::GitError::Other(m) => fatal(m),
+        e => e.into(),
+    };
+    // stderr as git prints it, stdout as the text; exit 1 when git does.
+    let done = |r: rgit_git::Report| {
+        if raw {
+            eprint!("{}", r.err);
+        }
+        crate::cli::set_exit(r.failed);
+        let mut out = lines(r.out);
+        if !raw && !r.err.is_empty() {
+            out = out.with("errors", r.err.trim_end().to_owned());
+        }
+        out
+    };
+    let (_, cwd) = top_and_prefix(backend)?;
+    Ok(match command {
+        Plumbing::CommitTree {
+            parents,
+            message,
+            file,
+            tree,
+        } => {
+            let mut msg = Vec::new();
+            for m in &message {
+                if !msg.is_empty() {
+                    msg.push(b'\n');
+                }
+                msg.extend_from_slice(m.as_bytes());
+                if !msg.ends_with(b"\n") {
+                    msg.push(b'\n');
+                }
+            }
+            for f in &file {
+                if !msg.is_empty() {
+                    msg.push(b'\n');
+                }
+                msg.extend(if f == "-" {
+                    stdin()?
+                } else {
+                    std::fs::read(f).map_err(|e| fatal(format!("could not read {f}: {e}")))?
+                });
+            }
+            if message.is_empty() && file.is_empty() {
+                msg = stdin()?;
+            }
+            done(rgit_git::commit_tree(git_dir, &tree, &parents, &msg).map_err(fatal_of)?)
+        }
+        Plumbing::WriteTree { missing_ok, prefix } => lines(format!(
+            "{}\n",
+            rgit_git::write_tree(git_dir, missing_ok, prefix.as_deref()).map_err(fatal_of)?
+        )),
+        Plumbing::ReadTree {
+            merge,
+            reset,
+            update,
+            index_only,
+            dry_run,
+            aggressive,
+            prefix,
+            empty,
+            verbose: _,
+            trees,
+        } => {
+            let opts = rgit_git::ReadTreeOpts {
+                merge,
+                reset,
+                update,
+                index_only,
+                dry_run,
+                aggressive,
+                prefix,
+                empty,
+            };
+            rgit_git::read_tree(git_dir, &trees, &opts).map_err(fatal_of)?;
+            Output::new(String::new()).with(
+                "result",
+                if dry_run {
+                    "merge checked"
+                } else {
+                    "index updated"
+                },
+            )
+        }
+        Plumbing::UpdateIndex { args } => {
+            let mut input = stdin;
+            done(rgit_git::update_index(git_dir, &cwd, &args, &mut input).map_err(fatal_of)?)
+        }
+        Plumbing::CheckoutIndex {
+            all,
+            force,
+            index,
+            quiet,
+            no_create,
+            prefix,
+            stdin: from_stdin,
+            z,
+            mut paths,
+        } => {
+            if from_stdin {
+                let input = stdin()?;
+                let end = if z { 0 } else { b'\n' };
+                paths.extend(
+                    input
+                        .split(|b| *b == end)
+                        .filter(|p| !p.is_empty())
+                        .map(|p| String::from_utf8_lossy(p).into_owned()),
+                );
+            }
+            let opts = rgit_git::CheckoutIndexOpts {
+                all,
+                force,
+                update_index: index,
+                quiet,
+                no_create,
+                prefix,
+            };
+            done(rgit_git::checkout_index(git_dir, &cwd, &paths, &opts).map_err(fatal_of)?)
+        }
+        Plumbing::Mktree { z, missing, batch } => {
+            lines(rgit_git::mktree(git_dir, &stdin()?, z, missing, batch).map_err(fatal_of)?)
+        }
+        Plumbing::Mktag { no_strict, .. } => {
+            done(rgit_git::mktag(git_dir, &stdin()?, !no_strict).map_err(fatal_of)?)
+        }
+        p => return repoless(Some(backend), p, raw),
+    })
+}
+
+/// `git interpret-trailers`: options apply in order, so they are parsed here
+/// rather than by clap. `git_dir` supplies config when in a repository.
+pub(crate) fn interpret_trailers(
+    git_dir: Option<&std::path::Path>,
+    args: Vec<String>,
+    input: Option<String>,
+) -> anyhow::Result<Output> {
+    use rgit_git::{NewTrailer, parse_if_exists, parse_if_missing, parse_where};
+    let mut o = rgit_git::TrailerOpts::default();
+    let (mut where_, mut if_exists, mut if_missing) = (None, None, None);
+    let mut in_place = false;
+    let mut files = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if !a.starts_with("--") || a == "--" {
+            if a != "--" {
+                files.push(a);
+            }
+            files.extend(it.by_ref());
+            break;
+        }
+        let (name, inline) = match a.split_once('=') {
+            Some((n, v)) => (n.to_owned(), Some(v.to_owned())),
+            None => (a.clone(), None),
+        };
+        let mut value = |what: &str| -> anyhow::Result<String> {
+            inline
+                .clone()
+                .or_else(|| it.next())
+                .ok_or_else(|| CliError::usage(format!("option `{what}' requires a value")))
+        };
+        let bad = |what: &str, v: &str| CliError::usage(format!("unknown value '{v}' for {what}"));
+        match name.as_str() {
+            "--in-place" => in_place = true,
+            "--trim-empty" => o.trim_empty = true,
+            "--only-trailers" => o.only_trailers = true,
+            "--only-input" => o.only_input = true,
+            "--unfold" => o.unfold = true,
+            "--no-divider" => o.no_divider = true,
+            "--parse" => {
+                o.only_trailers = true;
+                o.only_input = true;
+                o.unfold = true;
+            }
+            "--where" => {
+                let v = value("where")?;
+                where_ = Some(parse_where(&v).ok_or_else(|| bad("--where", &v))?);
+            }
+            "--if-exists" => {
+                let v = value("if-exists")?;
+                if_exists = Some(parse_if_exists(&v).ok_or_else(|| bad("--if-exists", &v))?);
+            }
+            "--if-missing" => {
+                let v = value("if-missing")?;
+                if_missing = Some(parse_if_missing(&v).ok_or_else(|| bad("--if-missing", &v))?);
+            }
+            "--no-where" => where_ = None,
+            "--no-if-exists" => if_exists = None,
+            "--no-if-missing" => if_missing = None,
+            "--trailer" => o.trailers.push(NewTrailer {
+                text: value("trailer")?,
+                where_,
+                if_exists,
+                if_missing,
+            }),
+            "--no-trailer" => o.trailers.clear(),
+            _ => return Err(CliError::usage(format!("unknown option `{}'", &name[2..]))),
+        }
+    }
+    if o.only_input && !o.trailers.is_empty() {
+        return Err(CliError::usage(
+            "--trailer with --only-input does not make sense",
+        ));
+    }
+    if in_place && files.is_empty() {
+        return Err(fatal("no input file given for in-place editing"));
+    }
+    let config: Vec<(String, Option<String>)> =
+        rgit_git::config_list(git_dir, &rgit_git::ConfigScope::Any, true)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| (e.name, e.value))
+            .collect();
+    let comment = config
+        .iter()
+        .rev()
+        .find(|(k, _)| k.eq_ignore_ascii_case("core.commentchar"))
+        .and_then(|(_, v)| v.clone())
+        .filter(|c| !c.is_empty() && c != "auto")
+        .unwrap_or_else(|| "#".to_owned());
+    let mut text = String::new();
+    if files.is_empty() {
+        let msg = String::from_utf8_lossy(&stdin_or(input)?).into_owned();
+        text = rgit_git::interpret_trailers(&msg, &o, &config, &comment);
+    }
+    for f in &files {
+        let msg =
+            std::fs::read(f).map_err(|e| fatal(format!("could not read input file '{f}': {e}")))?;
+        let out =
+            rgit_git::interpret_trailers(&String::from_utf8_lossy(&msg), &o, &config, &comment);
+        if in_place {
+            std::fs::write(f, out)?;
+        } else {
+            text.push_str(&out);
+        }
+    }
+    Ok(lines(text))
+}
+
+/// `git show-branch`; with no arguments at all, showbranch.default's when
+/// `defaults` is set.
+fn show_branch(
+    backend: &Arc<dyn GitBackend>,
+    command: Plumbing,
+    raw: bool,
+    defaults: bool,
+) -> anyhow::Result<Output> {
+    let Plumbing::ShowBranch {
+        all,
+        remotes,
+        current,
+        topo_order,
+        date_order,
+        sparse,
+        more,
+        list,
+        merge_base,
+        independent,
+        no_name,
+        sha1_name,
+        topics,
+        reflog,
+        color,
+        revs,
+    } = command
+    else {
+        unreachable!("show-branch only")
+    };
+    let git_dir = backend.git_dir();
+    let bare = !(all
+        || remotes
+        || current
+        || topo_order
+        || date_order
+        || sparse
+        || list
+        || merge_base
+        || independent
+        || no_name
+        || sha1_name
+        || topics)
+        && more.is_none()
+        && reflog.is_none()
+        && color.is_none()
+        && revs.is_empty();
+    if bare && defaults {
+        let args = rgit_git::show_branch_defaults(&git_dir);
+        if !args.is_empty() {
+            let argv = ["rgit", "show-branch"]
+                .into_iter()
+                .map(str::to_owned)
+                .chain(args);
+            let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(argv)
+                .map_err(|e| CliError::usage(e.to_string()))?;
+            if let Some(crate::cli::Command::Plumbing(c @ Plumbing::ShowBranch { .. })) =
+                cli.command
+            {
+                return show_branch(backend, c, raw, false);
+            }
+        }
+    }
+    let reflog = reflog.map(|r| {
+        let (n, base) = match r.split_once(',') {
+            Some((n, b)) => (n.to_owned(), Some(b.to_owned())),
+            None => (r, None),
+        };
+        (
+            n.parse::<usize>().ok().filter(|&n| n > 0).unwrap_or(4),
+            base,
+        )
+    });
+    let when = color
+        .or_else(|| backend.config_get("color.showbranch").ok().flatten())
+        .or_else(|| backend.config_get("color.ui").ok().flatten())
+        .unwrap_or_else(|| "auto".to_owned());
+    let color = match when.as_str() {
+        "always" | "true" | "yes" | "on" => true,
+        "auto" => raw && std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        _ => false,
+    };
+    let o = rgit_git::ShowBranchOpts {
+        revs,
+        all,
+        remotes,
+        current,
+        date_order: date_order && !topo_order,
+        sparse,
+        extra: if list { -1 } else { more.unwrap_or(0) },
+        merge_base,
+        independent,
+        no_name,
+        sha1_name,
+        topics,
+        reflog,
+        color,
+    };
+    let relative = |t: i64, off: i32| crate::pretty::format_date(t, off, "relative");
+    let (text, status) =
+        rgit_git::show_branch(&git_dir, &o, &relative).map_err(|e| fatal(e.to_string()))?;
+    crate::cli::set_exit(status != 0);
+    Ok(lines(text))
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1464,6 +2266,46 @@ fn var(backend: &Arc<dyn GitBackend>, list: bool, name: Option<String>) -> anyho
     }
 }
 
+/// `git get-tar-commit-id`: the commit id in the pax global header
+/// (`<len> comment=<id>\n`) that opens a tar on stdin.
+pub fn get_tar_commit_id() -> anyhow::Result<Output> {
+    use std::io::Read;
+    let mut buf = [0u8; 1024];
+    let mut n = 0;
+    let mut stdin = std::io::stdin().lock();
+    while n < buf.len() {
+        match stdin.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    if n != buf.len() {
+        return Err(fatal(
+            "git get-tar-commit-id: EOF before reading tar header",
+        ));
+    }
+    let none = || fail(true, true, "");
+    if buf[156] != b'g' {
+        return Err(none());
+    }
+    let content = &buf[512..];
+    let digits = content.iter().take_while(|b| b.is_ascii_digit()).count();
+    let len: usize = std::str::from_utf8(&content[..digits])
+        .ok()
+        .and_then(|d| d.parse().ok())
+        .ok_or_else(none)?;
+    let Some(rest) = content[digits..].strip_prefix(b" comment=") else {
+        return Err(none());
+    };
+    let len = len
+        .checked_sub(digits + " comment=".len())
+        .ok_or_else(none)?;
+    if len < 1 || len % 2 == 0 || ![20, 32].contains(&((len - 1) / 2)) || len > rest.len() {
+        return Err(none());
+    }
+    Ok(lines(String::from_utf8_lossy(&rest[..len]).into_owned()))
+}
+
 /// Exit 128 with `message`, as git's `fatal:` does.
 fn fatal(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(CliError {
@@ -1471,6 +2313,131 @@ fn fatal(message: impl Into<String>) -> anyhow::Error {
         help: None,
         code: 128,
     })
+}
+
+fn ambiguous(arg: &str) -> anyhow::Error {
+    fatal(format!(
+        "ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
+         Use '--' to separate paths from revisions, like this:\n\
+         'git <command> [<revision>...] -- [<file>...]'"
+    ))
+}
+
+/// Paths given before `--` must exist, as git checks.
+fn on_disk(backend: &Arc<dyn GitBackend>, paths: &[String]) -> anyhow::Result<()> {
+    let (top, prefix) = top_and_prefix(backend)?;
+    match paths.iter().find(|p| !top.join(&prefix).join(p).exists()) {
+        Some(p) => Err(ambiguous(p)),
+        None => Ok(()),
+    }
+}
+
+/// The format of a diff plumbing command, with its paths from the top level.
+fn raw_diff_fmt(
+    backend: &Arc<dyn GitBackend>,
+    f: &RawDiffArgs,
+    paths: Vec<String>,
+) -> anyhow::Result<rgit_git::DiffFmt> {
+    use rgit_git::DiffMode;
+    let (top, prefix) = top_and_prefix(backend)?;
+    let mode = if f.quiet || f.no_patch {
+        DiffMode::Nothing
+    } else if f.patch {
+        DiffMode::Patch
+    } else if f.name_only {
+        DiffMode::NameOnly
+    } else if f.name_status {
+        DiffMode::NameStatus
+    } else {
+        DiffMode::Raw
+    };
+    Ok(rgit_git::DiffFmt {
+        mode,
+        z: f.z,
+        recursive: f.recursive || f.trees,
+        trees: f.trees,
+        paths: paths
+            .iter()
+            .map(|p| crate::cli::repo_path(&top, Path::new(&prefix), p))
+            .filter(|p| p != ".")
+            .collect(),
+    })
+}
+
+fn raw_diff_done(f: &RawDiffArgs, (text, changed): (String, bool)) -> Output {
+    if f.quiet || f.exit_code {
+        crate::cli::set_exit(changed);
+    }
+    lines(text)
+}
+
+/// `git merge-file`: merge into the current file (or stdout, or a new blob
+/// with --object-id) and exit with the number of conflicts.
+pub(crate) fn merge_file(
+    backend: Option<&Arc<dyn GitBackend>>,
+    command: Plumbing,
+    raw: bool,
+) -> anyhow::Result<Output> {
+    let Plumbing::MergeFile {
+        labels,
+        stdout,
+        ours,
+        theirs,
+        union,
+        diff3,
+        zdiff3,
+        marker_size,
+        object_id,
+        current,
+        base,
+        other,
+        ..
+    } = command
+    else {
+        unreachable!("merge_file takes merge-file");
+    };
+    if labels.len() > 3 {
+        return Err(CliError::usage("too many labels on the command line"));
+    }
+    let read = |name: &str| -> anyhow::Result<Vec<u8>> {
+        match backend.filter(|_| object_id) {
+            Some(b) => Ok(b.read_object(name)?.data),
+            None => std::fs::read(name)
+                .map_err(|e| fatal(format!("could not open '{name}' for reading: {e}"))),
+        }
+    };
+    let (a, b, c) = (read(&current)?, read(&base)?, read(&other)?);
+    let mut names = [current.clone(), base, other];
+    for (slot, label) in names.iter_mut().zip(labels) {
+        *slot = label;
+    }
+    let o = rgit_git::MergeFileOpts {
+        labels: names,
+        favor: [(ours, "ours"), (theirs, "theirs"), (union, "union")]
+            .iter()
+            .find(|(on, _)| *on)
+            .map(|(_, f)| (*f).to_owned()),
+        style: (diff3 || zdiff3).then(|| if zdiff3 { "zdiff3" } else { "diff3" }.to_owned()),
+        marker_size,
+        alnum: true,
+    };
+    let (merged, conflicts) = rgit_git::merge_file(&a, &b, &c, &o)?;
+    crate::cli::set_exit_code(conflicts.min(127) as i32);
+    if stdout {
+        if raw {
+            let mut out = std::io::stdout();
+            out.write_all(&merged)?;
+            out.flush()?;
+            return Ok(Output::new(String::new()));
+        }
+        return Ok(lines(String::from_utf8_lossy(&merged).into_owned()));
+    }
+    if let Some(b) = backend.filter(|_| object_id) {
+        let id = rgit_git::hash_object(Some(&b.git_dir()), "blob", &merged, None, true, false)?;
+        return Ok(lines(format!("{id}\n")));
+    }
+    std::fs::write(&current, &merged)?;
+    Ok(Output::new(String::new()).with("conflicts", conflicts))
 }
 
 /// The top-level folder and the current folder under it as git's prefix:

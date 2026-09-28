@@ -75,6 +75,23 @@ pub struct FormatPatchOpts {
     pub range_diff: Option<String>,
     /// Percent for pairing in `range_diff` (default 60).
     pub creation_factor: Option<usize>,
+    /// `--attach`/`--inline`: the MIME boundary after git's dashes; the
+    /// patch goes in its own part.
+    pub attach: Option<String>,
+    /// With `attach`, an inline part instead of an attachment.
+    pub inline: bool,
+    /// The notes refs whose notes go after the `---` line.
+    pub notes: Vec<String>,
+    /// `--no-encode-email-headers`: raw UTF-8 in From: and Subject:.
+    pub no_encode_headers: bool,
+    /// With `from`, keep the author's From: in the body even when it is the
+    /// sender.
+    pub force_in_body_from: bool,
+    /// format.coverLetter=auto: a cover letter for more than one patch.
+    pub cover_letter_auto: bool,
+    /// `--no-to`/`--no-cc`: drop format.to/format.cc.
+    pub no_to: bool,
+    pub no_cc: bool,
 }
 
 /// One email: its file name and text.
@@ -173,9 +190,18 @@ pub fn format_patch(repo: &Repository, o: &FormatPatchOpts) -> Result<Vec<PatchM
     if let Some(v) = &o.reroll {
         prefix = format!("{prefix} v{v}");
     }
+    let cover_letter = o.cover_letter || (o.cover_letter_auto && commits.len() > 1);
+    let encode = !o.no_encode_headers;
+    let attach = (o.attach.as_deref()).map(|b| {
+        if b.is_empty() {
+            git_version()
+        } else {
+            b.to_owned()
+        }
+    });
     let start = o.start_number.unwrap_or(1);
     let last = start + commits.len() - 1;
-    let numbered = o.numbered.unwrap_or(commits.len() > 1 || o.cover_letter);
+    let numbered = o.numbered.unwrap_or(commits.len() > 1 || cover_letter);
     let tag = |n: usize| {
         if o.keep_subject {
             String::new()
@@ -208,12 +234,28 @@ pub fn format_patch(repo: &Repository, o: &FormatPatchOpts) -> Result<Vec<PatchM
         name + &suffix
     };
     let mut extra = String::new();
-    for h in &o.headers {
-        let _ = writeln!(extra, "{h}");
+    // Like git's add_header, To: and Cc: headers join those lists.
+    let (mut to, mut cc) = (Vec::new(), Vec::new());
+    for h in cfg_all("format.headers").iter().chain(&o.headers) {
+        let h = h.trim_end_matches('\n');
+        match h.get(..4).map(str::to_ascii_lowercase).as_deref() {
+            Some("to: ") => to.push(h[4..].to_owned()),
+            Some("cc: ") => cc.push(h[4..].to_owned()),
+            _ => {
+                let _ = writeln!(extra, "{h}");
+            }
+        }
     }
+    let config_or_none = |no: bool, key: &str| if no { Vec::new() } else { cfg_all(key) };
     for (field, list) in [
-        ("To", [o.to.clone(), cfg_all("format.to")].concat()),
-        ("Cc", [o.cc.clone(), cfg_all("format.cc")].concat()),
+        (
+            "To",
+            [config_or_none(o.no_to, "format.to"), o.to.clone(), to].concat(),
+        ),
+        (
+            "Cc",
+            [config_or_none(o.no_cc, "format.cc"), o.cc.clone(), cc].concat(),
+        ),
     ] {
         for (i, addr) in list.iter().enumerate() {
             let sep = if i + 1 < list.len() { "," } else { "" };
@@ -275,14 +317,14 @@ pub fn format_patch(repo: &Repository, o: &FormatPatchOpts) -> Result<Vec<PatchM
         })
         .collect();
     let mut message_id = None;
-    if o.cover_letter {
+    if cover_letter {
         if o.thread.is_some() {
             message_id = Some(msg_id("cover"));
         }
         let tip = commits.last().expect("commits");
         let mut text = from_line(tip.id());
         text.push_str(&threading(message_id.as_deref(), &refs));
-        text.push_str(&from_header(&me));
+        text.push_str(&from_header(&me, encode));
         let _ = writeln!(text, "Date: {}", rfc2822_date(me.when()));
         let subject_tag = if o.keep_subject {
             String::new()
@@ -292,7 +334,11 @@ pub fn format_patch(repo: &Repository, o: &FormatPatchOpts) -> Result<Vec<PatchM
         let (cover_subject, blurb) = cover_text(repo, o, &commits);
         let head = format!("Subject: {subject_tag}");
         text.push_str(&head);
-        text.push_str(&encode_subject(&cover_subject, head.chars().count()));
+        text.push_str(&encode_subject(
+            &cover_subject,
+            head.chars().count(),
+            encode,
+        ));
         text.push('\n');
         if commits
             .iter()
@@ -329,7 +375,7 @@ pub fn format_patch(repo: &Repository, o: &FormatPatchOpts) -> Result<Vec<PatchM
             if let Some(prev) = message_id.take() {
                 let shallow = thread == Thread::Shallow;
                 // Shallow threads keep replying to the root once there is one.
-                let to_root = shallow && !refs.is_empty() && (!o.cover_letter || i > 0);
+                let to_root = shallow && !refs.is_empty() && (!cover_letter || i > 0);
                 if !to_root {
                     refs.push(prev);
                 }
@@ -357,21 +403,40 @@ pub fn format_patch(repo: &Repository, o: &FormatPatchOpts) -> Result<Vec<PatchM
                 let (name, email) = ident
                     .rsplit_once(" <")
                     .map_or((ident.as_str(), ""), |(n, e)| (n, e.trim_end_matches('>')));
-                text.push_str(&from_header(&git2::Signature::now(name, email)?));
+                text.push_str(&from_header(&git2::Signature::now(name, email)?, encode));
             }
-            None => text.push_str(&from_header(&author)),
+            None => text.push_str(&from_header(&author, encode)),
         }
         let _ = writeln!(text, "Date: {}", rfc2822_date(author.when()));
         let head = format!("Subject: {}", tag(n));
         text.push_str(&head);
-        text.push_str(&encode_subject(&subject, head.chars().count()));
+        text.push_str(&encode_subject(&subject, head.chars().count(), encode));
         text.push('\n');
-        if !c.message_bytes().is_ascii() {
-            text.push_str(MIME);
+        let in_body_from = sender
+            .as_ref()
+            .is_some_and(|s| o.force_in_body_from || *s != author_ident);
+        let file_name = name(n, &subject);
+        match &attach {
+            Some(b) => {
+                text.push_str(&extra);
+                let _ = write!(
+                    text,
+                    "MIME-Version: 1.0\nContent-Type: multipart/mixed; boundary=\"{BOUNDARY}{b}\"\n\nThis is a multi-part message in MIME format.\n--{BOUNDARY}{b}\nContent-Type: text/plain; charset=UTF-8; format=fixed\nContent-Transfer-Encoding: 8bit\n\n"
+                );
+                // git trims the blank lines ending an empty message.
+                if body_of(c).is_empty() && !in_body_from {
+                    text.pop();
+                }
+            }
+            None => {
+                if !c.message_bytes().is_ascii() {
+                    text.push_str(MIME);
+                }
+                text.push_str(&extra);
+            }
         }
-        text.push_str(&extra);
         text.push('\n');
-        if sender.as_ref().is_some_and(|s| *s != author_ident) {
+        if in_body_from {
             let _ = write!(text, "From: {author_ident}\n\n");
         }
         let mut body = body_of(c);
@@ -384,18 +449,33 @@ pub fn format_patch(repo: &Repository, o: &FormatPatchOpts) -> Result<Vec<PatchM
             _ => Some(c.parent(0)?.tree()?),
         };
         let diff = tree_diff_opts(repo, parent.as_ref(), &c.tree()?, !o.no_binary)?;
+        let notes = notes_block(repo, &o.notes, c.id());
+        if !notes.is_empty() {
+            let _ = write!(text, "---\n{notes}");
+        }
         if diff.deltas().len() == 0 {
             // git shows an empty commit with no separator or stat.
         } else if o.no_stat {
             text.push('\n');
         } else {
-            text.push_str("---\n");
+            if notes.is_empty() {
+                text.push_str("---\n");
+            } else {
+                text.push('\n');
+            }
             text.push_str(&diffstat(&diff, 72)?);
             text.push_str(&summary(&diff)?);
             text.push('\n');
+            if let Some(b) = &attach {
+                let disposition = if o.inline { "inline" } else { "attachment" };
+                let _ = write!(
+                    text,
+                    "\n--{BOUNDARY}{b}\nContent-Type: text/x-patch; name=\"{file_name}\"\nContent-Transfer-Encoding: 8bit\nContent-Disposition: {disposition}; filename=\"{file_name}\"\n\n"
+                );
+            }
         }
         text.push_str(&patch_text(&diff)?);
-        if !o.cover_letter && commits.len() == 1 {
+        if !cover_letter && commits.len() == 1 {
             let v = versions(repo, o, &commits)?;
             if !v.is_empty() {
                 text.push('\n');
@@ -403,14 +483,20 @@ pub fn format_patch(repo: &Repository, o: &FormatPatchOpts) -> Result<Vec<PatchM
             }
         }
         if i == 0
-            && !o.cover_letter
+            && !cover_letter
             && let Some(b) = &bases
         {
             text.push_str(b);
         }
-        text.push_str(&sig);
+        match &attach {
+            // git leaves the signature out of attached patches.
+            Some(b) => {
+                let _ = write!(text, "\n--{BOUNDARY}{b}--\n\n\n");
+            }
+            None => text.push_str(&sig),
+        }
         mails.push(PatchMail {
-            name: name(n, &subject),
+            name: file_name,
             text,
             cover: false,
         });
@@ -569,15 +655,43 @@ fn versions(
             &crate::RangeDiffOpts {
                 range1: old,
                 range2: format!("{base}..{}", tip.id()),
-                creation_factor: o.creation_factor.unwrap_or(60),
+                // Like git, pair a new version of the same series readily.
+                creation_factor: o.creation_factor.unwrap_or(999),
                 patches: true,
                 left_only: false,
                 right_only: false,
+                ..Default::default()
             },
         )?;
         let _ = write!(out, "Range-diff{against}:\n{text}");
     }
     Ok(out)
+}
+
+/// The dashes git puts before a MIME boundary.
+const BOUNDARY: &str = "------------";
+
+/// The notes of `id` in `refs` as git shows them after `---`: a
+/// `Notes (<ref>):` header each and the lines indented.
+fn notes_block(repo: &Repository, refs: &[String], id: Oid) -> String {
+    let mut out = String::new();
+    for r in refs {
+        let Ok(note) = repo.find_note(Some(r), id) else {
+            continue;
+        };
+        if r == "refs/notes/commits" {
+            out.push_str("\nNotes:\n");
+        } else {
+            let short = r.strip_prefix("refs/").unwrap_or(r);
+            let short = short.strip_prefix("notes/").unwrap_or(short);
+            let _ = write!(out, "\nNotes ({short}):\n");
+        }
+        let text = String::from_utf8_lossy(note.message_bytes()).into_owned();
+        for line in text.strip_suffix('\n').unwrap_or(&text).split('\n') {
+            let _ = writeln!(out, "    {line}");
+        }
+    }
+    out
 }
 
 const MIME: &str =
@@ -989,12 +1103,12 @@ fn body_of(c: &Commit) -> String {
 }
 
 /// `From: name <email>`, quoted or RFC 2047-encoded as git does.
-fn from_header(sig: &git2::Signature) -> String {
+fn from_header(sig: &git2::Signature, encode: bool) -> String {
     let name = String::from_utf8_lossy(sig.name_bytes()).into_owned();
     let email = String::from_utf8_lossy(sig.email_bytes()).into_owned();
     let mut out = String::from("From: ");
     let mut max = 78;
-    if needs_rfc2047(&name) {
+    if encode && needs_rfc2047(&name) {
         out.push_str(&rfc2047(&name, 6, true));
         max = 76;
     } else if name.contains([
@@ -1015,8 +1129,8 @@ fn from_header(sig: &git2::Signature) -> String {
 
 /// The subject after `Subject: [PATCH] ` (`used` columns), wrapped at 78 or
 /// RFC 2047-encoded.
-fn encode_subject(subject: &str, used: usize) -> String {
-    if needs_rfc2047(subject) {
+fn encode_subject(subject: &str, used: usize, encode: bool) -> String {
+    if encode && needs_rfc2047(subject) {
         rfc2047(subject, used, false)
     } else {
         wrap(subject, used, 1, 78)
@@ -1343,7 +1457,7 @@ pub fn summary(diff: &Diff) -> Result<String, GitError> {
 }
 
 /// The diff as `git diff` prints a patch.
-fn patch_text(diff: &Diff) -> Result<String, GitError> {
+pub(crate) fn patch_text(diff: &Diff) -> Result<String, GitError> {
     let mut out = Vec::new();
     diff.print(git2::DiffFormat::Patch, |_, _, line| {
         if matches!(line.origin(), '+' | '-' | ' ') {

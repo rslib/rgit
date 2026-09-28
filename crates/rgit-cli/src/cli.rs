@@ -488,11 +488,29 @@ pub struct PrettyArgs {
     /// Abbreviate the commit ids in the format's header.
     #[arg(long)]
     pub abbrev_commit: bool,
+    /// Show the notes of the default notes refs, or of this notes ref
+    /// (repeatable; any format).
+    #[arg(
+        long,
+        value_name = "REF",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = ""
+    )]
+    pub notes: Vec<String>,
+    /// Show no notes (a later --notes=<ref> still shows that ref).
+    #[arg(long)]
+    pub no_notes: bool,
 }
 
 impl PrettyArgs {
     pub(crate) fn any(&self) -> bool {
-        self.format.is_some() || self.pretty.is_some() || self.oneline || self.graph
+        self.format.is_some()
+            || self.pretty.is_some()
+            || self.oneline
+            || self.graph
+            || !self.notes.is_empty()
+            || self.no_notes
     }
 }
 
@@ -1671,19 +1689,24 @@ pub enum Command {
         /// Write a reflog even for refs outside refs/heads, remotes and notes.
         #[arg(long)]
         create_reflog: bool,
-        /// Read `update`, `create`, `delete`, `verify` and
-        /// `start`/`prepare`/`commit`/`abort` lines from stdin, applied all or
-        /// nothing.
+        /// Read `update`, `create`, `delete`, `verify`, `symref-update`,
+        /// `symref-create`, `symref-delete`, `symref-verify`, `option
+        /// no-deref` and `start`/`prepare`/`commit`/`abort` lines from stdin,
+        /// applied all or nothing.
         #[arg(long, conflicts_with_all = ["name", "delete"])]
         stdin: bool,
         /// With --stdin, NUL-separated fields and commands.
         #[arg(short = 'z', requires = "stdin")]
         z: bool,
+        /// With --stdin, apply the updates that pass their checks and print
+        /// `rejected <ref> <new> <old> <reason>` for the others.
+        #[arg(short = '0', long, requires = "stdin")]
+        batch_updates: bool,
     },
     /// Print the object id of files or stdin; -w stores them.
     HashObject(HashObjectArgs),
     /// Write commits as mbox patch files (`-<n>`, `<since>` or `<a>..<b>`).
-    FormatPatch(FormatPatchArgs),
+    FormatPatch(Box<FormatPatchArgs>),
     /// Apply mbox patches (from format-patch) as commits.
     Am(AmArgs),
     /// Write a tar or zip of a revision's files.
@@ -1862,6 +1885,18 @@ pub enum Command {
         /// Accepted for git compatibility (rgit prints no color here).
         #[arg(long, hide = true)]
         no_dual_color: bool,
+        /// Lines of context in the diffs between pairs (default 3).
+        #[arg(short = 'U', long = "unified", value_name = "N")]
+        unified: Option<u32>,
+        /// Include these notes refs' notes (bare: the default notes too).
+        #[arg(long, value_name = "REF", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+        notes: Vec<String>,
+        /// Leave notes out of the compared patches.
+        #[arg(long)]
+        no_notes: bool,
+        /// Only commits touching these paths (after `--`).
+        #[arg(last = true)]
+        paths: Vec<String>,
     },
     /// Show changes in the configured diff tool (`git difftool`): diff.tool,
     /// difftool.<tool>.cmd or a known tool (vimdiff, meld, code, ...).
@@ -2733,6 +2768,574 @@ pub enum Plumbing {
         #[arg(short = 'v', long)]
         verbose: bool,
     },
+    /// Clean up text read from stdin as git cleans a commit message, like
+    /// `git stripspace`.
+    Stripspace {
+        /// Drop lines starting with the comment character too.
+        #[arg(short = 's', long = "strip-comments", conflicts_with = "comment_lines")]
+        strip_comments: bool,
+        /// Prefix each line with the comment character instead.
+        #[arg(short = 'c', long = "comment-lines")]
+        comment_lines: bool,
+        #[arg(skip)]
+        input: Option<String>,
+    },
+    /// Lay out lines read from stdin in columns, like `git column`.
+    Column {
+        /// Read column.<name> as well as column.ui.
+        #[arg(long, value_name = "NAME")]
+        command: Option<String>,
+        /// The layout: `column`, `row` or `plain`, with `dense`/`nodense`
+        /// and `always`/`never`/`auto`.
+        #[arg(long, value_name = "MODE")]
+        mode: Option<String>,
+        /// The layout as git's option bits.
+        #[arg(long = "raw-mode", value_name = "N")]
+        raw_mode: Option<u32>,
+        /// The maximum width (default: the terminal's, less one).
+        #[arg(long, value_name = "N")]
+        width: Option<usize>,
+        /// Text before each row.
+        #[arg(long, value_name = "STRING")]
+        indent: Option<String>,
+        /// Text after each row (default a newline).
+        #[arg(long, value_name = "STRING")]
+        nl: Option<String>,
+        /// Spaces between columns.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        padding: usize,
+        #[arg(skip)]
+        input: Option<String>,
+    },
+    /// Check that a ref name is valid, like `git check-ref-format`; exit 1
+    /// if not.
+    CheckRefFormat {
+        /// Print the name with repeated and leading slashes removed.
+        #[arg(long, visible_alias = "print")]
+        normalize: bool,
+        /// Accept a name with one level (no slash).
+        #[arg(long = "allow-onelevel", overrides_with = "no_allow_onelevel")]
+        allow_onelevel: bool,
+        /// Require two levels (the default).
+        #[arg(long = "no-allow-onelevel")]
+        no_allow_onelevel: bool,
+        /// Accept one `*`, as in a refspec.
+        #[arg(long = "refspec-pattern")]
+        refspec_pattern: bool,
+        /// Check a branch name (expanding `@{-N}`) and print it.
+        #[arg(long)]
+        branch: bool,
+        /// The ref name.
+        name: String,
+    },
+    /// Print the patch id of each patch read from stdin (`git log -p`,
+    /// `format-patch` or `diff` output), like `git patch-id`.
+    PatchId {
+        /// Sum per-file hashes so file order does not matter.
+        #[arg(long, overrides_with = "unstable")]
+        stable: bool,
+        /// Hash the patch as one stream (the default).
+        #[arg(long)]
+        unstable: bool,
+        /// Keep whitespace in the hash (implies --stable).
+        #[arg(long)]
+        verbatim: bool,
+        #[arg(skip)]
+        input: Option<String>,
+    },
+    /// Name commits by the refs that reach them (`main~2`, `tags/v1^0`), like
+    /// `git name-rev`.
+    NameRev {
+        /// Print only the names.
+        #[arg(long = "name-only")]
+        name_only: bool,
+        /// Use only tags.
+        #[arg(long)]
+        tags: bool,
+        /// Use only refs matching this pattern (repeatable).
+        #[arg(long, value_name = "PATTERN")]
+        refs: Vec<String>,
+        /// Skip refs matching this pattern (repeatable).
+        #[arg(long, value_name = "PATTERN")]
+        exclude: Vec<String>,
+        /// Name every commit reachable from a ref.
+        #[arg(long)]
+        all: bool,
+        /// Append names to the object ids in the text read from stdin.
+        #[arg(long = "annotate-stdin", visible_alias = "stdin")]
+        annotate_stdin: bool,
+        /// Fail on an unnamed commit instead of printing `undefined`.
+        #[arg(long = "no-undefined")]
+        no_undefined: bool,
+        /// Print an abbreviated id for an unnamed commit.
+        #[arg(long)]
+        always: bool,
+        /// Name tags by the commit they point at.
+        #[arg(long = "peel-tag")]
+        peel_tag: bool,
+        /// The commits to name.
+        revs: Vec<String>,
+        #[arg(skip)]
+        input: Option<String>,
+    },
+    /// Print the gitattributes of paths, like `git check-attr`: `ATTR PATH...`,
+    /// `ATTR... -- PATH...` or `-a PATH...`.
+    CheckAttr {
+        /// Every attribute that is set, unset or has a value.
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Read .gitattributes from the index only.
+        #[arg(long)]
+        cached: bool,
+        /// Read the paths from stdin, one per line.
+        #[arg(long)]
+        stdin: bool,
+        /// NUL-separated input and output.
+        #[arg(short = 'z')]
+        z: bool,
+        /// Attributes, then paths.
+        #[arg(value_name = "ATTR_OR_PATH")]
+        items: Vec<String>,
+        /// The paths, after `--`.
+        #[arg(last = true, value_name = "PATH")]
+        paths: Vec<String>,
+    },
+    /// Compare two trees, or a commit with its parent, like `git diff-tree`.
+    DiffTree {
+        #[command(flatten)]
+        format: RawDiffArgs,
+        /// Show a root commit's files as added.
+        #[arg(long)]
+        root: bool,
+        /// Do not print the commit id before its changes.
+        #[arg(long = "no-commit-id")]
+        no_commit_id: bool,
+        /// Read `<commit> [<parent>]` or `<tree> <tree>` lines from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// One commit or two tree-ishes, then paths.
+        #[arg(value_name = "TREE-ISH")]
+        args: Vec<String>,
+        /// Limit to these paths.
+        #[arg(last = true)]
+        paths: Vec<String>,
+    },
+    /// Compare a tree with the working tree or the index, like `git diff-index`.
+    DiffIndex {
+        #[command(flatten)]
+        format: RawDiffArgs,
+        /// Compare with the index, not the working tree.
+        #[arg(long)]
+        cached: bool,
+        /// The tree-ish, then paths.
+        #[arg(value_name = "TREE-ISH", required = true)]
+        args: Vec<String>,
+        /// Limit to these paths.
+        #[arg(last = true)]
+        paths: Vec<String>,
+    },
+    /// Compare the index with the working tree, like `git diff-files`.
+    DiffFiles {
+        #[command(flatten)]
+        format: RawDiffArgs,
+        /// Limit to these paths.
+        paths: Vec<String>,
+    },
+    /// Merge two commits without touching the index or working tree, like
+    /// `git merge-tree --write-tree`: prints the merged tree, conflicted
+    /// files and messages; exits 1 on conflicts.
+    MergeTree {
+        /// Accepted for git compatibility (the only mode).
+        #[arg(long = "write-tree")]
+        write_tree: bool,
+        /// List only the names of conflicted files.
+        #[arg(long = "name-only")]
+        name_only: bool,
+        /// Print the informational messages even on a clean merge.
+        #[arg(long, overrides_with = "no_messages")]
+        messages: bool,
+        /// Do not print the informational messages.
+        #[arg(long = "no-messages")]
+        no_messages: bool,
+        /// NUL-terminated output.
+        #[arg(short = 'z')]
+        z: bool,
+        /// Merge even without a common ancestor.
+        #[arg(long = "allow-unrelated-histories")]
+        allow_unrelated_histories: bool,
+        /// Use this commit or tree as the merge base.
+        #[arg(long = "merge-base", value_name = "TREE-ISH")]
+        merge_base: Option<String>,
+        branch1: String,
+        branch2: String,
+    },
+    /// Three-way merge of files into the first, like `git merge-file`; exits
+    /// with the number of conflicts.
+    MergeFile {
+        /// Labels for current, base and other (up to three -L).
+        #[arg(short = 'L', value_name = "LABEL", action = clap::ArgAction::Append)]
+        labels: Vec<String>,
+        /// Print the result instead of writing the current file.
+        #[arg(short = 'p', long)]
+        stdout: bool,
+        /// Resolve conflicts with our side.
+        #[arg(long, conflicts_with_all = ["theirs", "union"])]
+        ours: bool,
+        /// Resolve conflicts with their side.
+        #[arg(long, conflicts_with = "union")]
+        theirs: bool,
+        /// Keep both sides of conflicts.
+        #[arg(long)]
+        union: bool,
+        /// Show the base version in conflicts.
+        #[arg(long, conflicts_with = "zdiff3")]
+        diff3: bool,
+        /// Like --diff3, with common lines moved out of the conflict.
+        #[arg(long)]
+        zdiff3: bool,
+        /// Conflict marker length.
+        #[arg(long = "marker-size", value_name = "N")]
+        marker_size: Option<u16>,
+        /// Do not warn about conflicts.
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        /// The arguments are blob ids; write the result as a blob and print its id.
+        #[arg(long = "object-id")]
+        object_id: bool,
+        current: String,
+        base: String,
+        other: String,
+    },
+    /// Write a commit object for a tree and print its id, like `git
+    /// commit-tree`; the message comes from -m, -F or stdin.
+    CommitTree {
+        /// A parent commit (repeat for a merge).
+        #[arg(short = 'p', value_name = "PARENT")]
+        parents: Vec<String>,
+        /// A message paragraph (repeatable).
+        #[arg(short = 'm', value_name = "MESSAGE")]
+        message: Vec<String>,
+        /// Read the message from a file (`-` is stdin).
+        #[arg(short = 'F', value_name = "FILE")]
+        file: Vec<String>,
+        /// The tree (e.g. `HEAD^{tree}`).
+        tree: String,
+    },
+    /// Write the index as a tree and print its id, like `git write-tree`.
+    WriteTree {
+        /// Allow entries whose objects are missing.
+        #[arg(long = "missing-ok")]
+        missing_ok: bool,
+        /// Write only the subtree at this folder.
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+    },
+    /// Read trees into the index, like `git read-tree`: one tree replaces it,
+    /// -m merges one, two (switch) or three (base, ours, theirs) trees.
+    ReadTree {
+        /// Merge the trees into the index instead of replacing it.
+        #[arg(short = 'm')]
+        merge: bool,
+        /// Like -m, but drop unmerged entries and ignore local changes.
+        #[arg(long)]
+        reset: bool,
+        /// Update the working tree files to match (with -m, --reset or --prefix).
+        #[arg(short = 'u')]
+        update: bool,
+        /// Merge in the index only, without checking the working tree.
+        #[arg(short = 'i')]
+        index_only: bool,
+        /// Check the merge without writing the index.
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// Also resolve removals and identical additions in a 3-way merge.
+        #[arg(long)]
+        aggressive: bool,
+        /// Read the tree under this folder of the index.
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+        /// Empty the index.
+        #[arg(long)]
+        empty: bool,
+        /// Accepted for git compatibility.
+        #[arg(short = 'v', hide = true)]
+        verbose: bool,
+        /// The trees (commits or tree ids).
+        trees: Vec<String>,
+    },
+    /// Change index entries, like `git update-index`: options apply to the
+    /// paths after them (`--add`, `--remove`, `--force-remove`, `--cacheinfo
+    /// <mode>,<sha1>,<path>`, `--chmod=(+|-)x`, `--[no-]assume-unchanged`,
+    /// `--[no-]skip-worktree`, `--info-only`, `--refresh`, `--really-refresh`,
+    /// `-q`, `--unmerged`, `--ignore-missing`, `--verbose`, and last
+    /// `--index-info` or `--stdin`, with `-z`).
+    UpdateIndex {
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+    },
+    /// Copy files from the index to the working tree, like `git
+    /// checkout-index`.
+    CheckoutIndex {
+        /// Every file in the index.
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Overwrite existing files.
+        #[arg(short = 'f', long)]
+        force: bool,
+        /// Update the index's stat data for the written files.
+        #[arg(short = 'u', long = "index")]
+        index: bool,
+        /// Say nothing about existing or unknown files.
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        /// Only update files that exist.
+        #[arg(short = 'n', long = "no-create")]
+        no_create: bool,
+        /// Write under this folder (ending in `/`) instead.
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+        /// Read the paths from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// With --stdin, NUL-separated paths.
+        #[arg(short = 'z')]
+        z: bool,
+        /// The files to write.
+        paths: Vec<String>,
+    },
+    /// Build a tree from `ls-tree` lines on stdin and print its id, like `git
+    /// mktree`.
+    Mktree {
+        /// NUL-terminated lines.
+        #[arg(short = 'z')]
+        z: bool,
+        /// Allow objects that are missing.
+        #[arg(long)]
+        missing: bool,
+        /// Build a tree per blank-line-separated group.
+        #[arg(long)]
+        batch: bool,
+    },
+    /// Check a tag object on stdin and store it, like `git mktag`.
+    Mktag {
+        /// Allow what git's fsck only warns about (a missing tagger, a bad
+        /// tag name).
+        #[arg(long = "no-strict")]
+        no_strict: bool,
+        /// The default: refuse any fsck problem.
+        #[arg(long, hide = true)]
+        strict: bool,
+    },
+    /// Print the commit id `git archive` stored in the tar read from stdin,
+    /// like `git get-tar-commit-id`; exit 1 when it has none.
+    GetTarCommitId,
+    /// Write a merge commit's message from FETCH_HEAD-style lines on stdin,
+    /// like `git fmt-merge-msg`.
+    FmtMergeMsg {
+        /// Start with this text instead of the "Merge ..." title.
+        #[arg(short = 'm', long, value_name = "TEXT")]
+        message: Option<String>,
+        /// Add a shortlog of at most N commits per merged head (default 20).
+        #[arg(
+            long,
+            visible_alias = "summary",
+            value_name = "N",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "20"
+        )]
+        log: Option<usize>,
+        /// No shortlog, whatever merge.log says.
+        #[arg(long = "no-log", visible_alias = "no-summary")]
+        no_log: bool,
+        /// Name this branch as the one merged into.
+        #[arg(long = "into-name", value_name = "NAME")]
+        into_name: Option<String>,
+        /// Read the lines from this file instead of stdin.
+        #[arg(short = 'F', long, value_name = "FILE")]
+        file: Option<String>,
+        #[arg(skip)]
+        input: Option<String>,
+    },
+    /// Split mboxes or Maildirs into one numbered file per mail, like `git
+    /// mailsplit`; prints the number of the last mail.
+    Mailsplit {
+        /// The folder to write the mails to.
+        #[arg(short = 'o', value_name = "DIR", required = true)]
+        dir: String,
+        /// Take a file that does not start with a `From ` line as one mail.
+        #[arg(short = 'b')]
+        bare: bool,
+        /// Number the mails after N (default 0).
+        #[arg(short = 'f', value_name = "N", default_value_t = 0)]
+        start: usize,
+        /// Digits in the file names (default 4).
+        #[arg(short = 'd', value_name = "N", default_value_t = 4, value_parser = clap::value_parser!(u8).range(3..10))]
+        prec: u8,
+        /// Keep CRLF line endings.
+        #[arg(long = "keep-cr")]
+        keep_cr: bool,
+        /// Unescape `>From ` lines, as in an mboxrd.
+        #[arg(long)]
+        mboxrd: bool,
+        /// The mboxes or Maildirs (default: stdin).
+        mboxes: Vec<String>,
+    },
+    /// Read one mail from stdin, write its message and patch to MSG and
+    /// PATCH, and print its author, subject and date, like `git mailinfo`.
+    Mailinfo {
+        /// Keep the subject as it is.
+        #[arg(short = 'k')]
+        keep_subject: bool,
+        /// Drop only `[PATCH ...]` brackets from the subject.
+        #[arg(short = 'b')]
+        keep_non_patch: bool,
+        /// Reencode to UTF-8 (the default).
+        #[arg(short = 'u')]
+        utf8: bool,
+        /// Add the Message-ID header to the message.
+        #[arg(short = 'm', long = "message-id")]
+        message_id: bool,
+        /// Drop everything above a scissors line (`-- >8 --`).
+        #[arg(long, overrides_with = "no_scissors")]
+        scissors: bool,
+        /// Ignore scissors lines (overrides mailinfo.scissors).
+        #[arg(long = "no-scissors")]
+        no_scissors: bool,
+        /// Where to write the message.
+        msg: String,
+        /// Where to write the patch.
+        patch: String,
+        #[arg(skip)]
+        input: Option<String>,
+    },
+    /// Add or parse trailers (`Signed-off-by: ...`) in a commit message read
+    /// from files or stdin, like `git interpret-trailers`. Takes git's
+    /// options in order: `--trailer <key>[(=|:)<value>]`, `--where`,
+    /// `--if-exists`, `--if-missing` (and their `--no-` forms, applying to
+    /// the trailers after them), `--in-place`, `--trim-empty`,
+    /// `--only-trailers`, `--only-input`, `--unfold`, `--parse`,
+    /// `--no-divider`, then the files.
+    InterpretTrailers {
+        /// Options and files, as for git.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "ARGS"
+        )]
+        args: Vec<String>,
+        #[arg(skip)]
+        input: Option<String>,
+    },
+    /// Show branches side by side with the commits each has, down to where
+    /// they meet, like `git show-branch`.
+    ShowBranch {
+        /// Show local and remote-tracking branches.
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Show remote-tracking branches.
+        #[arg(short = 'r', long)]
+        remotes: bool,
+        /// Add the current branch if it is not listed.
+        #[arg(long)]
+        current: bool,
+        /// Parents after all their children (the default).
+        #[arg(long = "topo-order")]
+        topo_order: bool,
+        /// Newest first, parents still after their children.
+        #[arg(long = "date-order")]
+        date_order: bool,
+        /// Keep merges reachable from only one branch.
+        #[arg(long)]
+        sparse: bool,
+        /// Show N more commits past the common ancestor.
+        #[arg(
+            long,
+            value_name = "N",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "1"
+        )]
+        more: Option<i32>,
+        /// List only the branches and their tips.
+        #[arg(long)]
+        list: bool,
+        /// Print the merge bases of the branches.
+        #[arg(long = "merge-base")]
+        merge_base: bool,
+        /// Print the tips not reachable from any other.
+        #[arg(long)]
+        independent: bool,
+        /// Omit the names.
+        #[arg(long = "no-name")]
+        no_name: bool,
+        /// Name commits by abbreviated id instead of `branch~n`.
+        #[arg(long = "sha1-name")]
+        sha1_name: bool,
+        /// Only commits not on the first branch.
+        #[arg(long)]
+        topics: bool,
+        /// Show a branch's last N reflog entries (default 4), from BASE.
+        #[arg(
+            short = 'g',
+            long,
+            value_name = "N[,BASE]",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = ""
+        )]
+        reflog: Option<String>,
+        /// Color the columns: always, never or auto.
+        #[arg(
+            long,
+            value_name = "WHEN",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "always"
+        )]
+        color: Option<String>,
+        /// Branches, revisions or ref globs (default: every local branch).
+        revs: Vec<String>,
+    },
+}
+
+/// Output options shared by `diff-tree`, `diff-index` and `diff-files`.
+#[derive(clap::Args, Clone, Default)]
+pub struct RawDiffArgs {
+    /// Show patches instead of the raw listing.
+    #[arg(short = 'p', short_alias = 'u', long = "patch")]
+    pub patch: bool,
+    /// Show no diff (only diff-tree's commit id).
+    #[arg(short = 's', long = "no-patch")]
+    pub no_patch: bool,
+    /// Show the raw listing (the default).
+    #[arg(long)]
+    pub raw: bool,
+    /// Show only the names of changed files.
+    #[arg(long = "name-only")]
+    pub name_only: bool,
+    /// Show the names and status letters of changed files.
+    #[arg(long = "name-status")]
+    pub name_status: bool,
+    /// NUL-terminated output.
+    #[arg(short = 'z')]
+    pub z: bool,
+    /// Recurse into subtrees.
+    #[arg(short = 'r')]
+    pub recursive: bool,
+    /// Show changed trees too while recursing (implies -r).
+    #[arg(short = 't')]
+    pub trees: bool,
+    /// Exit 1 when there are changes.
+    #[arg(long = "exit-code")]
+    pub exit_code: bool,
+    /// Print nothing; exit 1 when there are changes.
+    #[arg(long)]
+    pub quiet: bool,
 }
 
 #[derive(Subcommand)]
@@ -3722,6 +4325,32 @@ pub struct ApplyArgs {
     /// Print no progress.
     #[arg(short = 'q', long)]
     pub quiet: bool,
+    /// Drop context down to N lines around each hunk when it does not
+    /// match otherwise.
+    #[arg(short = 'C', value_name = "N")]
+    pub context: Option<usize>,
+    /// Apply hunks without context where their header says (`diff -U0`).
+    #[arg(long)]
+    pub unidiff_zero: bool,
+    /// Ignore changes in the amount of whitespace when matching context.
+    #[arg(long, visible_alias = "ignore-space-change")]
+    pub ignore_whitespace: bool,
+    /// Tolerate a patch missing newlines at the ends of files.
+    #[arg(long)]
+    pub inaccurate_eof: bool,
+    /// Let hunks overlap lines earlier hunks changed.
+    #[arg(long)]
+    pub allow_overlap: bool,
+    /// Mark new files intent-to-add in the index (working-tree apply only).
+    #[arg(short = 'N', long)]
+    pub intent_to_add: bool,
+    /// Write an index of the preimage blobs to this file instead of
+    /// applying.
+    #[arg(long, value_name = "FILE")]
+    pub build_fake_ancestor: Option<String>,
+    /// With --numstat, end each entry with NUL instead of a newline.
+    #[arg(short = 'z')]
+    pub z: bool,
 }
 
 /// `rgit format-patch`'s arguments, as git's.
@@ -3844,6 +4473,53 @@ pub struct FormatPatchArgs {
     /// Do not print the names of the files written.
     #[arg(short = 'q', long)]
     pub quiet: bool,
+    /// Put each patch in a MIME attachment, with this boundary (default:
+    /// git's version).
+    #[arg(long, value_name = "BOUNDARY", num_args = 0..=1, require_equals = true,
+          default_missing_value = "")]
+    pub attach: Option<String>,
+    /// Like --attach, as an inline part.
+    #[arg(long, value_name = "BOUNDARY", num_args = 0..=1, require_equals = true,
+          default_missing_value = "")]
+    pub inline: Option<String>,
+    /// No MIME attachment (overrides format.attach).
+    #[arg(long)]
+    pub no_attach: bool,
+    /// Add the commit's notes after the `---` line (of this notes ref).
+    #[arg(long, value_name = "REF", num_args = 0..=1, require_equals = true,
+          default_missing_value = "")]
+    pub notes: Vec<String>,
+    /// No notes (overrides format.notes).
+    #[arg(long)]
+    pub no_notes: bool,
+    /// RFC 2047-encode non-ASCII From: and Subject: (the default).
+    #[arg(long, overrides_with = "no_encode_email_headers")]
+    pub encode_email_headers: bool,
+    /// Leave non-ASCII From: and Subject: as raw UTF-8.
+    #[arg(long)]
+    pub no_encode_email_headers: bool,
+    /// Write all the patches to this one file.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["stdout", "output_dir"])]
+    pub output: Option<String>,
+    /// No cover letter (overrides format.coverLetter).
+    #[arg(long, conflicts_with = "cover_letter")]
+    pub no_cover_letter: bool,
+    /// No threading headers (overrides format.thread).
+    #[arg(long, conflicts_with = "thread")]
+    pub no_thread: bool,
+    /// With --from, keep the author's From: in the body even when it is
+    /// the sender.
+    #[arg(long, overrides_with = "no_force_in_body_from")]
+    pub force_in_body_from: bool,
+    /// Only put the author's From: in the body when it is not the sender.
+    #[arg(long)]
+    pub no_force_in_body_from: bool,
+    /// Drop the To: addresses of format.to.
+    #[arg(long)]
+    pub no_to: bool,
+    /// Drop the Cc: addresses of format.cc.
+    #[arg(long)]
+    pub no_cc: bool,
 }
 
 /// `cherry-pick` and `revert` flags past the common ones.
@@ -3967,8 +4643,9 @@ pub struct ArchiveArgs {
     /// Limit to these paths.
     #[arg(allow_negative_numbers = true)]
     pub paths: Vec<String>,
-    /// tar, tgz (tar.gz) or zip (default: from -o's extension, else tar).
-    #[arg(long, value_parser = ["tar", "tgz", "tar.gz", "zip"])]
+    /// tar, tgz, tar.gz, zip or a tar.<format>.command filter (default:
+    /// from -o's extension, else tar).
+    #[arg(long)]
     pub format: Option<String>,
     /// Write to this file instead of stdout.
     #[arg(short = 'o', long)]
@@ -3989,12 +4666,23 @@ pub struct ArchiveArgs {
     /// List the formats.
     #[arg(short = 'l', long)]
     pub list: bool,
-    /// Archive from this repository (a local path) instead.
+    /// Archive from this repository instead: a remote name, a local path, or
+    /// an ssh:// , git:// or `host:path` URL (git's upload-archive protocol).
     #[arg(long, value_name = "REPO")]
     pub remote: Option<String>,
+    /// With --remote, the remote's upload-archive command.
+    #[arg(long, value_name = "COMMAND", requires = "remote")]
+    pub exec: Option<String>,
     /// The entries' modification time (a date, `now`, `2.weeks.ago`, ...).
     #[arg(long, value_name = "TIME")]
     pub mtime: Option<String>,
+    /// Print each archived path on stderr.
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+    /// The current folder below the top (`src/`), set from where rgit runs:
+    /// git archives only it.
+    #[arg(skip)]
+    pub cwd: String,
 }
 
 /// `rgit difftool` and `rgit mergetool` arguments, as git's.
@@ -4068,15 +4756,32 @@ pub struct NoteMessage {
     /// Put nothing between paragraphs.
     #[arg(long)]
     pub no_separator: bool,
+    /// Keep the text as given: no cleanup of blank lines and trailing spaces.
+    #[arg(long, overrides_with = "stripspace")]
+    pub no_stripspace: bool,
+    /// Clean up blank lines and trailing spaces (the default, but for -C).
+    #[arg(long)]
+    pub stripspace: bool,
 }
 
 impl NoteMessage {
-    /// What goes between two paragraphs, as git's --separator says.
-    fn joiner(&self) -> String {
+    /// What goes after a paragraph before the next, as git's --separator
+    /// says (a blank line once the paragraph ends with its newline).
+    fn separator(&self) -> String {
         match (&self.separator, self.no_separator) {
-            (_, true) => "\n".to_owned(),
-            (Some(s), _) => format!("\n{}\n", s.trim_end_matches('\n')),
-            (None, _) => "\n\n".to_owned(),
+            (_, true) => String::new(),
+            (Some(s), _) if s.ends_with('\n') => s.clone(),
+            (Some(s), _) => format!("{s}\n"),
+            (None, _) => "\n".to_owned(),
+        }
+    }
+
+    /// --stripspace (Some(true)), --no-stripspace (Some(false)) or neither.
+    fn strip(&self) -> Option<bool> {
+        if self.no_stripspace {
+            Some(false)
+        } else {
+            self.stripspace.then_some(true)
         }
     }
 }
@@ -4147,15 +4852,29 @@ pub enum NotesCmd {
         #[arg(short, long)]
         verbose: bool,
     },
-    /// Merge another notes ref into the current one.
+    /// Merge another notes ref into the current one, with their merge base.
     Merge {
         /// The notes ref to merge (e.g. `origin` for refs/notes/origin).
-        notes_ref: String,
-        /// On conflicting notes: manual (stop), ours, theirs, union or
-        /// cat_sort_uniq.
-        #[arg(short, long, default_value = "manual",
+        #[arg(required_unless_present_any = ["commit", "abort"])]
+        notes_ref: Option<String>,
+        /// On conflicting notes: manual (leave them in
+        /// .git/NOTES_MERGE_WORKTREE), ours, theirs, union or cat_sort_uniq
+        /// (default: notes.<ref>.mergeStrategy, notes.mergeStrategy, manual).
+        #[arg(short, long,
               value_parser = ["manual", "ours", "theirs", "union", "cat_sort_uniq"])]
-        strategy: String,
+        strategy: Option<String>,
+        /// Commit the notes resolved in .git/NOTES_MERGE_WORKTREE.
+        #[arg(long, conflicts_with_all = ["notes_ref", "abort", "strategy"])]
+        commit: bool,
+        /// Abandon a manual notes merge.
+        #[arg(long, conflicts_with_all = ["notes_ref", "strategy"])]
+        abort: bool,
+        /// Say more (repeatable).
+        #[arg(short, long, action = clap::ArgAction::Count)]
+        verbose: u8,
+        /// Say less.
+        #[arg(short, long)]
+        quiet: bool,
     },
     /// Print the notes ref in use.
     GetRef,
@@ -5403,6 +6122,30 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
             "var",
             "symbolic-ref",
             "count-objects",
+            "name-rev",
+            "check-attr",
+            "check-ref-format",
+            "patch-id",
+            "stripspace",
+            "column",
+            "diff-tree",
+            "diff-index",
+            "diff-files",
+            "merge-tree",
+            "merge-file",
+            "commit-tree",
+            "write-tree",
+            "read-tree",
+            "update-index",
+            "checkout-index",
+            "mktree",
+            "mktag",
+            "get-tar-commit-id",
+            "fmt-merge-msg",
+            "mailsplit",
+            "mailinfo",
+            "interpret-trailers",
+            "show-branch",
         ],
     ),
     ("Code search", &["index"]),
@@ -5604,8 +6347,11 @@ impl Command {
             Command::HashObject(a) => !a.write,
             Command::Apply(a) => !a.cached && !a.index && !a.three_way,
             Command::Archive(a) => a.list || a.remote.is_some(),
-            Command::LsRemote { .. } => true,
+            Command::LsRemote { .. } | Command::Plumbing(Plumbing::GetTarCommitId) => true,
+            Command::Plumbing(Plumbing::InterpretTrailers { .. }) => true,
             Command::Plumbing(Plumbing::Grep { no_index, .. }) => *no_index,
+            Command::Plumbing(Plumbing::MergeFile { object_id, .. }) => !object_id,
+            Command::Plumbing(p) => p.runs_without_repo(),
             Command::Bundle {
                 cmd: BundleCmd::ListHeads { .. },
             } => true,
@@ -5627,9 +6373,21 @@ pub fn run_without_repo(command: Command, raw: bool) -> anyhow::Result<crate::ou
         Command::Apply(a) => apply(None, a),
         Command::Archive(a) => archive_cmd(None, a),
         Command::Bundle { cmd } => bundle(None, cmd),
+        Command::Plumbing(
+            m @ Plumbing::MergeFile {
+                object_id: false, ..
+            },
+        ) => {
+            return crate::plumbing::merge_file(None, m, raw);
+        }
+        Command::Plumbing(Plumbing::GetTarCommitId) => return crate::plumbing::get_tar_commit_id(),
+        Command::Plumbing(Plumbing::InterpretTrailers { args, input }) => {
+            return crate::plumbing::interpret_trailers(None, args, input);
+        }
         Command::Plumbing(c @ Plumbing::Grep { no_index: true, .. }) => {
             return crate::plumbing::grep(None, c, raw);
         }
+        Command::Plumbing(p) => return crate::plumbing::repoless(None, p, raw),
         _ => Err(CliError::not_a_repo()),
     };
     text.map(Into::into)
@@ -7376,8 +8134,11 @@ pub fn run(
         Command::Config(args) => config(Some(&backend.git_dir()), args)?,
         Command::Apply(a) => apply(Some(backend.as_ref()), a)?,
         Command::Notes { notes_ref, cmd } => {
-            let notes_ref = notes_ref.map(|r| notes_ref_name(&r));
-            let r = notes_ref.as_deref();
+            let notes_ref = notes_ref.map_or_else(
+                || crate::pretty::default_notes_ref(backend),
+                |r| notes_ref_name(&r),
+            );
+            let r = Some(notes_ref.as_str());
             let head = |rev: Option<String>| rev.unwrap_or_else(|| "HEAD".to_owned());
             match cmd.unwrap_or(NotesCmd::List { rev: None }) {
                 NotesCmd::List { rev } => {
@@ -7418,13 +8179,17 @@ pub fn run(
                 NotesCmd::Append { rev, text } => {
                     let rev = head(rev);
                     let note = note_text(backend, &text, None, interactive)?;
-                    match backend
-                        .note_show(r, &rev)
-                        .ok()
-                        .filter(|_| !note.trim().is_empty())
-                    {
+                    let oid = backend.rev_parse(&rev)?;
+                    let old = match backend.notes(r)?.into_iter().find(|(_, o)| *o == oid) {
+                        Some((id, _)) => Some(
+                            String::from_utf8_lossy(&backend.read_object(&id)?.data).into_owned(),
+                        ),
+                        None => None,
+                    };
+                    match old.filter(|o| !o.is_empty()) {
+                        Some(old) if note.is_empty() => old,
                         Some(old) => {
-                            let joined = format!("{}{}{note}", old.trim_end(), text.joiner());
+                            let joined = format!("{old}{}{note}", text.separator());
                             write_note(backend, r, &rev, &joined, text.allow_empty, false)?
                         }
                         None => write_note(backend, r, &rev, &note, text.allow_empty, true)?,
@@ -7471,15 +8236,42 @@ pub fn run(
                 NotesCmd::Merge {
                     notes_ref: other,
                     strategy,
-                } => backend.notes_merge(r, &notes_ref_name(&other), &strategy)?,
-                NotesCmd::GetRef => match r {
-                    Some(r) => r.to_owned(),
-                    None => std::env::var("GIT_NOTES_REF")
-                        .ok()
-                        .filter(|v| !v.is_empty())
-                        .or_else(|| backend.config_get("core.notesRef").ok().flatten())
-                        .unwrap_or_else(|| "refs/notes/commits".to_owned()),
-                },
+                    commit,
+                    abort: _,
+                    verbose,
+                    quiet,
+                } => {
+                    let verbosity = (2 + verbose).saturating_sub(u8::from(quiet));
+                    // git dies (128) on these, but a failed --abort is an error (1).
+                    let fatal = |e: GitError| {
+                        anyhow::Error::new(CliError {
+                            message: e.to_string(),
+                            help: None,
+                            code: if commit || other.is_some() { 128 } else { 1 },
+                        })
+                    };
+                    let Some(other) = other.clone() else {
+                        return backend.notes_merge_finish(commit, verbosity).map_err(fatal);
+                    };
+                    let local = notes_ref.as_str();
+                    let short = local.strip_prefix("refs/notes/").unwrap_or(local);
+                    let strategy = match strategy {
+                        Some(s) => s,
+                        None => backend
+                            .config_get(&format!("notes.{short}.mergeStrategy"))?
+                            .or(backend.config_get("notes.mergeStrategy")?)
+                            .unwrap_or_else(|| "manual".to_owned()),
+                    };
+                    let (out, stop) = backend
+                        .notes_merge(local, &notes_ref_name(&other), &strategy, verbosity)
+                        .map_err(fatal)?;
+                    if let Some((message, code)) = stop {
+                        eprintln!("{message}");
+                        EXIT_CODE.store(code, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    out
+                }
+                NotesCmd::GetRef => notes_ref.clone(),
             }
         }
         Command::UpdateRef {
@@ -7492,9 +8284,17 @@ pub fn run(
             create_reflog,
             stdin,
             z,
+            batch_updates,
         } => {
             if stdin {
-                return update_ref_stdin(backend, z, message.as_deref(), no_deref, create_reflog);
+                return update_ref_stdin(
+                    backend,
+                    z,
+                    message.as_deref(),
+                    no_deref,
+                    create_reflog,
+                    batch_updates,
+                );
             }
             let name = name.ok_or_else(|| CliError::usage("a ref name required"))?;
             let update = if delete {
@@ -7503,9 +8303,8 @@ pub fn run(
                 }
                 rgit_git::RefUpdate {
                     name,
-                    new: None,
                     old: new,
-                    verify: false,
+                    ..Default::default()
                 }
             } else {
                 let new = new.ok_or_else(|| CliError::usage("a new value required"))?;
@@ -7513,7 +8312,7 @@ pub fn run(
                     name,
                     new: Some(new),
                     old,
-                    verify: false,
+                    ..Default::default()
                 }
             };
             backend.update_refs(
@@ -7522,11 +8321,13 @@ pub fn run(
                 no_deref,
                 create_reflog,
                 false,
+                false,
             )?;
             "ok".to_owned()
         }
         Command::HashObject(a) => hash_object(Some(backend.as_ref()), a)?,
         Command::FormatPatch(a) => {
+            let a = *a;
             let (counts, ranges): (Vec<&String>, Vec<&String>) = a.revs.iter().partition(|r| {
                 r.strip_prefix('-')
                     .is_some_and(|n| n.parse::<usize>().is_ok())
@@ -7537,21 +8338,99 @@ pub fn run(
                     "give `-<n>`, a `<since>` revision, or one `<a>..<b>` range",
                 ));
             }
-            let signature = match (&a.signature_file, a.no_signature) {
+            let cfg = |k: &str| backend.config_get(k).ok().flatten();
+            let cfg_bool = |k: &str| cfg(k).and_then(|v| maybe_bool(&v));
+            let signature_file = a
+                .signature_file
+                .clone()
+                .or_else(|| cfg("format.signatureFile"));
+            let signature = match (&signature_file, a.no_signature) {
                 (_, true) => Some(String::new()),
-                (Some(f), _) => Some(String::from_utf8(read_input(f)?)?),
-                _ => a.signature.clone(),
+                _ if a.signature.is_some() => a.signature.clone(),
+                // format.signature beats a signature file, as in git.
+                (Some(f), _) if cfg("format.signature").is_none() => {
+                    Some(String::from_utf8(read_input(f)?)?)
+                }
+                _ => None,
+            };
+            let numbered = match (a.numbered || a.no_numbered, cfg("format.numbered")) {
+                (true, _) => Some(a.numbered),
+                (false, Some(v)) if v != "auto" => maybe_bool(&v),
+                _ => None,
+            };
+            let thread = match (&a.thread, a.no_thread, cfg("format.thread")) {
+                (Some(t), ..) => Some(t.clone()),
+                (None, false, Some(v)) => match maybe_bool(&v) {
+                    Some(false) => None,
+                    Some(true) => Some("shallow".to_owned()),
+                    None => Some(v),
+                },
+                _ => None,
+            };
+            let cover = cfg("format.coverLetter");
+            let from = a.from.clone().or_else(|| {
+                cfg("format.from").and_then(|v| match maybe_bool(&v) {
+                    Some(false) => None,
+                    Some(true) => Some(String::new()),
+                    None => Some(v),
+                })
+            });
+            // --attach, --inline and --no-attach: the last one given decides.
+            let last = last_flag(&["--attach", "--inline", "--no-attach"]);
+            let inline = a.inline.is_some() && last.as_deref() != Some("--attach");
+            let attach = match (&a.attach, &a.inline, a.no_attach) {
+                (_, _, true) if last.as_deref() == Some("--no-attach") => None,
+                (Some(b), Some(i), _) => Some(if inline { i.clone() } else { b.clone() }),
+                (Some(b), None, _) | (None, Some(b), _) => Some(b.clone()),
+                (None, None, _) => cfg("format.attach").filter(|b| !b.is_empty()),
+            };
+            // format.notes, then --no-notes and --notes, as git's display
+            // notes options.
+            let (mut show_notes, mut use_default, mut extra) = (false, None, Vec::new());
+            for v in backend
+                .config_entries(rgit_git::ConfigScope::Any, Some("format.notes"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, v)| v)
+                .chain(a.no_notes.then(|| "false".to_owned()))
+                .chain(a.notes.iter().map(|n| {
+                    if n.is_empty() {
+                        "true".to_owned()
+                    } else {
+                        n.clone()
+                    }
+                }))
+            {
+                match maybe_bool(&v) {
+                    Some(true) => (show_notes, use_default) = (true, Some(true)),
+                    Some(false) => {
+                        (show_notes, use_default, extra) = (false, Some(false), Vec::new())
+                    }
+                    None => {
+                        show_notes = true;
+                        extra.push(notes_ref_name(&v));
+                    }
+                }
+            }
+            let notes = if show_notes {
+                crate::pretty::display_notes_refs(backend, use_default, &extra)
+            } else {
+                Vec::new()
             };
             let opts = rgit_git::FormatPatchOpts {
                 range: ranges.first().map(|r| r.to_string()),
                 count,
-                numbered: (a.numbered || a.no_numbered).then_some(a.numbered),
+                numbered,
                 subject_prefix: a.subject_prefix,
                 reroll: a.reroll,
                 rfc: a.rfc,
                 keep_subject: a.keep_subject,
-                cover_letter: a.cover_letter,
-                thread: a.thread.as_deref().map(|t| match t {
+                cover_letter: a.cover_letter
+                    || (!a.no_cover_letter && cover.as_deref().and_then(maybe_bool) == Some(true)),
+                cover_letter_auto: !a.cover_letter
+                    && !a.no_cover_letter
+                    && cover.as_deref() == Some("auto"),
+                thread: thread.as_deref().map(|t| match t {
                     "deep" => rgit_git::Thread::Deep,
                     _ => rgit_git::Thread::Shallow,
                 }),
@@ -7567,9 +8446,11 @@ pub fn run(
                 numbered_files: a.numbered_files,
                 suffix: a.suffix,
                 root: a.root,
-                signoff: a.signoff,
-                from: a.from,
-                filename_max_length: a.filename_max_length,
+                signoff: a.signoff || cfg_bool("format.signOff") == Some(true),
+                from,
+                filename_max_length: a
+                    .filename_max_length
+                    .or_else(|| cfg("format.filenameMaxLength").and_then(|v| v.parse().ok())),
                 no_binary: a.no_binary,
                 ignore_if_in_upstream: a.ignore_if_in_upstream,
                 cover_from_description: a.cover_from_description,
@@ -7580,6 +8461,17 @@ pub fn run(
                 interdiff: a.interdiff,
                 range_diff: a.range_diff,
                 creation_factor: a.creation_factor,
+                attach,
+                inline,
+                notes,
+                no_encode_headers: a.no_encode_email_headers
+                    || (!a.encode_email_headers
+                        && cfg_bool("format.encodeEmailHeaders") == Some(false)),
+                force_in_body_from: a.force_in_body_from
+                    || (!a.no_force_in_body_from
+                        && cfg_bool("format.forceInBodyFrom") == Some(true)),
+                no_to: a.no_to,
+                no_cc: a.no_cc,
             };
             let mails = backend.format_patch(&opts)?;
             if mails.is_empty() && a.stdout {
@@ -7591,7 +8483,15 @@ pub fn run(
             if a.stdout {
                 return Ok(rgit_git::mbox(&mails));
             }
-            let dir = PathBuf::from(a.output_dir.unwrap_or_default());
+            if let Some(file) = &a.output {
+                std::fs::write(file, rgit_git::mbox(&mails))?;
+                return Ok(String::new());
+            }
+            let dir = PathBuf::from(
+                a.output_dir
+                    .or_else(|| cfg("format.outputDirectory"))
+                    .unwrap_or_default(),
+            );
             if !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(&dir)?;
             }
@@ -7837,8 +8737,21 @@ pub fn run(
             no_patch,
             left_only,
             right_only,
+            unified,
+            notes,
+            no_notes,
+            paths,
             ..
         } => {
+            // `--notes=<ref>` shows only the refs named; a bare --notes (an
+            // empty entry) adds the default ref back.
+            let notes = if notes.iter().any(|n| !n.is_empty()) {
+                Some(notes)
+            } else if no_notes {
+                Some(Vec::new())
+            } else {
+                None
+            };
             let (range1, range2) = match revs.as_slice() {
                 [base, old, new] => (format!("{base}..{old}"), format!("{base}..{new}")),
                 [r1, r2] if r1.contains("..") && r2.contains("..") => (r1.clone(), r2.clone()),
@@ -7863,6 +8776,9 @@ pub fn run(
                 patches: !no_patch,
                 left_only,
                 right_only,
+                context: unified,
+                paths,
+                notes,
             })?
         }
         Command::Difftool(a) => difftool(backend, a, interactive)?,
@@ -8621,7 +9537,7 @@ fn run_editor(git_dir: Option<&Path>, path: &Path) -> anyhow::Result<()> {
 }
 
 /// git's notes ref for `--ref`: `refs/notes/<name>` unless already a ref.
-fn notes_ref_name(name: &str) -> String {
+pub(crate) fn notes_ref_name(name: &str) -> String {
     if name.starts_with("refs/notes/") {
         name.to_owned()
     } else if name.starts_with("notes/") {
@@ -8639,23 +9555,53 @@ fn note_text(
     current: Option<String>,
     interactive: bool,
 ) -> anyhow::Result<String> {
-    let mut parts: Vec<String> = Vec::new();
+    // (text, cleaned up unless --no-stripspace): -C/-c blobs are kept as is.
+    let mut blobs = Vec::new();
     for reuse in t
         .reuse
         .iter()
         .chain(t.reedit.iter().filter(|r| !r.is_empty()))
     {
-        parts.push(String::from_utf8_lossy(&backend.read_object(reuse)?.data).into_owned());
+        let obj = backend.read_object(reuse)?;
+        if obj.kind != "blob" {
+            return Err(fatal_128(format!(
+                "cannot read note data from non-blob object '{reuse}'."
+            )));
+        }
+        blobs.push((String::from_utf8_lossy(&obj.data).into_owned(), false));
     }
-    parts.extend(t.message.iter().cloned());
+    let messages = t.message.iter().map(|m| (m.clone(), true));
+    let mut files = Vec::new();
     for f in &t.file {
-        parts.push(String::from_utf8(read_input(f)?)?);
+        files.push((String::from_utf8(read_input(f)?)?, true));
     }
-    let text = parts
-        .iter()
-        .map(|p| p.trim_end())
-        .collect::<Vec<_>>()
-        .join(&t.joiner());
+    // git takes the paragraphs in command-line order.
+    let order = message_order();
+    let mut sources = [
+        blobs.into_iter(),
+        messages.collect::<Vec<_>>().into_iter(),
+        files.into_iter(),
+    ];
+    let mut parts: Vec<(String, bool)> = Vec::new();
+    if order.iter().filter(|&&k| k == 0).count() == sources[0].len()
+        && order.iter().filter(|&&k| k == 1).count() == sources[1].len()
+        && order.iter().filter(|&&k| k == 2).count() == sources[2].len()
+    {
+        parts.extend(order.iter().filter_map(|&k| sources[k].next()));
+    } else {
+        parts.extend(sources.into_iter().flatten());
+    }
+    // git's concat_messages: each cleanup covers everything so far.
+    let mut text = String::new();
+    for (part, strip) in &parts {
+        if !text.is_empty() {
+            text.push_str(&t.separator());
+        }
+        text.push_str(part);
+        if t.strip().unwrap_or(*strip) {
+            text = stripspace(&text);
+        }
+    }
     if !(parts.is_empty() || t.reedit.is_some() || t.edit) {
         return Ok(text);
     }
@@ -8672,7 +9618,65 @@ fn note_text(
         ),
     )?;
     let _ = std::fs::remove_file(backend.git_dir().join("NOTES_EDITMSG"));
-    Ok(strip_comments(&edited).trim().to_owned())
+    Ok(match t.strip() {
+        Some(false) => edited,
+        _ => stripspace(&strip_comments(&edited)),
+    })
+}
+
+/// git's maybe-bool config values.
+fn maybe_bool(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" | "" => Some(false),
+        _ => None,
+    }
+}
+
+/// Which of `flags` (bare or `--flag=value`) comes last on the command line.
+fn last_flag(flags: &[&str]) -> Option<String> {
+    std::env::args().rev().find_map(|a| {
+        let name = a.split('=').next().unwrap_or("").to_owned();
+        flags.contains(&name.as_str()).then_some(name)
+    })
+}
+
+/// The kinds of note paragraphs on the command line, in order: 0 for -C/-c,
+/// 1 for -m, 2 for -F.
+fn message_order() -> Vec<usize> {
+    let mut order = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--" {
+            break;
+        }
+        let kind = |a: &str| match a {
+            "-C" | "-c" | "--reuse-message" | "--reedit-message" => Some(0),
+            "-m" | "--message" => Some(1),
+            "-F" | "--file" => Some(2),
+            _ => None,
+        };
+        let (flag, joined) = match a.split_once('=') {
+            Some((f, _)) if f.starts_with("--") => (f.to_owned(), true),
+            _ if a.len() > 2 && !a.starts_with("--") => (a[..2].to_owned(), true),
+            _ => (a.clone(), false),
+        };
+        if let Some(k) = kind(&flag) {
+            order.push(k);
+            if !joined {
+                args.next();
+            }
+        }
+    }
+    order
+}
+
+fn fatal_128(message: String) -> anyhow::Error {
+    anyhow::Error::new(CliError {
+        message,
+        help: None,
+        code: 128,
+    })
 }
 
 /// Write (or append) a note; an empty one removes the note unless allowed.
@@ -8684,15 +9688,14 @@ fn write_note(
     allow_empty: bool,
     append: bool,
 ) -> anyhow::Result<String> {
-    if text.trim().is_empty() && !allow_empty {
+    if text.is_empty() && !allow_empty {
         if append {
             return Ok("ok".to_owned());
         }
-        let oid = backend.rev_parse(rev)?;
-        return match backend.note_remove(notes_ref, rev) {
-            Ok(()) => Ok(format!("Removing note for object {oid}")),
-            Err(_) => Ok("ok".to_owned()),
-        };
+        if backend.note_remove(notes_ref, rev).is_ok() {
+            eprintln!("Removing note for object {rev}");
+        }
+        return Ok("ok".to_owned());
     }
     backend.note_add(notes_ref, rev, text, true, append)?;
     Ok("ok".to_owned())
@@ -8706,6 +9709,7 @@ fn update_ref_stdin(
     message: Option<&str>,
     no_deref: bool,
     create_reflog: bool,
+    batch_updates: bool,
 ) -> anyhow::Result<String> {
     use std::io::{BufRead, Write};
     let mut input = std::io::stdin().lock();
@@ -8727,7 +9731,25 @@ fn update_ref_stdin(
         out.flush()?;
         Ok(())
     };
+    let run = |batch: &[rgit_git::RefUpdate], check: bool| -> anyhow::Result<()> {
+        let rejected = backend.update_refs(
+            batch,
+            message,
+            no_deref,
+            create_reflog,
+            check,
+            batch_updates,
+        )?;
+        let mut out = std::io::stdout();
+        for r in rejected {
+            writeln!(out, "{r}")?;
+        }
+        Ok(())
+    };
+    let zero = || "0".repeat(40);
     let mut open = false;
+    // `option no-deref` holds for the next command only.
+    let mut next_no_deref = false;
     while let Some(line) = read(&mut input)? {
         let (cmd, rest) = line.split_once(' ').unwrap_or((line.as_str(), ""));
         // With -z the values follow as their own NUL-terminated fields.
@@ -8740,9 +9762,10 @@ fn update_ref_stdin(
                 .collect()
         };
         let wanted = match cmd {
+            "symref-update" => 4,
             "update" => 3,
-            "create" => 2,
-            "delete" | "verify" => 2,
+            "create" | "delete" | "verify" => 2,
+            "symref-create" | "symref-delete" | "symref-verify" => 2,
             _ => 1,
         };
         while z && fields.len() < wanted && !rest.is_empty() {
@@ -8750,46 +9773,119 @@ fn update_ref_stdin(
         }
         let field = |i: usize| fields.get(i).filter(|f| !f.is_empty()).cloned();
         let name = || field(0).ok_or_else(|| CliError::usage(format!("{cmd}: missing <ref>")));
-        match cmd {
-            "update" => batch.push(rgit_git::RefUpdate {
+        let missing = |what: &str| CliError::usage(format!("{cmd}: missing <{what}>"));
+        let deref_only = || -> anyhow::Result<()> {
+            if !(no_deref || next_no_deref) {
+                return Err(CliError::usage(format!(
+                    "{cmd}: cannot operate with deref mode"
+                )));
+            }
+            Ok(())
+        };
+        let update = rgit_git::RefUpdate {
+            no_deref: next_no_deref,
+            ..Default::default()
+        };
+        let update = match cmd {
+            "update" => Some(rgit_git::RefUpdate {
                 name: name()?,
-                new: Some(field(1).ok_or_else(|| CliError::usage("update: missing <new-oid>"))?),
+                new: Some(field(1).ok_or_else(|| missing("new-oid"))?),
                 old: field(2),
-                verify: false,
+                ..update
             }),
-            "create" => batch.push(rgit_git::RefUpdate {
+            "create" => Some(rgit_git::RefUpdate {
                 name: name()?,
-                new: Some(field(1).ok_or_else(|| CliError::usage("create: missing <new-oid>"))?),
-                old: Some("0".repeat(40)),
-                verify: false,
+                new: Some(field(1).ok_or_else(|| missing("new-oid"))?),
+                old: Some(zero()),
+                ..update
             }),
-            "delete" => batch.push(rgit_git::RefUpdate {
+            "delete" => Some(rgit_git::RefUpdate {
                 name: name()?,
-                new: None,
                 old: field(1),
-                verify: false,
+                ..update
             }),
-            "verify" => batch.push(rgit_git::RefUpdate {
+            "verify" => Some(rgit_git::RefUpdate {
                 name: name()?,
-                new: None,
-                old: Some(field(1).unwrap_or_else(|| "0".repeat(40))),
+                old: Some(field(1).unwrap_or_else(zero)),
                 verify: true,
+                ..update
             }),
+            "symref-update" => {
+                let (old, old_target) = match (field(2).as_deref(), field(3)) {
+                    (None, _) => (None, None),
+                    (Some(_), None) => {
+                        return Err(CliError::usage("symref-update: expected old value"));
+                    }
+                    (Some("oid"), v) => (v, None),
+                    (Some("ref"), v) => (None, v),
+                    (Some(arg), _) => {
+                        return Err(CliError::usage(format!(
+                            "symref-update {}: invalid arg '{arg}' for old value",
+                            name()?
+                        )));
+                    }
+                };
+                Some(rgit_git::RefUpdate {
+                    name: name()?,
+                    new_target: Some(field(1).ok_or_else(|| missing("new-target"))?),
+                    old,
+                    old_target,
+                    symref: true,
+                    ..update
+                })
+            }
+            "symref-create" => Some(rgit_git::RefUpdate {
+                name: name()?,
+                new_target: Some(field(1).ok_or_else(|| missing("new-target"))?),
+                old: Some(zero()),
+                symref: true,
+                ..update
+            }),
+            "symref-delete" => {
+                deref_only()?;
+                Some(rgit_git::RefUpdate {
+                    name: name()?,
+                    old_target: field(1),
+                    symref: true,
+                    ..update
+                })
+            }
+            "symref-verify" => {
+                deref_only()?;
+                Some(rgit_git::RefUpdate {
+                    name: name()?,
+                    old_target: field(1),
+                    verify: true,
+                    symref: true,
+                    ..update
+                })
+            }
+            _ => None,
+        };
+        if let Some(u) = update {
+            batch.push(u);
+            next_no_deref = false;
+            continue;
+        }
+        match cmd {
             "option" => {
                 if rest.trim() != "no-deref" {
                     return Err(CliError::usage(format!("option unknown: {rest}")));
                 }
+                next_no_deref = true;
             }
             "start" => {
                 open = true;
                 reply("start: ok")?;
             }
             "prepare" => {
-                backend.update_refs(&batch, message, no_deref, create_reflog, true)?;
+                if !batch_updates {
+                    run(&batch, true)?;
+                }
                 reply("prepare: ok")?;
             }
             "commit" => {
-                backend.update_refs(&batch, message, no_deref, create_reflog, false)?;
+                run(&batch, false)?;
                 batch.clear();
                 open = false;
                 reply("commit: ok")?;
@@ -8806,7 +9902,7 @@ fn update_ref_stdin(
     // Without an explicit transaction, everything read is one; an open
     // transaction left at EOF is aborted, as in git.
     if !open && !batch.is_empty() {
-        backend.update_refs(&batch, message, no_deref, create_reflog, false)?;
+        run(&batch, false)?;
     }
     Ok(String::new())
 }
@@ -9398,6 +10494,16 @@ pub fn apply(backend: Option<&dyn GitBackend>, a: ApplyArgs) -> anyhow::Result<S
             .find_map(|(on, f)| on.then(|| f.to_owned())),
         recount: a.recount,
         quiet: a.quiet,
+        context: a.context,
+        unidiff_zero: a.unidiff_zero,
+        ignore_whitespace: a.ignore_whitespace
+            || backend
+                .and_then(|b| b.config_get("apply.ignoreWhitespace").ok().flatten())
+                .is_some_and(|v| v == "change"),
+        inaccurate_eof: a.inaccurate_eof,
+        allow_overlap: a.allow_overlap,
+        intent_to_add: a.intent_to_add && !a.cached && !a.index && !a.three_way,
+        fake_ancestor: a.build_fake_ancestor.map(Into::into),
         // As in git, a subfolder only applies the paths under it.
         prefix: backend.and_then(|b| {
             let root = b.workdir().canonicalize().ok()?;
@@ -9425,7 +10531,12 @@ pub fn apply(backend: Option<&dyn GitBackend>, a: ApplyArgs) -> anyhow::Result<S
         out.push_str(&rgit_git::patch_stat(&files));
     }
     if a.numstat {
-        out.push_str(&rgit_git::patch_numstat(&files));
+        let numstat = rgit_git::patch_numstat(&files);
+        out.push_str(&if a.z {
+            numstat.replace('\n', "\0")
+        } else {
+            numstat
+        });
     }
     if a.summary {
         out.push_str(&rgit_git::patch_summary(&files));
@@ -9455,23 +10566,39 @@ fn read_input(path: &str) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+/// `--add-file`s and `--add-virtual-file`s in command-line order, as git adds
+/// them, each add-file with the `--prefix` in force where it stood: `(true,
+/// "")` is a virtual file, `(false, prefix)` an add-file. Without such a
+/// command line (MCP), add-files take `fallback` and come first.
+fn extra_order(files: usize, virtuals: usize, fallback: &str) -> Vec<(bool, String)> {
+    let mut prefix = String::new();
+    let mut found = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let (name, value) = arg.split_once('=').unwrap_or((&arg, ""));
+        let value = match name {
+            "--prefix" | "--add-file" | "--add-virtual-file" if !arg.contains('=') => {
+                args.next().unwrap_or_default()
+            }
+            _ => value.to_owned(),
+        };
+        match name {
+            "--prefix" => prefix = value,
+            "--add-file" => found.push((false, prefix.clone())),
+            "--add-virtual-file" => found.push((true, String::new())),
+            _ => {}
+        }
+    }
+    if found.iter().filter(|(v, _)| !v).count() == files && found.len() == files + virtuals {
+        return found;
+    }
+    let mut order = vec![(false, fallback.to_owned()); files];
+    order.extend(vec![(true, String::new()); virtuals]);
+    order
+}
+
 /// `rgit archive` output; the format defaults from `output`'s extension.
 pub fn archive(backend: Option<&Arc<dyn GitBackend>>, a: &ArchiveArgs) -> anyhow::Result<Vec<u8>> {
-    let remote: Arc<dyn GitBackend>;
-    let backend = match (&a.remote, backend) {
-        (Some(url), _) => {
-            let path = url.strip_prefix("file://").unwrap_or(url);
-            if !Path::new(path).exists() {
-                return Err(anyhow::anyhow!(
-                    "rgit archive --remote reaches only local repositories, not {url}"
-                ));
-            }
-            remote = Arc::new(rgit_git::Git2Backend::discover(path)?);
-            &remote
-        }
-        (None, Some(b)) => b,
-        (None, None) => return Err(CliError::not_a_repo()),
-    };
     // `-0` to `-9` arrive as positionals.
     let is_level = |s: &str| s.len() == 2 && s.starts_with('-') && s.as_bytes()[1].is_ascii_digit();
     let mut words: Vec<&String> = a.rev.iter().chain(&a.paths).collect();
@@ -9481,33 +10608,102 @@ pub fn archive(backend: Option<&Arc<dyn GitBackend>>, a: &ArchiveArgs) -> anyhow
         .find(|w| is_level(w))
         .map(|w| u32::from(w.as_bytes()[1] - b'0'));
     words.retain(|w| !is_level(w));
+    let formats = rgit_git::archive_formats(backend.map(|b| b.workdir()));
+    let inferred = a
+        .output
+        .as_deref()
+        .and_then(|o| rgit_git::archive_format_from_filename(o, &formats));
+    let mut cwd = a.cwd.clone();
+    let remote: Arc<dyn GitBackend>;
+    let backend = match (&a.remote, backend) {
+        (Some(name), b) => {
+            let url = b
+                .and_then(|b| b.config_get(&format!("remote.{name}.url")).ok().flatten())
+                .unwrap_or_else(|| name.clone());
+            if !rgit_git::is_local_url(&url) {
+                // git sends its own arguments, the format -o implies first.
+                let mut args: Vec<String> = inferred
+                    .map(|f| format!("--format={f}"))
+                    .into_iter()
+                    .collect();
+                args.extend(a.list.then(|| "-l".to_owned()));
+                args.extend(a.format.as_ref().map(|f| format!("--format={f}")));
+                args.extend(a.prefix.as_ref().map(|p| format!("--prefix={p}")));
+                args.extend(a.add_file.iter().map(|f| format!("--add-file={f}")));
+                args.extend(
+                    a.add_virtual_file
+                        .iter()
+                        .map(|f| format!("--add-virtual-file={f}")),
+                );
+                args.extend(
+                    a.worktree_attributes
+                        .then(|| "--worktree-attributes".to_owned()),
+                );
+                args.extend(a.verbose.then(|| "-v".to_owned()));
+                args.extend(a.mtime.as_ref().map(|t| format!("--mtime={t}")));
+                args.extend(level.map(|l| format!("-{l}")));
+                args.extend(words.iter().map(|w| w.to_string()));
+                let ssh = b.and_then(|b| b.config_get("core.sshCommand").ok().flatten());
+                let exec = a.exec.as_deref().unwrap_or("git-upload-archive");
+                // The remote's own error prints as git shows it, `remote: ...`.
+                return rgit_git::remote_archive(&url, exec, &args, ssh.as_deref()).map_err(|e| {
+                    let msg = e.to_string();
+                    if !msg.starts_with("remote: ") {
+                        return e.into();
+                    }
+                    eprintln!("{msg}");
+                    anyhow::Error::new(CliError {
+                        message: String::new(),
+                        help: None,
+                        code: 1,
+                    })
+                });
+            }
+            let path = url.strip_prefix("file://").unwrap_or(&url);
+            remote = Arc::new(rgit_git::Git2Backend::discover(path)?);
+            cwd.clear();
+            &remote
+        }
+        (None, Some(b)) => b,
+        (None, None) => return Err(CliError::not_a_repo()),
+    };
+    if a.list {
+        return Ok(formats
+            .iter()
+            .map(|f| format!("{f}\n"))
+            .collect::<String>()
+            .into_bytes());
+    }
     let rev = words.first().map_or("HEAD".to_owned(), |r| r.to_string());
     let paths: Vec<String> = words.iter().skip(1).map(|p| p.to_string()).collect();
-    let out = a.output.clone().unwrap_or_default();
-    let format = a.format.clone().unwrap_or_else(|| {
-        if out.ends_with(".zip") {
-            "zip"
-        } else if out.ends_with(".tgz") || out.ends_with(".tar.gz") {
-            "tgz"
-        } else {
-            "tar"
-        }
-        .to_owned()
-    });
+    let format = a
+        .format
+        .clone()
+        .or(inferred)
+        .unwrap_or_else(|| "tar".to_owned());
+    let prefix = a.prefix.clone().unwrap_or_default();
     let mut extra = Vec::new();
-    for f in &a.add_file {
-        extra.push(rgit_git::archive_file(Path::new(f))?);
-    }
-    for v in &a.add_virtual_file {
-        let (path, content) = v
-            .split_once(':')
-            .ok_or_else(|| CliError::usage("--add-virtual-file takes <path>:<content>"))?;
-        extra.push((path.to_owned(), 0o100644, content.as_bytes().to_vec()));
+    let (mut files, mut virtuals) = (a.add_file.iter(), a.add_virtual_file.iter());
+    for (virtual_file, base) in extra_order(a.add_file.len(), a.add_virtual_file.len(), &prefix) {
+        if !virtual_file && let Some(f) = files.next() {
+            let (name, mode, data) = rgit_git::archive_file(Path::new(f))?;
+            extra.push((format!("{base}{name}"), mode, data));
+        } else if let Some(v) = virtuals.next() {
+            let (path, content) = v
+                .split_once(':')
+                .filter(|(p, _)| !p.is_empty())
+                .ok_or_else(|| CliError::usage(format!("missing colon: '{v}'")))?;
+            extra.push((
+                format!("{cwd}{path}"),
+                0o100644,
+                content.as_bytes().to_vec(),
+            ));
+        }
     }
     Ok(backend.archive(&rgit_git::ArchiveOpts {
         rev,
         format,
-        prefix: a.prefix.clone().unwrap_or_default(),
+        prefix,
         paths,
         level,
         extra,
@@ -9519,6 +10715,8 @@ pub fn archive(backend: Option<&Arc<dyn GitBackend>>, a: &ArchiveArgs) -> anyhow
             ),
             None => None,
         },
+        verbose: a.verbose,
+        cwd,
     })?)
 }
 
@@ -9528,7 +10726,7 @@ pub fn archive_cmd(
     a: ArchiveArgs,
 ) -> anyhow::Result<String> {
     if a.list {
-        return Ok("tar\ntgz\ntar.gz\nzip\n".to_owned());
+        return Ok(String::from_utf8_lossy(&archive(backend, &a)?).into_owned());
     }
     let Some(output) = a.output.clone().filter(|o| o != "-") else {
         return Err(CliError::usage("-o <file> required"));
@@ -10850,6 +12048,26 @@ fn ensure_reflog(backend: &Arc<dyn GitBackend>, refname: &str) -> anyhow::Result
 }
 
 /// `text` without its `#` lines.
+/// git's strbuf_stripspace: no trailing spaces, no leading, trailing or
+/// repeated blank lines, and a final newline.
+fn stripspace(text: &str) -> String {
+    let mut out = String::new();
+    let mut blank = false;
+    for line in text.lines().map(str::trim_end) {
+        if line.is_empty() {
+            blank = !out.is_empty();
+            continue;
+        }
+        if blank {
+            out.push('\n');
+            blank = false;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 fn strip_comments(text: &str) -> String {
     text.lines()
         .filter(|l| !l.starts_with('#'))
@@ -11047,7 +12265,6 @@ pub fn from_cwd(mut command: Command, backend: &Arc<dyn GitBackend>) -> Command 
         | Command::Unstage { paths, .. }
         | Command::Discard { paths, .. }
         | Command::Split { paths, .. }
-        | Command::Archive(ArchiveArgs { paths, .. })
         | Command::Add { paths, .. }
         | Command::Restore { paths, .. }
         | Command::Commit { paths, .. }
@@ -11091,6 +12308,12 @@ pub fn from_cwd(mut command: Command, backend: &Arc<dyn GitBackend>) -> Command 
             pathspec.iter_mut().chain(paths).for_each(fix);
         }
         Command::Resolve { path, .. } => fix(path),
+        Command::Archive(a) => {
+            a.cwd = prefix
+                .components()
+                .map(|c| format!("{}/", c.as_os_str().to_string_lossy()))
+                .collect();
+        }
         Command::Blame { args, .. } => args.last_mut().into_iter().for_each(fix),
         Command::Show { paths, .. } => paths.iter_mut().for_each(fix),
         Command::Log { revs, paths, .. }
@@ -11859,8 +13082,13 @@ pub(crate) fn diff_files(
 static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// Make a successful run exit 1, as `diff --exit-code` does on differences.
-fn set_exit(differs: bool) {
-    EXIT_CODE.store(i32::from(differs), std::sync::atomic::Ordering::Relaxed);
+pub(crate) fn set_exit(differs: bool) {
+    set_exit_code(i32::from(differs));
+}
+
+/// The exit status of a run that succeeds, as `merge-file`'s conflict count.
+pub(crate) fn set_exit_code(code: i32) {
+    EXIT_CODE.store(code, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The exit status of a run that succeeded.

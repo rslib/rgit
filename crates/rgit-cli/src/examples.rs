@@ -164,6 +164,160 @@ const EXAMPLES: &[Entry] = &[
     ),
     ("count-objects", &["rgit count-objects -v"]),
     (
+        "stripspace",
+        &["rgit stripspace < msg.txt", "rgit stripspace -s < msg.txt"],
+    ),
+    (
+        "column",
+        &["rgit branch | rgit column --mode=column,dense --width=80"],
+    ),
+    (
+        "check-ref-format",
+        &[
+            "rgit check-ref-format refs/heads/topic",
+            "rgit check-ref-format --branch @{-1}",
+            "rgit check-ref-format --normalize --allow-onelevel //x",
+        ],
+    ),
+    (
+        "patch-id",
+        &[
+            "rgit log -p main..topic | rgit patch-id --stable",
+            "rgit diff | rgit patch-id",
+        ],
+    ),
+    (
+        "name-rev",
+        &[
+            "rgit name-rev HEAD~3",
+            "rgit name-rev --tags --name-only <rev>",
+            "rgit log --format=%H | rgit name-rev --annotate-stdin",
+        ],
+    ),
+    (
+        "check-attr",
+        &[
+            "rgit check-attr -a src/lib.rs",
+            "rgit check-attr text eol -- a.txt b.bin",
+        ],
+    ),
+    (
+        "diff-tree",
+        &[
+            "rgit diff-tree -r HEAD",
+            "rgit diff-tree -p main feature -- src",
+        ],
+    ),
+    (
+        "diff-index",
+        &[
+            "rgit diff-index HEAD",
+            "rgit diff-index --cached --name-only HEAD",
+        ],
+    ),
+    (
+        "diff-files",
+        &["rgit diff-files", "rgit diff-files --quiet"],
+    ),
+    (
+        "merge-tree",
+        &[
+            "rgit merge-tree --write-tree main feature",
+            "rgit merge-tree --name-only main feature",
+        ],
+    ),
+    (
+        "merge-file",
+        &[
+            "rgit merge-file ours.txt base.txt theirs.txt",
+            "rgit merge-file -p --diff3 -L a -L b -L c a b c",
+        ],
+    ),
+    (
+        "commit-tree",
+        &[
+            "rgit commit-tree 'HEAD^{tree}' -p HEAD -m 'Snapshot'",
+            "rgit commit-tree $(rgit write-tree) -p main -p topic -F msg.txt",
+        ],
+    ),
+    (
+        "write-tree",
+        &["rgit write-tree", "rgit write-tree --prefix=src/"],
+    ),
+    (
+        "read-tree",
+        &[
+            "rgit read-tree HEAD",
+            "rgit read-tree -m -u HEAD topic",
+            "rgit read-tree -m base ours theirs",
+            "rgit read-tree --prefix=vendor/lib/ lib-main",
+        ],
+    ),
+    (
+        "update-index",
+        &[
+            "rgit update-index --add new.txt",
+            "rgit update-index --chmod=+x run.sh",
+            "rgit update-index --add --cacheinfo 100644,<sha1>,path",
+            "rgit update-index --assume-unchanged config.local",
+            "rgit update-index --refresh",
+        ],
+    ),
+    (
+        "checkout-index",
+        &[
+            "rgit checkout-index -f src/lib.rs",
+            "rgit checkout-index -a --prefix=/tmp/export/",
+        ],
+    ),
+    (
+        "mktree",
+        &[
+            "rgit ls-tree HEAD | rgit mktree",
+            "rgit mktree --batch < trees.txt",
+        ],
+    ),
+    ("mktag", &["rgit mktag < tag.txt"]),
+    (
+        "get-tar-commit-id",
+        &["rgit get-tar-commit-id < release.tar"],
+    ),
+    (
+        "fmt-merge-msg",
+        &[
+            "rgit fmt-merge-msg < .git/FETCH_HEAD",
+            "rgit fmt-merge-msg --log=5 -F .git/FETCH_HEAD",
+        ],
+    ),
+    (
+        "mailsplit",
+        &[
+            "rgit mailsplit -o/tmp/mails series.mbox",
+            "rgit mailsplit -b -d3 -f10 -o/tmp/mails --mboxrd inbox.mbox",
+        ],
+    ),
+    (
+        "mailinfo",
+        &["rgit mailinfo msg.txt patch.diff < /tmp/mails/0001"],
+    ),
+    (
+        "interpret-trailers",
+        &[
+            "rgit interpret-trailers --trailer 'Reviewed-by: A <a@x>' < msg.txt",
+            "rgit interpret-trailers --in-place --where start --trailer Fixes=123 msg.txt",
+            "rgit log -1 --format=%B | rgit interpret-trailers --parse",
+        ],
+    ),
+    (
+        "show-branch",
+        &[
+            "rgit show-branch",
+            "rgit show-branch --more=5 main topic",
+            "rgit show-branch --merge-base main topic",
+            "rgit show-branch --reflog=4 main",
+        ],
+    ),
+    (
         "stage",
         &[
             "rgit stage src/lib.rs",
@@ -503,6 +657,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit apply --3way fix.patch",
             "rgit apply --reject -p2 --directory=vendor/lib fix.patch",
             "rgit apply --stat --summary --numstat fix.patch",
+            "rgit apply -C1 --ignore-whitespace fix.patch",
+            "rgit apply -N new-files.patch",
         ],
     ),
     ("notes", &["rgit notes", "rgit notes show HEAD"]),
@@ -514,6 +670,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit notes add -m \"<note>\"",
             "rgit notes add <rev> -m \"<note>\" --force",
             "rgit notes add -F notes.txt <rev>",
+            "rgit notes add --no-stripspace -F notes.txt <rev>",
         ],
     ),
     ("notes append", &["rgit notes append -m \"<more>\""]),
@@ -527,7 +684,15 @@ const EXAMPLES: &[Entry] = &[
     ("notes copy", &["rgit notes copy <from> <to>"]),
     ("notes edit", &["rgit notes edit <rev>"]),
     ("notes prune", &["rgit notes prune -n"]),
-    ("notes merge", &["rgit notes merge -s union origin"]),
+    (
+        "notes merge",
+        &[
+            "rgit notes merge -s union origin",
+            "rgit notes merge origin",
+            "rgit notes merge --commit",
+            "rgit notes merge --abort",
+        ],
+    ),
     ("notes get-ref", &["rgit notes --ref review get-ref"]),
     (
         "update-ref",
@@ -537,6 +702,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit update-ref -d refs/heads/topic",
             "printf 'start\\nupdate refs/heads/a <new> <old>\\ncommit\\n' | rgit update-ref --stdin",
             "rgit update-ref --create-reflog refs/backup/main main",
+            "printf 'symref-update refs/heads/alias refs/heads/main\\n' | rgit update-ref --stdin",
+            "printf 'create refs/heads/a <rev>\\ncreate refs/heads/b <rev>\\n' | rgit update-ref --stdin --batch-updates",
         ],
     ),
     (
@@ -556,6 +723,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit format-patch main..topic --stdout",
             "rgit format-patch main --cover-letter --thread -v2 --to list@example.com",
             "rgit format-patch -3 --rfc --base=auto --subject-prefix=\"PATCH net\"",
+            "rgit format-patch -2 --attach --notes --output=series.mbox",
         ],
     ),
     (
@@ -578,6 +746,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit archive HEAD src > src.tar",
             "rgit archive -9 --add-file=VERSION --format=tar.gz -o dist.tgz v1.0",
             "rgit archive --remote ../other -o other.zip",
+            "rgit archive -v --remote=git@example.com:me/repo.git -o repo.tar.gz v1.0",
             "rgit archive -l",
         ],
     ),
@@ -639,6 +808,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit range-diff main topic-v1 topic-v2",
             "rgit range-diff -s main..topic@{1} main..topic",
             "rgit range-diff topic@{u}...topic",
+            "rgit range-diff --creation-factor=80 --no-notes -U1 main v1 v2 -- src",
         ],
     ),
     (

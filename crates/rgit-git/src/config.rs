@@ -829,7 +829,7 @@ pub fn expiry_date(value: &str) -> Option<i64> {
         };
         return Some(now - n * secs);
     }
-    civil_seconds(&v)
+    civil_seconds(&v).or_else(|| crate::plumbing::parse_git_date(value, 0).map(|(t, _)| t))
 }
 
 /// `YYYY-MM-DD[ HH:MM[:SS]]` (UTC) as a unix timestamp.

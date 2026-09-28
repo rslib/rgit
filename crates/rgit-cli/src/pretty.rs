@@ -110,7 +110,8 @@ pub struct Pretty {
     decorate: bool,
     color: bool,
     decorations: HashMap<String, Vec<(&'static str, String)>>,
-    notes: HashSet<String>,
+    /// The notes refs shown and the objects each annotates.
+    notes: Vec<(String, HashSet<String>)>,
     backend: Arc<dyn GitBackend>,
     graph: bool,
     /// Print the parents after each commit's id.
@@ -134,7 +135,7 @@ impl Pretty {
             .as_deref()
             .or(args.pretty.as_deref())
             .or(args.oneline.then_some("oneline"))
-            .or(args.graph.then_some("medium"))
+            .or((args.graph || args.no_notes || !args.notes.is_empty()).then_some("medium"))
             .or(fallback);
         let Some(spec) = spec else {
             return Ok(None);
@@ -167,12 +168,35 @@ impl Pretty {
             (Some(d), _) => d != "no",
             (None, _) => terminal,
         };
-        // Like git, notes show only in the default format.
-        let notes = if args.format.is_some() || args.pretty.is_some() || args.oneline {
-            HashSet::new()
+        // Like git, notes show only in the built-in formats unless asked for
+        // (or named by %N).
+        let show_notes = if args.no_notes || !args.notes.is_empty() {
+            !args.notes.is_empty()
         } else {
-            let notes = backend.notes(None).unwrap_or_default();
-            notes.into_iter().map(|(_, commit)| commit).collect()
+            !(args.format.is_some() || args.pretty.is_some() || args.oneline)
+                || matches!(&fmt, Fmt::User(f) if f.contains("%N"))
+        };
+        let notes = if show_notes {
+            let use_default = if args.notes.iter().any(String::is_empty) {
+                Some(true)
+            } else {
+                args.no_notes.then_some(false)
+            };
+            let extra: Vec<String> = args
+                .notes
+                .iter()
+                .filter(|r| !r.is_empty())
+                .map(|r| crate::cli::notes_ref_name(r))
+                .collect();
+            display_notes_refs(backend, use_default, &extra)
+                .into_iter()
+                .map(|r| {
+                    let objs = backend.notes(Some(&r)).unwrap_or_default();
+                    (r, objs.into_iter().map(|(_, commit)| commit).collect())
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
         Ok(Some(Pretty {
             fmt,
@@ -383,15 +407,42 @@ impl Pretty {
                 (head, out)
             }
         };
-        if self.notes.contains(&c.id)
-            && let Ok(note) = self.backend.note_show(None, &c.id)
-        {
-            out.push_str("\nNotes:\n");
-            for line in note.lines() {
-                out.push_str(&format!("    {line}\n"));
-            }
+        if !matches!(self.fmt, Fmt::User(_)) {
+            out.push_str(&self.note_block(&c.id, false));
         }
         (head, out)
+    }
+
+    /// The commit's notes as git's format_display_notes writes them: under a
+    /// `Notes (<ref>):` header each, or with `raw` (%N) bare.
+    pub fn note_block(&self, id: &str, raw: bool) -> String {
+        let mut out = String::new();
+        for (r, objs) in &self.notes {
+            let Some(note) = objs
+                .contains(id)
+                .then(|| self.backend.note_show(Some(r), id).ok())
+                .flatten()
+            else {
+                continue;
+            };
+            if !raw {
+                if r == "refs/notes/commits" {
+                    out.push_str("\nNotes:\n");
+                } else {
+                    let short = r.strip_prefix("refs/").unwrap_or(r);
+                    let short = short.strip_prefix("notes/").unwrap_or(short);
+                    out.push_str(&format!("\nNotes ({short}):\n"));
+                }
+            }
+            for line in note.strip_suffix('\n').unwrap_or(&note).split('\n') {
+                if !raw {
+                    out.push_str("    ");
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
     }
 
     /// An annotated tag as `git show` prints it before the tagged object.
@@ -494,7 +545,8 @@ impl Pretty {
             'B' => one(c.message.clone()),
             'd' => one(self.decor(&c.id)),
             'D' => one(self.decor_in(&c.id, false, false)),
-            'e' | 'N' => one(String::new()),
+            'e' => one(String::new()),
+            'N' => one(self.note_block(&c.id, true)),
             'm' => one(c.mark.unwrap_or('>').to_string()),
             'S' => one(c.source.clone().unwrap_or_default()),
             'g' => {
@@ -956,6 +1008,69 @@ fn relative(time: i64) -> String {
         };
     }
     format!("{} ago", plural((diff + 183) / 365, "year"))
+}
+
+/// The notes ref git reads and writes by default: $GIT_NOTES_REF, else
+/// core.notesRef, else refs/notes/commits.
+pub(crate) fn default_notes_ref(backend: &Arc<dyn GitBackend>) -> String {
+    std::env::var("GIT_NOTES_REF")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| backend.config_get("core.notesRef").ok().flatten())
+        .unwrap_or_else(|| "refs/notes/commits".to_owned())
+}
+
+/// The notes refs log and show display, in git's order (notes.c's
+/// load_display_notes): the default ref and $GIT_NOTES_DISPLAY_REF or
+/// notes.displayRef unless `use_default` is false (or unset while `extra`
+/// names refs), then `extra`. Globs expand to the refs they match.
+pub(crate) fn display_notes_refs(
+    backend: &Arc<dyn GitBackend>,
+    use_default: Option<bool>,
+    extra: &[String],
+) -> Vec<String> {
+    let mut patterns = Vec::new();
+    if use_default.unwrap_or(extra.is_empty()) {
+        patterns.push(default_notes_ref(backend));
+        match std::env::var("GIT_NOTES_DISPLAY_REF") {
+            Ok(env) => patterns.extend(env.split(':').filter(|p| !p.is_empty()).map(str::to_owned)),
+            Err(_) => patterns.extend(
+                backend
+                    .config_entries(rgit_git::ConfigScope::Any, Some("notes.displayRef"))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(_, v)| v),
+            ),
+        }
+    }
+    patterns.extend(extra.iter().cloned());
+    let mut refs: Vec<String> = Vec::new();
+    let mut all = None;
+    for p in patterns {
+        let found = if p.contains(['*', '?', '[', '\\']) {
+            let names = all.get_or_insert_with(|| {
+                backend
+                    .ref_details()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| r.name)
+                    .collect::<Vec<_>>()
+            });
+            names
+                .iter()
+                .filter(|n| crate::plumbing::glob(p.as_bytes(), n.as_bytes()))
+                .cloned()
+                .collect()
+        } else {
+            vec![p]
+        };
+        for r in found {
+            if !refs.contains(&r) {
+                refs.push(r);
+            }
+        }
+    }
+    refs
 }
 
 #[cfg(test)]

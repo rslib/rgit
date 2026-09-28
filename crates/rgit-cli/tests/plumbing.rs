@@ -889,3 +889,1075 @@ fn agent_output_is_structured() {
     assert!(toon(&["shortlog", "HEAD"]).contains("authors[2]{author,count}:"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn diff_plumbing_matches_git() {
+    let dir = repo("diff-plumbing");
+    git(&dir, &["add", "dir/a"], &[]);
+    write(&dir, "dir/a", b"alpha\nagain\n");
+    let cases: Vec<Vec<&str>> = [
+        "diff-tree HEAD",
+        "diff-tree -r HEAD~1",
+        "diff-tree -r -t HEAD~2 side",
+        "diff-tree --root -r HEAD~2",
+        "diff-tree HEAD~2",
+        "diff-tree -p HEAD~1",
+        "diff-tree --name-status -r lw side",
+        "diff-tree --name-only -z -r lw side",
+        "diff-tree -z lw side",
+        "diff-tree -s HEAD~1",
+        "diff-tree --no-commit-id -r HEAD~1",
+        "diff-tree lw side -- dir",
+        "diff-tree -r HEAD~2 HEAD dir",
+        "diff-tree --quiet HEAD~1",
+        "diff-tree nope",
+        "diff-index HEAD",
+        "diff-index --cached HEAD",
+        "diff-index -p HEAD",
+        "diff-index --cached --name-status HEAD~2",
+        "diff-index HEAD -- dir",
+        "diff-files",
+        "diff-files -p",
+        "diff-files --name-only -z",
+        "diff-files dir",
+        "diff-files --quiet",
+    ]
+    .iter()
+    .map(|c| c.split(' ').collect())
+    .collect();
+    let cases: Vec<&[&str]> = cases.iter().map(Vec::as_slice).collect();
+    same(&dir, &cases);
+    same(
+        &dir.join("dir"),
+        &[&["diff-files", "a"][..], &["diff-index", "HEAD", "."]],
+    );
+    let revs = git(&dir, &["rev-list", "--all"], &[]);
+    same_input(&dir, &["diff-tree", "--stdin", "-r"], revs.as_bytes());
+    let trees = git(&dir, &["rev-parse", "lw^{tree}", "side^{tree}"], &[]).replace('\n', " ");
+    same_input(
+        &dir,
+        &["diff-tree", "--stdin"],
+        format!("{}\nnot an id\n", trees.trim_end()).as_bytes(),
+    );
+    let code = |args: &[&str]| rgit(&dir, args).status.code();
+    assert_eq!(code(&["diff-files", "--quiet"]), Some(1));
+    assert_eq!(
+        code(&["diff-index", "--cached", "--exit-code", "HEAD"]),
+        Some(1)
+    );
+    assert_eq!(code(&["diff-tree", "--exit-code", "HEAD", "HEAD"]), Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn merge_tree_and_merge_file_match_git() {
+    let dir = repo("merge-tree");
+    git(&dir, &["stash", "-u", "-q"], &[]);
+    git(&dir, &["checkout", "-q", "-b", "x", "lw"], &[]);
+    write(&dir, "c.txt", b"one\nFoo X\nfoobar\na+b\ntwo\n");
+    write(&dir, "e.txt", b"echo x\n");
+    write(&dir, "both", b"x\n");
+    write(&dir, "g", b"1\n2\n3\n4\n5\n6\n");
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 6, "x", "T");
+    git(&dir, &["checkout", "-q", "-b", "y", "lw"], &[]);
+    write(&dir, "c.txt", b"one\nFoo Y\nfoobar\na+b\ntwo\n");
+    git(&dir, &["rm", "-q", "e.txt"], &[]);
+    write(&dir, "both", b"y\n");
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 7, "y", "T");
+    git(&dir, &["checkout", "-q", "-b", "z", "x"], &[]);
+    write(&dir, "g", b"1\n2\n3\n4\n5\nsix\n");
+    commit_all(&dir, "z");
+    git(&dir, &["checkout", "-q", "x"], &[]);
+    write(&dir, "g", b"one\n2\n3\n4\n5\n6\n");
+    commit_all(&dir, "x2");
+    same(
+        &dir,
+        &[
+            &["merge-tree", "--write-tree", "x", "y"][..],
+            &["merge-tree", "y", "x"],
+            &["merge-tree", "--name-only", "x", "y"],
+            &["merge-tree", "-z", "x", "y"],
+            &["merge-tree", "--no-messages", "x", "y"],
+            &["merge-tree", "x", "z"],
+            &["merge-tree", "--messages", "x", "z"],
+            &["merge-tree", "-z", "--messages", "x", "z"],
+            &["merge-tree", "--merge-base=lw", "z", "y"],
+            &["merge-tree", "x", "nope"],
+        ],
+    );
+    assert_eq!(rgit(&dir, &["merge-tree", "x", "y"]).status.code(), Some(1));
+    write(&dir, "base", b"a\nb\nc\nd\ne\nf\ng\nh\n");
+    write(&dir, "ours", b"a\nB\nc\nd\ne\nf\ng\nh1\n");
+    write(&dir, "theirs", b"a\nX\nc\nd\ne\nf\ng\nh2\n");
+    write(&dir, "zb", b"a\nb x y\nc\n");
+    write(&dir, "zo", b"a\nb x Q\nz\nc\n");
+    write(&dir, "zt", b"a\nb x R\nz\nc\n");
+    let with = |extra: &[&'static str]| -> Vec<&'static str> {
+        let mut v = vec!["merge-file", "-p"];
+        v.extend(extra);
+        v
+    };
+    let cases = [
+        with(&["ours", "base", "theirs"]),
+        with(&["-L", "A", "-L", "B", "-L", "C", "ours", "base", "theirs"]),
+        with(&["--diff3", "ours", "base", "theirs"]),
+        with(&["--zdiff3", "zo", "zb", "zt"]),
+        with(&["--diff3", "zo", "zb", "zt"]),
+        with(&["--ours", "ours", "base", "theirs"]),
+        with(&["--theirs", "ours", "base", "theirs"]),
+        with(&["--union", "ours", "base", "theirs"]),
+        with(&["--marker-size=3", "ours", "base", "theirs"]),
+        with(&["base", "base", "theirs"]),
+    ];
+    let cases: Vec<&[&str]> = cases.iter().map(Vec::as_slice).collect();
+    same(&dir, &cases);
+    for args in &cases {
+        assert_eq!(
+            rgit(&dir, args).status.code(),
+            run("git", &dir, args, &[]).status.code(),
+            "{args:?}"
+        );
+    }
+    std::fs::copy(dir.join("ours"), dir.join("mine")).unwrap();
+    rgit(&dir, &["merge-file", "mine", "base", "theirs"]);
+    run("git", &dir, &["merge-file", "ours", "base", "theirs"], &[]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("mine"))
+            .unwrap()
+            .replace("mine", "ours"),
+        std::fs::read_to_string(dir.join("ours")).unwrap()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn commit_all(dir: &Path, message: &str) {
+    git(dir, &["commit", "-q", "-am", message], &[]);
+}
+
+#[test]
+fn text_filters_match_git() {
+    let dir = repo("text-filters");
+    let messy = b"\n\n  a  \n\tb\n\n\n# note\n  \nc\t\n\n";
+    same_input(&dir, &["stripspace"], messy);
+    same_input(&dir, &["stripspace", "-s"], messy);
+    same_input(&dir, &["stripspace", "-c"], messy);
+    same_input(&dir, &["stripspace", "-c"], b"no newline");
+    let words: String = (1..=23)
+        .map(|i| format!("item{}\n", "x".repeat(i % 7)))
+        .collect();
+    for args in [
+        &["column"][..],
+        &["column", "--mode=column", "--width=40"],
+        &["column", "--mode=row", "--width=40"],
+        &["column", "--mode=column,dense", "--width=40"],
+        &["column", "--mode=row,dense", "--width=50", "--padding=3"],
+        &[
+            "column",
+            "--mode=column",
+            "--width=30",
+            "--indent=> ",
+            "--nl=|\n",
+        ],
+        &["column", "--mode=plain", "--indent=* "],
+        &["column", "--raw-mode=16", "--width=20"],
+        &["column", "--mode=never"],
+    ] {
+        same_input(&dir, args, words.as_bytes());
+    }
+    let log = git(&dir, &["log", "-p", "--all"], &[]);
+    same_input(&dir, &["patch-id"], log.as_bytes());
+    same_input(&dir, &["patch-id", "--stable"], log.as_bytes());
+    same_input(&dir, &["patch-id", "--verbatim"], log.as_bytes());
+    let mails = git(&dir, &["format-patch", "--stdout", "HEAD~2"], &[]);
+    same_input(&dir, &["patch-id", "--stable"], mails.as_bytes());
+    let diff = git(&dir, &["diff"], &[]);
+    same_input(&dir, &["patch-id"], diff.as_bytes());
+    let mut cases: Vec<Vec<&str>> = Vec::new();
+    for name in [
+        "a/b",
+        "a",
+        "refs/heads/x.",
+        "a/.b",
+        "a..b",
+        "a/b.lock",
+        "a/@{b",
+        "@",
+        "a//b",
+        "/a/b",
+        "a/b/",
+        "a/*",
+        "a/b*c",
+        "a/*/*",
+        "a b/c",
+        "a\\b/c",
+        "refs/heads/-x",
+        "a/b~1",
+    ] {
+        for flag in [
+            "--normalize",
+            "--refspec-pattern",
+            "--allow-onelevel",
+            "--print",
+        ] {
+            cases.push(vec!["check-ref-format", flag, name]);
+        }
+        cases.push(vec!["check-ref-format", name]);
+    }
+    for name in ["feature/x", "-x", "HEAD", "a..b", "@{-1}"] {
+        cases.push(vec!["check-ref-format", "--branch", name]);
+    }
+    let cases: Vec<&[&str]> = cases.iter().map(Vec::as_slice).collect();
+    same(&dir, &cases);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn name_rev_matches_git() {
+    let dir = repo("name-rev");
+    git(&dir, &["branch", "old", "HEAD~1"], &[]);
+    let side = git(&dir, &["rev-parse", "side"], &[]);
+    let first = git(&dir, &["rev-parse", "HEAD~1"], &[]);
+    same(
+        &dir,
+        &[
+            &["name-rev", "HEAD"][..],
+            &["name-rev", "HEAD~1", "side", "HEAD^2", "v1"],
+            &["name-rev", "--name-only", "HEAD~1", "side"],
+            &["name-rev", "--tags", "HEAD~1", "side"],
+            &["name-rev", "--tags", "--name-only", "side"],
+            &["name-rev", "--refs=side", "HEAD~1"],
+            &["name-rev", "--refs=refs/heads/*", "HEAD~2"],
+            &["name-rev", "--exclude=main", "HEAD~1"],
+            &["name-rev", "--peel-tag", "v1"],
+            &["name-rev", "--tags", "HEAD"],
+            &["name-rev", "--tags", "--always", "HEAD"],
+            &["name-rev", "--tags", "--no-undefined", "HEAD"],
+            &["name-rev", "lw", "HEAD^{tree}"],
+        ],
+    );
+    let text = format!(
+        "fix {} and\n{}x\n{}",
+        side.trim(),
+        first.trim(),
+        first.trim()
+    );
+    same_input(&dir, &["name-rev", "--annotate-stdin"], text.as_bytes());
+    same_input(
+        &dir,
+        &["name-rev", "--annotate-stdin", "--name-only"],
+        text.as_bytes(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_attr_matches_git() {
+    let dir = repo("check-attr");
+    write(
+        &dir,
+        ".gitattributes",
+        b"*.bin binary\n*.txt text eol=lf foo=bar\n[attr]mine -text zz\nsub/* mine\n\"we ird*\" odd\n",
+    );
+    write(&dir, "sub/.gitattributes", b"*.c whitespace=x -foo !zz\n");
+    git(&dir, &["add", ".gitattributes"], &[]);
+    write(&dir, ".gitattributes", b"*.txt -text\n");
+    same(
+        &dir,
+        &[
+            &[
+                "check-attr",
+                "-a",
+                "a.bin",
+                "a.txt",
+                "sub/x.c",
+                "sub/y",
+                "none",
+            ][..],
+            &["check-attr", "text", "a.bin", "a.txt", "sub/x.c"],
+            &[
+                "check-attr",
+                "text",
+                "eol",
+                "binary",
+                "--",
+                "a.bin",
+                "a.txt",
+            ],
+            &["check-attr", "--cached", "-a", "a.txt", "sub/x.c"],
+            &["check-attr", "-a", "-z", "a.txt", "we ird\"x"],
+            &["check-attr", "odd", "we ird\"x"],
+        ],
+    );
+    same(
+        &dir.join("sub"),
+        &[&["check-attr", "-a", "x.c", "../a.txt"][..]],
+    );
+    same_input(
+        &dir,
+        &["check-attr", "--stdin", "text", "zz"],
+        b"a.txt\nsub/q.c\n",
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Run each step with git in one twin of `repo` and rgit in the other, and
+/// check they print the same, agree on success and leave the same index
+/// (`ls-files -s`, `-v`) and working tree (`status`). A step is the folder
+/// under the top, the arguments and stdin.
+fn twins(tag: &str, steps: &[(&str, &[&str], &[u8])]) {
+    let (a, b) = (repo(&format!("{tag}-git")), repo(&format!("{tag}-rgit")));
+    let feed = |bin: &str, dir: &Path, args: &[&str], input: &[u8]| {
+        use std::io::Write;
+        let mut child = Command::new(bin)
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("RGIT_OPLOG", "0")
+            .env("GIT_AUTHOR_DATE", "2024-02-01T10:00:00+0100")
+            .env("GIT_COMMITTER_DATE", "2024-02-01T10:00:00+0100")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let state = |dir: &Path| {
+        [
+            &["ls-files", "-s"][..],
+            &["ls-files", "-v"],
+            &["status", "--porcelain", "-uall"],
+        ]
+        .map(|args| git(dir, args, &[]))
+    };
+    for (sub, args, input) in steps {
+        let want = feed("git", &a.join(sub), args, input);
+        let mut human = vec!["--human"];
+        human.extend(*args);
+        let got = feed(env!("CARGO_BIN_EXE_rgit"), &b.join(sub), &human, input);
+        assert_eq!(
+            (String::from_utf8_lossy(&got.stdout), got.status.success()),
+            (String::from_utf8_lossy(&want.stdout), want.status.success()),
+            "{args:?} in {sub:?}\n  git stderr: {}\n  rgit stderr: {}",
+            String::from_utf8_lossy(&want.stderr),
+            String::from_utf8_lossy(&got.stderr)
+        );
+        assert_eq!(state(&b), state(&a), "state after {args:?}");
+    }
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}
+
+#[test]
+fn object_writers_match_git() {
+    let blob = "3e757656cf36eca53338e520d134963a44f793f8";
+    let tree_in = format!(
+        "100644 blob {blob}\tz\n040000 tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\tsub\n100755 blob {blob}\t\"q\\tx\"\n"
+    );
+    let missing = b"100644 blob 0000000000000000000000000000000000000001\tz\n";
+    twins(
+        "writers",
+        &[
+            ("", &["hash-object", "-w", "--stdin"], b"new\n"),
+            ("", &["write-tree"], b""),
+            ("", &["write-tree", "--prefix=dir"], b""),
+            ("", &["write-tree", "--prefix=nope/"], b""),
+            (
+                "",
+                &[
+                    "commit-tree",
+                    "HEAD^{tree}",
+                    "-p",
+                    "HEAD",
+                    "-m",
+                    "one",
+                    "-m",
+                    "two",
+                ],
+                b"",
+            ),
+            (
+                "",
+                &[
+                    "commit-tree",
+                    "HEAD^{tree}",
+                    "-p",
+                    "HEAD",
+                    "-p",
+                    "side",
+                    "-p",
+                    "HEAD",
+                ],
+                b"from stdin\n",
+            ),
+            ("", &["commit-tree", "HEAD"], b"x"),
+            (
+                "",
+                &["commit-tree", "HEAD^{tree}", "-F", "-"],
+                b"no newline",
+            ),
+            ("", &["mktree"], tree_in.as_bytes()),
+            (
+                "",
+                &["mktree", "--batch"],
+                tree_in.replace("\n0", "\n\n0").as_bytes(),
+            ),
+            ("", &["mktree"], missing),
+            ("", &["mktree", "--missing"], missing),
+            (
+                "",
+                &["mktree"],
+                format!("100644 tree {blob}\tz\n").as_bytes(),
+            ),
+            (
+                "",
+                &["mktree"],
+                format!("100644 blob {blob}\tz/y\n").as_bytes(),
+            ),
+            (
+                "",
+                &["mktree", "-z"],
+                format!("100644 blob {blob}\tz\0").as_bytes(),
+            ),
+        ],
+    );
+    let dir = repo("mktag");
+    let head = git(&dir, &["rev-parse", "HEAD"], &[]);
+    let tag = |object: &str, kind: &str, rest: &str| {
+        format!("object {object}\ntype {kind}\ntag v2\n{rest}").into_bytes()
+    };
+    let head = head.trim();
+    let ok = "tagger T <t@e> 1700000000 +0000\n\nhi\n";
+    for input in [
+        tag(head, "commit", ok),
+        tag(head, "tree", ok),
+        tag(head, "commit", "\nhi\n"),
+        tag(
+            head,
+            "commit",
+            "tagger T <t@e> 1700000000 +0000\nfoo bar\n\nhi\n",
+        ),
+        tag(head, "commit", "tagger T <t@e> 1700000000 +0000\n"),
+        tag(head, "commit", "tagger T t@e 1700000000 +0000\n\nx\n"),
+        tag("0000000000000000000000000000000000000001", "commit", ok),
+        format!("object {head}\ntype commit\ntag v 1\n{ok}").into_bytes(),
+    ] {
+        same_input(&dir, &["mktag"], &input);
+        same_input(&dir, &["mktag", "--no-strict"], &input);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn index_writers_match_git() {
+    let a_blob = "78981922613b2afb6025042ff6bd878ac1994e85";
+    let info = format!(
+        "100644 {a_blob} 1\tc2\n100644 {a_blob} 2\tc2\n0 {a_blob}\te.txt\n100755 blob {a_blob}\tw\n"
+    );
+    let cacheinfo = format!("100644,{a_blob},x");
+    twins(
+        "update-index",
+        &[
+            ("", &["hash-object", "-w", "--stdin"], b"a\n"),
+            ("", &["update-index", "u.txt"], b""),
+            ("", &["update-index", "--add", "u.txt"], b""),
+            ("", &["update-index", "dir/sub/b"], b""),
+            ("", &["update-index", "--remove", "dir/sub/b"], b""),
+            ("", &["update-index", "--force-remove", "e.txt"], b""),
+            ("", &["update-index", "--cacheinfo", &cacheinfo], b""),
+            (
+                "",
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    "100644",
+                    a_blob,
+                    "x",
+                ],
+                b"",
+            ),
+            ("", &["update-index", "--chmod=+x", "x.log"], b""),
+            (
+                "dir",
+                &[
+                    "update-index",
+                    "--add",
+                    "--chmod=+x",
+                    "--verbose",
+                    "a",
+                    "../x.log",
+                ],
+                b"",
+            ),
+            ("", &["update-index", "--chmod=-x", "dir/a"], b""),
+            ("", &["update-index", "--assume-unchanged", "c.txt"], b""),
+            ("", &["update-index", "--skip-worktree", "s.txt"], b""),
+            (
+                "",
+                &[
+                    "update-index",
+                    "--no-assume-unchanged",
+                    "c.txt",
+                    "--no-skip-worktree",
+                    "s.txt",
+                ],
+                b"",
+            ),
+            ("", &["update-index", "--index-info"], info.as_bytes()),
+            ("", &["update-index", "--refresh"], b""),
+            ("", &["update-index", "-q", "--refresh"], b""),
+            ("dir", &["update-index", "--really-refresh"], b""),
+            (
+                "",
+                &["update-index", "--add", "--stdin"],
+                b"dir/y.tmp\nbuild/out.o\n",
+            ),
+            ("", &["update-index", "--add", "-z", "--stdin"], b"u.txt\0"),
+            ("", &["update-index", "--add", "--info-only", "x.log"], b""),
+            ("", &["update-index", "--stdin", "u.txt"], b""),
+        ],
+    );
+    twins(
+        "checkout-index",
+        &[
+            ("", &["checkout-index", "dir/a"], b""),
+            ("", &["checkout-index", "dir/sub/b", "nope"], b""),
+            ("", &["checkout-index", "-a"], b""),
+            ("dir", &["checkout-index", "-f", "-u", "a"], b""),
+            ("", &["checkout-index", "-f", "-a", "--prefix=out/"], b""),
+            (
+                "",
+                &["checkout-index", "-n", "-f", "--stdin"],
+                b"c.txt\ne.txt\n",
+            ),
+        ],
+    );
+    twins(
+        "read-tree",
+        &[
+            ("", &["read-tree", "side"], b""),
+            ("", &["read-tree", "-u", "HEAD"], b""),
+            ("", &["read-tree", "--reset", "-u", "HEAD"], b""),
+            ("", &["read-tree", "--prefix=v/", "side"], b""),
+            ("", &["read-tree", "--prefix=v", "side"], b""),
+            ("", &["read-tree", "-m", "-u", "HEAD", "side"], b""),
+            ("", &["read-tree", "--reset", "-u", "HEAD"], b""),
+            ("", &["read-tree", "-m", "HEAD~1", "HEAD", "side"], b""),
+            ("", &["read-tree", "--empty"], b""),
+            (
+                "",
+                &[
+                    "read-tree",
+                    "-m",
+                    "--aggressive",
+                    "-i",
+                    "HEAD~2",
+                    "HEAD",
+                    "side",
+                ],
+                b"",
+            ),
+            ("", &["write-tree"], b""),
+            ("", &["read-tree", "--reset", "-u", "side"], b""),
+            ("", &["read-tree", "-m", "-u", "side", "HEAD"], b""),
+            ("", &["read-tree", "-n", "-m", "HEAD", "side"], b""),
+        ],
+    );
+    // A tree whose c.txt differs from HEAD's, for a 3-way conflict.
+    let probe = repo("read-tree-probe");
+    let new = git(&probe, &["hash-object", "-w", "--stdin"], &[]);
+    let new = new.trim();
+    let cacheinfo = format!("100644,{new},c.txt");
+    git(&probe, &["update-index", "--cacheinfo", &cacheinfo], &[]);
+    let theirs = git(&probe, &["write-tree"], &[]);
+    let theirs = theirs.trim();
+    let _ = std::fs::remove_dir_all(&probe);
+    let three = ["read-tree", "-m", "HEAD~2", "HEAD", theirs];
+    twins(
+        "read-tree-3way",
+        &[
+            ("", &["update-index", "--cacheinfo", &cacheinfo], b""),
+            ("", &["write-tree"], b""),
+            ("", &["read-tree", "--reset", "-u", "HEAD"], b""),
+            ("", &three, b""),
+            ("", &["write-tree"], b""),
+            ("", &["read-tree", "-m", "HEAD"], b""),
+            ("", &["read-tree", "--reset", "HEAD"], b""),
+            (
+                "",
+                &[
+                    "read-tree",
+                    "-m",
+                    "-u",
+                    "--aggressive",
+                    "HEAD~2",
+                    "HEAD",
+                    theirs,
+                ],
+                b"",
+            ),
+            ("", &["read-tree", "--reset", "-u", "HEAD"], b""),
+            ("", &["read-tree", "-m", "-u", "HEAD", theirs], b""),
+        ],
+    );
+}
+
+#[test]
+fn get_tar_commit_id_reads_the_pax_comment() {
+    let dir = repo("tar-commit-id");
+    let tar = |rev: &str| run("git", &dir, &["archive", rev], &[]).stdout;
+    let id = git(&dir, &["rev-parse", "HEAD"], &[]);
+    same_input(&dir, &["get-tar-commit-id"], &tar("HEAD"));
+    same_input(&dir, &["get-tar-commit-id"], &tar("HEAD^{tree}"));
+    same_input(&dir, &["get-tar-commit-id"], b"short");
+    let got = |input: &[u8]| {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rgit"))
+            .args(["--human", "get-tar-commit-id"])
+            .current_dir(std::env::temp_dir())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let out = got(&tar("HEAD"));
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), id);
+    assert_eq!(got(&tar("HEAD^{tree}")).status.code(), Some(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fmt_merge_msg_matches_git() {
+    let dir = repo("fmt-merge-msg");
+    git(&dir, &["stash", "-u", "-q"], &[]);
+    for (branch, n, author) in [("topic", 6, "Bob"), ("fix", 7, "Carol")] {
+        git(&dir, &["checkout", "-q", "-b", branch, "main"], &[]);
+        for k in 0..3 {
+            write(&dir, &format!("{branch}{k}.txt"), b"x\n");
+            git(&dir, &["add", "."], &[]);
+            commit(&dir, n, &format!("{branch} work {k}"), author);
+        }
+    }
+    git(
+        &dir,
+        &["tag", "-a", "v2", "-m", "second release\n\nwith notes"],
+        &[],
+    );
+    git(&dir, &["checkout", "-q", "main"], &[]);
+    git(
+        &dir,
+        &[
+            "config",
+            "branch.topic.description",
+            "the topic\nsecond line",
+        ],
+        &[],
+    );
+    let id = |r: &str| git(&dir, &["rev-parse", r], &[]).trim().to_owned();
+    let (topic, fix, v2, side) = (id("topic"), id("fix"), id("v2"), id("side"));
+    let inputs = [
+        format!("{topic}\t\tbranch 'topic' of .\n"),
+        format!("{topic}\t\tbranch 'topic' of .\n{fix}\t\tbranch 'fix' of .\n"),
+        format!("{v2}\t\ttag 'v2' of .\n"),
+        format!(
+            "{topic}\t\tbranch 'topic' of https://example.com/r.git\n{fix}\tnot-for-merge\tbranch 'fix' of https://example.com/r.git\n"
+        ),
+        format!(
+            "{topic}\t\tbranch 'topic' of https://example.com/r.git\n{fix}\t\t'fix' of https://example.com/s.git\n{v2}\t\tremote-tracking branch 'origin/x' of .\n"
+        ),
+        format!("{topic}\t\thttps://example.com/r.git\n"),
+        format!("{side}\t\tbranch 'side' of .\n{topic}\t\tbranch 'topic' of .\n"),
+        format!("{fix}\t\tcommit '{fix}' of .\n"),
+    ];
+    for input in &inputs {
+        same_input(&dir, &["fmt-merge-msg"], input.as_bytes());
+        same_input(&dir, &["fmt-merge-msg", "--log"], input.as_bytes());
+        same_input(
+            &dir,
+            &["fmt-merge-msg", "--log=1", "-m", "Custom"],
+            input.as_bytes(),
+        );
+        same_input(
+            &dir,
+            &["fmt-merge-msg", "--into-name", "rel"],
+            input.as_bytes(),
+        );
+    }
+    git(&dir, &["config", "merge.log", "2"], &[]);
+    git(&dir, &["config", "merge.branchdesc", "true"], &[]);
+    git(&dir, &["config", "merge.suppressDest", "rel*"], &[]);
+    same_input(&dir, &["fmt-merge-msg"], inputs[1].as_bytes());
+    same_input(&dir, &["fmt-merge-msg", "--no-log"], inputs[1].as_bytes());
+    same_input(
+        &dir,
+        &["fmt-merge-msg", "--into-name", "release"],
+        inputs[0].as_bytes(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn interpret_trailers_matches_git() {
+    let dir = repo("trailers");
+    let msgs: &[&[u8]] = &[
+        b"",
+        b"subject",
+        b"subject\n\nbody\n",
+        b"subject\n\nbody\n\nSigned-off-by: A <a@x>\nAcked-by: B\n",
+        b"subject\n\nSigned-off-by: A\n  continued here\nFixes: 123\n",
+        b"subject\n\nbody text\nmore text\nnot: a trailer block really\nSigned-off-by: A\n",
+        b"subject\n\nsome prose\n(cherry picked from commit abc)\nMore prose\nx\n",
+        b"subject\n\nReviewed-by: R\n\n# comment\n# more\n",
+        b"subject\n\nReviewed-by: R\n---\n diff --git a/x b/x\n",
+        b"subject\n\nReviewed-by: R\n# ------------------------ >8 ------------------------\ncut: yes\n",
+        b"Signed-off-by: only title\n",
+        b"subject\n\nbody\n\nfoo bar\nSigned-off-by: A\n",
+        b"subject\n\nKey: v1\nKey: v2\nOther: o\n",
+    ];
+    let cases: &[&[&str]] = &[
+        &["interpret-trailers"],
+        &["interpret-trailers", "--trailer", "Acked-by: Z"],
+        &["interpret-trailers", "--trailer", "Signed-off-by=A <a@x>"],
+        &[
+            "interpret-trailers",
+            "--trailer",
+            "key: v2",
+            "--trailer",
+            "key=v3",
+        ],
+        &[
+            "interpret-trailers",
+            "--where",
+            "start",
+            "--trailer",
+            "Key: s",
+        ],
+        &[
+            "interpret-trailers",
+            "--where=before",
+            "--trailer",
+            "Key: b",
+            "--no-where",
+            "--trailer",
+            "Other: e",
+        ],
+        &[
+            "interpret-trailers",
+            "--where",
+            "after",
+            "--if-exists",
+            "replace",
+            "--trailer",
+            "key: new",
+        ],
+        &[
+            "interpret-trailers",
+            "--if-exists",
+            "addIfDifferent",
+            "--trailer",
+            "Key: v1",
+            "--trailer",
+            "Key: v9",
+        ],
+        &[
+            "interpret-trailers",
+            "--if-exists",
+            "add",
+            "--trailer",
+            "Key: v2",
+        ],
+        &[
+            "interpret-trailers",
+            "--if-exists",
+            "doNothing",
+            "--trailer",
+            "Key: z",
+        ],
+        &[
+            "interpret-trailers",
+            "--if-missing",
+            "doNothing",
+            "--trailer",
+            "New: z",
+            "--trailer",
+            "Key: n",
+        ],
+        &["interpret-trailers", "--trailer", "Empty", "--trim-empty"],
+        &["interpret-trailers", "--trailer", "Empty"],
+        &["interpret-trailers", "--only-trailers"],
+        &["interpret-trailers", "--only-trailers", "--unfold"],
+        &["interpret-trailers", "--parse"],
+        &["interpret-trailers", "--no-divider", "--trailer", "X: y"],
+        &["interpret-trailers", "--trailer", ": novalue"],
+    ];
+    for msg in msgs {
+        for args in cases {
+            same_input(&dir, args, msg);
+        }
+    }
+    for (k, v) in [
+        ("trailer.sign.key", "Signed-off-by: "),
+        ("trailer.ack.key", "Acked-by"),
+        ("trailer.ack.where", "start"),
+        ("trailer.separators", ":#"),
+        ("trailer.ifexists", "addIfDifferent"),
+        ("trailer.see.command", "echo got $ARG"),
+    ] {
+        git(&dir, &["config", k, v], &[]);
+    }
+    let conf_cases: &[&[&str]] = &[
+        &["interpret-trailers"],
+        &["interpret-trailers", "--trailer", "sign=Me"],
+        &[
+            "interpret-trailers",
+            "--trailer",
+            "ack: You",
+            "--trailer",
+            "Key#x",
+        ],
+        &["interpret-trailers", "--trailer", "see: it"],
+        &["interpret-trailers", "--only-input"],
+    ];
+    for msg in msgs {
+        for args in conf_cases {
+            same_input(&dir, args, msg);
+        }
+    }
+    write(&dir, "m1.txt", b"subject\n\nbody\n");
+    same(
+        &dir,
+        &[&[
+            "interpret-trailers",
+            "--trailer",
+            "a: b",
+            "m1.txt",
+            "m1.txt",
+        ][..]],
+    );
+    write(&dir, "m2.txt", b"subject\n\nbody\n");
+    let want = git(
+        &dir,
+        &["interpret-trailers", "--trailer", "a: b", "m1.txt"],
+        &[],
+    );
+    assert!(
+        rgit(
+            &dir,
+            &[
+                "interpret-trailers",
+                "--in-place",
+                "--trailer",
+                "a: b",
+                "m2.txt"
+            ]
+        )
+        .status
+        .success()
+    );
+    assert_eq!(std::fs::read_to_string(dir.join("m2.txt")).unwrap(), want);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn show_branch_matches_git() {
+    let dir = repo("show-branch");
+    git(&dir, &["stash", "-u", "-q"], &[]);
+    git(&dir, &["branch", "old", "HEAD~1"], &[]);
+    git(&dir, &["checkout", "-q", "-b", "feat", "HEAD~1"], &[]);
+    for (n, f) in [(6, "f1"), (7, "[PATCH] f2\nwrapped")] {
+        write(&dir, &format!("{n}.txt"), b"x\n");
+        git(&dir, &["add", "."], &[]);
+        commit(&dir, n, f, "T");
+    }
+    git(&dir, &["checkout", "-q", "-b", "topic", "side"], &[]);
+    write(&dir, "t.txt", b"t\n");
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 8, "topic work", "T");
+    let date = "2024-01-09T10:00:00+0200";
+    git(
+        &dir,
+        &["merge", "-q", "--no-ff", "-m", "merge feat", "feat"],
+        &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+    );
+    git(&dir, &["checkout", "-q", "main"], &[]);
+    git(&dir, &["tag", "feat", "HEAD~1"], &[]);
+    git(
+        &dir,
+        &["update-ref", "refs/remotes/origin/main", "HEAD~1"],
+        &[],
+    );
+    git(
+        &dir,
+        &["update-ref", "refs/remotes/origin/feat", "feat"],
+        &[],
+    );
+    same(
+        &dir,
+        &[
+            &["show-branch"][..],
+            &["show-branch", "--all"],
+            &["show-branch", "-r"],
+            &["show-branch", "main", "side", "heads/feat"],
+            &["show-branch", "--more=2", "main", "side"],
+            &["show-branch", "--more", "main", "topic"],
+            &["show-branch", "--list"],
+            &["show-branch", "--list", "-a"],
+            &["show-branch", "--merge-base", "main", "heads/feat", "topic"],
+            &["show-branch", "--merge-base", "old", "side"],
+            &[
+                "show-branch",
+                "--independent",
+                "main",
+                "side",
+                "heads/feat",
+                "old",
+            ],
+            &["show-branch", "--no-name", "main", "topic"],
+            &["show-branch", "--sha1-name", "main", "topic"],
+            &["show-branch", "--topics", "main", "topic", "side"],
+            &["show-branch", "--sparse", "main", "topic", "side"],
+            &[
+                "show-branch",
+                "--date-order",
+                "main",
+                "side",
+                "heads/feat",
+                "topic",
+            ],
+            &["show-branch", "--topo-order", "old", "topic"],
+            &["show-branch", "--current", "side", "topic"],
+            &["show-branch", "t*", "heads/*"],
+            &["show-branch", "main"],
+            &["show-branch", "main~1", "topic^2"],
+            &["show-branch", "--color=always", "main", "topic"],
+            &["show-branch", "--reflog=2", "main"],
+            &["show-branch", "-g"],
+            &["show-branch", "--reflog=3,1", "topic"],
+        ],
+    );
+    git(
+        &dir,
+        &["config", "--add", "showbranch.default", "--topo-order"],
+        &[],
+    );
+    git(
+        &dir,
+        &["config", "--add", "showbranch.default", "side"],
+        &[],
+    );
+    git(&dir, &["config", "--add", "showbranch.default", "old"], &[]);
+    same(
+        &dir,
+        &[&["show-branch"][..], &["show-branch", "main", "topic"]],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mailsplit_and_mailinfo_match_git() {
+    let dir = repo("mail");
+    let mbox = git(&dir, &["format-patch", "--stdout", "-2", "HEAD~1"], &[]);
+    let crlf = mbox.replace('\n', "\r\n");
+    write(&dir, "series.mbox", mbox.as_bytes());
+    write(&dir, "crlf.mbox", crlf.as_bytes());
+    write(
+        &dir,
+        "bare.txt",
+        b"Subject: [PATCH v2 1/1] [tag] bare one\n\nbody\n---\n a | 1 +\n",
+    );
+    let listing = |d: &Path| -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<_> = std::fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    for (i, args) in [
+        &["series.mbox"][..],
+        &["-d3", "-f7", "series.mbox", "crlf.mbox"],
+        &["-d2", "series.mbox"],
+        &["--keep-cr", "crlf.mbox"],
+        &["-b", "bare.txt"],
+        &["bare.txt"],
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (g, r) = (format!("g{i}"), format!("r{i}"));
+        std::fs::create_dir_all(dir.join(&g)).unwrap();
+        std::fs::create_dir_all(dir.join(&r)).unwrap();
+        let mut ga = vec!["mailsplit".to_owned(), format!("-o{g}")];
+        let mut ra = vec!["mailsplit".to_owned(), format!("-o{r}")];
+        ga.extend(args.iter().map(|s| s.to_string()));
+        ra.extend(args.iter().map(|s| s.to_string()));
+        let ga: Vec<&str> = ga.iter().map(String::as_str).collect();
+        let ra: Vec<&str> = ra.iter().map(String::as_str).collect();
+        let want = run("git", &dir, &ga, &[]);
+        let got = rgit(&dir, &ra);
+        assert_eq!(got.stdout, want.stdout, "{args:?}");
+        assert_eq!(got.status.success(), want.status.success(), "{args:?}");
+        assert_eq!(listing(&dir.join(&r)), listing(&dir.join(&g)), "{args:?}");
+    }
+    let mails = [
+        mbox.split("\nFrom ").next().unwrap().to_owned() + "\n",
+        "From: \"Doe, Jane\" <jane@example.com>\nSubject: Re: [PATCH 2/3] [RFC] fix\n thing\nDate: Mon, 1 Jan 2024 10:00:00 +0000\n\nFrom: Other <o@example.com>\nSubject: in-body\n\nmessage\n-- >8 --\nafter scissors\n---\ndiff --git a/x b/x\n".to_owned(),
+        "Subject: no patch\n\njust text\n".to_owned(),
+    ];
+    for mail in &mails {
+        for flags in [&[][..], &["-k"], &["-b"], &["--scissors"], &["-m"]] {
+            // git -k keeps an in-body Subject's newline and prints an extra
+            // empty `Subject: ` line; rgit does not copy that.
+            if flags == ["-k"] && mail.contains("\n\nFrom: Other") {
+                continue;
+            }
+            let feed = |bin: &str, pre: &[&str], out: &str| {
+                use std::io::Write;
+                let mut args: Vec<String> = pre.iter().map(|s| s.to_string()).collect();
+                args.push("mailinfo".to_owned());
+                args.extend(flags.iter().map(|s| s.to_string()));
+                args.push(format!("{out}.msg"));
+                args.push(format!("{out}.patch"));
+                let mut child = Command::new(bin)
+                    .args(&args)
+                    .current_dir(&dir)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(mail.as_bytes())
+                    .unwrap();
+                let out_text = child.wait_with_output().unwrap().stdout;
+                (
+                    String::from_utf8_lossy(&out_text).into_owned(),
+                    std::fs::read_to_string(dir.join(format!("{out}.msg"))).unwrap(),
+                    std::fs::read_to_string(dir.join(format!("{out}.patch"))).unwrap(),
+                )
+            };
+            let want = feed("git", &[], "g");
+            let got = feed(env!("CARGO_BIN_EXE_rgit"), &["--human"], "r");
+            assert_eq!(got, want, "{flags:?} {mail}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

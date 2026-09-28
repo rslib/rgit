@@ -18,8 +18,8 @@ use crate::cli::{
     AmArgs, ApplyArgs, ArchiveArgs, BisectCmd, BlameArgs, BlameFormat, BranchCmd, BranchOpts,
     BundleCmd, CliError, Command, ConfigArgs, DiffFormat, FlowCmd, FormatPatchArgs, HashObjectArgs,
     IndexCmd, LanesCmd, MaintenanceCmd, MergeDiffArgs, NoteMessage, NotesCmd, PickFlags, Plumbing,
-    PrettyArgs, RebaseFlags, RemoteCmd, StackCmd, StashCmd, StashPush, SubmoduleCmd, TagOpts,
-    WalkArgs, WorkspaceCmd, WorktreeCmd,
+    PrettyArgs, RawDiffArgs, RebaseFlags, RemoteCmd, StackCmd, StashCmd, StashPush, SubmoduleCmd,
+    TagOpts, WalkArgs, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::toon::{Node, Obj};
@@ -94,6 +94,18 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "git_var",
     "git_symbolic_ref",
     "git_count_objects",
+    "git_name_rev",
+    "git_check_attr",
+    "git_check_ref_format",
+    "git_patch_id",
+    "git_stripspace",
+    "git_column",
+    "git_fmt_merge_msg",
+    "git_diff_tree",
+    "git_diff_index",
+    "git_diff_files",
+    "git_interpret_trailers",
+    "git_show_branch",
     "git_cherry",
     "git_range_diff",
 ];
@@ -1776,7 +1788,10 @@ fn tools() -> Vec<Tool> {
              preimage when it does not apply (conflicts are left in the index); `reject` applies \
              the hunks that fit and writes the rest to <file>.rej. `strip` drops leading path \
              components (default 1), `directory` prepends a folder, `include`/`exclude` filter \
-             paths by glob. Undo with git_undo.",
+             paths by glob. A hunk that no longer matches where its header says is looked for \
+             nearby, as git does; `context` lets it match with only that many context lines, \
+             and `ignore_whitespace` ignores changes in the amount of whitespace. Undo with \
+             git_undo.",
             &[
                 ("patch", "paths", true),
                 ("cached", "boolean", false),
@@ -1792,6 +1807,8 @@ fn tools() -> Vec<Tool> {
                 ("directory", "string", false),
                 ("include", "paths", false),
                 ("exclude", "paths", false),
+                ("context", "integer", false),
+                ("ignore_whitespace", "boolean", false),
             ],
         ),
         tool(
@@ -1838,11 +1855,14 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_notes_merge",
             "Merge notes ref `from` (e.g. origin for refs/notes/origin) into the current notes \
-             ref. Conflicting notes fail unless `strategy` is ours, theirs, union or \
+             ref with their merge base. Conflicting notes are left in .git/NOTES_MERGE_WORKTREE \
+             (finish with `commit` or `abort`) unless `strategy` is ours, theirs, union or \
              cat_sort_uniq.",
             &[
-                ("from", "string", true),
+                ("from", "string", false),
                 ("strategy", "string", false),
+                ("commit", "boolean", false),
+                ("abort", "boolean", false),
                 ("ref", "string", false),
             ],
         ),
@@ -1876,6 +1896,64 @@ fn tools() -> Vec<Tool> {
             ],
         ),
         tool(
+            "git_commit_tree",
+            "Write a commit of `tree` (e.g. HEAD^{tree} or a git_write_tree id) with these \
+             `parents` and `message`, without moving any ref; returns the commit id.",
+            &[
+                ("tree", "string", true),
+                ("message", "string", true),
+                ("parents", "string[]", false),
+            ],
+        ),
+        tool(
+            "git_write_tree",
+            "Write the index as a tree and return its id; `prefix` writes only that folder's \
+             subtree, `missing_ok` allows entries whose objects are missing.",
+            &[
+                ("prefix", "string", false),
+                ("missing_ok", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_read_tree",
+            "Read `trees` into the index (git read-tree). One tree replaces the index; `merge` \
+             merges one, two (from, to) or three (base, ours, theirs) trees, leaving conflicts \
+             as stages; `reset` also drops unmerged entries; `update` writes the working tree; \
+             `prefix` reads one tree under that folder; `empty` empties the index. Destructive \
+             with `update`.",
+            &[
+                ("trees", "string[]", false),
+                ("merge", "boolean", false),
+                ("reset", "boolean", false),
+                ("update", "boolean", false),
+                ("aggressive", "boolean", false),
+                ("dry_run", "boolean", false),
+                ("prefix", "string", false),
+                ("empty", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_update_index",
+            "Change index entries with git update-index's arguments, in order: options apply \
+             to the paths after them (--add, --remove, --force-remove, --cacheinfo \
+             <mode>,<sha1>,<path>, --chmod=+x, --assume-unchanged, --skip-worktree, --refresh, \
+             --info-only). No --stdin or --index-info.",
+            &[("args", "string[]", true)],
+        ),
+        tool(
+            "git_checkout_index",
+            "Write `paths` (or `all` files) from the index into the working tree; `force` \
+             overwrites existing files, `index` refreshes their stat data, `prefix` (ending in /) \
+             writes under that folder instead.",
+            &[
+                ("paths", "string[]", false),
+                ("all", "boolean", false),
+                ("force", "boolean", false),
+                ("index", "boolean", false),
+                ("prefix", "string", false),
+            ],
+        ),
+        tool(
             "git_format_patch",
             "Write commits as mbox patch files, oldest first, and return their paths. `range` is \
              `<a>..<b>`, or a base revision for the commits after it up to HEAD; `count` takes the \
@@ -1883,7 +1961,8 @@ fn tools() -> Vec<Tool> {
              current one); `stdout` returns the patches instead of writing files. \
              `cover_letter` adds a 0000 cover letter; `subject_prefix` replaces PATCH, \
              `reroll_count` marks version n; `thread` adds Message-ID/In-Reply-To; `to`/`cc` add \
-             headers; `base` records the base commit (`auto`: the upstream's merge base).",
+             headers; `base` records the base commit (`auto`: the upstream's merge base); \
+             `attach` puts each patch in a MIME attachment; `notes` adds the commits' notes.",
             &[
                 ("range", "string", false),
                 ("count", "integer", false),
@@ -1896,6 +1975,8 @@ fn tools() -> Vec<Tool> {
                 ("to", "paths", false),
                 ("cc", "paths", false),
                 ("base", "string", false),
+                ("attach", "boolean", false),
+                ("notes", "boolean", false),
             ],
         ),
         tool(
@@ -1999,12 +2080,14 @@ fn tools() -> Vec<Tool> {
             "git_range_diff",
             "Compare two versions of a patch series (git range-diff): `old` and `new` are ranges \
              (a..b), or revisions on top of `base`. Returns each commit pairing (= same, ! \
-             changed with the patch's diff, < dropped, > added); `no_patch` leaves out the diffs.",
+             changed with the patch's diff, < dropped, > added); `no_patch` leaves out the diffs; \
+             `creation_factor` (default 60) is how much a patch may change and still pair.",
             &[
                 ("old", "string", true),
                 ("new", "string", true),
                 ("base", "string", false),
                 ("no_patch", "boolean", false),
+                ("creation_factor", "integer", false),
             ],
         ),
         tool(
@@ -2270,6 +2353,163 @@ fn tools() -> Vec<Tool> {
             &[("verbose", "boolean", false)],
         ),
         tool(
+            "git_name_rev",
+            "Name commits by the refs that reach them (main~2, tags/v1^0); `tags` uses only \
+             tags, `refs`/`exclude` filter refs by pattern, `always` falls back to an id.",
+            &[
+                ("revs", "string[]", true),
+                ("name_only", "boolean", false),
+                ("tags", "boolean", false),
+                ("refs", "string[]", false),
+                ("exclude", "string[]", false),
+                ("always", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_check_attr",
+            "gitattributes of paths: the named `attrs`, or every decided one when none; \
+             `cached` reads .gitattributes from the index.",
+            &[
+                ("paths", "string[]", true),
+                ("attrs", "string[]", false),
+                ("cached", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_check_ref_format",
+            "Whether a ref name is valid (errors if not); `branch` checks a branch name, \
+             `normalize` prints it with slashes collapsed.",
+            &[
+                ("name", "string", true),
+                ("allow_onelevel", "boolean", false),
+                ("refspec_pattern", "boolean", false),
+                ("normalize", "boolean", false),
+                ("branch", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_patch_id",
+            "Patch ids of the patches in `input` (log -p, format-patch or diff text); \
+             `stable` makes them independent of file order.",
+            &[("input", "string", true), ("stable", "boolean", false)],
+        ),
+        tool(
+            "git_stripspace",
+            "Clean up `input` as git cleans a commit message; `strip_comments` drops # lines, \
+             `comment_lines` comments every line instead.",
+            &[
+                ("input", "string", true),
+                ("strip_comments", "boolean", false),
+                ("comment_lines", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_column",
+            "Lay out the lines of `input` in columns (`mode`: column, row or plain, with dense).",
+            &[
+                ("input", "string", true),
+                ("mode", "string", false),
+                ("width", "integer", false),
+                ("padding", "integer", false),
+            ],
+        ),
+        tool(
+            "git_fmt_merge_msg",
+            "A merge commit's message from FETCH_HEAD-style `input` lines (`<id>\\t\\tbranch \
+             'x' of <url>`); `log` adds a shortlog of at most that many commits per head.",
+            &[
+                ("input", "string", true),
+                ("log", "integer", false),
+                ("message", "string", false),
+            ],
+        ),
+        tool(
+            "git_diff_tree",
+            "Changes between two tree-ishes, or a commit and its parent, in git's raw format \
+             (`recursive` into subtrees; `patch`, `name_only` or `name_status` instead).",
+            &[
+                ("revs", "string[]", true),
+                ("paths", "string[]", false),
+                ("recursive", "boolean", false),
+                ("root", "boolean", false),
+                ("patch", "boolean", false),
+                ("name_only", "boolean", false),
+                ("name_status", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_diff_index",
+            "Changes between a tree-ish and the working tree (or the index with `cached`), in \
+             git's raw format.",
+            &[
+                ("rev", "string", true),
+                ("cached", "boolean", false),
+                ("paths", "string[]", false),
+                ("patch", "boolean", false),
+                ("name_only", "boolean", false),
+                ("name_status", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_diff_files",
+            "Changes between the index and the working tree, in git's raw format.",
+            &[
+                ("paths", "string[]", false),
+                ("patch", "boolean", false),
+                ("name_only", "boolean", false),
+                ("name_status", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_merge_tree",
+            "Merge two commits without touching the index or working tree: the merged tree id \
+             (conflicts written with markers), the conflicted files and git's messages.",
+            &[
+                ("branch1", "string", true),
+                ("branch2", "string", true),
+                ("merge_base", "string", false),
+                ("name_only", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_merge_file",
+            "Three-way merge of the files `current`, `base` and `other` into `current` (or \
+             returned with `stdout`); `favor` is ours, theirs or union; `style` diff3 or zdiff3.",
+            &[
+                ("current", "string", true),
+                ("base", "string", true),
+                ("other", "string", true),
+                ("labels", "string[]", false),
+                ("stdout", "boolean", false),
+                ("favor", "string", false),
+                ("style", "string", false),
+            ],
+        ),
+        tool(
+            "git_interpret_trailers",
+            "Add `trailers` (`Key: value`) to the commit message in `input`, or with `parse` \
+             list its trailers, as git interpret-trailers does (trailer.* config applies).",
+            &[
+                ("input", "string", true),
+                ("trailers", "string[]", false),
+                ("parse", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_show_branch",
+            "Branches side by side with the commits each has, down to where they meet \
+             (default: every local branch); `more` shows N past it, `list` only the tips, \
+             `merge_base`/`independent` print ids.",
+            &[
+                ("revs", "string[]", false),
+                ("all", "boolean", false),
+                ("more", "integer", false),
+                ("list", "boolean", false),
+                ("merge_base", "boolean", false),
+                ("independent", "boolean", false),
+            ],
+        ),
+        tool(
             "git_run",
             "Run any git subcommand and return its output as lines (the escape hatch); the first \
              200 lines unless full.",
@@ -2387,6 +2627,11 @@ const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
     ("format-patch", "git_format_patch", &["range"]),
     ("am", "git_am", &["mbox"]),
     ("update-ref", "git_update_ref", &["name", "new", "old"]),
+    ("commit-tree", "git_commit_tree", &["tree"]),
+    ("write-tree", "git_write_tree", &[]),
+    ("read-tree", "git_read_tree", &["trees"]),
+    ("update-index", "git_update_index", &["args"]),
+    ("checkout-index", "git_checkout_index", &["paths"]),
     ("gc", "git_gc", &[]),
     ("fsck", "git_fsck", &[]),
     ("repack", "git_repack", &[]),
@@ -2482,6 +2727,17 @@ fn as_tool_call(hint: &str) -> String {
 }
 
 /// Typed access to a tool call's JSON arguments; bad input is a usage error.
+/// The output flags of the diff plumbing tools.
+fn raw_diff_args(a: &Args, recursive: bool) -> RawDiffArgs {
+    RawDiffArgs {
+        patch: a.flag("patch"),
+        name_only: a.flag("name_only"),
+        name_status: a.flag("name_status"),
+        recursive,
+        ..Default::default()
+    }
+}
+
 struct Args<'a> {
     tool: &'a str,
     args: &'a Value,
@@ -3517,6 +3773,8 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             directory: a.str("directory"),
             include: a.strs("include").unwrap_or_default(),
             exclude: a.strs("exclude").unwrap_or_default(),
+            context: a.num("context")?.map(|n| n as usize),
+            ignore_whitespace: a.flag("ignore_whitespace"),
             ..Default::default()
         }),
         "git_notes" | "git_note_add" | "git_note_remove" | "git_note_copy" | "git_notes_prune"
@@ -3540,10 +3798,21 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                     dry_run: a.flag("dry_run"),
                     verbose: true,
                 },
-                "git_notes_merge" => NotesCmd::Merge {
-                    notes_ref: a.req("from")?,
-                    strategy: a.or("strategy", "manual"),
-                },
+                "git_notes_merge" => {
+                    let (commit, abort) = (a.flag("commit"), a.flag("abort"));
+                    NotesCmd::Merge {
+                        notes_ref: if commit || abort {
+                            None
+                        } else {
+                            Some(a.req("from")?)
+                        },
+                        strategy: a.str("strategy"),
+                        commit,
+                        abort,
+                        verbose: 0,
+                        quiet: false,
+                    }
+                }
                 _ if a.flag("append") => NotesCmd::Append {
                     rev: a.str("rev"),
                     text: NoteMessage {
@@ -3579,6 +3848,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                 create_reflog: a.flag("create_reflog"),
                 stdin: false,
                 z: false,
+                batch_updates: false,
             }
         }
         "git_hash_object" => Command::HashObject(HashObjectArgs {
@@ -3589,7 +3859,47 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             no_filters: a.flag("no_filters"),
             ..Default::default()
         }),
-        "git_format_patch" => Command::FormatPatch(FormatPatchArgs {
+        "git_commit_tree" => Command::Plumbing(Plumbing::CommitTree {
+            tree: a.req("tree")?,
+            message: vec![a.req("message")?],
+            parents: a.strings("parents")?,
+            file: Vec::new(),
+        }),
+        "git_write_tree" => Command::Plumbing(Plumbing::WriteTree {
+            missing_ok: a.flag("missing_ok"),
+            prefix: a.str("prefix"),
+        }),
+        "git_read_tree" => Command::Plumbing(Plumbing::ReadTree {
+            merge: a.flag("merge"),
+            reset: a.flag("reset"),
+            update: a.flag("update"),
+            index_only: false,
+            dry_run: a.flag("dry_run"),
+            aggressive: a.flag("aggressive"),
+            prefix: a.str("prefix"),
+            empty: a.flag("empty"),
+            verbose: false,
+            trees: a.strings("trees")?,
+        }),
+        "git_update_index" => {
+            let args = a.req_strings("args")?;
+            if args.iter().any(|x| x == "--stdin" || x == "--index-info") {
+                return Err(a.invalid("args", "arguments without --stdin or --index-info"));
+            }
+            Command::Plumbing(Plumbing::UpdateIndex { args })
+        }
+        "git_checkout_index" => Command::Plumbing(Plumbing::CheckoutIndex {
+            all: a.flag("all"),
+            force: a.flag("force"),
+            index: a.flag("index"),
+            quiet: false,
+            no_create: false,
+            prefix: a.str("prefix"),
+            stdin: false,
+            z: false,
+            paths: a.strings("paths")?,
+        }),
+        "git_format_patch" => Command::FormatPatch(Box::new(FormatPatchArgs {
             revs: a
                 .num("count")?
                 .map(|n| format!("-{n}"))
@@ -3605,8 +3915,10 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             to: a.strs("to").unwrap_or_default(),
             cc: a.strs("cc").unwrap_or_default(),
             base: a.str("base"),
+            attach: a.flag("attach").then(String::new),
+            notes: a.flag("notes").then(String::new).into_iter().collect(),
             ..Default::default()
-        }),
+        })),
         "git_am" => {
             let (abort, cont, skip) = (a.flag("abort"), a.flag("continue"), a.flag("skip"));
             let quit = a.flag("quit");
@@ -3692,11 +4004,15 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
                 .into_iter()
                 .chain([a.req("old")?, a.req("new")?])
                 .collect(),
-            creation_factor: 60,
+            creation_factor: a.num("creation_factor")?.map_or(60, |n| n as usize),
             no_patch: a.flag("no_patch"),
             left_only: false,
             right_only: false,
             no_dual_color: true,
+            unified: None,
+            notes: Vec::new(),
+            no_notes: false,
+            paths: Vec::new(),
         },
         "git_repack" => Command::Repack {
             all: a.flag("all"),
@@ -3981,6 +4297,147 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         }),
         "git_count_objects" => Command::Plumbing(Plumbing::CountObjects {
             verbose: a.flag("verbose"),
+        }),
+        "git_name_rev" => Command::Plumbing(Plumbing::NameRev {
+            name_only: a.flag("name_only"),
+            tags: a.flag("tags"),
+            refs: a.strings("refs")?,
+            exclude: a.strings("exclude")?,
+            all: false,
+            annotate_stdin: false,
+            no_undefined: false,
+            always: a.flag("always"),
+            peel_tag: false,
+            revs: a.req_strings("revs")?,
+            input: None,
+        }),
+        "git_check_attr" => {
+            let attrs = a.strings("attrs")?;
+            Command::Plumbing(Plumbing::CheckAttr {
+                all: attrs.is_empty(),
+                cached: a.flag("cached"),
+                stdin: false,
+                z: false,
+                items: attrs,
+                paths: a.req_strings("paths")?,
+            })
+        }
+        "git_check_ref_format" => Command::Plumbing(Plumbing::CheckRefFormat {
+            normalize: a.flag("normalize"),
+            allow_onelevel: a.flag("allow_onelevel"),
+            no_allow_onelevel: false,
+            refspec_pattern: a.flag("refspec_pattern"),
+            branch: a.flag("branch"),
+            name: a.req("name")?,
+        }),
+        "git_patch_id" => Command::Plumbing(Plumbing::PatchId {
+            stable: a.flag("stable"),
+            unstable: false,
+            verbatim: false,
+            input: Some(a.req("input")?),
+        }),
+        "git_stripspace" => Command::Plumbing(Plumbing::Stripspace {
+            strip_comments: a.flag("strip_comments"),
+            comment_lines: a.flag("comment_lines"),
+            input: Some(a.req("input")?),
+        }),
+        "git_fmt_merge_msg" => Command::Plumbing(Plumbing::FmtMergeMsg {
+            message: a.str("message"),
+            log: a.num("log")?.map(|n| n as usize),
+            no_log: false,
+            into_name: None,
+            file: None,
+            input: Some(a.req("input")?),
+        }),
+        "git_column" => Command::Plumbing(Plumbing::Column {
+            command: None,
+            mode: Some(a.or("mode", "column")),
+            raw_mode: None,
+            width: a.num("width")?.map(|n| n as usize),
+            indent: None,
+            nl: None,
+            padding: a.num("padding")?.map_or(1, |n| n as usize),
+            input: Some(a.req("input")?),
+        }),
+        "git_diff_tree" => Command::Plumbing(Plumbing::DiffTree {
+            format: raw_diff_args(a, a.flag("recursive")),
+            root: a.flag("root"),
+            no_commit_id: false,
+            stdin: false,
+            args: a.strings("revs")?,
+            paths: a.strings("paths")?,
+        }),
+        "git_diff_index" => Command::Plumbing(Plumbing::DiffIndex {
+            format: raw_diff_args(a, false),
+            cached: a.flag("cached"),
+            args: vec![a.req("rev")?],
+            paths: a.strings("paths")?,
+        }),
+        "git_diff_files" => Command::Plumbing(Plumbing::DiffFiles {
+            format: raw_diff_args(a, false),
+            paths: a.strings("paths")?,
+        }),
+        "git_merge_tree" => Command::Plumbing(Plumbing::MergeTree {
+            write_tree: true,
+            name_only: a.flag("name_only"),
+            messages: false,
+            no_messages: false,
+            z: false,
+            allow_unrelated_histories: false,
+            merge_base: a.str("merge_base"),
+            branch1: a.req("branch1")?,
+            branch2: a.req("branch2")?,
+        }),
+        "git_merge_file" => {
+            let favor = a.str("favor");
+            let style = a.str("style");
+            Command::Plumbing(Plumbing::MergeFile {
+                labels: a.strings("labels")?,
+                stdout: a.flag("stdout"),
+                ours: favor.as_deref() == Some("ours"),
+                theirs: favor.as_deref() == Some("theirs"),
+                union: favor.as_deref() == Some("union"),
+                diff3: style.as_deref() == Some("diff3"),
+                zdiff3: style.as_deref() == Some("zdiff3"),
+                marker_size: None,
+                quiet: false,
+                object_id: false,
+                current: a.req("current")?,
+                base: a.req("base")?,
+                other: a.req("other")?,
+            })
+        }
+        "git_interpret_trailers" => {
+            let mut args: Vec<String> = a
+                .strings("trailers")?
+                .into_iter()
+                .flat_map(|t| ["--trailer".to_owned(), t])
+                .collect();
+            if a.flag("parse") {
+                args.push("--parse".to_owned());
+            }
+            Command::Plumbing(Plumbing::InterpretTrailers {
+                args,
+                input: Some(a.req("input")?),
+            })
+        }
+        "git_show_branch" => Command::Plumbing(Plumbing::ShowBranch {
+            all: a.flag("all"),
+            remotes: false,
+            current: false,
+            topo_order: false,
+            date_order: false,
+            sparse: false,
+            more: a.num("more")?.map(|n| n as i32),
+            list: a.flag("list"),
+            merge_base: a.flag("merge_base"),
+            independent: a.flag("independent"),
+            no_name: false,
+            sha1_name: false,
+            topics: false,
+            reflog: None,
+            color: Some("never".to_owned()),
+            revs: a.strings("revs")?,
         }),
         "git_run" => Command::Git {
             args: a.req_strings("args")?,

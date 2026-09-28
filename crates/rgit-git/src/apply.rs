@@ -43,6 +43,20 @@ pub struct ApplyOpts {
     pub recount: bool,
     /// No progress lines.
     pub quiet: bool,
+    /// Context lines that must still match (git's `-C<n>`); by default all.
+    pub context: Option<usize>,
+    /// Trust hunks without context to apply where their header says.
+    pub unidiff_zero: bool,
+    /// Match context lines ignoring changes in the amount of whitespace.
+    pub ignore_whitespace: bool,
+    /// The patch may lack newlines at the end of files.
+    pub inaccurate_eof: bool,
+    /// Let a hunk match lines an earlier hunk wrote.
+    pub allow_overlap: bool,
+    /// Record new files as intent-to-add in the index (working-tree apply).
+    pub intent_to_add: bool,
+    /// Write an index of the preimage blobs here instead of applying.
+    pub fake_ancestor: Option<std::path::PathBuf>,
 }
 
 /// One file's part of a patch.
@@ -261,7 +275,7 @@ fn header_path(s: &str, n: usize) -> Option<Option<String>> {
 }
 
 /// A C-quoted path (`"a\tb"`) unquoted; other paths as they are.
-fn unquote(s: &str) -> String {
+pub(crate) fn unquote(s: &str) -> String {
     let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
         return s.to_owned();
     };
@@ -755,27 +769,53 @@ pub fn apply(repo: &Repository, files: &[FilePatch], opts: &ApplyOpts) -> Result
         repo.apply(&diff, location, Some(&mut o))?;
         Ok(())
     };
+    if let Some(path) = &opts.fake_ancestor {
+        fake_ancestor(repo, files, path)?;
+        return Ok(String::new());
+    }
     let mut log = String::new();
     // First decide how each file goes, so a patch that cannot apply at all
     // changes nothing.
     enum Plan {
-        Direct,
+        Direct(String),
         Merge(Vec<u8>, Vec<u8>, Vec<u8>),
-        Reject,
+        Reject(Vec<Option<Hunk>>),
     }
     let mut plans = Vec::new();
     for f in files {
-        let text = f.render();
         if opts.verbose || opts.reject {
             let _ = writeln!(log, "Checking patch {}...", f.label());
         }
-        let plan = match fits(&text) {
-            Ok(()) => Plan::Direct,
+        // Hunks are placed as git places them; libgit2 then applies them
+        // exactly there.
+        let fitted = if f.created.is_some() || f.is_binary() || f.hunks.is_empty() {
+            None
+        } else {
+            preimage(repo, f, opts.cached).map(|image| fit(&image, f, opts, &mut log))
+        };
+        let whole = match &fitted {
+            None => Ok(f.clone()),
+            Some(hunks) => match hunks.iter().position(Option::is_none) {
+                None => Ok(FilePatch {
+                    hunks: hunks.iter().flatten().cloned().collect(),
+                    ..f.clone()
+                }),
+                Some(i) => Err(GitError::Other(format!(
+                    "patch failed: {}:{}",
+                    f.old.as_deref().unwrap_or_else(|| f.name()),
+                    f.hunks[i].old.0
+                ))),
+            },
+        };
+        let plan = match whole.map(|w| w.render()).and_then(|t| fits(&t).map(|()| t)) {
+            Ok(w) => Plan::Direct(w),
             Err(e) if opts.three_way => match three_way_inputs(repo, f, opts.cached) {
                 Some((base, ours, theirs)) => Plan::Merge(base, ours, theirs),
                 None => return Err(patch_failed(f, e)),
             },
-            Err(_) if opts.reject => Plan::Reject,
+            Err(_) if opts.reject => {
+                Plan::Reject(fitted.unwrap_or_else(|| f.hunks.iter().cloned().map(Some).collect()))
+            }
             Err(e) => return Err(patch_failed(f, e)),
         };
         plans.push(plan);
@@ -783,19 +823,23 @@ pub fn apply(repo: &Repository, files: &[FilePatch], opts: &ApplyOpts) -> Result
     if opts.check {
         return Ok(log.trim_end().to_owned());
     }
-    let direct: String = files
+    let direct: String = plans
         .iter()
-        .zip(&plans)
-        .filter(|(_, p)| matches!(p, Plan::Direct))
-        .map(|(f, _)| f.render())
+        .filter_map(|p| match p {
+            Plan::Direct(w) => Some(w.as_str()),
+            _ => None,
+        })
         .collect();
     if !direct.is_empty() {
         repo.apply(&Diff::from_buffer(direct.as_bytes())?, location, None)?;
     }
+    if opts.intent_to_add && matches!(location, ApplyLocation::WorkDir) {
+        intent_to_add(repo, files)?;
+    }
     let mut failed = false;
     for (f, plan) in files.iter().zip(plans) {
         match plan {
-            Plan::Direct => {
+            Plan::Direct(_) => {
                 if opts.verbose || opts.reject {
                     let _ = writeln!(log, "Applied patch {} cleanly.", f.label());
                 }
@@ -819,9 +863,9 @@ pub fn apply(repo: &Repository, files: &[FilePatch], opts: &ApplyOpts) -> Result
                     let _ = writeln!(log, "U {name}");
                 }
             }
-            Plan::Reject => {
+            Plan::Reject(fitted) => {
                 failed = true;
-                apply_with_rejects(repo, f, location, &mut log)?;
+                apply_with_rejects(repo, f, &fitted, location, &mut log)?;
             }
         }
     }
@@ -838,32 +882,41 @@ pub fn apply(repo: &Repository, files: &[FilePatch], opts: &ApplyOpts) -> Result
 }
 
 fn patch_failed(f: &FilePatch, e: GitError) -> GitError {
-    GitError::Other(format!("{}: patch does not apply ({e})", f.name()))
+    match e {
+        GitError::Other(m) if m.starts_with("patch failed: ") => {
+            GitError::Other(format!("{m}\nerror: {}: patch does not apply", f.name()))
+        }
+        e => GitError::Other(format!("{}: patch does not apply ({e})", f.name())),
+    }
 }
 
-/// Apply the hunks of `f` that fit, one by one, and write the rest to
-/// `<file>.rej` as git does.
+/// Apply the hunks of `f` that fit (`fitted`, placed), one by one, and
+/// write the rest to `<file>.rej` as git does.
 fn apply_with_rejects(
     repo: &Repository,
     f: &FilePatch,
+    fitted: &[Option<Hunk>],
     location: ApplyLocation,
     log: &mut String,
 ) -> Result<(), GitError> {
     let mut rejected = Vec::new();
     let mut outcomes = Vec::new();
-    for (i, h) in f.hunks.iter().enumerate() {
-        let one = FilePatch {
-            hunks: vec![h.clone()],
-            ..f.clone()
-        };
-        let diff = Diff::from_buffer(one.render().as_bytes())?;
-        repo.index()?.read(true)?;
-        match repo.apply(&diff, location, None) {
-            Ok(()) => outcomes.push(format!("Hunk #{} applied cleanly.", i + 1)),
-            Err(_) => {
-                outcomes.push(format!("Rejected hunk #{}.", i + 1));
-                rejected.push(h);
-            }
+    for (i, (h, placed)) in f.hunks.iter().zip(fitted).enumerate() {
+        let applied = placed.as_ref().is_some_and(|placed| {
+            let one = FilePatch {
+                hunks: vec![placed.clone()],
+                ..f.clone()
+            };
+            Diff::from_buffer(one.render().as_bytes()).is_ok_and(|diff| {
+                repo.index().and_then(|mut i| i.read(true)).is_ok()
+                    && repo.apply(&diff, location, None).is_ok()
+            })
+        });
+        if applied {
+            outcomes.push(format!("Hunk #{} applied cleanly.", i + 1));
+        } else {
+            outcomes.push(format!("Rejected hunk #{}.", i + 1));
+            rejected.push(h);
         }
     }
     let _ = writeln!(
@@ -890,6 +943,396 @@ fn apply_with_rejects(
     if let Some(workdir) = repo.workdir() {
         std::fs::write(workdir.join(format!("{name}.rej")), rej)?;
     }
+    Ok(())
+}
+
+/// The content `f` patches: its index blob (`--cached`) or its file.
+fn preimage(repo: &Repository, f: &FilePatch, cached: bool) -> Option<Vec<u8>> {
+    let path = f.old.as_deref()?;
+    if cached {
+        let entry = repo.index().ok()?.get_path(Path::new(path), 0)?;
+        Some(repo.find_blob(entry.id).ok()?.content().to_vec())
+    } else {
+        std::fs::read(repo.workdir()?.join(path)).ok()
+    }
+}
+
+/// One hunk line: in the preimage, the postimage, or both (context).
+struct Part {
+    pre: Option<Vec<u8>>,
+    post: Option<Vec<u8>>,
+}
+
+/// Place `f`'s hunks in `image` as git's apply does: at the line the header
+/// names or the nearest one around it that matches (never over lines an
+/// earlier hunk wrote, unless `--allow-overlap`), dropping context down to
+/// `-C` lines when needed. Each placed hunk is rewritten to match the image
+/// exactly where it goes; one that fits nowhere is `None`.
+fn fit(image: &[u8], f: &FilePatch, opts: &ApplyOpts, log: &mut String) -> Vec<Option<Hunk>> {
+    // Each line of the image, and whether a hunk wrote it.
+    let mut img: Vec<(Vec<u8>, bool)> = image
+        .split_inclusive(|b| *b == b'\n')
+        .map(|l| (l.to_vec(), false))
+        .collect();
+    let mut out = Vec::new();
+    for (n, h) in f.hunks.iter().enumerate() {
+        let mut parts: Vec<Part> = Vec::new();
+        for l in &h.lines {
+            let (tag, body) = (l.as_bytes()[0], l.as_bytes()[1..].to_vec());
+            match tag {
+                b' ' => parts.push(Part {
+                    pre: Some(body.clone()),
+                    post: Some(body),
+                }),
+                b'-' => parts.push(Part {
+                    pre: Some(body),
+                    post: None,
+                }),
+                b'+' => parts.push(Part {
+                    pre: None,
+                    post: Some(body),
+                }),
+                // `\ No newline at end of file` ends the line before it.
+                _ => {
+                    if let Some(p) = parts.last_mut() {
+                        for s in [&mut p.pre, &mut p.post].into_iter().flatten() {
+                            if s.last() == Some(&b'\n') {
+                                s.pop();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if opts.inaccurate_eof {
+            let last_pre = parts.iter().rposition(|p| p.pre.is_some());
+            let last_post = parts.iter().rposition(|p| p.post.is_some());
+            if let (Some(a), Some(b)) = (last_pre, last_post)
+                && parts[a].pre.as_ref().is_some_and(|l| l.ends_with(b"\n"))
+                && parts[b].post.as_ref().is_some_and(|l| l.ends_with(b"\n"))
+            {
+                parts[a].pre.as_mut().map(Vec::pop);
+                parts[b].post.as_mut().map(Vec::pop);
+            }
+        }
+        let common = |p: &Part| p.pre.is_some() && p.post.is_some();
+        let leading = parts.iter().take_while(|p| common(p)).count();
+        let trailing = parts.iter().rev().take_while(|p| common(p)).count();
+        let (mut lead, mut trail) = (leading, trailing);
+        let limit = opts.context.unwrap_or(usize::MAX);
+        let mut beginning = h.old.0 == 0 || (h.old.0 == 1 && !opts.unidiff_zero);
+        let mut end = !opts.unidiff_zero && trailing == 0;
+        let mut pos = h.new.0 as isize - 1;
+        let found = loop {
+            if let Some(found) = find_pos(&img, &parts, pos, beginning, end, opts) {
+                break Some(found);
+            }
+            if lead <= limit && trail <= limit {
+                break None;
+            }
+            if beginning || end {
+                beginning = false;
+                end = false;
+                continue;
+            }
+            if lead >= trail {
+                parts.remove(0);
+                pos -= 1;
+                lead -= 1;
+            }
+            if trail > lead {
+                parts.pop();
+                trail -= 1;
+            }
+        };
+        let Some((at, fuzzy)) = found else {
+            out.push(None);
+            continue;
+        };
+        if opts.verbose && at as isize != pos {
+            let offset = if opts.reverse {
+                pos - at as isize
+            } else {
+                at as isize - pos
+            };
+            let _ = writeln!(
+                log,
+                "Hunk #{} succeeded at {} (offset {offset} line{}).",
+                n + 1,
+                at + 1,
+                if offset == 1 { "" } else { "s" }
+            );
+        }
+        if (lead, trail) != (leading, trailing) && !opts.quiet {
+            let _ = writeln!(
+                log,
+                "Context reduced to ({lead}/{trail}) to apply fragment at {}",
+                at + 1
+            );
+        }
+        // The preimage is what the image holds; with whitespace fuzz the
+        // context keeps the image's whitespace too.
+        let mut k = at;
+        for p in &mut parts {
+            if let Some(pre) = &mut p.pre {
+                *pre = img[k].0.clone();
+                if fuzzy && p.post.is_some() {
+                    p.post = Some(pre.clone());
+                }
+                k += 1;
+            }
+        }
+        let post: Vec<(Vec<u8>, bool)> = parts
+            .iter()
+            .filter_map(|p| p.post.clone())
+            .map(|l| (l, !opts.allow_overlap))
+            .collect();
+        let (old_len, new_len) = (k - at, post.len());
+        img.splice(at..k, post);
+        let mut lines = Vec::new();
+        let mut push = |tag: char, body: &[u8]| {
+            lines.push(format!(
+                "{tag}{}\n",
+                String::from_utf8_lossy(body).trim_end_matches('\n')
+            ));
+            if !body.ends_with(b"\n") {
+                lines.push("\\ No newline at end of file\n".to_owned());
+            }
+        };
+        for p in &parts {
+            match (&p.pre, &p.post) {
+                (Some(a), Some(b)) if a == b => push(' ', a),
+                (a, b) => {
+                    if let Some(a) = a {
+                        push('-', a);
+                    }
+                    if let Some(b) = b {
+                        push('+', b);
+                    }
+                }
+            }
+        }
+        let start = at as u32 + 1;
+        out.push(Some(Hunk {
+            old: (start, old_len as u32),
+            new: (start, new_len as u32),
+            tail: h.tail.clone(),
+            lines,
+        }));
+    }
+    out
+}
+
+/// git's `find_pos`: the line where `parts`' preimage matches `img`,
+/// trying `line`, then one after, one before, two after, and so on; and
+/// whether it matched only with whitespace fuzz.
+fn find_pos(
+    img: &[(Vec<u8>, bool)],
+    parts: &[Part],
+    line: isize,
+    beginning: bool,
+    end: bool,
+    opts: &ApplyOpts,
+) -> Option<(usize, bool)> {
+    let pre: Vec<&[u8]> = parts.iter().filter_map(|p| p.pre.as_deref()).collect();
+    if pre.len() > img.len() {
+        return None;
+    }
+    let line = if beginning {
+        0
+    } else if end {
+        img.len() - pre.len()
+    } else {
+        // Before the start wraps around to the end, as in git.
+        usize::try_from(line).map_or(img.len(), |l| l.min(img.len()))
+    };
+    let matches = |at: usize| -> Option<bool> {
+        if at + pre.len() > img.len()
+            || (end && at + pre.len() != img.len())
+            || (beginning && at != 0)
+        {
+            return None;
+        }
+        let lines = &img[at..at + pre.len()];
+        if lines.iter().any(|(_, patched)| *patched) {
+            return None;
+        }
+        // A last preimage line without its newline matches a line that has
+        // one (git compares the preimage as a prefix of the image).
+        let exact = lines.iter().zip(&pre).enumerate().all(|(i, ((l, _), p))| {
+            l == p
+                || (i + 1 == pre.len()
+                    && !end
+                    && !p.ends_with(b"\n")
+                    && l.starts_with(p)
+                    && l[p.len()..].iter().all(u8::is_ascii_whitespace))
+        });
+        if exact {
+            return Some(false);
+        }
+        (opts.ignore_whitespace && lines.iter().zip(&pre).all(|((l, _), p)| fuzzy_eq(l, p)))
+            .then_some(true)
+    };
+    let (mut back, mut fwd, mut at) = (line, line, line);
+    let mut i = 0usize;
+    loop {
+        if let Some(fuzzy) = matches(at) {
+            return Some((at, fuzzy));
+        }
+        loop {
+            if back == 0 && fwd == img.len() {
+                return None;
+            }
+            if i & 1 == 1 {
+                if back == 0 {
+                    i += 1;
+                    continue;
+                }
+                back -= 1;
+                at = back;
+            } else {
+                if fwd == img.len() {
+                    i += 1;
+                    continue;
+                }
+                fwd += 1;
+                at = fwd;
+            }
+            break;
+        }
+        i += 1;
+    }
+}
+
+/// git's `fuzzy_matchlines`: equal but for the amount of whitespace, where
+/// there is some on both sides, and line endings.
+fn fuzzy_eq(a: &[u8], b: &[u8]) -> bool {
+    let trim = |s: &[u8]| -> usize {
+        s.iter()
+            .rposition(|c| *c != b'\r' && *c != b'\n')
+            .map_or(0, |i| i + 1)
+    };
+    let (a, b) = (&a[..trim(a)], &b[..trim(b)]);
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_whitespace() {
+            if !b[j].is_ascii_whitespace() {
+                return false;
+            }
+            while i < a.len() && a[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+        } else if a[i] != b[j] {
+            return false;
+        } else {
+            i += 1;
+            j += 1;
+        }
+    }
+    i == a.len() && j == b.len()
+}
+
+/// `git apply -N`: every file the patch writes goes in the index as an
+/// intent-to-add entry (changed files too, as git does).
+fn intent_to_add(repo: &Repository, files: &[FilePatch]) -> Result<(), GitError> {
+    let mut index = repo.index()?;
+    let written: Vec<(&str, u32)> = files
+        .iter()
+        .filter_map(|f| {
+            let path = f.new.as_deref()?;
+            let mode = [f.new_mode.as_deref(), f.created.as_deref()]
+                .into_iter()
+                .flatten()
+                .chain(f.index.as_ref().map(|(_, _, m)| m.trim()))
+                .find_map(|m| u32::from_str_radix(m, 8).ok())
+                .or_else(|| index.get_path(Path::new(path), 0).map(|e| e.mode))
+                .unwrap_or(0o100644);
+            Some((path, mode))
+        })
+        .collect();
+    if written.is_empty() {
+        return Ok(());
+    }
+    let empty = repo.blob(b"")?;
+    for (path, mode) in written {
+        index.add(&git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id: empty,
+            flags: path.len().min(0xfff) as u16,
+            // GIT_INDEX_ENTRY_INTENT_TO_ADD
+            flags_extended: 1 << 13,
+            path: path.as_bytes().to_vec(),
+        })?;
+    }
+    index.write()?;
+    Ok(())
+}
+
+/// `git apply --build-fake-ancestor`: an index at `path` holding each
+/// patched file's preimage blob, as the `index` lines name them.
+fn fake_ancestor(repo: &Repository, files: &[FilePatch], path: &Path) -> Result<(), GitError> {
+    let _ = std::fs::remove_file(path);
+    let mut out = git2::Index::open(path)?;
+    for f in files {
+        let Some(name) = f.old.as_deref().filter(|_| f.created.is_none()) else {
+            continue;
+        };
+        let (added, deleted) = f.counts();
+        let mode_of = |m: &str| u32::from_str_radix(m.trim(), 8).ok();
+        let (id, mode) = if added == 0 && deleted == 0 && !f.is_binary() {
+            // A mode change only: the blob the index has now.
+            let entry = repo.index()?.get_path(Path::new(name), 0).ok_or_else(|| {
+                GitError::Other(format!(
+                    "mode change for {name}, which is not in current HEAD"
+                ))
+            })?;
+            let mode = f.old_mode.as_deref().and_then(mode_of);
+            (entry.id, mode.unwrap_or(entry.mode))
+        } else {
+            let lacking =
+                || GitError::Other(format!("sha1 information is lacking or useless ({name})."));
+            let (pre, _, mode) = f.index.as_ref().ok_or_else(lacking)?;
+            let id = repo
+                .revparse_single(pre)
+                .ok()
+                .filter(|o| o.kind() == Some(git2::ObjectType::Blob))
+                .ok_or_else(lacking)?
+                .id();
+            let mode = f
+                .old_mode
+                .as_deref()
+                .or(f.deleted.as_deref())
+                .and_then(mode_of)
+                .or_else(|| mode_of(mode))
+                .unwrap_or(0o100644);
+            (id, mode)
+        };
+        out.add(&git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode,
+            uid: 0,
+            gid: 0,
+            file_size: 0,
+            id,
+            flags: name.len().min(0xfff) as u16,
+            flags_extended: 0,
+            path: name.as_bytes().to_vec(),
+        })?;
+    }
+    out.write()?;
     Ok(())
 }
 
@@ -1058,7 +1501,13 @@ pub fn apply_outside(files: &[FilePatch], opts: &ApplyOpts) -> Result<String, Gi
     let result = std::env::current_dir()
         .map_err(GitError::from)
         .and_then(|cwd| Ok(repo.set_workdir(&cwd, false)?))
-        .and_then(|()| apply(&repo, files, opts));
+        .and_then(|()| {
+            let opts = ApplyOpts {
+                intent_to_add: false,
+                ..opts.clone()
+            };
+            apply(&repo, files, &opts)
+        });
     let _ = std::fs::remove_dir_all(&tmp);
     result
 }
