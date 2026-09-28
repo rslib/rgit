@@ -179,6 +179,41 @@ fn stash_state(dir: &Path) -> (String, String, String) {
 }
 
 #[test]
+fn stash_push_pathspec_builds_gits_stash_commits() {
+    for flags in [&["-m", "m"][..], &["-u"], &["-k"]] {
+        let (g, r) = twins(&format!("stash-commits{}", flags[0]));
+        for d in [&g, &r] {
+            std::fs::write(d.join("dir/new"), "n\n").unwrap();
+            git(d, &["add", "dir/new"]);
+            std::fs::write(d.join("dir/loose"), "l\n").unwrap();
+        }
+        let mut args = vec!["stash", "push"];
+        args.extend(flags);
+        args.extend(["--", "dir", "b"]);
+        git(&g, &args);
+        ok(&r, &args);
+        let trees = |d: &Path| {
+            let mut revs = vec!["stash^{tree}", "stash^2^{tree}"];
+            revs.extend((flags[0] == "-u").then_some("stash^3^{tree}"));
+            revs.iter()
+                .map(|r| git(d, &["rev-parse", r]))
+                .collect::<String>()
+        };
+        assert_eq!(stash_state(&r), stash_state(&g), "{flags:?}");
+        assert_eq!(trees(&r), trees(&g), "{flags:?}");
+        let listing = |d: &Path| {
+            let mut names: Vec<_> = std::fs::read_dir(d.join("dir"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(listing(&r), listing(&g), "{flags:?}");
+    }
+}
+
+#[test]
 fn stash_push_takes_staged_pathspec_files_and_parts() {
     let (g, r) = twins("stash-staged");
     git(&g, &["stash", "push", "--staged", "-m", "only staged"]);

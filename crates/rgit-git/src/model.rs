@@ -986,6 +986,12 @@ pub struct FetchArgs {
     pub refmap: Option<Vec<String>>,
     /// Record the fetched branch as the current branch's upstream (`--set-upstream`).
     pub set_upstream: bool,
+    /// Fetch these remotes and groups instead of one (`--multiple`, `remote update`).
+    pub remotes: Vec<String>,
+    /// Fetch this many remotes at once (`--jobs`); 0 follows `fetch.parallel`.
+    pub jobs: usize,
+    /// Add to FETCH_HEAD instead of replacing it (`--append`).
+    pub append: bool,
 }
 
 /// `git pull` flags beyond the remote and branch.
@@ -1043,6 +1049,9 @@ pub struct PushArgs {
     pub porcelain: bool,
     /// Also report refs that are already up to date (`--verbose`).
     pub verbose: bool,
+    /// `check`, `on-demand`, `only` or `no` for the submodule commits pushed
+    /// (`--recurse-submodules`); `None` follows `push.recurseSubmodules`.
+    pub recurse_submodules: Option<String>,
 }
 
 /// A submodule as `git submodule status` reports it.
@@ -1082,6 +1091,9 @@ pub enum SubmoduleOp {
         init: bool,
         recursive: bool,
         remote: bool,
+        /// Submodules cloned and checked out at once (`--jobs`); `None`
+        /// follows `submodule.fetchJobs`.
+        jobs: Option<usize>,
     },
     Sync {
         paths: Vec<String>,
@@ -1148,7 +1160,24 @@ pub struct CloneArgs {
     pub no_tags: bool,
     /// `key=value` settings written to the new repository (`-c`).
     pub config: Vec<String>,
-    /// Flags only git's own clone implements (`--reference`, `--shared`,
-    /// `--filter`, `--sparse`, `--template`, ...), handed to it as given.
-    pub git_flags: Vec<String>,
+    /// Fetch every branch even when shallow (`--no-single-branch`).
+    pub no_single_branch: bool,
+    /// Borrow objects from these local repositories (`--reference`).
+    pub reference: Vec<String>,
+    /// Borrow from these when they are repositories (`--reference-if-able`).
+    pub reference_if_able: Vec<String>,
+    /// Copy the borrowed objects and drop the link (`--dissociate`).
+    pub dissociate: bool,
+    /// Borrow the source's objects instead of copying them (`--shared`).
+    pub shared: bool,
+    /// A partial clone (`--filter`), which only git can make.
+    pub filter: Option<String>,
+    /// Check out only the top-level files (`--sparse`).
+    pub sparse: bool,
+    /// Copy hooks and other files from this folder (`--template`).
+    pub template: Option<String>,
+    /// Keep the history after this date (`--shallow-since`).
+    pub shallow_since: Option<String>,
+    /// Put the repository here and link it from the working tree (`--separate-git-dir`).
+    pub separate_git_dir: Option<String>,
 }

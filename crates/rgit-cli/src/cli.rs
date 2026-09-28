@@ -691,9 +691,12 @@ pub enum Command {
         /// Report more (accepted for git compatibility).
         #[arg(short, long)]
         verbose: bool,
-        /// Parallel fetches (accepted; remotes are fetched in turn).
+        /// Fetch up to N remotes at once (default: `fetch.parallel`).
         #[arg(short = 'j', long, value_name = "N")]
         jobs: Option<usize>,
+        /// Add to FETCH_HEAD instead of replacing it.
+        #[arg(short = 'a', long)]
+        append: bool,
     },
     /// Fetch and integrate the current branch's upstream (merges when it has
     /// diverged, unless `pull.rebase` says otherwise).
@@ -800,8 +803,9 @@ pub enum Command {
         /// Report in git's machine-readable format.
         #[arg(long)]
         porcelain: bool,
-        /// Submodule check: check, on-demand, only or no (accepted; submodules
-        /// are not pushed or checked).
+        /// Submodule commits the pushed history records: `check` refuses
+        /// unpushed ones, `on-demand` pushes them first, `only` pushes just
+        /// them, `no` ignores them (default: `push.recurseSubmodules`).
         #[arg(long, value_name = "MODE", require_equals = true)]
         recurse_submodules: Option<String>,
         /// Print nothing unless an error occurs.
@@ -1707,6 +1711,12 @@ pub enum Command {
         /// Borrow objects from this local repository (git's alternates).
         #[arg(long, value_name = "REPO")]
         reference: Vec<String>,
+        /// Like --reference, but go on without it when REPO is not a repository.
+        #[arg(long, value_name = "REPO")]
+        reference_if_able: Vec<String>,
+        /// Accepted for git compatibility; the clone fetches everything itself.
+        #[arg(long, value_name = "URI")]
+        bundle_uri: Option<String>,
         /// With --reference, copy the borrowed objects and drop the link.
         #[arg(long)]
         dissociate: bool,
@@ -3876,7 +3886,7 @@ pub enum SubmoduleCmd {
         /// Print nothing unless an error occurs.
         #[arg(short, long)]
         quiet: bool,
-        /// Parallel clones (accepted; cloned in turn).
+        /// Clone and check out this many submodules at once.
         #[arg(short = 'j', long, value_name = "N")]
         jobs: Option<usize>,
         /// Only these submodule paths.
@@ -5713,8 +5723,13 @@ pub fn run(
             set_upstream,
             quiet,
             verbose: _,
-            jobs: _,
+            jobs,
+            append,
         } => {
+            let multiple = multiple.then(|| {
+                let names = remote.iter().chain(&repository).chain(&refspecs);
+                names.cloned().collect::<Vec<_>>()
+            });
             let args = rgit_git::FetchArgs {
                 all,
                 prune,
@@ -5730,15 +5745,12 @@ pub fn run(
                 refmap: (!refmap.is_empty())
                     .then(|| refmap.into_iter().filter(|m| !m.is_empty()).collect()),
                 set_upstream,
+                remotes: multiple.clone().unwrap_or_default(),
+                jobs: jobs.unwrap_or(0),
+                append,
             };
-            let out = if multiple {
-                let mut out = Vec::new();
-                for name in remote.into_iter().chain(repository).chain(refspecs) {
-                    out.push(net(interactive, "fetch", |r| {
-                        backend.fetch(Some(&name), &[], &args, r)
-                    })?);
-                }
-                out.join("\n")
+            let out = if multiple.is_some() {
+                net(interactive, "fetch", |r| backend.fetch(None, &[], &args, r))?
             } else {
                 let (remote, refspecs) = remote_and_refspecs(remote, repository, refspecs);
                 net(interactive, "fetch", |r| {
@@ -5810,7 +5822,7 @@ pub fn run(
             push_option,
             no_verify,
             porcelain,
-            recurse_submodules: _,
+            recurse_submodules,
             quiet,
             verbose,
         } => {
@@ -5847,6 +5859,7 @@ pub fn run(
                 no_verify,
                 porcelain,
                 verbose,
+                recurse_submodules,
             };
             let out = net(interactive, "push", |r| {
                 backend.push_to(remote.as_deref(), &refspecs, &args, r)
@@ -6580,14 +6593,10 @@ pub fn run(
                 }
                 let args = rgit_git::FetchArgs {
                     prune,
+                    remotes: targets,
                     ..rgit_git::FetchArgs::default()
                 };
-                let mut out = Vec::new();
-                for t in targets {
-                    backend.fetch(Some(&t), &[], &args, &|_| {})?;
-                    out.push(format!("Fetching {t}"));
-                }
-                out.join("\n")
+                net(interactive, "fetch", |r| backend.fetch(None, &[], &args, r))?
             }
             Some(RemoteCmd::SetHead {
                 name,
@@ -7457,6 +7466,7 @@ fn submodule(
             remote,
             quiet,
             paths,
+            jobs,
             ..
         }) => (
             Op::Update {
@@ -7464,6 +7474,7 @@ fn submodule(
                 init,
                 recursive,
                 remote,
+                jobs,
             },
             quiet,
         ),
@@ -7486,7 +7497,9 @@ fn submodule(
         Some(SubmoduleCmd::Absorbgitdirs { paths }) => (Op::AbsorbGitDirs { paths }, false),
     };
     let out = net(interactive, "submodule", |r| backend.submodule(&op, r))?;
-    Ok(if quiet { String::new() } else { out })
+    // An empty summary prints nothing, as in git.
+    let empty = matches!(op, Op::Summary { .. }) && out == "ok";
+    Ok(if quiet || empty { String::new() } else { out })
 }
 
 /// `submodule foreach`: run `command` in each checked-out submodule with
@@ -7498,20 +7511,37 @@ fn submodule_foreach(
     command: &[String],
 ) -> anyhow::Result<String> {
     let top = backend.workdir().to_path_buf();
+    let top = std::fs::canonicalize(&top).unwrap_or(top);
     let mut out = String::new();
-    for s in backend.submodules(recursive)? {
+    let all = backend.submodules(recursive)?;
+    for s in &all {
         if s.state == '-' {
             continue;
         }
         if !quiet {
             out.push_str(&format!("Entering '{}'\n", s.path));
         }
-        // ponytail: nested submodules get the top-level $toplevel and a
-        // top-relative $sm_path; git gives their immediate superproject's.
+        // A nested submodule's $toplevel and $sm_path are its immediate
+        // superproject's, as in git.
+        let parent = all
+            .iter()
+            .filter(|p| s.path.starts_with(&format!("{}/", p.path)))
+            .max_by_key(|p| p.path.len());
+        let (toplevel, sm_path) = match parent {
+            Some(p) => (top.join(&p.path), &s.path[p.path.len() + 1..]),
+            None => (top.clone(), s.path.as_str()),
+        };
+        // As in git, only a single-argument command sees the variables.
         let mut cmd = match command {
             [one] => {
+                let quoted = format!("'{}'", sm_path.replace('\'', r"'\''"));
                 let mut sh = std::process::Command::new("sh");
-                sh.args(["-c", one]);
+                sh.args(["-c", &format!("path={quoted}; {one}")])
+                    .env("name", &s.name)
+                    .env("sm_path", sm_path)
+                    .env("displaypath", &s.path)
+                    .env("sha1", s.recorded.as_deref().unwrap_or_default())
+                    .env("toplevel", &toplevel);
                 sh
             }
             [program, args @ ..] => {
@@ -7521,14 +7551,7 @@ fn submodule_foreach(
             }
             [] => anyhow::bail!("foreach needs a command"),
         };
-        let result = cmd
-            .current_dir(top.join(&s.path))
-            .env("name", &s.name)
-            .env("sm_path", &s.path)
-            .env("displaypath", &s.path)
-            .env("sha1", s.checked_out.as_deref().unwrap_or_default())
-            .env("toplevel", &top)
-            .output()?;
+        let result = cmd.current_dir(top.join(&s.path)).output()?;
         out.push_str(&String::from_utf8_lossy(&result.stdout));
         if !result.status.success() {
             return Err(CliError {

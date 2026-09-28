@@ -15,6 +15,7 @@ use crate::backend::GitBackend;
 use crate::diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 use crate::error::GitError;
 use crate::model::{Commit, Head, OpProgress, RepoStatus, Stash, StatusCode, StatusEntry};
+use crate::shallow;
 
 const RECENT_LIMIT: usize = 10;
 
@@ -79,43 +80,6 @@ impl Git2Backend {
         result
     }
 
-    /// Push arbitrary refspecs to `remote` (or the current branch's upstream
-    /// remote when `None`). Shared by tag and delete pushes; surfaces a refused
-    /// ref as an error the way [`push`] does.
-    fn push_refspecs(
-        &self,
-        remote: Option<&str>,
-        refspecs: &[String],
-        report: &dyn Fn(OpProgress),
-    ) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
-        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
-        let remote_name = match remote {
-            Some(r) => r.to_owned(),
-            None => upstream_remote(&repo)?.0,
-        };
-        if multi_url(&repo, &remote_name, true) {
-            let mut cmd = vec!["push", remote_name.as_str()];
-            cmd.extend(refspecs.iter().map(String::as_str));
-            self.run_git(&cmd, &[])?;
-            return Ok(());
-        }
-        let mut remote = repo.find_remote(&remote_name)?;
-        if let Ok(url) = remote.url() {
-            report(OpProgress::Line(format!("To {url}")));
-        }
-        let rejected = std::sync::atomic::AtomicBool::new(false);
-        let callbacks = remote_callbacks(report, &rejected, cred_guard.as_deref());
-        let mut opts = PushOptions::new();
-        opts.remote_callbacks(callbacks);
-        let specs: Vec<&str> = refspecs.iter().map(String::as_str).collect();
-        remote.push(&specs, Some(&mut opts))?;
-        if rejected.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(GitError::PushRejected);
-        }
-        Ok(())
-    }
-
     /// Run a `git` CLI command in the working directory, returning its stdout on
     /// success or its stderr as a `Cli` error. Used only for the few operations
     /// libgit2 cannot do (bisect, shallow fetches, signing).
@@ -141,9 +105,7 @@ impl Git2Backend {
         }
     }
 
-    /// Fetch one remote natively, or through git for what libgit2 cannot do:
-    /// deepening by a count or a date, and shallow fetches over its local
-    /// transport.
+    /// Fetch one remote natively.
     fn fetch_remote(
         &self,
         repo: &Repository,
@@ -156,46 +118,78 @@ impl Git2Backend {
         if args.dry_run {
             return fetch_dry_run(repo, name, refspecs, args, report, cred);
         }
-        let local = repo.find_remote(name)?.url().is_ok_and(is_local_url);
-        if !(args.deepen > 0
-            || args.shallow_since.is_some()
-            || (local && (args.depth > 0 || args.unshallow))
-            || multi_url(repo, name, false))
-        {
-            return do_fetch(repo, name, refspecs, args, report, cred);
+        fetch_one(repo, name, refspecs, args, report, cred)
+    }
+
+    /// Fetch several remotes as git's `fetch --multiple` does: up to
+    /// `--jobs` (or `fetch.parallel`) at once, each adding to FETCH_HEAD,
+    /// reported in order under a `Fetching <name>` line.
+    fn fetch_many(
+        &self,
+        repo: &Repository,
+        names: &[String],
+        args: &crate::FetchArgs,
+        report: &dyn Fn(OpProgress),
+        cred: Option<&dyn crate::CredentialPrompt>,
+    ) -> Result<(), GitError> {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        if !args.append && !args.dry_run {
+            std::fs::write(repo.path().join("FETCH_HEAD"), "")?;
         }
-        let mut cmd = vec!["fetch".to_owned()];
-        if args.depth > 0 {
-            cmd.push(format!("--depth={}", args.depth));
-        }
-        if args.deepen > 0 {
-            cmd.push(format!("--deepen={}", args.deepen));
-        }
-        if let Some(date) = &args.shallow_since {
-            cmd.push(format!("--shallow-since={date}"));
-        }
-        for (on, flag) in [
-            (args.unshallow, "--unshallow"),
-            (args.prune, "--prune"),
-            (args.prune_tags, "--prune-tags"),
-            (args.tags, "--tags"),
-            (args.no_tags, "--no-tags"),
-            (args.force, "--force"),
-        ] {
-            if on {
-                cmd.push(flag.to_owned());
+        let each = crate::FetchArgs {
+            append: true,
+            ..args.clone()
+        };
+        let jobs = match args.jobs {
+            0 => repo.config()?.get_i32("fetch.parallel").unwrap_or(1).max(0) as usize,
+            n => n,
+        };
+        let jobs = match jobs {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n,
+        };
+        let path = repo.path().to_path_buf();
+        type Outcome = (Vec<String>, Result<(), GitError>);
+        let done: Vec<Mutex<Option<Outcome>>> = names.iter().map(|_| Mutex::new(None)).collect();
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..jobs.min(names.len()) {
+                s.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Relaxed);
+                        let Some(name) = names.get(i) else { break };
+                        let lines = Mutex::new(Vec::new());
+                        let buffer = |p: OpProgress| {
+                            if let OpProgress::Line(l) = p {
+                                lines.lock().expect("lines mutex").push(l);
+                            }
+                        };
+                        let result = Repository::open(&path)
+                            .map_err(GitError::from)
+                            .and_then(|r| self.fetch_remote(&r, name, &[], &each, &buffer, cred));
+                        let lines = lines.into_inner().expect("lines mutex");
+                        *done[i].lock().expect("outcome mutex") = Some((lines, result));
+                    }
+                });
+            }
+        });
+        let mut failed = Vec::new();
+        for (name, slot) in names.iter().zip(done) {
+            report(OpProgress::Line(format!("Fetching {name}")));
+            let Some((lines, result)) = slot.into_inner().expect("outcome mutex") else {
+                continue;
+            };
+            for line in lines {
+                report(OpProgress::Line(line));
+            }
+            if let Err(e) = result {
+                failed.push(format!("{e}\nerror: could not fetch {name}"));
             }
         }
-        match &args.refmap {
-            Some(map) if map.is_empty() => cmd.push("--refmap=".to_owned()),
-            Some(map) => cmd.extend(map.iter().map(|m| format!("--refmap={m}"))),
-            None => {}
+        match failed.is_empty() {
+            true => Ok(()),
+            false => Err(GitError::Other(failed.join("\n"))),
         }
-        cmd.push(name.to_owned());
-        cmd.extend(refspecs.iter().cloned());
-        let argv: Vec<&str> = cmd.iter().map(String::as_str).collect();
-        self.run_git(&argv, &[])?;
-        Ok(())
     }
 }
 
@@ -302,18 +296,15 @@ impl GitBackend for Git2Backend {
                 repo.stash_save2(&sig, message, Some(flags))?;
                 return Ok(stash_saved_line(&repo));
             }
-            // libgit2 can stash a pathspec, but git2 cannot name such a stash.
-            let mut args = vec!["stash", "push"];
-            args.extend(include_untracked.then_some("-u"));
-            args.extend(all.then_some("-a"));
-            args.extend(keep_index.then_some("-k"));
-            if let Some(m) = message {
-                args.extend(["-m", m]);
-            }
-            args.push("--");
-            args.extend(paths.iter().map(String::as_str));
-            let out = self.run_git(&args, &[])?;
-            sync_index(&self.repo.lock().expect("repo mutex"))?;
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            let opts = crate::stash::Opts {
+                message,
+                untracked: include_untracked,
+                all,
+                keep_index,
+            };
+            let out = crate::stash::push_paths(&repo, paths, &opts)?;
             Ok(out)
         })
     }
@@ -3326,32 +3317,37 @@ impl GitBackend for Git2Backend {
         self.logged("remote prune", || {
             let repo = self.repo.lock().expect("repo mutex");
             let cred_guard = self.cred_prompt.lock().expect("cred mutex");
-            let cred = cred_guard.as_deref();
-            let tracking = |repo: &Repository| -> Result<Vec<String>, GitError> {
-                let mut out = Vec::new();
-                for b in repo.branches(Some(BranchType::Remote))? {
-                    if let Some(n) = b?.0.name()? {
-                        out.push(n.to_owned());
+            // What the remote's first URL has, as git reads it.
+            let (mut remote, _, _) = fetch_source(&repo, name)?;
+            let ignored = std::sync::atomic::AtomicBool::new(false);
+            let callbacks = remote_callbacks(&|_| {}, &ignored, cred_guard.as_deref());
+            let conn = remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None)?;
+            let theirs: Vec<String> = conn.list()?.iter().map(|h| h.name().to_owned()).collect();
+            drop(conn);
+            let mut pruned = Vec::new();
+            for spec in config_values(&repo, &format!("remote.{name}.fetch"))? {
+                let Some((src, dst)) = spec.trim_start_matches('+').split_once(':') else {
+                    continue;
+                };
+                let pattern = match dst.split_once('*') {
+                    Some((pre, _)) => format!("{pre}*"),
+                    None => dst.to_owned(),
+                };
+                for r in repo.references_glob(&pattern)? {
+                    let mut r = r?;
+                    if r.symbolic_target().is_ok_and(|t| t.is_some()) {
+                        continue;
+                    }
+                    let Ok(local) = r.name().map(str::to_owned) else {
+                        continue;
+                    };
+                    if map_glob(dst, src, &local).is_some_and(|t| !theirs.contains(&t)) {
+                        r.delete()?;
+                        pruned.push(short_ref(&local).to_owned());
                     }
                 }
-                Ok(out)
-            };
-            let before = tracking(&repo)?;
-            if multi_url(&repo, name, false) {
-                self.run_git(&["remote", "prune", name], &[])?;
-            } else {
-                let rejected = std::sync::atomic::AtomicBool::new(false);
-                let mut remote = repo.find_remote(name)?;
-                let mut conn = remote.connect_auth(
-                    git2::Direction::Fetch,
-                    Some(remote_callbacks(&|_| {}, &rejected, cred)),
-                    None,
-                )?;
-                conn.remote()
-                    .prune(Some(remote_callbacks(&|_| {}, &rejected, cred)))?;
             }
-            let after = tracking(&repo)?;
-            Ok(before.into_iter().filter(|b| !after.contains(b)).collect())
+            Ok(pruned)
         })
     }
 
@@ -4605,20 +4601,65 @@ impl GitBackend for Git2Backend {
         let repo = self.repo.lock().expect("repo mutex");
         let cred_guard = self.cred_prompt.lock().expect("cred mutex");
         let cred = cred_guard.as_deref();
-        let names: Vec<String> = if args.all {
-            repo.remotes()?
+        // As in git, a group (`remotes.<group>`) stands for its remotes.
+        let expand = |name: &str| -> Result<Vec<String>, GitError> {
+            let group: Vec<String> = config_values(&repo, &format!("remotes.{name}"))?
                 .iter()
-                .filter_map(|t| t.ok().flatten())
-                .map(|s| s.to_owned())
-                .collect()
-        } else {
-            vec![match remote {
-                Some(r) => r.to_owned(),
-                None => upstream_remote(&repo)?.0,
-            }]
+                .flat_map(|v| v.split_whitespace().map(str::to_owned))
+                .collect();
+            match group.is_empty() {
+                false => Ok(group),
+                true if repo.find_remote(name).is_ok() => Ok(vec![name.to_owned()]),
+                true => Err(GitError::Other(format!(
+                    "no such remote or remote group: {name}"
+                ))),
+            }
         };
-        for name in &names {
-            self.fetch_remote(&repo, name, refspecs, args, report, cred)?;
+        let (names, multiple): (Vec<String>, bool) = if args.all {
+            let config = repo.config()?;
+            let names: Vec<String> = repo
+                .remotes()?
+                .iter()
+                .flatten()
+                .flatten()
+                .filter(|r| {
+                    !config
+                        .get_bool(&format!("remote.{r}.skipFetchAll"))
+                        .unwrap_or(false)
+                })
+                .map(str::to_owned)
+                .collect();
+            let many = names.len() > 1;
+            (names, many)
+        } else if !args.remotes.is_empty() {
+            let mut names = Vec::new();
+            for r in &args.remotes {
+                names.extend(expand(r)?);
+            }
+            (names, true)
+        } else {
+            match remote {
+                Some(r) if repo.find_remote(r).is_err() => {
+                    let names = expand(r)?;
+                    if names.len() > 1 && !refspecs.is_empty() {
+                        return Err(GitError::Other(
+                            "fetching a group and specifying refspecs does not make sense"
+                                .to_owned(),
+                        ));
+                    }
+                    let many = names.len() > 1;
+                    (names, many)
+                }
+                Some(r) => (vec![r.to_owned()], false),
+                None => (vec![upstream_remote(&repo)?.0], false),
+            }
+        };
+        if multiple {
+            self.fetch_many(&repo, &names, args, report, cred)?;
+        } else {
+            for name in &names {
+                self.fetch_remote(&repo, name, refspecs, args, report, cred)?;
+            }
         }
         if args.set_upstream && !args.dry_run {
             let name = &names[0];
@@ -4696,11 +4737,6 @@ impl GitBackend for Git2Backend {
                 autostash,
             )
         };
-        if rebase && args.strategy_option.is_some() {
-            return Err(GitError::Other(
-                "-X applies to a merge only; add --no-rebase".to_owned(),
-            ));
-        }
         self.logged(if rebase { "pull --rebase" } else { "pull" }, || {
             let mut repo = self.repo.lock().expect("repo mutex");
             {
@@ -4747,6 +4783,7 @@ impl GitBackend for Git2Backend {
                 let opts = crate::RebaseOptions {
                     fork_point: Some(true),
                     autostash,
+                    strategy_option: args.strategy_option.clone(),
                     ..Default::default()
                 };
                 let upstream = format!("refs/remotes/{remote}/{branch}");
@@ -4825,7 +4862,6 @@ impl GitBackend for Git2Backend {
         args: &crate::PushArgs,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
-        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
         let repo = self.repo.lock().expect("repo mutex");
         let cred_guard = self.cred_prompt.lock().expect("cred mutex");
         let cred = cred_guard.as_deref();
@@ -4900,225 +4936,72 @@ impl GitBackend for Git2Backend {
                 }
             }
         }
-        if multi_url(&repo, &remote_name, true) {
-            let mut cmd = vec!["push".to_owned()];
-            for (on, flag) in [
-                (args.force_with_lease, "--force-with-lease"),
-                (args.dry_run, "--dry-run"),
-                (args.set_upstream, "--set-upstream"),
-            ] {
-                if on {
-                    cmd.push(flag.to_owned());
-                }
-            }
-            cmd.push(remote_name);
-            cmd.extend(specs.iter().map(|(f, src, dst)| {
-                let lead = if args.force || *f { "+" } else { "" };
-                format!("{lead}{src}:{dst}")
-            }));
-            let cmd: Vec<&str> = cmd.iter().map(String::as_str).collect();
-            self.run_git(&cmd, &[])?;
-            return Ok(());
-        }
-
-        let mut remote = repo.find_remote(&remote_name)?;
-        let url = remote.url().unwrap_or(&remote_name).to_owned();
-        let prune: &[&str] = match (args.mirror, args.prune, args.all, args.tags) {
-            (true, ..) => &["refs/"],
-            (_, true, true, true) => &["refs/heads/", "refs/tags/"],
-            (_, true, true, _) => &["refs/heads/"],
-            (_, true, _, true) => &["refs/tags/"],
-            _ => &[],
+        let mode = match &args.recurse_submodules {
+            Some(m) => m.clone(),
+            None => repo
+                .config()?
+                .get_string("push.recurseSubmodules")
+                .unwrap_or_default(),
         };
-        if !prune.is_empty() {
-            let ignored = AtomicBool::new(false);
-            let callbacks = remote_callbacks(report, &ignored, cred);
-            let conn = remote.connect_auth(git2::Direction::Push, Some(callbacks), None)?;
-            let theirs: Vec<String> = conn.list()?.iter().map(|h| h.name().to_owned()).collect();
-            drop(conn);
-            for name in theirs {
-                if prune.iter().any(|p| name.starts_with(p))
-                    && !name.ends_with("^{}")
-                    && !specs.iter().any(|(_, _, d)| *d == name)
-                {
-                    specs.push((false, String::new(), name));
-                }
+        if matches!(mode.as_str(), "check" | "on-demand" | "only") {
+            push_submodules(&repo, &remote_name, &specs, refspecs, args, &mode, report)?;
+            if mode == "only" {
+                return Ok(());
             }
         }
-
-        let forced_all = args.force || args.force_with_lease || args.mirror;
-        // Force-with-lease: each remote branch must still match the ref we
-        // last fetched for it.
-        let leases: std::collections::HashMap<String, Oid> = specs
-            .iter()
-            .filter(|_| args.force_with_lease)
-            .filter_map(|(_, _, dst)| {
-                let name = dst.strip_prefix("refs/heads/")?;
-                let id = repo
-                    .refname_to_id(&format!("refs/remotes/{remote_name}/{name}"))
-                    .ok()?;
-                Some((dst.clone(), id))
-            })
-            .collect();
-        let push_options: Vec<&str> = args.push_options.iter().map(String::as_str).collect();
-        let repo_ref = &*repo;
-        let rows: Mutex<Vec<PushRow>> = Mutex::new(Vec::new());
-        let hook_failed: Mutex<Option<String>> = Mutex::new(None);
-        let mut failed: Vec<PushRow> = Vec::new();
-        let mut todo = specs.clone();
-        // A rejected ref (checked here, before anything is sent) aborts the
-        // push; unless atomic, the rest are pushed again without it, as git
-        // pushes every ref it can.
-        loop {
-            let (retry, stop) = (AtomicBool::new(false), AtomicBool::new(false));
-            let forced: std::collections::HashMap<String, bool> = todo
-                .iter()
-                .map(|(f, _, d)| (d.clone(), forced_all || *f))
-                .collect();
-            let ignored = AtomicBool::new(false);
-            let mut callbacks = remote_callbacks(report, &ignored, cred);
-            callbacks.update_tips(|_, _, _| true);
-            callbacks.push_update_reference(|refname, status| {
-                if let Some(msg) = status
-                    && let Some(row) = rows
-                        .lock()
-                        .expect("rows mutex")
-                        .iter_mut()
-                        .find(|r| r.dst == refname)
-                {
-                    row.flag = '!';
-                    row.summary = "[remote rejected]".to_owned();
-                    row.reason = Some(msg.to_owned());
-                }
-                Ok(())
-            });
-            callbacks.push_negotiation(|updates| {
-                let mut out: Vec<PushRow> = updates
-                    .iter()
-                    .map(|u| {
-                        let dst = u.dst_refname().unwrap_or_default();
-                        push_row(
-                            repo_ref,
-                            u,
-                            forced.get(dst).copied().unwrap_or(forced_all),
-                            leases.get(dst).copied(),
-                        )
-                    })
-                    .collect();
-                let rejected = out.iter().any(|r| r.flag == '!');
-                if rejected && args.atomic {
-                    for r in out.iter_mut().filter(|r| !matches!(r.flag, '!' | '=')) {
-                        r.flag = '!';
-                        r.summary = "[rejected]".to_owned();
-                        r.reason = Some("atomic push failed".to_owned());
-                    }
-                }
-                if rejected && !args.dry_run && !args.atomic {
-                    *rows.lock().expect("rows mutex") = out;
-                    retry.store(true, Relaxed);
-                    return Err(git2::Error::from_str("rejected"));
-                }
-                if !rejected && !args.no_verify {
-                    let refs: Vec<git2_hooks::PrePushRef> = out
-                        .iter()
-                        .filter(|r| r.flag != '=')
-                        .map(|r| {
-                            let (local, new) = match r.flag {
-                                '-' => ("(delete)", None),
-                                _ => (r.src.as_str(), Some(r.new)),
-                            };
-                            let old = (!r.old.is_zero()).then_some(r.old);
-                            git2_hooks::PrePushRef::new(local, new, r.dst.as_str(), old)
-                        })
-                        .collect();
-                    let hook =
-                        git2_hooks::hooks_pre_push(repo_ref, None, Some(&remote_name), &url, &refs);
-                    if let Err(e) = run_hook("pre-push", hook) {
-                        *hook_failed.lock().expect("hook mutex") = Some(e.to_string());
-                        stop.store(true, Relaxed);
-                        return Err(git2::Error::from_str("pre-push hook failed"));
-                    }
-                }
-                *rows.lock().expect("rows mutex") = out;
-                if args.dry_run || rejected {
-                    stop.store(true, Relaxed);
-                    return Err(git2::Error::from_str("not pushed"));
-                }
-                Ok(())
-            });
-            let mut opts = PushOptions::new();
-            opts.remote_callbacks(callbacks);
-            if !push_options.is_empty() {
-                opts.remote_push_options(&push_options);
-            }
-            let wire: Vec<String> = todo
-                .iter()
-                .map(|(f, src, dst)| {
-                    let lead = if forced_all || *f { "+" } else { "" };
-                    format!("{lead}{src}:{dst}")
-                })
-                .collect();
-            let pushed = remote.push(&wire, Some(&mut opts));
-            if retry.load(Relaxed) {
-                let out = std::mem::take(&mut *rows.lock().expect("rows mutex"));
-                let (bad, _): (Vec<PushRow>, Vec<PushRow>) =
-                    out.into_iter().partition(|r| r.flag == '!');
-                todo.retain(|(_, _, d)| !bad.iter().any(|r| r.dst == *d));
-                failed.extend(bad);
-                if todo.is_empty() {
-                    break;
-                }
-                continue;
-            }
-            if !stop.load(Relaxed) {
-                pushed?;
-            }
-            break;
+        let urls = remote_urls(&repo, &remote_name, true)?;
+        if urls.len() < 2 {
+            let mut remote = repo.find_remote(&remote_name)?;
+            let url = remote.url().unwrap_or(&remote_name).to_owned();
+            return push_one(
+                &repo,
+                &mut remote,
+                &url,
+                &remote_name,
+                specs,
+                &followed,
+                args,
+                report,
+                cred,
+                false,
+            );
         }
-        if let Some(msg) = hook_failed.into_inner().expect("hook mutex") {
-            return Err(GitError::PushFailed(format!(
-                "{msg}\nerror: failed to push some refs to '{url}'"
-            )));
-        }
-
-        let mut all = failed;
-        all.extend(rows.into_inner().expect("rows mutex"));
-        all.retain(|r| !(r.summary == "[rejected]" && followed.contains(&r.dst)));
-        let at = |d: &str| specs.iter().position(|(_, _, x)| x == d);
-        all.sort_by_key(|r| at(&r.dst));
-        let shown: Vec<String> = all
-            .iter()
-            .filter(|r| args.porcelain || args.verbose || r.flag != '=')
-            .map(|r| r.line(args.porcelain))
-            .collect();
-        let mut text = Vec::new();
-        if shown.is_empty() {
-            text.push("Everything up-to-date".to_owned());
-        } else {
-            text.push(format!("To {url}"));
-            text.extend(shown);
-            if args.porcelain {
-                text.push("Done".to_owned());
+        // Like git, push to each URL in turn and report every one.
+        let lines = Mutex::new(Vec::new());
+        let buffer = |p: OpProgress| match p {
+            OpProgress::Line(l) => lines.lock().expect("lines mutex").push(l),
+            other => report(other),
+        };
+        let mut failed = false;
+        for url in &urls {
+            let mut remote = repo.remote_anonymous(url)?;
+            let pushed = push_one(
+                &repo,
+                &mut remote,
+                url,
+                &remote_name,
+                specs.clone(),
+                &followed,
+                args,
+                &buffer,
+                cred,
+                true,
+            );
+            if let Err(e) = pushed {
+                failed = true;
+                let text = match e {
+                    GitError::PushFailed(t) => t,
+                    e => e.to_string(),
+                };
+                lines.lock().expect("lines mutex").push(text);
             }
         }
-        if all.iter().any(|r| r.flag == '!') {
-            text.push(format!("error: failed to push some refs to '{url}'"));
-            text.extend(push_hints(&repo, &all));
-            return Err(GitError::PushFailed(text.join("\n")));
+        let lines = lines.into_inner().expect("lines mutex");
+        if failed {
+            return Err(GitError::PushFailed(lines.join("\n")));
         }
-        for line in text {
+        for line in lines {
             report(OpProgress::Line(line));
-        }
-        if args.set_upstream && !args.dry_run {
-            for (_, src, dst) in &todo {
-                if let (Some(local), Some(theirs)) = (
-                    src.strip_prefix("refs/heads/"),
-                    dst.strip_prefix("refs/heads/"),
-                ) {
-                    repo.find_branch(local, BranchType::Local)?
-                        .set_upstream(Some(&format!("{remote_name}/{theirs}")))?;
-                }
-            }
         }
         Ok(())
     }
@@ -5138,7 +5021,7 @@ impl GitBackend for Git2Backend {
             report(OpProgress::Line("no tags to push".to_owned()));
             return Ok(());
         }
-        self.push_refspecs(remote, &refspecs, report)
+        self.push_to(remote, &refspecs, &crate::PushArgs::default(), report)
     }
 
     fn push_delete(
@@ -5149,7 +5032,12 @@ impl GitBackend for Git2Backend {
     ) -> Result<(), GitError> {
         self.logged("push delete", || {
             // An empty source ref deletes the destination on the remote.
-            self.push_refspecs(remote, &[format!(":refs/heads/{branch}")], report)
+            self.push_to(
+                remote,
+                &[format!(":refs/heads/{branch}")],
+                &crate::PushArgs::default(),
+                report,
+            )
         })
     }
 
@@ -5167,51 +5055,16 @@ impl GitBackend for Git2Backend {
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
         use crate::SubmoduleOp as Op;
-        // libgit2 cannot name a submodule apart from its path, move a
-        // submodule's repository into .git/modules, or summarize one.
-        let mut argv = vec!["submodule".to_owned()];
-        match op {
-            Op::Add {
-                url,
-                path,
-                branch,
-                name: Some(name),
-            } => {
-                argv.push("add".to_owned());
-                if let Some(b) = branch {
-                    argv.extend(["-b".to_owned(), b.clone()]);
-                }
-                argv.extend([
-                    "--name".to_owned(),
-                    name.clone(),
-                    "--".to_owned(),
-                    url.clone(),
-                ]);
-                argv.extend(path.clone());
-            }
-            Op::AbsorbGitDirs { paths } => {
-                argv.push("absorbgitdirs".to_owned());
-                argv.push("--".to_owned());
-                argv.extend(paths.iter().cloned());
-            }
-            Op::Summary { args } => {
-                argv.push("summary".to_owned());
-                argv.extend(args.iter().cloned());
-            }
-            _ => {
-                return self.logged("submodule", || {
-                    let repo = self.repo.lock().expect("repo mutex");
-                    sync_index(&repo)?;
-                    submodule_op(&repo, op, report)
-                });
-            }
+        if let Op::Summary { args } = op {
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            return crate::submodule::summary(&repo, args, report);
         }
-        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let out = self.run_git(&args, &[])?;
-        for line in out.lines() {
-            report(OpProgress::Line(line.to_owned()));
-        }
-        sync_index(&self.repo.lock().expect("repo mutex"))
+        self.logged("submodule", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            submodule_op(&repo, op, report)
+        })
     }
 
     fn resolve_object(&self, rev: &str) -> Result<String, GitError> {
@@ -5323,6 +5176,360 @@ impl GitBackend for Git2Backend {
     }
 }
 
+/// Push `specs` (with the `followed` tags) through `remote` at `url` and
+/// report it as git does; `anonymous` says `remote` stands in for
+/// `remote_name` at one of its URLs.
+#[allow(clippy::too_many_arguments)]
+fn push_one(
+    repo: &Repository,
+    remote: &mut git2::Remote<'_>,
+    url: &str,
+    remote_name: &str,
+    mut specs: Vec<(bool, String, String)>,
+    followed: &[String],
+    args: &crate::PushArgs,
+    report: &dyn Fn(OpProgress),
+    cred: Option<&dyn crate::CredentialPrompt>,
+    anonymous: bool,
+) -> Result<(), GitError> {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let prune: &[&str] = match (args.mirror, args.prune, args.all, args.tags) {
+        (true, ..) => &["refs/"],
+        (_, true, true, true) => &["refs/heads/", "refs/tags/"],
+        (_, true, true, _) => &["refs/heads/"],
+        (_, true, _, true) => &["refs/tags/"],
+        _ => &[],
+    };
+    if !prune.is_empty() {
+        let ignored = AtomicBool::new(false);
+        let callbacks = remote_callbacks(report, &ignored, cred);
+        let conn = remote.connect_auth(git2::Direction::Push, Some(callbacks), None)?;
+        let theirs: Vec<String> = conn.list()?.iter().map(|h| h.name().to_owned()).collect();
+        drop(conn);
+        for name in theirs {
+            if prune.iter().any(|p| name.starts_with(p))
+                && !name.ends_with("^{}")
+                && !specs.iter().any(|(_, _, d)| *d == name)
+            {
+                specs.push((false, String::new(), name));
+            }
+        }
+    }
+
+    let forced_all = args.force || args.force_with_lease || args.mirror;
+    // Force-with-lease: each remote branch must still match the ref we
+    // last fetched for it.
+    let leases: std::collections::HashMap<String, Oid> = specs
+        .iter()
+        .filter(|_| args.force_with_lease)
+        .filter_map(|(_, _, dst)| {
+            let name = dst.strip_prefix("refs/heads/")?;
+            let id = repo
+                .refname_to_id(&format!("refs/remotes/{remote_name}/{name}"))
+                .ok()?;
+            Some((dst.clone(), id))
+        })
+        .collect();
+    let push_options: Vec<&str> = args.push_options.iter().map(String::as_str).collect();
+    let rows: Mutex<Vec<PushRow>> = Mutex::new(Vec::new());
+    let hook_failed: Mutex<Option<String>> = Mutex::new(None);
+    let mut failed: Vec<PushRow> = Vec::new();
+    let mut todo = specs.clone();
+    // A rejected ref (checked here, before anything is sent) aborts the
+    // push; unless atomic, the rest are pushed again without it, as git
+    // pushes every ref it can.
+    loop {
+        let (retry, stop) = (AtomicBool::new(false), AtomicBool::new(false));
+        let forced: std::collections::HashMap<String, bool> = todo
+            .iter()
+            .map(|(f, _, d)| (d.clone(), forced_all || *f))
+            .collect();
+        let ignored = AtomicBool::new(false);
+        let mut callbacks = remote_callbacks(report, &ignored, cred);
+        callbacks.update_tips(|_, _, _| true);
+        callbacks.push_update_reference(|refname, status| {
+            if let Some(msg) = status
+                && let Some(row) = rows
+                    .lock()
+                    .expect("rows mutex")
+                    .iter_mut()
+                    .find(|r| r.dst == refname)
+            {
+                row.flag = '!';
+                row.summary = "[remote rejected]".to_owned();
+                row.reason = Some(msg.to_owned());
+            }
+            Ok(())
+        });
+        callbacks.push_negotiation(|updates| {
+            let mut out: Vec<PushRow> = updates
+                .iter()
+                .map(|u| {
+                    let dst = u.dst_refname().unwrap_or_default();
+                    push_row(
+                        repo,
+                        u,
+                        forced.get(dst).copied().unwrap_or(forced_all),
+                        leases.get(dst).copied(),
+                    )
+                })
+                .collect();
+            let rejected = out.iter().any(|r| r.flag == '!');
+            if rejected && args.atomic {
+                for r in out.iter_mut().filter(|r| !matches!(r.flag, '!' | '=')) {
+                    r.flag = '!';
+                    r.summary = "[rejected]".to_owned();
+                    r.reason = Some("atomic push failed".to_owned());
+                }
+            }
+            if rejected && !args.dry_run && !args.atomic {
+                *rows.lock().expect("rows mutex") = out;
+                retry.store(true, Relaxed);
+                return Err(git2::Error::from_str("rejected"));
+            }
+            if !rejected && !args.no_verify {
+                let refs: Vec<git2_hooks::PrePushRef> = out
+                    .iter()
+                    .filter(|r| r.flag != '=')
+                    .map(|r| {
+                        let (local, new) = match r.flag {
+                            '-' => ("(delete)", None),
+                            _ => (r.src.as_str(), Some(r.new)),
+                        };
+                        let old = (!r.old.is_zero()).then_some(r.old);
+                        git2_hooks::PrePushRef::new(local, new, r.dst.as_str(), old)
+                    })
+                    .collect();
+                let hook = git2_hooks::hooks_pre_push(repo, None, Some(remote_name), url, &refs);
+                if let Err(e) = run_hook("pre-push", hook) {
+                    *hook_failed.lock().expect("hook mutex") = Some(e.to_string());
+                    stop.store(true, Relaxed);
+                    return Err(git2::Error::from_str("pre-push hook failed"));
+                }
+            }
+            *rows.lock().expect("rows mutex") = out;
+            if args.dry_run || rejected {
+                stop.store(true, Relaxed);
+                return Err(git2::Error::from_str("not pushed"));
+            }
+            Ok(())
+        });
+        let mut opts = PushOptions::new();
+        opts.remote_callbacks(callbacks);
+        if !push_options.is_empty() {
+            opts.remote_push_options(&push_options);
+        }
+        let wire: Vec<String> = todo
+            .iter()
+            .map(|(f, src, dst)| {
+                let lead = if forced_all || *f { "+" } else { "" };
+                format!("{lead}{src}:{dst}")
+            })
+            .collect();
+        let pushed = remote.push(&wire, Some(&mut opts));
+        if retry.load(Relaxed) {
+            let out = std::mem::take(&mut *rows.lock().expect("rows mutex"));
+            let (bad, _): (Vec<PushRow>, Vec<PushRow>) =
+                out.into_iter().partition(|r| r.flag == '!');
+            todo.retain(|(_, _, d)| !bad.iter().any(|r| r.dst == *d));
+            failed.extend(bad);
+            if todo.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if !stop.load(Relaxed) {
+            pushed?;
+        }
+        break;
+    }
+    if let Some(msg) = hook_failed.into_inner().expect("hook mutex") {
+        return Err(GitError::PushFailed(format!(
+            "{msg}\nerror: failed to push some refs to '{url}'"
+        )));
+    }
+
+    let mut all = failed;
+    all.extend(rows.into_inner().expect("rows mutex"));
+    all.retain(|r| !(r.summary == "[rejected]" && followed.contains(&r.dst)));
+    let at = |d: &str| specs.iter().position(|(_, _, x)| x == d);
+    all.sort_by_key(|r| at(&r.dst));
+    let shown: Vec<String> = all
+        .iter()
+        .filter(|r| args.porcelain || args.verbose || r.flag != '=')
+        .map(|r| r.line(args.porcelain))
+        .collect();
+    let mut text = Vec::new();
+    if shown.is_empty() {
+        text.push("Everything up-to-date".to_owned());
+    } else {
+        text.push(format!("To {url}"));
+        text.extend(shown);
+        if args.porcelain {
+            text.push("Done".to_owned());
+        }
+    }
+    if all.iter().any(|r| r.flag == '!') {
+        text.push(format!("error: failed to push some refs to '{url}'"));
+        text.extend(push_hints(repo, &all));
+        return Err(GitError::PushFailed(text.join("\n")));
+    }
+    for line in text {
+        report(OpProgress::Line(line));
+    }
+    if anonymous && !args.dry_run {
+        track_pushed(repo, remote_name, &all)?;
+    }
+    if args.set_upstream && !args.dry_run {
+        for (_, src, dst) in &todo {
+            if let (Some(local), Some(theirs)) = (
+                src.strip_prefix("refs/heads/"),
+                dst.strip_prefix("refs/heads/"),
+            ) {
+                repo.find_branch(local, BranchType::Local)?
+                    .set_upstream(Some(&format!("{remote_name}/{theirs}")))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Move `remote`'s remote-tracking refs to what `rows` pushed, as git does
+/// after a push; libgit2 does it only through a named remote.
+fn track_pushed(repo: &Repository, remote: &str, rows: &[PushRow]) -> Result<(), GitError> {
+    let specs = config_values(repo, &format!("remote.{remote}.fetch"))?;
+    for row in rows.iter().filter(|r| r.flag != '!') {
+        let Some(local) = specs.iter().find_map(|s| {
+            let (src, dst) = s.trim_start_matches('+').split_once(':')?;
+            map_glob(src, dst, &row.dst)
+        }) else {
+            continue;
+        };
+        if row.flag != '-' {
+            repo.reference(&local, row.new, true, "update by push")?;
+        } else if let Ok(mut r) = repo.find_reference(&local) {
+            r.delete()?;
+        }
+    }
+    Ok(())
+}
+
+/// git's `push --recurse-submodules`: submodule commits that the pushed
+/// history records and no remote-tracking ref of the submodule has are
+/// refused (`check`) or pushed first (`on-demand`, `only`).
+fn push_submodules(
+    repo: &Repository,
+    remote_name: &str,
+    specs: &[(bool, String, String)],
+    refspecs: &[String],
+    args: &crate::PushArgs,
+    mode: &str,
+    report: &dyn Fn(OpProgress),
+) -> Result<(), GitError> {
+    let tips: Vec<Oid> = specs
+        .iter()
+        .filter(|(_, src, _)| !src.is_empty())
+        .filter_map(|(_, src, _)| Some(repo.revparse_single(src).ok()?.peel_to_commit().ok()?.id()))
+        .collect();
+    let mut pending = unpushed_submodules(repo, remote_name, &tips)?;
+    if mode != "check" {
+        let workdir = repo.workdir().unwrap_or(repo.path());
+        for path in &pending {
+            report(OpProgress::Line(format!("Pushing submodule '{path}'")));
+            let sub_args = crate::PushArgs {
+                dry_run: args.dry_run,
+                push_options: args.push_options.clone(),
+                ..Default::default()
+            };
+            Git2Backend::discover(workdir.join(path))
+                .and_then(|sub| sub.push_to(Some(remote_name), refspecs, &sub_args, report))
+                .map_err(|e| {
+                    GitError::Other(format!(
+                        "{e}\nUnable to push submodule '{path}'\nfailed to push all needed submodules"
+                    ))
+                })?;
+        }
+        if mode == "only" || args.dry_run {
+            return Ok(());
+        }
+        pending = unpushed_submodules(repo, remote_name, &tips)?;
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let paths: String = pending.iter().map(|p| format!("  {p}\n")).collect();
+    Err(GitError::Other(format!(
+        "The following submodule paths contain changes that can\n\
+         not be found on any remote:\n{paths}\n\
+         Please try\n\n\
+         \tgit push --recurse-submodules=on-demand\n\n\
+         or cd to the path and use\n\n\
+         \tgit push\n\n\
+         to push them to a remote.\n\n\
+         Aborting."
+    )))
+}
+
+/// The paths of submodules whose commits, recorded by the history from
+/// `tips` not yet on `remote`, the submodule has but no remote-tracking ref
+/// of it reaches (git's find_unpushed_submodules).
+fn unpushed_submodules(
+    repo: &Repository,
+    remote: &str,
+    tips: &[Oid],
+) -> Result<Vec<String>, GitError> {
+    let mut walk = repo.revwalk()?;
+    for tip in tips {
+        walk.push(*tip)?;
+    }
+    walk.hide_glob(&format!("refs/remotes/{remote}/*"))?;
+    let mut recorded: std::collections::BTreeMap<String, Vec<Oid>> = Default::default();
+    for id in walk {
+        let commit = repo.find_commit(id?)?;
+        let tree = commit.tree()?;
+        let mut parents: Vec<Option<git2::Tree>> = Vec::new();
+        for p in commit.parents() {
+            parents.push(Some(p.tree()?));
+        }
+        if parents.is_empty() {
+            parents.push(None);
+        }
+        for parent in &parents {
+            let diff = repo.diff_tree_to_tree(parent.as_ref(), Some(&tree), None)?;
+            for delta in diff.deltas() {
+                let file = delta.new_file();
+                if file.mode() == git2::FileMode::Commit
+                    && !file.id().is_zero()
+                    && let Some(path) = file.path()
+                {
+                    let path = path.to_string_lossy().into_owned();
+                    recorded.entry(path).or_default().push(file.id());
+                }
+            }
+        }
+    }
+    let workdir = repo.workdir().unwrap_or(repo.path());
+    let mut out = Vec::new();
+    for (path, commits) in recorded {
+        // A submodule without these commits cannot push them; git lets it be.
+        let Ok(sub) = Repository::open(workdir.join(&path)) else {
+            continue;
+        };
+        if commits.iter().any(|c| sub.find_commit(*c).is_err()) {
+            continue;
+        }
+        let mut walk = sub.revwalk()?;
+        for c in &commits {
+            walk.push(*c)?;
+        }
+        walk.hide_glob("refs/remotes/*")?;
+        if walk.next().is_some() {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
 /// The current branch name, erroring on a detached or unborn HEAD.
 fn current_branch(repo: &Repository) -> Result<String, GitError> {
     if repo.head_detached().unwrap_or(false) {
@@ -5347,17 +5554,39 @@ fn upstream_remote(repo: &Repository) -> Result<(String, String), GitError> {
     Ok((remote, branch))
 }
 
+/// One fetched ref update: source, destination, old and new id.
+type FetchUpdate = (String, String, Option<Oid>, Oid);
+
+/// Serializes the ref and FETCH_HEAD updates of fetches running at once.
+static FETCH_UPDATE: Mutex<()> = Mutex::new(());
+
+/// The remote to fetch `name` through, the URL it reads and whether it is
+/// an anonymous stand-in: git fetches only from a remote's first URL, so a
+/// remote with several is fetched through an anonymous remote for that one.
+fn fetch_source<'r>(
+    repo: &'r Repository,
+    name: &str,
+) -> Result<(git2::Remote<'r>, String, bool), GitError> {
+    let remote = repo.find_remote(name)?;
+    match remote_urls(repo, name, false)?.as_slice() {
+        [first, _, ..] => Ok((repo.remote_anonymous(first)?, first.clone(), true)),
+        _ => {
+            let url = remote.url().unwrap_or_default().to_owned();
+            Ok((remote, url, false))
+        }
+    }
+}
+
 fn do_fetch(
     repo: &Repository,
-    remote: &str,
+    name: &str,
     refspecs: &[String],
     args: &crate::FetchArgs,
     report: &dyn Fn(OpProgress),
     cred: Option<&dyn crate::CredentialPrompt>,
 ) -> Result<(), GitError> {
-    let mut remote = repo.find_remote(remote)?;
-    let url = remote.url().unwrap_or_default().to_owned();
-    let announced = std::sync::atomic::AtomicBool::new(false);
+    let (mut remote, url, anonymous) = fetch_source(repo, name)?;
+    let configured = config_values(repo, &format!("remote.{name}.fetch"))?;
     let mut specs: Vec<String> = refspecs
         .iter()
         .map(|s| match args.force && !s.starts_with('+') {
@@ -5368,58 +5597,449 @@ fn do_fetch(
     if let Some(map) = &args.refmap {
         // An anonymous remote has no configured refspecs to update through.
         specs = specs.iter().map(|s| refmap_spec(s, map)).collect();
-        remote = repo.remote_anonymous(&url)?;
+        if !anonymous {
+            remote = repo.remote_anonymous(&url)?;
+        }
+    } else if anonymous {
+        specs = match specs.is_empty() {
+            true => configured.clone(),
+            false => specs.iter().map(|s| refmap_spec(s, &configured)).collect(),
+        };
     }
     if args.prune_tags {
         if specs.is_empty() {
-            specs = remote
-                .fetch_refspecs()?
-                .iter()
-                .flatten()
-                .flatten()
-                .map(str::to_owned)
-                .collect();
+            specs = configured.clone();
         }
         specs.push("refs/tags/*:refs/tags/*".to_owned());
     }
     let tracking = tracking_specs(&remote, &specs)?;
-    let ignored = std::sync::atomic::AtomicBool::new(false);
-    let mut callbacks = remote_callbacks(report, &ignored, cred);
-    callbacks.update_tips(|dst, old, new| {
+    let updates: Mutex<Vec<FetchUpdate>> = Mutex::new(Vec::new());
+    let on_tip = |dst: &str, old: Oid, new: Oid| {
         let src = tracking
             .iter()
             .find_map(|(s, d)| map_glob(d, s, dst))
             .unwrap_or_else(|| dst.to_owned());
-        if let Some(line) = fetch_line(repo, &src, dst, Some(old), new, true) {
-            // Like git, "From" only heads a fetch that changed something.
-            if !announced.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                report(OpProgress::Line(format!("From {url}")));
-            }
-            report(OpProgress::Line(line));
-        }
+        updates
+            .lock()
+            .expect("updates mutex")
+            .push((src, dst.to_owned(), Some(old), new));
         true
-    });
-    let mut opts = FetchOptions::new();
-    opts.remote_callbacks(callbacks);
-    if args.prune {
-        opts.prune(git2::FetchPrune::On);
-    }
-    if args.no_tags {
-        opts.download_tags(git2::AutotagOption::None);
-    } else if args.tags {
-        opts.download_tags(git2::AutotagOption::All);
+    };
+    let tag_opt = repo
+        .config()?
+        .get_string(&format!("remote.{name}.tagOpt"))
+        .unwrap_or_default();
+    let tags = if args.no_tags || (anonymous && tag_opt == "--no-tags") {
+        git2::AutotagOption::None
+    } else if args.tags || (anonymous && tag_opt == "--tags") {
+        git2::AutotagOption::All
     } else if !refspecs.is_empty() {
         // git follows no tags when the refs to fetch are named.
-        opts.download_tags(git2::AutotagOption::None);
-    }
+        git2::AutotagOption::None
+    } else {
+        git2::AutotagOption::Unspecified
+    };
+    let ignored = std::sync::atomic::AtomicBool::new(false);
+    let mut opts = FetchOptions::new();
+    opts.remote_callbacks(remote_callbacks(report, &ignored, cred));
+    opts.download_tags(tags);
     if args.unshallow {
         // libgit2's GIT_FETCH_DEPTH_UNSHALLOW.
         opts.depth(i32::MAX);
     } else if args.depth > 0 {
         opts.depth(args.depth);
     }
-    remote.fetch(&specs, Some(&mut opts), None)?;
+    // git_remote_fetch's steps, with the ref updates one fetch at a time so
+    // fetches running at once can share FETCH_HEAD.
+    remote.download(&specs, Some(&mut opts))?;
+    let their_head = remote
+        .default_branch()
+        .ok()
+        .and_then(|b| b.as_str().ok().map(str::to_owned));
+    remote.disconnect()?;
+    let fetch_head = repo.path().join("FETCH_HEAD");
+    let fetched = {
+        let _serial = FETCH_UPDATE.lock().unwrap_or_else(|e| e.into_inner());
+        let before = match args.append {
+            true => std::fs::read_to_string(&fetch_head).unwrap_or_default(),
+            false => String::new(),
+        };
+        let mut callbacks = RemoteCallbacks::new();
+        callbacks.update_tips(|d, o, n| on_tip(d, o, n));
+        let msg = format!("fetch {}", if anonymous { &url } else { name });
+        remote.update_tips(
+            Some(&mut callbacks),
+            git2::RemoteUpdateFlags::UPDATE_FETCHHEAD,
+            tags,
+            Some(&msg),
+        )?;
+        if args.prune {
+            let mut callbacks = RemoteCallbacks::new();
+            callbacks.update_tips(|d, o, n| on_tip(d, o, n));
+            remote.prune(Some(callbacks))?;
+        }
+        // git names the URL in FETCH_HEAD as it shows it after `From`.
+        let shown = crate::fetch_display::display_url(&url);
+        let written: String = std::fs::read_to_string(&fetch_head)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| match l.strip_suffix(url.as_str()) {
+                Some(head) => format!("{head}{shown}\n"),
+                None => format!("{l}\n"),
+            })
+            .collect();
+        std::fs::write(&fetch_head, format!("{before}{written}"))?;
+        fetch_head_refs(&written)
+    };
+    if refspecs.is_empty()
+        && args.refmap.is_none()
+        && let Some(head) = their_head
+    {
+        follow_remote_head(repo, name, &configured, &head)?;
+    }
+    let updates = updates.into_inner().expect("updates mutex");
+    let rows = fetch_rows(repo, name, refspecs, &updates, &fetched, true);
+    for line in crate::fetch_display::render(&url, &rows, compact_fetch(repo)) {
+        report(OpProgress::Line(line));
+    }
     Ok(())
+}
+
+/// Fetch `name`, making its history as shallow as `args` asks. From a local
+/// repository the objects are copied here, just those of the history the
+/// fetch takes (libgit2's local transport sends every object, and no shallow
+/// history); over the network deepening by a count or a date is turned into
+/// the depth libgit2 fetches to.
+fn fetch_one(
+    repo: &Repository,
+    name: &str,
+    refspecs: &[String],
+    args: &crate::FetchArgs,
+    report: &dyn Fn(OpProgress),
+    cred: Option<&dyn crate::CredentialPrompt>,
+) -> Result<(), GitError> {
+    let since = match &args.shallow_since {
+        Some(s) => Some(
+            crate::config::expiry_date(s)
+                .ok_or_else(|| GitError::Other(format!("invalid date: {s}")))?,
+        ),
+        None => None,
+    };
+    let plain = |depth: i32| crate::FetchArgs {
+        depth,
+        deepen: 0,
+        shallow_since: None,
+        unshallow: false,
+        ..args.clone()
+    };
+    let url = repo.find_remote(name)?.url().unwrap_or_default().to_owned();
+    if is_local_url(&url) {
+        let cut = match since {
+            _ if args.unshallow => Some(shallow::Cut::Full),
+            Some(t) => Some(shallow::Cut::Since(t)),
+            None if args.deepen > 0 => Some(shallow::Cut::Deepen(args.deepen as usize)),
+            None if args.depth > 0 => Some(shallow::Cut::Depth(args.depth as usize)),
+            None => None,
+        };
+        let src = Repository::open(local_path(repo, &url))?;
+        copy_history(repo, &src, name, refspecs, args, cut)?;
+        return do_fetch(repo, name, refspecs, &plain(0), report, cred);
+    }
+    let Some(since) = since else {
+        let depth = match args.deepen {
+            n if n > 0 => history_depth(repo) as i32 + n,
+            _ => args.depth,
+        };
+        let args = crate::FetchArgs {
+            unshallow: args.unshallow,
+            ..plain(depth)
+        };
+        return do_fetch(repo, name, refspecs, &args, report, cred);
+    };
+    // Over the network: fetch ever deeper until every boundary is older than
+    // the date, then move the boundary up to the date.
+    let mut depth = 1;
+    loop {
+        do_fetch(repo, name, refspecs, &plain(depth), report, cred)?;
+        let roots = shallow::roots(repo);
+        let past = roots.iter().all(|r| {
+            repo.find_commit(*r)
+                .is_ok_and(|c| c.committer().when().seconds() < since)
+        });
+        if past || depth >= 1 << 20 {
+            break;
+        }
+        depth *= 2;
+    }
+    let tips: Vec<Oid> = std::fs::read_to_string(repo.path().join("FETCH_HEAD"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| Oid::from_str(l.split('\t').next()?).ok())
+        .filter_map(|id| Some(repo.find_object(id, None).ok()?.peel_to_commit().ok()?.id()))
+        .collect();
+    let mut roots: std::collections::HashSet<Oid> = shallow::roots(repo).into_iter().collect();
+    let (_, cutoff) = shallow::select(repo, &tips, &shallow::Cut::Since(since), &roots, None)?;
+    roots.extend(cutoff);
+    shallow::write_roots(repo, &roots)
+}
+
+/// Copy from the local repository `src` the history of the refs a fetch of
+/// `name` takes, as far back as `cut` says (else down to what is here), with
+/// the annotated tags on it, and mark where it now stops shallow.
+fn copy_history(
+    repo: &Repository,
+    src: &Repository,
+    name: &str,
+    refspecs: &[String],
+    args: &crate::FetchArgs,
+    cut: Option<shallow::Cut>,
+) -> Result<(), GitError> {
+    let remote = repo.find_remote(name)?;
+    let configured = remote.fetch_refspecs()?;
+    let patterns: Vec<&str> = match refspecs.is_empty() {
+        true => configured.iter().flatten().flatten().collect(),
+        false => refspecs.iter().map(String::as_str).collect(),
+    };
+    let patterns: Vec<&str> = patterns
+        .iter()
+        .map(|s| s.trim_start_matches('+').split(':').next().unwrap_or(""))
+        .collect();
+    let all_tags = args.tags || args.prune_tags;
+    let (mut tips, mut tags) = (Vec::new(), Vec::new());
+    if patterns.contains(&"HEAD") {
+        tips.extend(
+            src.head()
+                .ok()
+                .and_then(|h| h.peel_to_commit().ok())
+                .map(|c| c.id()),
+        );
+    }
+    for r in src.references()? {
+        let r = r?;
+        let (Ok(refname), Some(target)) = (r.name(), r.target()) else {
+            continue;
+        };
+        let peeled = r.peel_to_commit().ok().map(|c| c.id());
+        let tag = refname.starts_with("refs/tags/");
+        if tag {
+            tags.push((target, peeled));
+        }
+        if (tag && all_tags) || patterns.iter().any(|p| ref_matches(p, refname)) {
+            tips.extend(peeled);
+        }
+    }
+    let odb = repo.odb()?;
+    let old: std::collections::HashSet<Oid> = shallow::roots(repo).into_iter().collect();
+    // A fetch that does not change the depth leaves the boundary alone.
+    let boundary = match cut {
+        Some(_) => old.clone(),
+        None => Default::default(),
+    };
+    let cut = cut.unwrap_or(shallow::Cut::Full);
+    let (kept, cutoff) = shallow::select(src, &tips, &cut, &boundary, Some(&odb))?;
+    let followed: Vec<Oid> = tags
+        .iter()
+        .filter(|(_, peeled)| peeled.is_some_and(|p| kept.contains(&p) || odb.exists(p)))
+        .map(|(t, _)| *t)
+        .collect();
+    shallow::copy(src, repo, &kept, &followed)?;
+    let mut roots = shallow::incomplete(repo, &old);
+    roots.extend(cutoff);
+    shallow::write_roots(repo, &roots)
+}
+
+/// Whether the refspec source `pattern` (a glob, full name or short name)
+/// names the ref `name`.
+fn ref_matches(pattern: &str, name: &str) -> bool {
+    if pattern.contains('*') {
+        return map_glob(pattern, pattern, name).is_some();
+    }
+    name == pattern
+        || ["refs/", "refs/heads/", "refs/tags/"]
+            .iter()
+            .any(|p| name.strip_prefix(p) == Some(pattern))
+}
+
+/// How many commits deep the longest shallow history of `repo`'s refs is.
+fn history_depth(repo: &Repository) -> usize {
+    let mut seen = std::collections::HashMap::new();
+    let mut queue: std::collections::VecDeque<(Oid, usize)> = repo
+        .references()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|r| Some((r.peel_to_commit().ok()?.id(), 1)))
+        .collect();
+    let mut deepest = 0;
+    while let Some((id, depth)) = queue.pop_front() {
+        if seen.insert(id, depth).is_some() {
+            continue;
+        }
+        deepest = deepest.max(depth);
+        if let Ok(c) = repo.find_commit(id) {
+            queue.extend(c.parent_ids().map(|p| (p, depth + 1)));
+        }
+    }
+    deepest
+}
+
+/// The folder a local remote URL names; a relative one is taken from the
+/// working tree, where git runs.
+fn local_path(repo: &Repository, url: &str) -> PathBuf {
+    let path = Path::new(url.strip_prefix("file://").unwrap_or(url));
+    match path.is_relative() {
+        true => repo.workdir().unwrap_or(repo.path()).join(path),
+        false => path.to_path_buf(),
+    }
+}
+
+/// Point `refs/remotes/<name>/HEAD` at the remote's HEAD branch after a
+/// fetch, as `remote.<name>.followRemoteHEAD` says (git 2.48's default,
+/// `create`, sets it only when missing).
+fn follow_remote_head(
+    repo: &Repository,
+    name: &str,
+    specs: &[String],
+    head: &str,
+) -> Result<(), GitError> {
+    let mode = repo
+        .config()?
+        .get_string(&format!("remote.{name}.followRemoteHEAD"))
+        .unwrap_or_default();
+    if mode == "never" {
+        return Ok(());
+    }
+    let link = format!("refs/remotes/{name}/HEAD");
+    let Some(target) = specs.iter().find_map(|s| {
+        let (src, dst) = s.trim_start_matches('+').split_once(':')?;
+        map_glob(src, dst, head)
+    }) else {
+        return Ok(());
+    };
+    let current = repo
+        .find_reference(&link)
+        .ok()
+        .map(|r| r.symbolic_target().ok().flatten().map(str::to_owned));
+    let wanted = match current {
+        None => true,
+        Some(t) => mode == "always" && t.as_deref() != Some(target.as_str()),
+    };
+    let tracking = target.starts_with(&format!("refs/remotes/{name}/"));
+    if wanted && tracking && link != target && repo.find_reference(&target).is_ok() {
+        repo.reference_symbolic(&link, &target, true, "remote set-head")?;
+    }
+    Ok(())
+}
+
+/// The refs a FETCH_HEAD file lists, as full names.
+fn fetch_head_refs(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| {
+            let desc = l.splitn(3, '\t').nth(2)?;
+            let desc = desc.rsplit_once(" of ").map_or(desc, |(d, _)| d);
+            let quoted = |d: &str| Some(d.strip_prefix('\'')?.strip_suffix('\'')?.to_owned());
+            Some(if let Some(b) = desc.strip_prefix("branch ") {
+                format!("refs/heads/{}", quoted(b)?)
+            } else if let Some(t) = desc.strip_prefix("tag ") {
+                format!("refs/tags/{}", quoted(t)?)
+            } else {
+                quoted(desc).unwrap_or_else(|| "HEAD".to_owned())
+            })
+        })
+        .collect()
+}
+
+/// Whether `fetch.output` asks for git's compact report.
+fn compact_fetch(repo: &Repository) -> bool {
+    repo.config()
+        .and_then(|c| c.get_string("fetch.output"))
+        .is_ok_and(|v| v.eq_ignore_ascii_case("compact"))
+}
+
+/// git's report rows for a fetch from `remote`, in git's order: pruned refs,
+/// then the refs to merge, the other refs, and last the remote-tracking
+/// refs updated along the way. `fetched` names the remote refs fetched, for
+/// the `-> FETCH_HEAD` lines of refspecs with no destination.
+fn fetch_rows(
+    repo: &Repository,
+    remote: &str,
+    cli: &[String],
+    updates: &[FetchUpdate],
+    fetched: &[String],
+    done: bool,
+) -> Vec<crate::fetch_display::Row> {
+    let cli: Vec<(&str, Option<&str>)> = cli
+        .iter()
+        .map(|s| {
+            let s = s.trim_start_matches('+');
+            match s.split_once(':') {
+                Some((src, dst)) if !dst.is_empty() => (src, Some(dst)),
+                Some((src, _)) => (src, None),
+                None => (s, None),
+            }
+        })
+        .collect();
+    let named = |pat: &str, name: &str| {
+        name == pat
+            || short_ref(name) == pat
+            || name.strip_prefix("refs/") == Some(pat)
+            || (pat.contains('*') && map_glob(pat, pat, name).is_some())
+    };
+    let merge = current_branch(repo).ok().and_then(|b| {
+        let key = format!("refs/heads/{b}");
+        let theirs = repo.branch_upstream_remote(&key).ok()?;
+        (theirs.as_str().ok()? == remote).then_some(())?;
+        repo.branch_upstream_merge(&key)
+            .ok()?
+            .as_str()
+            .ok()
+            .map(str::to_owned)
+    });
+    let mut keyed = Vec::new();
+    for (src, dst, old, new) in updates {
+        let Some(row) = fetch_line(repo, src, dst, *old, *new, done) else {
+            continue;
+        };
+        let key = if new.is_zero() {
+            (0, 0)
+        } else if cli.is_empty() {
+            (if merge.as_deref() == Some(src) { 1 } else { 2 }, 0)
+        } else {
+            match cli.iter().position(|(s, _)| named(s, src)) {
+                Some(i) if cli[i].1.is_some() => (1, i),
+                None if dst.starts_with("refs/tags/") => (2, 0),
+                _ => (3, 0),
+            }
+        };
+        keyed.push((key, row));
+    }
+    for name in fetched {
+        let Some(i) = cli.iter().position(|(s, d)| d.is_none() && named(s, name)) else {
+            continue;
+        };
+        let (kind, what) = if let Some(b) = name.strip_prefix("refs/heads/") {
+            ("branch", b)
+        } else if let Some(t) = name.strip_prefix("refs/tags/") {
+            ("tag", t)
+        } else if let Some(r) = name.strip_prefix("refs/remotes/") {
+            ("remote-tracking branch", r)
+        } else {
+            ("branch", name.as_str())
+        };
+        keyed.push((
+            (1, i),
+            crate::fetch_display::Row {
+                code: '*',
+                summary: kind.to_owned(),
+                remote: what.to_owned(),
+                local: "FETCH_HEAD".to_owned(),
+                error: None,
+                counted: false,
+            },
+        ));
+    }
+    keyed.sort_by_key(|(k, _)| *k);
+    keyed.into_iter().map(|(_, r)| r).collect()
 }
 
 /// The (source, destination) patterns that name remote-tracking refs: the
@@ -5476,7 +6096,7 @@ fn refmap_spec(spec: &str, map: &[String]) -> String {
         .unwrap_or(full)
 }
 
-/// A git-style fetch line for `dst` moving from `old` to `new`; `None` when
+/// git's report row for `dst` moving from `old` to `new`; `None` when
 /// nothing changes. `done` says the update happened (else a dry run).
 fn fetch_line(
     repo: &Repository,
@@ -5485,32 +6105,46 @@ fn fetch_line(
     old: Option<Oid>,
     new: Oid,
     done: bool,
-) -> Option<String> {
-    let (src, short) = (short_ref(src), short_ref(dst));
+) -> Option<crate::fetch_display::Row> {
+    let row = |code, summary: &str, error: Option<&str>| {
+        Some(crate::fetch_display::Row {
+            code,
+            summary: summary.to_owned(),
+            remote: short_ref(src).to_owned(),
+            local: short_ref(dst).to_owned(),
+            error: error.map(str::to_owned),
+            counted: true,
+        })
+    };
     let tag = dst.starts_with("refs/tags/");
     if new.is_zero() {
-        return Some(format!(" - [deleted]         (none)     -> {short}"));
+        return Some(crate::fetch_display::Row {
+            code: '-',
+            summary: "[deleted]".to_owned(),
+            remote: "(none)".to_owned(),
+            local: short_ref(dst).to_owned(),
+            error: None,
+            counted: false,
+        });
     }
-    Some(match old.filter(|o| !o.is_zero()) {
-        Some(old) if old == new => return None,
-        None if tag => format!(" * [new tag]         {src} -> {short}"),
-        None if dst.starts_with("refs/heads/") || dst.starts_with("refs/remotes/") => {
-            format!(" * [new branch]      {src} -> {short}")
+    match old.filter(|o| !o.is_zero()) {
+        Some(old) if old == new => None,
+        None if src.starts_with("refs/tags/") || (tag && src == dst) => row('*', "[new tag]", None),
+        None if src.starts_with("refs/heads/") || !src.starts_with("refs/") => {
+            row('*', "[new branch]", None)
         }
-        None => format!(" * [new ref]         {src} -> {short}"),
-        Some(_) if tag && done => format!(" t [tag update]      {src} -> {short}"),
-        Some(_) if tag => {
-            format!(" ! [rejected]        {src} -> {short}  (would clobber existing tag)")
-        }
+        None => row('*', "[new ref]", None),
+        Some(_) if tag && done => row('t', "[tag update]", None),
+        Some(_) if tag => row('!', "[rejected]", Some("would clobber existing tag")),
         Some(old) if repo.graph_descendant_of(new, old).unwrap_or(false) => {
-            format!("   {}..{}  {src} -> {short}", short7(old), short7(new))
+            row(' ', &format!("{}..{}", short7(old), short7(new)), None)
         }
-        Some(old) => format!(
-            " + {}...{} {src} -> {short}  (forced update)",
-            short7(old),
-            short7(new)
+        Some(old) => row(
+            '+',
+            &format!("{}...{}", short7(old), short7(new)),
+            Some("forced update"),
         ),
-    })
+    }
 }
 
 /// `git fetch --dry-run`: download the objects as git does, then report the
@@ -5524,11 +6158,15 @@ fn fetch_dry_run(
     report: &dyn Fn(OpProgress),
     cred: Option<&dyn crate::CredentialPrompt>,
 ) -> Result<(), GitError> {
-    let mut remote = repo.find_remote(name)?;
-    if let Ok(url) = remote.url() {
-        report(OpProgress::Line(format!("From {url}")));
+    let (mut remote, url, anonymous) = fetch_source(repo, name)?;
+    let mut tracking = tracking_specs(&remote, refspecs)?;
+    if anonymous {
+        let configured = config_values(repo, &format!("remote.{name}.fetch"))?;
+        tracking.extend(configured.iter().filter_map(|s| {
+            let (src, dst) = s.trim_start_matches('+').split_once(':')?;
+            Some((src.to_owned(), dst.to_owned()))
+        }));
     }
-    let tracking = tracking_specs(&remote, refspecs)?;
     let ignored = std::sync::atomic::AtomicBool::new(false);
     let heads: Vec<(String, Oid)> = {
         let callbacks = remote_callbacks(report, &ignored, cred);
@@ -5559,6 +6197,9 @@ fn fetch_dry_run(
         repo.find_commit(peeled).is_ok()
     };
     let all_tags = args.tags || args.prune_tags;
+    let mut updates: Vec<FetchUpdate> = Vec::new();
+    let mut backfill: Vec<FetchUpdate> = Vec::new();
+    let mut fetched = Vec::new();
     for (head, new) in &heads {
         if head.ends_with("^{}") {
             continue;
@@ -5571,16 +6212,18 @@ fn fetch_dry_run(
         } else if !wanted(head) {
             continue;
         } else {
+            fetched.push(head.clone());
             match tracking.iter().find_map(|(s, d)| map_glob(s, d, head)) {
                 Some(dst) => dst,
                 None => continue,
             }
         };
         let old = repo.refname_to_id(&dst).ok();
-        let Some(line) = fetch_line(repo, head, &dst, old, *new, args.force) else {
-            continue;
-        };
-        report(OpProgress::Line(line));
+        // git's dry run lists a followed tag again as it backfills tags.
+        if tag && !all_tags && refspecs.is_empty() {
+            backfill.push((head.clone(), dst.clone(), old, *new));
+        }
+        updates.push((head.clone(), dst, old, *new));
     }
     if args.prune {
         for (src, dst) in &tracking {
@@ -5596,13 +6239,15 @@ fn fetch_dry_run(
                     && let Some(theirs) = map_glob(dst, src, local)
                     && !heads.iter().any(|(h, _)| *h == theirs)
                 {
-                    report(OpProgress::Line(format!(
-                        " - [deleted]         (none)     -> {}",
-                        short_ref(local)
-                    )));
+                    updates.push((theirs, local.to_owned(), r.target(), Oid::ZERO_SHA1));
                 }
             }
         }
+    }
+    let mut rows = fetch_rows(repo, name, refspecs, &updates, &fetched, args.force);
+    rows.extend(fetch_rows(repo, name, refspecs, &backfill, &[], args.force));
+    for line in crate::fetch_display::render(&url, &rows, compact_fetch(repo)) {
+        report(OpProgress::Line(line));
     }
     Ok(())
 }
@@ -6211,149 +6856,320 @@ pub fn ls_remote(
 }
 
 /// Clone `url` into `path` (`git clone`), via libgit2, using the same
-/// credentials as fetch/push and reporting git-style progress.
-/// `args.depth` is ignored for a plain local path, as git does.
+/// credentials as fetch/push and reporting git-style progress. What a failed
+/// clone made is removed again, as git does.
 pub fn clone(
     url: &str,
     path: &Path,
     args: &crate::CloneArgs,
     report: &dyn Fn(OpProgress),
 ) -> Result<(), GitError> {
-    let mut depth = args.depth;
-    if !args.git_flags.is_empty() || (depth > 0 && url.starts_with("file://")) {
-        return clone_with_git(url, path, args);
+    if let Some(filter) = &args.filter {
+        return clone_filtered(url, path, args, filter);
     }
-    if depth > 0 && is_local_url(url) {
+    if path.is_file() || path.read_dir().is_ok_and(|mut d| d.next().is_some()) {
+        return Err(GitError::Other(format!(
+            "destination path '{}' already exists and is not an empty directory.",
+            path.display()
+        )));
+    }
+    let made: Vec<PathBuf> = std::iter::once(path.to_path_buf())
+        .chain(args.separate_git_dir.iter().map(PathBuf::from))
+        .filter(|p| !p.exists())
+        .collect();
+    let result = clone_into(url, path, args, report);
+    if result.is_err() {
+        for p in made {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+    result
+}
+
+fn clone_into(
+    url: &str,
+    path: &Path,
+    args: &crate::CloneArgs,
+    report: &dyn Fn(OpProgress),
+) -> Result<(), GitError> {
+    let plain = is_local_url(url) && !url.starts_with("file://");
+    // git records a local path as an absolute one.
+    let url = match plain {
+        true => std::fs::canonicalize(url)
+            .map_err(|_| GitError::Other(format!("repository '{url}' does not exist")))?
+            .to_string_lossy()
+            .into_owned(),
+        false => url.to_owned(),
+    };
+    let (mut depth, mut since) = (args.depth, args.shallow_since.clone());
+    if plain && depth > 0 {
         report(OpProgress::Line(
             "warning: --depth is ignored in local clones; use file:// instead.".to_owned(),
         ));
         depth = 0;
     }
-    let ignored = std::sync::atomic::AtomicBool::new(false);
-    let mut opts = FetchOptions::new();
-    opts.remote_callbacks(remote_callbacks(report, &ignored, None));
-    if depth > 0 {
-        opts.depth(depth);
+    if plain && since.is_some() {
+        report(OpProgress::Line(
+            "warning: --shallow-since is ignored in local clones; use file:// instead.".to_owned(),
+        ));
+        since = None;
     }
-    if args.no_tags {
-        opts.download_tags(git2::AutotagOption::None);
+    let bare = args.bare || args.mirror;
+    init(
+        path,
+        &crate::InitArgs {
+            bare,
+            template: args.template.clone(),
+            separate_git_dir: args.separate_git_dir.clone(),
+            ..Default::default()
+        },
+    )?;
+    let repo = Repository::open(path)?;
+
+    let mut alternates = Vec::new();
+    for r in args.reference.iter().chain(args.shared.then_some(&url)) {
+        alternates.push(objects_dir(r)?);
     }
-    let single = match (&args.branch, args.single_branch && !args.mirror) {
-        (Some(b), true) => Some(b.clone()),
-        (None, true) => {
-            let mut remote = git2::Remote::create_detached(url)?;
-            let callbacks = remote_callbacks(report, &ignored, None);
-            let conn = remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None)?;
-            let head = conn.default_branch()?;
-            Some(short_ref(head.as_str().unwrap_or("main")).to_owned())
+    for r in &args.reference_if_able {
+        match objects_dir(r) {
+            Ok(dir) => alternates.push(dir),
+            Err(e) => report(OpProgress::Line(format!(
+                "info: Could not add alternate for '{r}': {e}"
+            ))),
         }
-        _ => None,
-    };
-    let mut builder = git2::build::RepoBuilder::new();
-    builder.fetch_options(opts).bare(args.bare || args.mirror);
-    if let Some(b) = &args.branch {
-        builder.branch(b);
     }
-    if args.no_checkout {
-        let mut checkout = CheckoutBuilder::new();
-        checkout.dry_run();
-        builder.with_checkout(checkout);
+    let alternates_file = repo.path().join("objects/info/alternates");
+    if !alternates.is_empty() {
+        std::fs::create_dir_all(repo.path().join("objects/info"))?;
+        std::fs::write(&alternates_file, alternates.concat())?;
     }
+    // Opened again to read the objects through the alternates.
+    let repo = Repository::open(path)?;
+
     let origin = args.origin.clone().unwrap_or_else(|| "origin".to_owned());
-    let (mirror, no_tags) = (args.mirror, args.no_tags);
-    let (name, only) = (origin.clone(), single.clone());
-    builder.remote_create(move |repo, _, url| {
-        let fetch = match &only {
-            _ if mirror => "+refs/*:refs/*".to_owned(),
-            Some(b) => format!("+refs/heads/{b}:refs/remotes/{name}/{b}"),
-            None => format!("+refs/heads/*:refs/remotes/{name}/*"),
-        };
-        let remote = repo.remote_with_fetch(&name, url, &fetch)?;
-        let mut config = repo.config()?;
-        if mirror {
-            config.set_bool(&format!("remote.{name}.mirror"), true)?;
+    let ignored = std::sync::atomic::AtomicBool::new(false);
+    let (heads, default) = {
+        let mut remote = repo.remote_anonymous(&url)?;
+        let callbacks = remote_callbacks(report, &ignored, None);
+        let conn = remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None)?;
+        let heads: Vec<String> = conn.list()?.iter().map(|h| h.name().to_owned()).collect();
+        let default = conn
+            .default_branch()
+            .ok()
+            .and_then(|b| b.as_str().ok().map(|s| short_ref(s).to_owned()));
+        (heads, default)
+    };
+    let has = |r: String| heads.contains(&r);
+    let tag_head = match &args.branch {
+        Some(b) if has(format!("refs/heads/{b}")) => false,
+        Some(b) if has(format!("refs/tags/{b}")) => true,
+        Some(b) => {
+            return Err(GitError::Other(format!(
+                "Remote branch {b} not found in upstream {origin}"
+            )));
         }
-        if no_tags {
-            config.set_str(&format!("remote.{name}.tagOpt"), "--no-tags")?;
-        }
-        Ok(remote)
-    });
-    let repo = builder.clone(url, path)?;
-    if mirror {
-        // A mirror has no remote-tracking refs and no upstreams.
-        if let Ok(mut head) = repo.find_reference(&format!("refs/remotes/{origin}/HEAD")) {
-            head.delete()?;
-        }
-        if let Ok(b) = current_branch(&repo) {
-            let mut config = repo.config()?;
-            let _ = config.remove(&format!("branch.{b}.remote"));
-            let _ = config.remove(&format!("branch.{b}.merge"));
-        }
-    }
-    if let Some(b) = single
-        .as_ref()
-        .filter(|_| !mirror)
-        .or(no_tags.then_some(&origin))
-    {
-        // libgit2's clone takes every tag; git follows only the branch's, or none.
-        let tip = repo
-            .refname_to_id(&format!("refs/remotes/{origin}/{b}"))
-            .ok();
-        for tag in repo.tag_names(None)?.iter().flatten().flatten() {
-            let mut r = repo.find_reference(&format!("refs/tags/{tag}"))?;
-            let on_branch = !no_tags
-                && r.peel_to_commit().is_ok_and(|c| {
-                    tip.is_some_and(|t| {
-                        c.id() == t || repo.graph_descendant_of(t, c.id()).unwrap_or(false)
-                    })
-                });
-            if !on_branch {
-                r.delete()?;
-            }
-        }
-    }
+        None => false,
+    };
+    let branch = args.branch.clone().or(default.clone());
+    // A shallow clone takes one branch unless told otherwise, as in git.
+    let single = !args.mirror
+        && (args.single_branch || ((depth > 0 || since.is_some()) && !args.no_single_branch));
+    let top = match bare {
+        true => "refs/heads/".to_owned(),
+        false => format!("refs/remotes/{origin}/"),
+    };
+    let fetch = match &branch {
+        _ if args.mirror => "+refs/*:refs/*".to_owned(),
+        Some(b) if single && tag_head => format!("+refs/tags/{b}:refs/tags/{b}"),
+        Some(b) if single => format!("+refs/heads/{b}:{top}{b}"),
+        _ => format!("+refs/heads/*:{top}*"),
+    };
+    repo.remote_with_fetch(&origin, &url, &fetch)?;
     let mut config = repo.config()?;
+    if args.mirror {
+        config.set_bool(&format!("remote.{origin}.mirror"), true)?;
+    }
+    if args.no_tags || args.mirror {
+        config.set_str(&format!("remote.{origin}.tagOpt"), "--no-tags")?;
+    }
     for kv in &args.config {
         let (key, value) = kv.split_once('=').unwrap_or((kv, "true"));
-        config.set_str(key, value)?;
+        config.set_multivar(key, "$^", value)?;
     }
-    if args.recurse_submodules && !args.bare && !args.mirror {
+
+    // Like git: every tag with all branches, those on the history with one.
+    let fetch_args = crate::FetchArgs {
+        tags: !single && !args.mirror && !args.no_tags,
+        no_tags: args.no_tags,
+        depth,
+        shallow_since: since,
+        ..Default::default()
+    };
+    fetch_one(&repo, &origin, &[], &fetch_args, report, None)?;
+    let _ = std::fs::remove_file(repo.path().join("FETCH_HEAD"));
+    if bare && !args.mirror {
+        config.remove_multivar(&format!("remote.{origin}.fetch"), ".*")?;
+    }
+    if args.dissociate && !alternates.is_empty() {
+        let mut pack = repo.packbuilder()?;
+        let mut walk = repo.revwalk()?;
+        for r in repo.references()? {
+            let r = r?;
+            if let Ok(c) = r.peel_to_commit() {
+                walk.push(c.id())?;
+            }
+            if let Some(id) = r.target() {
+                pack.insert_recursive(id, None)?;
+            }
+        }
+        pack.insert_walk(&mut walk)?;
+        shallow::write_pack(&mut pack, &repo.odb()?)?;
+        std::fs::remove_file(&alternates_file)?;
+    }
+    let repo = Repository::open(path)?;
+
+    if heads.is_empty() {
+        report(OpProgress::Line(
+            "warning: You appear to have cloned an empty repository.".to_owned(),
+        ));
+    }
+    let tracking = |b: &str| repo.refname_to_id(&format!("{top}{b}")).ok();
+    match &branch {
+        Some(b) if tag_head => {
+            let tag = repo.revparse_single(&format!("refs/tags/{b}"))?;
+            repo.set_head_detached(tag.peel_to_commit()?.id())?;
+        }
+        Some(b) if bare => repo.set_head(&format!("refs/heads/{b}"))?,
+        Some(b) => {
+            if let Some(id) = tracking(b) {
+                repo.branch(b, &repo.find_commit(id)?, true)?;
+                config.set_str(&format!("branch.{b}.remote"), &origin)?;
+                config.set_str(&format!("branch.{b}.merge"), &format!("refs/heads/{b}"))?;
+            }
+            repo.set_head(&format!("refs/heads/{b}"))?;
+        }
+        None => {}
+    }
+    if let Some(d) = default.as_deref().filter(|_| !bare)
+        && tracking(d).is_some()
+    {
+        repo.reference_symbolic(
+            &format!("refs/remotes/{origin}/HEAD"),
+            &format!("refs/remotes/{origin}/{d}"),
+            true,
+            &format!("clone: from {url}"),
+        )?;
+    }
+    let checkout = !bare && !args.no_checkout && repo.head().is_ok();
+    if args.sparse && !bare {
+        sparse_checkout(&repo, checkout)?;
+    } else if checkout {
+        repo.checkout_head(Some(CheckoutBuilder::new().force()))?;
+    }
+    if args.recurse_submodules && checkout {
         update_submodules(&repo, report)?;
     }
     Ok(())
 }
 
-/// A clone through git, for what libgit2 cannot do: shallow over `file://`,
-/// and alternates, partial, sparse and template clones.
-fn clone_with_git(url: &str, path: &Path, args: &crate::CloneArgs) -> Result<(), GitError> {
+/// The objects folder of the local repository at `path`, as a line of an
+/// alternates file.
+fn objects_dir(path: &str) -> Result<String, GitError> {
+    let path = path.strip_prefix("file://").unwrap_or(path);
+    let repo = Repository::open(path).map_err(|_| {
+        GitError::Other(format!(
+            "reference repository '{path}' is not a local repository."
+        ))
+    })?;
+    let dir = std::fs::canonicalize(repo.commondir().join("objects"))?;
+    Ok(format!("{}\n", dir.display()))
+}
+
+/// Start a cone-mode sparse checkout of the top-level files only, as
+/// `clone --sparse` does: every other file is marked skip-worktree in the
+/// index and left out of the working tree.
+fn sparse_checkout(repo: &Repository, checkout: bool) -> Result<(), GitError> {
+    // git keeps these in the worktree's own config.
+    repo.config()?.set_bool("extensions.worktreeConfig", true)?;
+    let mut config = git2::Config::open(&repo.path().join("config.worktree"))?;
+    config.set_bool("core.sparseCheckout", true)?;
+    config.set_bool("core.sparseCheckoutCone", true)?;
+    std::fs::create_dir_all(repo.path().join("info"))?;
+    std::fs::write(repo.path().join("info/sparse-checkout"), "/*\n!/*/\n")?;
+    if !checkout {
+        return Ok(());
+    }
+    let mut index = repo.index()?;
+    index.read_tree(&repo.head()?.peel_to_tree()?)?;
+    let mut top = CheckoutBuilder::new();
+    top.force();
+    let mut any = false;
+    for mut e in index.iter().collect::<Vec<_>>() {
+        if e.path.contains(&b'/') {
+            e.flags_extended |= libgit2_sys::GIT_INDEX_ENTRY_SKIP_WORKTREE as u16;
+            index.add(&e)?;
+        } else {
+            top.path(&e.path);
+            any = true;
+        }
+    }
+    index.write()?;
+    if any {
+        repo.checkout_index(Some(&mut index), Some(&mut top))?;
+    }
+    Ok(())
+}
+
+/// A partial clone through git: libgit2 cannot fetch with a filter, nor
+/// fetch the objects left out later, on demand, as a partial clone needs.
+fn clone_filtered(
+    url: &str,
+    path: &Path,
+    args: &crate::CloneArgs,
+    filter: &str,
+) -> Result<(), GitError> {
     let mut cmd = std::process::Command::new("git");
-    cmd.args(["clone", "--quiet"]);
+    cmd.args(["clone", "--quiet", &format!("--filter={filter}")]);
     if args.depth > 0 {
         cmd.arg(format!("--depth={}", args.depth));
     }
-    if let Some(b) = &args.branch {
-        cmd.args(["--branch", b]);
-    }
-    if let Some(o) = &args.origin {
-        cmd.args(["--origin", o]);
+    for (flag, value) in [
+        ("--branch", &args.branch),
+        ("--origin", &args.origin),
+        ("--template", &args.template),
+        ("--shallow-since", &args.shallow_since),
+        ("--separate-git-dir", &args.separate_git_dir),
+    ] {
+        if let Some(v) = value {
+            cmd.arg(format!("{flag}={v}"));
+        }
     }
     for (on, flag) in [
         (args.bare, "--bare"),
         (args.mirror, "--mirror"),
         (args.recurse_submodules, "--recurse-submodules"),
         (args.single_branch, "--single-branch"),
+        (args.no_single_branch, "--no-single-branch"),
         (args.no_checkout, "--no-checkout"),
         (args.no_tags, "--no-tags"),
+        (args.dissociate, "--dissociate"),
+        (args.shared, "--shared"),
+        (args.sparse, "--sparse"),
     ] {
         if on {
             cmd.arg(flag);
         }
     }
+    for r in &args.reference {
+        cmd.arg(format!("--reference={r}"));
+    }
+    for r in &args.reference_if_able {
+        cmd.arg(format!("--reference-if-able={r}"));
+    }
     for kv in &args.config {
         cmd.args(["--config", kv]);
     }
     let out = cmd
-        .args(&args.git_flags)
         .arg(url)
         .arg(path)
         .output()
@@ -6491,12 +7307,25 @@ fn submodule_op(
     };
     match op {
         Op::Add {
-            url, path, branch, ..
+            url,
+            path,
+            branch,
+            name,
         } => {
             let path = path.clone().unwrap_or_else(|| {
                 let base = url.trim_end_matches('/').rsplit(['/', ':']).next();
                 base.unwrap_or(url).trim_end_matches(".git").to_owned()
             });
+            if let Some(name) = name.as_deref().filter(|n| *n != path) {
+                return crate::submodule::add_named(
+                    repo,
+                    url,
+                    &path,
+                    name,
+                    branch.as_deref(),
+                    report,
+                );
+            }
             report(OpProgress::Line(format!(
                 "Cloning into '{}'...",
                 top.join(&path).display()
@@ -6532,7 +7361,19 @@ fn submodule_op(
             init,
             recursive,
             remote,
-        } => update_each(repo, "", paths, *init, *recursive, *remote, report)?,
+            jobs,
+        } => {
+            let jobs = jobs.unwrap_or_else(|| {
+                let n = repo.config().and_then(|c| c.get_i64("submodule.fetchJobs"));
+                n.map_or(1, |n| n.max(1) as usize)
+            });
+            let o = UpdateOpts {
+                init: *init,
+                recursive: *recursive,
+                remote: *remote,
+            };
+            update_each(repo, "", paths, o, jobs, report)?
+        }
         Op::Sync { paths, recursive } => sync_each(repo, "", paths, *recursive, report)?,
         Op::Deinit { paths, force, all } => {
             if paths.is_empty() && !all {
@@ -6599,24 +7440,31 @@ fn submodule_op(
                 }
             }
         }
-        Op::AbsorbGitDirs { .. } | Op::Summary { .. } => {
-            unreachable!("run through git")
-        }
+        Op::AbsorbGitDirs { paths } => crate::submodule::absorb(repo, "", paths, report)?,
+        Op::Summary { args } => crate::submodule::summary(repo, args, report)?,
     }
     Ok(())
 }
 
-/// `submodule update` over `repo`'s chosen submodules, reporting paths under `prefix`.
+/// Options `submodule update` passes down to nested submodules.
+#[derive(Clone, Copy)]
+struct UpdateOpts {
+    init: bool,
+    recursive: bool,
+    remote: bool,
+}
+
+/// `submodule update` over `repo`'s chosen submodules, reporting paths under
+/// `prefix`, `jobs` of them at once.
 fn update_each(
     repo: &Repository,
     prefix: &str,
     paths: &[String],
-    init: bool,
-    recursive: bool,
-    remote: bool,
+    o: UpdateOpts,
+    jobs: usize,
     report: &dyn Fn(OpProgress),
 ) -> Result<(), GitError> {
-    let top = repo.workdir().unwrap_or(repo.path()).to_path_buf();
+    let mut names = Vec::new();
     for mut sm in chosen_submodules(repo, paths)? {
         let name = sm.name().unwrap_or_default().to_owned();
         let path = format!("{prefix}{}", sm.path().display());
@@ -6624,7 +7472,7 @@ fn update_each(
             .config()?
             .get_string(&format!("submodule.{name}.url"))
             .is_ok();
-        if !registered && !init {
+        if !registered && !o.init {
             continue;
         }
         if !registered {
@@ -6637,6 +7485,60 @@ fn update_each(
                 "Submodule '{name}' ({url}) registered for path '{path}'"
             )));
         }
+        names.push(name);
+    }
+    if jobs <= 1 || names.len() <= 1 {
+        for name in &names {
+            update_one(repo, prefix, name, o, report)?;
+        }
+        return Ok(());
+    }
+    // Each thread works on its own handle; output is replayed in order.
+    use rayon::prelude::*;
+    let gitdir = repo.path().to_path_buf();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .build()
+        .map_err(|e| GitError::Other(e.to_string()))?;
+    let results: Vec<(Vec<String>, Result<(), GitError>)> = pool.install(|| {
+        names
+            .par_iter()
+            .map(|name| {
+                let lines = Mutex::new(Vec::new());
+                let result = Repository::open(&gitdir)
+                    .map_err(GitError::from)
+                    .and_then(|r| {
+                        update_one(&r, prefix, name, o, &|p| {
+                            if let OpProgress::Line(l) = p {
+                                lines.lock().expect("lines mutex").push(l);
+                            }
+                        })
+                    });
+                (lines.into_inner().expect("lines mutex"), result)
+            })
+            .collect()
+    });
+    for (lines, result) in results {
+        for line in lines {
+            report(OpProgress::Line(line));
+        }
+        result?;
+    }
+    Ok(())
+}
+
+/// Clone (if needed) and check out one registered submodule, by name.
+fn update_one(
+    repo: &Repository,
+    prefix: &str,
+    name: &str,
+    o: UpdateOpts,
+    report: &dyn Fn(OpProgress),
+) -> Result<(), GitError> {
+    let top = repo.workdir().unwrap_or(repo.path()).to_path_buf();
+    let mut sm = repo.find_submodule(name)?;
+    let path = format!("{prefix}{}", sm.path().display());
+    {
         let before = sm.open().ok().and_then(|r| r.head().ok()?.target());
         if before.is_none() {
             report(OpProgress::Line(format!(
@@ -6646,7 +7548,7 @@ fn update_each(
         }
         sm.update(true, None)?;
         let sub = sm.open()?;
-        let after = if remote {
+        let after = if o.remote {
             // --remote: the submodule's remote-tracking branch, not the
             // recorded commit.
             sub.find_remote("origin")?
@@ -6674,8 +7576,8 @@ fn update_each(
                 "Submodule path '{path}': checked out '{id}'"
             )));
         }
-        if recursive {
-            update_each(&sub, &format!("{path}/"), &[], init, true, remote, report)?;
+        if o.recursive {
+            update_each(&sub, &format!("{path}/"), &[], o, 1, report)?;
         }
     }
     Ok(())
@@ -6864,12 +7766,20 @@ fn remote_callbacks<'a>(
         }
         Err(git2::Error::from_str("no supported authentication method"))
     });
-    // The remote's own progress text (`remote: Counting objects...`).
+    // The remote's own messages, without the object-counting progress git
+    // shows only on a terminal.
     cb.sideband_progress(move |data| {
+        const PROGRESS: [&str; 5] = [
+            "Counting objects",
+            "Compressing objects",
+            "Enumerating objects",
+            "Total ",
+            "Resolving deltas",
+        ];
         for line in String::from_utf8_lossy(data)
             .split(['\r', '\n'])
             .map(str::trim)
-            .filter(|l| !l.is_empty())
+            .filter(|l| !l.is_empty() && !PROGRESS.iter().any(|p| l.starts_with(p)))
         {
             report(OpProgress::Line(format!("remote: {line}")));
         }
@@ -7242,13 +8152,6 @@ fn remote_urls(repo: &Repository, name: &str, push: bool) -> Result<Vec<String>,
     } else {
         Ok(push_urls)
     }
-}
-
-/// Whether remote `name` has several URLs for the direction: libgit2 reads
-/// only the last, while git fetches from the first and pushes to each, so
-/// such remotes go through git.
-fn multi_url(repo: &Repository, name: &str, push: bool) -> bool {
-    remote_urls(repo, name, push).is_ok_and(|u| u.len() > 1)
 }
 
 /// A stash commit of worktree `tree` as git makes one: the index as its

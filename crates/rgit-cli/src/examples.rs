@@ -256,7 +256,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit fetch --dry-run",
             "rgit fetch --unshallow",
             "rgit fetch --prune --prune-tags",
-            "rgit fetch --multiple origin upstream",
+            "rgit fetch --multiple -j 4 origin upstream",
         ],
     ),
     (
@@ -286,6 +286,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit push --follow-tags",
             "rgit push --atomic origin main v1",
             "rgit push --porcelain origin main",
+            "rgit push --recurse-submodules=on-demand origin main",
         ],
     ),
     (
@@ -688,6 +689,9 @@ const EXAMPLES: &[Entry] = &[
             "rgit clone --single-branch -b main https://github.com/example/repo.git",
             "rgit clone --mirror https://github.com/example/repo.git",
             "rgit clone --filter=blob:none https://github.com/example/repo.git",
+            "rgit clone --shallow-since=2024-01-01 https://github.com/example/repo.git",
+            "rgit clone --reference ../other --dissociate https://github.com/example/repo.git",
+            "rgit clone --sparse https://github.com/example/repo.git",
         ],
     ),
     (

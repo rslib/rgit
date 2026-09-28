@@ -227,7 +227,7 @@ fn fetch_takes_remote_refspecs_tags_and_dry_run() {
     let refs = || git(&clone, &["for-each-ref", "--format=%(refname)"]);
     let before = refs();
     let out = ok(&clone, &["fetch", "--dry-run", "origin"]);
-    assert!(out.contains("topic -> origin/topic"), "{out}");
+    assert!(out.contains("topic      -> origin/topic"), "{out}");
     assert_eq!(refs(), before);
 
     ok(&clone, &["fetch", "origin", "topic"]);
@@ -644,9 +644,12 @@ fn fetch_writes_fetch_head_and_takes_gits_flags() {
 
     // A dry run lists the tag a fetch would follow, and writes nothing.
     let (out, _, _) = human(&clone, &["fetch", "--dry-run"]);
-    assert!(out.contains(" * [new tag]         rel -> rel"), "{out}");
     assert!(
-        out.contains(" * [new branch]      topic -> origin/topic"),
+        out.contains(" * [new tag]         rel        -> rel"),
+        "{out}"
+    );
+    assert!(
+        out.contains(" * [new branch]      topic      -> origin/topic"),
         "{out}"
     );
     assert_eq!(tags(), "");
@@ -661,7 +664,7 @@ fn fetch_writes_fetch_head_and_takes_gits_flags() {
         format!(
             "{}\t\tbranch 'topic' of {}\n",
             git(&up, &["rev-parse", "topic"]).trim(),
-            remote.display()
+            remote.with_extension("").display()
         )
     );
     ok(&clone, &["merge", "FETCH_HEAD"]);
@@ -745,6 +748,34 @@ fn pull_autostashes_with_the_flag_or_config() {
     ok(&clone, &["pull", "--rebase"]);
     assert_eq!(std::fs::read_to_string(clone.join("a")).unwrap(), "dirty\n");
     assert!(clone.join("remote2").exists());
+}
+
+#[test]
+fn pull_rebase_keeps_the_autostash_across_a_stop_and_takes_x() {
+    let (_, up, clone) = fetch_setup("pull-rebase-autostash-x");
+    commit(&clone, "a", "mine\n");
+    commit(&up, "a", "theirs\n");
+    git(&up, &["push", "-q", "origin", "main"]);
+    std::fs::write(clone.join("b"), "dirty\n").unwrap();
+    fails(&clone, &["pull", "--rebase", "--autostash"]);
+    let saved = std::fs::read_to_string(clone.join(".git/rebase-merge/autostash")).unwrap();
+    assert_eq!(git(&clone, &["cat-file", "-t", saved.trim()]), "commit\n");
+    assert_eq!(std::fs::read_to_string(clone.join("b")).unwrap(), "b\n");
+    std::fs::write(clone.join("a"), "both\n").unwrap();
+    git(&clone, &["add", "a"]);
+    ok(&clone, &["rebase", "--continue"]);
+    assert_eq!(std::fs::read_to_string(clone.join("b")).unwrap(), "dirty\n");
+    git(&clone, &["checkout", "-q", "--", "b"]);
+
+    commit(&clone, "a", "mine2\n");
+    commit(&up, "a", "theirs2\n");
+    git(&up, &["push", "-q", "origin", "main"]);
+    ok(&clone, &["pull", "--rebase", "-X", "ours"]);
+    // In a rebase "ours" is the upstream being rebased onto, as in git.
+    assert_eq!(
+        std::fs::read_to_string(clone.join("a")).unwrap(),
+        "theirs2\n"
+    );
 }
 
 #[test]
@@ -1015,44 +1046,504 @@ fn submodule_add_status_update_and_deinit() {
     assert!(out.starts_with('-'), "{out}");
 }
 
+/// git with local-path submodule clones allowed.
+fn git_sm(dir: &Path, args: &[&str]) -> String {
+    git(dir, &[&["-c", "protocol.file.allow=always"], args].concat())
+}
+
 #[test]
-fn submodule_absorbgitdirs_and_named_add_go_through_git() {
-    let (root, up, lib) = submodule_setup("sub-git");
-    // Named add and absorbgitdirs are git's own (libgit2 has neither).
-    let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
-        .args([
-            "submodule",
-            "add",
-            "--name",
-            "other",
-            lib.to_str().unwrap(),
-            "two",
-        ])
-        .current_dir(&up)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("HOME", &root)
-        .env("RGIT_OPLOG", "0")
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
-        .env("GIT_CONFIG_VALUE_0", "always")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
+fn submodule_named_add_and_absorbgitdirs_match_git() {
+    let (root, ours, lib) = submodule_setup("sub-named");
+    let theirs = root.join("theirs");
+    let remote = root.join("r.git");
+    git(&root, &["clone", "-q", remote.to_str().unwrap(), "theirs"]);
+    git_sm(&theirs, &["submodule", "update", "-q", "--init"]);
+    let url = lib.to_str().unwrap();
+    ok(&ours, &["submodule", "add", "--name", "other", url, "two"]);
+    git_sm(
+        &theirs,
+        &["submodule", "add", "--name", "other", url, "two"],
+    );
+    for d in [&ours, &theirs] {
+        git_sm(d, &["clone", "-q", url, "emb"]);
+        git_sm(d, &["submodule", "add", "-q", url, "emb"]);
+    }
+    ok(&ours, &["submodule", "absorbgitdirs"]);
+    git(&theirs, &["submodule", "absorbgitdirs"]);
+    let state = |d: &Path| {
+        let read = |p: &str| std::fs::read_to_string(d.join(p)).unwrap();
+        (
+            read(".gitmodules"),
+            read("two/.git"),
+            read("emb/.git"),
+            git(
+                d,
+                &["config", "--get-regexp", "^submodule\\.(other|emb)\\."],
+            ),
+            git(d, &["ls-files", "-s"]),
+            git(d, &["status", "--short", "--untracked-files=no"]),
+            git(d, &["submodule", "status"]),
+            ["other", "emb"].map(|m| {
+                let file = format!(".git/modules/{m}/config");
+                git(d, &["config", "-f", &file, "core.worktree"])
+            }),
+        )
+    };
+    assert_eq!(state(&ours), state(&theirs));
+}
+
+#[test]
+fn submodule_summary_foreach_and_parallel_update_match_git() {
+    let (root, up, lib) = submodule_setup("sub-summary");
+    let sub = up.join("sub");
+    identity(&sub);
+    commit(&sub, "s1", "1\n");
+    commit(&sub, "s2", "2\n");
+    let same = |args: &[&str]| {
+        let (out, err, success) = human(&up, args);
+        assert!(success, "{args:?}: {err}");
+        assert_eq!(out.trim_end(), git(&up, args).trim_end(), "{args:?}");
+    };
+    same(&["submodule", "summary"]);
+    same(&["submodule", "summary", "-n", "1"]);
+    git(&up, &["add", "sub"]);
+    same(&["submodule", "summary", "--cached"]);
+    same(&["submodule", "summary", "--files"]);
+    git(&sub, &["reset", "-q", "--hard", "HEAD~2"]);
+    commit(&sub, "s3", "3\n");
+    same(&["submodule", "summary", "--files"]);
+    same(&["submodule", "summary", "HEAD", "--", "sub"]);
+    git(&up, &["reset", "-q", "sub"]);
+
+    // A nested submodule sees its own superproject in $toplevel and $sm_path.
+    let inner = root.join("inner");
+    git(
+        &root,
+        &["init", "-q", "-b", "main", inner.to_str().unwrap()],
+    );
+    identity(&inner);
+    commit(&inner, "i", "i\n");
+    git_sm(
+        &lib,
+        &["submodule", "add", "-q", inner.to_str().unwrap(), "deep"],
+    );
+    git(&lib, &["commit", "-qm", "deep"]);
+    git(&sub, &["fetch", "-q", "origin"]);
+    git(&sub, &["checkout", "-q", "origin/main"]);
+    git_sm(&sub, &["submodule", "update", "-q", "--init"]);
+    let cmd = "echo $name $sm_path $displaypath $sha1 $toplevel $path";
+    same(&["submodule", "foreach", "--recursive", cmd]);
+    same(&["submodule", "foreach", "echo", "$name"]);
+
+    git_sm(
+        &up,
+        &["submodule", "add", "-q", inner.to_str().unwrap(), "more"],
+    );
+    git(&up, &["commit", "-qm", "more"]);
+    git(&up, &["push", "-q", "origin", "main"]);
+    let remote = root.join("r.git");
+    git(&root, &["clone", "-q", remote.to_str().unwrap(), "par"]);
+    git(&root, &["clone", "-q", remote.to_str().unwrap(), "gpar"]);
+    let par = root.join("par");
+    let (out, err, success) = human(&par, &["submodule", "update", "--init", "--jobs", "2"]);
+    assert!(success, "{out}{err}");
+    assert!(out.contains("Submodule path 'more': checked out"), "{out}");
+    let gpar = root.join("gpar");
+    git_sm(
+        &gpar,
+        &["submodule", "update", "-q", "--init", "--jobs", "2"],
     );
     assert_eq!(
-        git(
-            &up,
-            &["config", "-f", ".gitmodules", "submodule.other.path"]
-        )
-        .trim(),
-        "two"
+        git(&par, &["submodule", "status"]),
+        git(&gpar, &["submodule", "status"])
     );
-    ok(&up, &["submodule", "absorbgitdirs"]);
-    assert!(up.join("two/.git").is_file());
-    let out = ok(&up, &["submodule", "status"]);
-    assert!(out.contains("submodules[2]"), "{out}");
+}
+
+/// An upstream on `main` with dated commits (an older one tagged), and a
+/// `topic` branch with a tag of its own, pushed to a bare remote. Returns the
+/// test folder and the remote's file:// URL.
+fn dated_setup(tag: &str) -> (PathBuf, String) {
+    let (remote, up, _) = fetch_setup(tag);
+    std::fs::create_dir_all(up.join("d")).unwrap();
+    for year in ["2021", "2022", "2023"] {
+        std::fs::write(up.join("d").join(year), year).unwrap();
+        git(&up, &["add", "."]);
+        let date = format!("{year}-01-01T00:00:00Z");
+        let out = env(Command::new("git").arg("-C").arg(&up), &up)
+            .env("GIT_COMMITTER_DATE", &date)
+            .env("GIT_AUTHOR_DATE", &date)
+            .args(["commit", "-qm", year])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+    git(&up, &["tag", "-a", "-m", "old", "old", "main~3"]);
+    git(&up, &["checkout", "-qb", "topic"]);
+    commit(&up, "t", "t\n");
+    git(&up, &["tag", "tt"]);
+    git(&up, &["checkout", "-q", "main"]);
+    git(&up, &["push", "-q", "origin", "main", "topic", "old", "tt"]);
+    let url = format!("file://{}", remote.display());
+    (remote.parent().unwrap().to_path_buf(), url)
+}
+
+/// The refs, history and shallow boundary of two repositories match.
+fn same_history(a: &Path, b: &Path) {
+    for args in [
+        &["for-each-ref"][..],
+        &["log", "--all", "--format=%H %s"],
+        &["diff", "HEAD", "--stat"],
+    ] {
+        assert_eq!(git(a, args), git(b, args), "{args:?}");
+    }
+    let shallow = |d: &Path| std::fs::read_to_string(d.join(".git/shallow")).ok();
+    assert_eq!(shallow(a), shallow(b));
+}
+
+#[test]
+fn shallow_clones_and_fetches_over_file_match_git() {
+    let (root, url) = dated_setup("shallow-file");
+    for (name, flags) in [
+        ("depth", &["--depth", "2"][..]),
+        ("since", &["--shallow-since=2021-06-01"]),
+        ("wide", &["--depth", "1", "--no-single-branch"]),
+    ] {
+        let theirs = format!("g{name}");
+        let mut args = vec!["clone"];
+        args.extend(flags);
+        ok(&root, &[&args[..], &[url.as_str(), name]].concat());
+        args.push("-q");
+        git(
+            &root,
+            &[&args[..], &[url.as_str(), theirs.as_str()]].concat(),
+        );
+        same_history(&root.join(name), &root.join(theirs));
+    }
+    let (mine, theirs) = (root.join("depth"), root.join("gdepth"));
+    for step in [
+        &["fetch", "--deepen", "1"][..],
+        &["fetch", "--shallow-since=2020-01-01"],
+        &["fetch", "--depth", "1", "origin", "topic"],
+        &["fetch", "--unshallow"],
+    ] {
+        ok(&mine, step);
+        git(&theirs, &[step, &["-q"]].concat());
+        same_history(&mine, &theirs);
+    }
+    assert!(!mine.join(".git/shallow").exists());
+}
+
+#[test]
+fn clone_borrows_objects_separates_and_starts_sparse_like_git() {
+    let (root, url) = dated_setup("clone-native");
+    let clone = |flags: &[&str], name: &str| {
+        let theirs = format!("g{name}");
+        let mut args = vec!["clone"];
+        args.extend(flags);
+        ok(&root, &[&args[..], &[url.as_str(), name]].concat());
+        args.push("-q");
+        git(
+            &root,
+            &[&args[..], &[url.as_str(), theirs.as_str()]].concat(),
+        );
+        (root.join(name), root.join(theirs))
+    };
+
+    // One branch takes only the tags on its history.
+    let (a, b) = clone(&["--single-branch"], "single");
+    same_history(&a, &b);
+    assert!(!git(&a, &["tag"]).contains("tt"));
+    let (a, b) = clone(&["-b", "old", "-c", "advice.detachedHead=false"], "tagged");
+    assert_eq!(
+        git(&a, &["rev-parse", "HEAD"]),
+        git(&b, &["rev-parse", "HEAD"])
+    );
+
+    // Borrowed objects: --dissociate copies them in and drops the link.
+    let up = root.join("up");
+    let (a, b) = clone(
+        &["--reference", up.to_str().unwrap(), "--dissociate"],
+        "dissociated",
+    );
+    same_history(&a, &b);
+    assert!(!a.join(".git/objects/info/alternates").exists());
+    git(&a, &["fsck", "--no-progress"]);
+    let (_, err, success) = rgit(
+        &root,
+        &["clone", "--reference-if-able", "nowhere", &url, "able"],
+    );
+    assert!(success && err.contains("Could not add alternate"), "{err}");
+
+    // The repository lives apart, linked by a .git file.
+    let apart = root.join("apart.git");
+    let flag = format!("--separate-git-dir={}", apart.display());
+    ok(&root, &["clone", &flag, &url, "separate"]);
+    assert!(root.join("separate/.git").is_file());
+    assert!(apart.join("HEAD").exists());
+    assert_eq!(git(&root.join("separate"), &["status", "--porcelain"]), "");
+
+    // A template's hooks are copied in.
+    let tpl = root.join("tpl");
+    std::fs::create_dir_all(tpl.join("hooks")).unwrap();
+    std::fs::write(tpl.join("hooks/post-checkout"), "#!/bin/sh\n").unwrap();
+    let flag = format!("--template={}", tpl.display());
+    ok(&root, &["clone", &flag, &url, "templated"]);
+    assert!(root.join("templated/.git/hooks/post-checkout").exists());
+
+    // A sparse checkout has the top-level files only, as git's has.
+    let (a, b) = clone(&["--sparse"], "sparse");
+    same_history(&a, &b);
+    assert!(!a.join("d").exists());
+    for args in [&["ls-files", "-t"][..], &["sparse-checkout", "list"]] {
+        assert_eq!(git(&a, args), git(&b, args), "{args:?}");
+    }
+
+    // A failed clone leaves nothing behind.
+    fails(&root, &["clone", "-b", "nope", &url, "gone"]);
+    assert!(!root.join("gone").exists());
+}
+
+/// What `sh -c <script>` prints on stdout and stderr together, in `dir`.
+fn shell(dir: &Path, script: &str) -> String {
+    let out = env(Command::new("sh").arg("-c").arg(script), dir)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{script}: {out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The same fetch by rgit in `clone` and by git in `twin` reports the same.
+fn same_fetch(clone: &Path, twin: &Path, args: &[&str]) {
+    let (out, err, success) = human(clone, &[&["fetch"], args].concat());
+    assert!(success, "fetch {args:?}: {err}");
+    let theirs = shell(twin, &format!("git fetch {} 2>&1", args.join(" ")));
+    assert_eq!(out, theirs, "fetch {args:?}");
+}
+
+#[test]
+fn fetch_reports_like_git() {
+    let (remote, up, clone) = fetch_setup("fetch-report");
+    let twin = clone.with_file_name("g");
+    let root = remote.parent().unwrap();
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            remote.to_str().unwrap(),
+            twin.to_str().unwrap(),
+        ],
+    );
+    git(
+        &up,
+        &["checkout", "-qb", "a-very-long-branch-name-for-the-column"],
+    );
+    commit(&up, "t", "t\n");
+    git(&up, &["checkout", "-qb", "topic"]);
+    git(&up, &["checkout", "-q", "main"]);
+    commit(&up, "c", "c\n");
+    git(&up, &["tag", "-a", "-m", "rel", "rel"]);
+    git(&up, &["branch", "doomed"]);
+    git(&up, &["push", "-q", "--all", "origin"]);
+    git(&up, &["push", "-q", "origin", "rel"]);
+    same_fetch(&clone, &twin, &["--dry-run"]);
+    same_fetch(&clone, &twin, &[]);
+
+    git(&up, &["reset", "-q", "--hard", "HEAD~1"]);
+    commit(&up, "forced", "f\n");
+    git(&up, &["push", "-q", "-f", "origin", "main", ":doomed"]);
+    same_fetch(&clone, &twin, &["--prune"]);
+
+    git(&up, &["checkout", "-q", "topic"]);
+    commit(&up, "t2", "t2\n");
+    git(&up, &["push", "-q", "origin", "topic"]);
+    same_fetch(&clone, &twin, &["origin", "topic"]);
+    same_fetch(&clone, &twin, &["origin", "topic:refs/heads/copy"]);
+
+    for dir in [&clone, &twin] {
+        git(dir, &["config", "fetch.output", "compact"]);
+    }
+    git(&up, &["checkout", "-q", "main"]);
+    commit(&up, "d", "d\n");
+    git(&up, &["push", "-q", "origin", "main"]);
+    same_fetch(&clone, &twin, &[]);
+}
+
+#[test]
+fn fetch_multiple_remote_update_and_groups_fetch_each_remote() {
+    let (remote, up, clone) = fetch_setup("fetch-many");
+    let twin = clone.with_file_name("g");
+    let root = remote.parent().unwrap();
+    git(
+        root,
+        &[
+            "clone",
+            "-q",
+            remote.to_str().unwrap(),
+            twin.to_str().unwrap(),
+        ],
+    );
+    for dir in [&clone, &twin] {
+        git(dir, &["remote", "add", "second", remote.to_str().unwrap()]);
+        git(dir, &["config", "remotes.both", "origin second"]);
+    }
+    commit(&up, "c", "c\n");
+    git(&up, &["push", "-q", "origin", "main"]);
+
+    let (out, _, success) = human(&clone, &["remote", "update", "both"]);
+    assert!(success, "{out}");
+    let theirs = shell(&twin, "git remote update both 2>&1");
+    assert_eq!(out, theirs);
+
+    commit(&up, "d", "d\n");
+    git(&up, &["push", "-q", "origin", "main"]);
+    ok(
+        &clone,
+        &["fetch", "--multiple", "-j", "2", "origin", "second"],
+    );
+    git(
+        &twin,
+        &["fetch", "-q", "--multiple", "-j", "2", "origin", "second"],
+    );
+    let sorted = |dir: &Path| {
+        let mut lines: Vec<String> = std::fs::read_to_string(dir.join(".git/FETCH_HEAD"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        lines
+    };
+    assert_eq!(sorted(&clone), sorted(&twin));
+    assert_eq!(
+        git(&clone, &["for-each-ref", "refs/remotes"]),
+        git(&twin, &["for-each-ref", "refs/remotes"])
+    );
+
+    // A group fetches as `--multiple` does; skipFetchAll leaves one out of --all.
+    commit(&up, "e", "e\n");
+    git(&up, &["push", "-q", "origin", "main"]);
+    ok(&clone, &["fetch", "both"]);
+    assert_eq!(
+        git(&clone, &["rev-parse", "second/main"]),
+        git(&up, &["rev-parse", "main"])
+    );
+    commit(&up, "f", "f\n");
+    git(&up, &["push", "-q", "origin", "main"]);
+    git(&clone, &["config", "remote.second.skipFetchAll", "true"]);
+    let out = ok(&clone, &["fetch", "--all"]);
+    assert!(!out.contains("second"), "{out}");
+    assert_ne!(
+        git(&clone, &["rev-parse", "second/main"]),
+        git(&up, &["rev-parse", "main"])
+    );
+}
+
+#[test]
+fn remotes_with_several_urls_fetch_the_first_and_push_to_each() {
+    let (work, origin, second) = push_setup("multi-url");
+    let url = |p: &Path| p.to_str().unwrap().to_owned();
+    git(
+        &work,
+        &["remote", "set-url", "--add", "origin", &url(&second)],
+    );
+    git(&work, &["branch", "gone"]);
+    let out = ok(&work, &["push", "origin", "main", "gone"]);
+    assert_eq!(
+        out.matches("[new branch]      gone -> gone").count(),
+        2,
+        "{out}"
+    );
+    assert_eq!(heads(&origin), heads(&second));
+    // Like git, the remote-tracking refs follow what was pushed.
+    assert_eq!(
+        git(&work, &["rev-parse", "origin/gone"]),
+        git(&work, &["rev-parse", "gone"])
+    );
+    ok(&work, &["push", "origin", ":gone"]);
+    assert!(!heads(&origin).contains("gone") && !heads(&second).contains("gone"));
+    assert!(!git(&work, &["branch", "-r"]).contains("origin/gone"));
+
+    // Fetch reads the first URL only.
+    git(&origin, &["branch", "first-only", "main"]);
+    git(&second, &["branch", "second-only", "main"]);
+    ok(&work, &["fetch", "origin"]);
+    let remotes = git(&work, &["branch", "-r"]);
+    assert!(remotes.contains("origin/first-only"), "{remotes}");
+    assert!(!remotes.contains("second-only"), "{remotes}");
+
+    git(&origin, &["branch", "-D", "first-only"]);
+    let out = ok(&work, &["--human", "remote", "prune", "origin"]);
+    assert_eq!(out.trim(), "pruned origin/first-only");
+
+    // A mirror push moves the remote-tracking refs, as git's does.
+    git(
+        &work,
+        &["remote", "set-url", "--delete", "origin", &url(&second)],
+    );
+    commit(&work, "m", "m\n");
+    git(&work, &["branch", "x"]);
+    ok(&work, &["push", "--mirror", "origin"]);
+    assert_eq!(
+        git(&work, &["rev-parse", "origin/main", "origin/x"]),
+        git(&work, &["rev-parse", "main", "x"])
+    );
+}
+
+#[test]
+fn push_recurse_submodules_checks_and_pushes_them() {
+    let (root, up, lib) = submodule_setup("push-sub");
+    let lib_bare = root.join("lib.git");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            lib.to_str().unwrap(),
+            lib_bare.to_str().unwrap(),
+        ],
+    );
+    let sub = up.join("sub");
+    identity(&sub);
+    git(
+        &sub,
+        &["remote", "set-url", "origin", lib_bare.to_str().unwrap()],
+    );
+    git(&sub, &["fetch", "-q", "origin"]);
+    commit(&sub, "s", "s\n");
+    git(&up, &["commit", "-qam", "bump"]);
+    let before = heads(&root.join("r.git"));
+
+    let (_, msg, _) = human(
+        &up,
+        &["push", "--recurse-submodules=check", "origin", "main"],
+    );
+    assert!(
+        msg.contains(
+            "The following submodule paths contain changes that can\n\
+             not be found on any remote:\n  sub\n"
+        ),
+        "{msg}"
+    );
+    git(&up, &["config", "push.recurseSubmodules", "check"]);
+    fails(&up, &["push", "origin", "main"]);
+    assert_eq!(heads(&root.join("r.git")), before);
+
+    let (out, err, success) = human(
+        &up,
+        &["push", "--recurse-submodules=on-demand", "origin", "main"],
+    );
+    assert!(success, "{out}{err}");
+    assert!(out.contains("Pushing submodule 'sub'"), "{out}");
+    assert_eq!(
+        git(&lib_bare, &["rev-parse", "main"]),
+        git(&sub, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        git(&root.join("r.git"), &["rev-parse", "main"]),
+        git(&up, &["rev-parse", "HEAD"])
+    );
+    ok(&up, &["push", "origin", "main"]);
 }

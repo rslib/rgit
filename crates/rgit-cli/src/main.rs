@@ -125,11 +125,13 @@ fn main() -> ! {
             origin,
             recurse_submodules,
             single_branch,
-            no_single_branch: _,
+            no_single_branch,
             no_checkout,
             mirror,
             no_tags,
             reference,
+            reference_if_able,
+            bundle_uri: _,
             dissociate,
             shared,
             filter,
@@ -152,30 +154,6 @@ fn main() -> ! {
                     .to_owned()
                     + if bare || mirror { ".git" } else { "" }
             });
-            // What libgit2 cannot clone with goes to git as given.
-            let mut git_flags: Vec<String> = reference
-                .iter()
-                .map(|r| format!("--reference={r}"))
-                .collect();
-            for (on, flag) in [
-                (dissociate, "--dissociate"),
-                (shared, "--shared"),
-                (sparse, "--sparse"),
-            ] {
-                if on {
-                    git_flags.push(flag.to_owned());
-                }
-            }
-            for (flag, value) in [
-                ("--filter", filter),
-                ("--template", template),
-                ("--shallow-since", shallow_since),
-                ("--separate-git-dir", separate_git_dir),
-            ] {
-                if let Some(v) = value {
-                    git_flags.push(format!("{flag}={v}"));
-                }
-            }
             let args = rgit_git::CloneArgs {
                 branch,
                 depth,
@@ -187,11 +165,20 @@ fn main() -> ! {
                 mirror,
                 no_tags,
                 config,
-                git_flags,
+                no_single_branch,
+                reference,
+                reference_if_able,
+                dissociate,
+                shared,
+                filter,
+                sparse,
+                template,
+                shallow_since,
+                separate_git_dir,
             };
             let result = rgit_git::clone(&url, std::path::Path::new(&dir), &args, &|p| {
                 if let rgit_git::OpProgress::Line(l) = p
-                    && l.starts_with("warning:")
+                    && (l.starts_with("warning:") || l.starts_with("info:"))
                 {
                     eprintln!("{l}");
                 }

@@ -13,6 +13,7 @@ mod config;
 mod creds;
 mod diff;
 mod error;
+mod fetch_display;
 mod format_patch;
 mod git_repo;
 mod lanes;
@@ -21,8 +22,11 @@ mod oplog;
 mod plumbing;
 mod range_diff;
 mod rebase;
+mod shallow;
 #[cfg(feature = "ssh")]
 mod ssh;
+mod stash;
+mod submodule;
 pub mod workflow;
 
 /// Install a callback that supplies an SSH password when key-based auth over an

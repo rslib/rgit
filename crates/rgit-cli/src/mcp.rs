@@ -1014,7 +1014,9 @@ fn tools() -> Vec<Tool> {
              tags on the pushed history, `atomic` pushes all or nothing, `prune` (with `all` or \
              `tags`) deletes remote refs no local ref maps to, `mirror` makes the remote match \
              every local ref, `push_options` go to the server's hooks, `no_verify` skips the \
-             pre-push hook. A rejected ref fails with git's report and advice.",
+             pre-push hook, `recurse_submodules` (check|on-demand|only|no) checks or pushes \
+             the submodule commits the pushed history records. A rejected ref fails with \
+             git's report and advice.",
             &[
                 ("force", "boolean", false),
                 ("force_with_lease", "boolean", false),
@@ -1031,6 +1033,7 @@ fn tools() -> Vec<Tool> {
                 ("mirror", "boolean", false),
                 ("push_options", "string[]", false),
                 ("no_verify", "boolean", false),
+                ("recurse_submodules", "string", false),
             ],
         ),
         tool(
@@ -1068,11 +1071,13 @@ fn tools() -> Vec<Tool> {
             "git_submodule_update",
             "Clone missing submodules and check out the commits the superproject records. \
              `init` initializes them first, `recursive` includes nested ones, `remote` checks \
-             out each submodule's remote-tracking branch instead; `paths` limits which.",
+             out each submodule's remote-tracking branch instead, `jobs` clones that many at once; \
+             `paths` limits which.",
             &[
                 ("init", "boolean", false),
                 ("recursive", "boolean", false),
                 ("remote", "boolean", false),
+                ("jobs", "integer", false),
                 ("paths", "paths", false),
             ],
         ),
@@ -2831,6 +2836,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             quiet: false,
             verbose: false,
             jobs: None,
+            append: false,
         },
         "git_pull" => Command::Pull {
             repository: a.str("remote"),
@@ -2872,7 +2878,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             push_option: a.strs("push_options").unwrap_or_default(),
             no_verify: a.flag("no_verify"),
             porcelain: false,
-            recurse_submodules: None,
+            recurse_submodules: a.str("recurse_submodules"),
             quiet: false,
             verbose: false,
         },
@@ -2906,7 +2912,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             remote: a.flag("remote"),
             checkout: false,
             quiet: false,
-            jobs: None,
+            jobs: a.num("jobs")?.map(|n| n as usize),
             paths: a.strs("paths").unwrap_or_default(),
         }),
         "git_submodule_deinit" => submodule(SubmoduleCmd::Deinit {
