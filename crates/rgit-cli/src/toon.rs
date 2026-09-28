@@ -30,121 +30,6 @@ impl Node {
     fn is_primitive(&self) -> bool {
         !matches!(self, Node::List(_) | Node::Obj(_))
     }
-
-    pub fn get(&self, key: &str) -> Option<&Node> {
-        match self {
-            Node::Obj(fields) => fields.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-
-    pub fn get_mut(&mut self, key: &str) -> Option<&mut Node> {
-        match self {
-            Node::Obj(fields) => fields.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-
-    /// The value at `key` in an object, inserting `default` at the end when
-    /// absent. `None` when `self` is not an object.
-    pub fn entry(&mut self, key: &str, default: Node) -> Option<&mut Node> {
-        let Node::Obj(fields) = self else {
-            return None;
-        };
-        let i = match fields.iter().position(|(k, _)| k == key) {
-            Some(i) => i,
-            None => {
-                fields.push((key.to_owned(), default));
-                fields.len() - 1
-            }
-        };
-        Some(&mut fields[i].1)
-    }
-
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            Node::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    pub fn as_list(&self) -> Option<&Vec<Node>> {
-        match self {
-            Node::List(items) => Some(items),
-            _ => None,
-        }
-    }
-
-    pub fn as_list_mut(&mut self) -> Option<&mut Vec<Node>> {
-        match self {
-            Node::List(items) => Some(items),
-            _ => None,
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for Node {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        d.deserialize_any(NodeVisitor)
-    }
-}
-
-struct NodeVisitor;
-
-impl<'de> serde::de::Visitor<'de> for NodeVisitor {
-    type Value = Node;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("any JSON value")
-    }
-
-    fn visit_unit<E>(self) -> Result<Node, E> {
-        Ok(Node::Null)
-    }
-
-    fn visit_none<E>(self) -> Result<Node, E> {
-        Ok(Node::Null)
-    }
-
-    fn visit_bool<E>(self, b: bool) -> Result<Node, E> {
-        Ok(Node::Bool(b))
-    }
-
-    fn visit_i64<E>(self, i: i64) -> Result<Node, E> {
-        Ok(Node::Int(i))
-    }
-
-    fn visit_u64<E>(self, u: u64) -> Result<Node, E> {
-        Ok(i64::try_from(u).map_or(Node::Float(u as f64), Node::Int))
-    }
-
-    fn visit_f64<E>(self, f: f64) -> Result<Node, E> {
-        Ok(Node::Float(f))
-    }
-
-    fn visit_str<E>(self, s: &str) -> Result<Node, E> {
-        Ok(Node::Str(s.to_owned()))
-    }
-
-    fn visit_string<E>(self, s: String) -> Result<Node, E> {
-        Ok(Node::Str(s))
-    }
-
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Node, A::Error> {
-        let mut items = Vec::new();
-        while let Some(item) = seq.next_element()? {
-            items.push(item);
-        }
-        Ok(Node::List(items))
-    }
-
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Node, A::Error> {
-        let mut fields = Obj::new();
-        while let Some((k, v)) = map.next_entry::<String, Node>()? {
-            fields.push((k, v));
-        }
-        Ok(Node::Obj(fields))
-    }
 }
 
 impl From<serde_json::Value> for Node {
@@ -507,7 +392,7 @@ mod tests {
     #[test]
     fn json_round_trip_keeps_key_order() {
         let text = r#"{"zeta":1,"alpha":{"b":true,"a":null},"list":[2.5,"x"]}"#;
-        let node: Node = serde_json::from_str(text).unwrap();
+        let node = Node::from(serde_json::from_str::<serde_json::Value>(text).unwrap());
         assert_eq!(serde_json::to_string(&node).unwrap(), text);
     }
 

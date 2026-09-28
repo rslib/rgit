@@ -18,6 +18,8 @@ rgit-tui.workspace = true
 rgit-web.workspace = true
 serde.workspace = true
 toml.workspace = true
+toml_edit = "0.22"
+sha2 = "0.10"
 # MCP structured content (a serde_json::Value) keeps schema key order.
 serde_json = { workspace = true, features = ["preserve_order"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }

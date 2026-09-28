@@ -1238,14 +1238,30 @@ pub(crate) fn check_ignore(
 }
 
 pub(crate) fn ident(repo: &Repository, committer: bool) -> Result<String, GitError> {
+    ident_or(repo, committer, None)
+}
+
+/// git's ident: GIT_{AUTHOR,COMMITTER}_* first, then author.* or committer.*
+/// and user.* config, then `fallback` (git stash's), then $EMAIL.
+pub(crate) fn ident_or(
+    repo: &Repository,
+    committer: bool,
+    fallback: Option<(&str, &str)>,
+) -> Result<String, GitError> {
     let role = if committer { "COMMITTER" } else { "AUTHOR" };
     let config = repo.config()?;
+    let role_key = role.to_ascii_lowercase();
     let get = |var: &str, key: &str| {
         std::env::var(format!("GIT_{role}_{var}"))
             .ok()
-            .or_else(|| config.get_string(key).ok())
+            .or_else(|| config.get_string(&format!("{role_key}.{key}")).ok())
+            .or_else(|| config.get_string(&format!("user.{key}")).ok())
     };
-    let (Some(name), Some(email)) = (get("NAME", "user.name"), get("EMAIL", "user.email")) else {
+    let name = get("NAME", "name").or_else(|| fallback.map(|f| f.0.to_owned()));
+    let email = get("EMAIL", "email")
+        .or_else(|| fallback.map(|f| f.1.to_owned()))
+        .or_else(|| std::env::var("EMAIL").ok());
+    let (Some(name), Some(email)) = (name, email) else {
         return Err(GitError::Other(format!(
             "{} identity unknown; set user.name and user.email",
             if committer { "committer" } else { "author" }

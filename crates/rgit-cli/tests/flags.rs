@@ -391,32 +391,6 @@ fn prune_is_object_prune_branch_prune_is_separate() {
 }
 
 #[test]
-fn skills_install_project_writes_portable_and_claude() {
-    let dir = std::env::temp_dir().join(format!("rgit-skills-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let (out, err, ok) = rgit(&dir, &["skills", "install", "--project"]);
-    assert!(ok, "skills install failed: {err}");
-    assert!(out.contains(".agents/skills/rgit/SKILL.md"));
-    assert!(out.contains(".claude/skills/rgit/SKILL.md"));
-
-    let agents = std::fs::read_to_string(dir.join(".agents/skills/rgit/SKILL.md")).unwrap();
-    let claude = std::fs::read_to_string(dir.join(".claude/skills/rgit/SKILL.md")).unwrap();
-    assert!(agents.contains("name: rgit"));
-    assert_eq!(agents, claude);
-
-    let (out, err, ok) = rgit(&dir, &["skills", "install", "--project"]);
-    assert!(ok, "skills reinstall failed: {err}");
-    assert!(
-        !out.contains("installed"),
-        "reinstall must be a no-op: {out}"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn json_wraps_cli_output() {
     let dir = repo("json");
     commit(&dir, "f", "x\n", "init");
@@ -545,23 +519,6 @@ fn porcelain_missing_arg_exits_2() {
     assert!(!ok);
     assert!(out.starts_with("error: a branch name required"), "{out}");
 
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn no_args_non_tty_prints_status() {
-    let dir = repo("home-human");
-    commit(&dir, "f", "x\n", "init");
-    let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
-        .current_dir(&dir)
-        .env("RGIT_OPLOG", "0")
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        "On branch main\nnothing to commit, working tree clean\n"
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -915,7 +872,8 @@ fn plain_diff_show_log_status_blame_match_git() {
         &["log"],
         &["log", "-p"],
         &["status"],
-        &["blame", "f"],
+        // Only committed lines: "Not Committed Yet" carries the current time.
+        &["blame", "-L", "1,3", "f"],
     ] {
         assert_eq!(
             fixed(rgit, &dir, args),
@@ -963,5 +921,72 @@ fn piped_output_without_flags_is_human_and_toon_is_opt_in() {
     assert_eq!(fixed(rgit, &dir, &["--axi", "branch"]), toon);
     assert!(fixed(rgit, &dir, &["--json", "branch"]).starts_with('{'));
     assert_eq!(fixed(rgit, &dir, &["--human", "branch"]), human);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stash_takes_identity_like_git() {
+    let dir = std::env::temp_dir().join(format!("rgit-flags-{}-stash-ident", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |bin: &str, args: &[&str], env: &[(&str, &str)]| {
+        let out = Command::new(bin)
+            .args(args)
+            .current_dir(&dir)
+            .env("HOME", &dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("RGIT_OPLOG", "0")
+            .env_remove("EMAIL")
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{bin} {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let me: &[(&str, &str)] = &[("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t")];
+    let me = [
+        me,
+        &[("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")],
+    ]
+    .concat();
+    run("git", &["init", "-q", "-b", "main"], &[]);
+    std::fs::write(dir.join("a"), "a\n").unwrap();
+    run("git", &["add", "a"], &[]);
+    run("git", &["commit", "-qm", "a"], &me);
+    let envs: [&[(&str, &str)]; 3] = [
+        &[
+            ("GIT_AUTHOR_NAME", "Ann"),
+            ("GIT_AUTHOR_EMAIL", "ann@example.com"),
+            ("GIT_COMMITTER_NAME", "Cy"),
+            ("EMAIL", "cy@example.com"),
+        ],
+        &[("EMAIL", "e@example.com")],
+        &[],
+    ];
+    let who = "--format=%an <%ae>|%cn <%ce>|%s";
+    for env in envs {
+        for args in [
+            &["stash"][..],
+            &["stash", "push", "--", "a"],
+            &["stash", "-u"],
+        ] {
+            let mut stashed = Vec::new();
+            for bin in ["git", env!("CARGO_BIN_EXE_rgit")] {
+                std::fs::write(dir.join("a"), "b\n").unwrap();
+                std::fs::write(dir.join("u"), "u\n").unwrap();
+                run(bin, args, env);
+                stashed.push(run(
+                    "git",
+                    &["log", "-1", who, "stash@{0}", "stash@{0}^2"],
+                    &[],
+                ));
+                run("git", &["stash", "drop", "-q"], &[]);
+                let _ = std::fs::remove_file(dir.join("u"));
+            }
+            assert_eq!(stashed[1], stashed[0], "{env:?} {args:?}");
+            assert_eq!(run("git", &["stash", "list"], &[]), "");
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

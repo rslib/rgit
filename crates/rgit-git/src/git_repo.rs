@@ -278,8 +278,9 @@ impl GitBackend for Git2Backend {
     fn stash_push(&self, include_untracked: bool) -> Result<String, GitError> {
         self.logged("stash", || {
             let mut repo = self.repo.lock().expect("repo mutex");
-            let sig = repo.signature()?;
+            let sig = stash_signature(&repo, true)?;
             repo.stash_save2(&sig, None, stash_flags(include_untracked))?;
+            restamp_stash(&repo, &sig)?;
             Ok(stash_saved_line(&repo))
         })
     }
@@ -291,8 +292,9 @@ impl GitBackend for Git2Backend {
     ) -> Result<String, GitError> {
         self.logged("stash", || {
             let mut repo = self.repo.lock().expect("repo mutex");
-            let sig = repo.signature()?;
+            let sig = stash_signature(&repo, true)?;
             repo.stash_save2(&sig, Some(message), stash_flags(include_untracked))?;
+            restamp_stash(&repo, &sig)?;
             Ok(stash_saved_line(&repo))
         })
     }
@@ -308,11 +310,12 @@ impl GitBackend for Git2Backend {
         self.logged("stash", || {
             if paths.is_empty() {
                 let mut repo = self.repo.lock().expect("repo mutex");
-                let sig = repo.signature()?;
+                let sig = stash_signature(&repo, true)?;
                 let mut flags = stash_flags(include_untracked || all).unwrap_or_default();
                 flags.set(git2::StashFlags::INCLUDE_IGNORED, all);
                 flags.set(git2::StashFlags::KEEP_INDEX, keep_index);
                 repo.stash_save2(&sig, message, Some(flags))?;
+                restamp_stash(&repo, &sig)?;
                 return Ok(stash_saved_line(&repo));
             }
             let repo = self.repo.lock().expect("repo mutex");
@@ -2101,9 +2104,9 @@ impl GitBackend for Git2Backend {
             // target's hunks (staged one at a time from a freshly recomputed diff).
             {
                 let repo = self.repo.lock().expect("repo mutex");
-                let sig = repo
-                    .signature()
+                let sig = ident_signature(&repo, true)
                     .or_else(|_| git2::Signature::now("rgit", "rgit@localhost"))?;
+                let author = ident_signature(&repo, false).unwrap_or_else(|_| sig.clone());
                 for target in &order {
                     for (path, new_start) in &groups[target] {
                         let mut dopts = DiffOptions::new();
@@ -2124,7 +2127,7 @@ impl GitBackend for Git2Backend {
                     crate::sign::commit_configured(
                         &repo,
                         Some("HEAD"),
-                        &sig,
+                        &author,
                         &sig,
                         &format!("fixup! {subject}"),
                         &tree,
@@ -3111,7 +3114,7 @@ impl GitBackend for Git2Backend {
         if message.trim().is_empty() {
             repo.tag_lightweight(name, &target, force)?;
         } else {
-            let sig = repo.signature()?;
+            let sig = ident_signature(&repo, true)?;
             repo.tag(name, &target, &sig, message, force)?;
         }
         Ok(())
@@ -3149,7 +3152,14 @@ impl GitBackend for Git2Backend {
         if !force && repo.find_reference(&refname).is_ok() {
             return Err(GitError::Other(format!("tag '{name}' already exists")));
         }
-        let id = crate::sign::tag_object(&repo, name, &target, &repo.signature()?, &m, sign)?;
+        let id = crate::sign::tag_object(
+            &repo,
+            name,
+            &target,
+            &ident_signature(&repo, true)?,
+            &m,
+            sign,
+        )?;
         repo.reference(&refname, id, true, "")?;
         Ok(())
     }
@@ -3921,7 +3931,7 @@ impl GitBackend for Git2Backend {
                 log.append(e.id_new(), &e.committer(), e.message()?)?;
             }
             let msg = format!("Branch: copied {from} to {to}");
-            log.append(commit.id(), &repo.signature()?, Some(&msg))?;
+            log.append(commit.id(), &ident_signature(&repo, true)?, Some(&msg))?;
             log.write()?;
             let mut config = open_config(&repo, ConfigScope::Local, true)?;
             let mut copied = Vec::new();
@@ -4221,7 +4231,7 @@ impl GitBackend for Git2Backend {
                 }
                 let part1_tree = repo.find_tree(index.write_tree_to(&repo)?)?;
 
-                let sig = repo.signature()?;
+                let sig = ident_signature(&repo, true)?;
                 let full_msg = target.message().unwrap_or("");
                 // Part 1 keeps only the subject (a fresh change id); part 2 keeps the
                 // full message and the original change id.
@@ -4442,7 +4452,7 @@ impl GitBackend for Git2Backend {
                 }
                 let msg =
                     crate::change_id::preserve(&repo, head.message().unwrap_or(""), msg.trim_end());
-                let sig = repo.signature()?;
+                let sig = ident_signature(&repo, true)?;
                 let new = crate::sign::commit_configured(
                     &repo,
                     None,
@@ -4479,7 +4489,7 @@ impl GitBackend for Git2Backend {
                 );
                 let combined =
                     crate::change_id::preserve(&repo, parent.message().unwrap_or(""), &combined);
-                let sig = repo.signature()?;
+                let sig = ident_signature(&repo, true)?;
                 let grandparents: Vec<git2::Commit> = (0..parent.parent_count())
                     .filter_map(|k| parent.parent(k).ok())
                     .collect();
@@ -4757,7 +4767,7 @@ impl GitBackend for Git2Backend {
                     .iter()
                     .any(|e| e.status() != Status::CURRENT);
             if dirty {
-                let sig = repo.signature()?;
+                let sig = stash_signature(&repo, true)?;
                 let id = repo.stash_save2(&sig, Some("autostash"), None)?;
                 report(OpProgress::Line(format!(
                     "Created autostash: {}",
@@ -7838,9 +7848,8 @@ fn pack_refs_where(repo: &Repository, keep: impl Fn(&str) -> bool) -> Result<(),
 
 /// Leave each of `refs` a reflog of one entry, `msg`, as a clone does.
 fn clone_reflogs(repo: &Repository, refs: &[String], msg: &str) -> Result<(), GitError> {
-    let sig = ident_signature(repo, true)
-        .or_else(|_| repo.signature())
-        .or_else(|_| git2::Signature::now("unknown", "unknown"))?;
+    let sig =
+        ident_signature(repo, true).or_else(|_| git2::Signature::now("unknown", "unknown"))?;
     for name in refs {
         let Ok(id) = repo.refname_to_id(name) else {
             continue;
@@ -8723,7 +8732,7 @@ fn autostash_create(
         return Ok(None);
     }
     let mut own = Repository::open(repo.path())?;
-    let sig = own.signature()?;
+    let sig = stash_signature(&own, true)?;
     let id = own.stash_save2(&sig, Some("autostash"), None)?;
     own.stash_drop(0)?;
     sync_index(repo)?;
@@ -8756,7 +8765,7 @@ fn stash_store(repo: &Repository, id: Oid) -> Result<(), GitError> {
     repo.reference("refs/stash", id, true, "autostash")?;
     let mut log = repo.reflog("refs/stash")?;
     if log.get(0).map(|e| e.id_new()) != Some(id) {
-        log.append(id, &repo.signature()?, Some("autostash"))?;
+        log.append(id, &ident_signature(repo, true)?, Some("autostash"))?;
         log.write()?;
     }
     Ok(())
@@ -8928,8 +8937,24 @@ pub(crate) fn ident_signature(
     repo: &Repository,
     committer: bool,
 ) -> Result<git2::Signature<'static>, GitError> {
-    let ident = crate::plumbing::ident(repo, committer)?;
-    let (name, rest) = ident.split_once(" <").unwrap_or((&ident, ""));
+    signature_of(&crate::plumbing::ident(repo, committer)?)
+}
+
+/// The ident git stash records: git's usual rules, but `git stash
+/// <git@stash>` fills in a name or email nothing configures.
+pub(crate) fn stash_signature(
+    repo: &Repository,
+    committer: bool,
+) -> Result<git2::Signature<'static>, GitError> {
+    signature_of(&crate::plumbing::ident_or(
+        repo,
+        committer,
+        Some(("git stash", "git@stash")),
+    )?)
+}
+
+fn signature_of(ident: &str) -> Result<git2::Signature<'static>, GitError> {
+    let (name, rest) = ident.split_once(" <").unwrap_or((ident, ""));
     let (email, when) = rest.split_once("> ").unwrap_or((rest, ""));
     let (secs, zone) = when.split_once(' ').unwrap_or((when, "+0000"));
     let n: i32 = zone.get(1..).and_then(|n| n.parse().ok()).unwrap_or(0);
@@ -9072,11 +9097,11 @@ fn stash_commit<'r>(
         short.as_str().unwrap_or_default(),
         commit.summary().ok().flatten().unwrap_or_default()
     );
-    let sig = repo.signature()?;
+    let (author, sig) = (stash_signature(repo, false)?, stash_signature(repo, true)?);
     let index_tree = repo.find_tree(repo.index()?.write_tree()?)?;
     let index = repo.commit(
         None,
-        &sig,
+        &author,
         &sig,
         &format!("index on {base}\n"),
         &index_tree,
@@ -9088,13 +9113,44 @@ fn stash_commit<'r>(
     };
     let id = repo.commit(
         None,
-        &sig,
+        &author,
         &sig,
         &message,
         tree,
         &[&commit, &repo.find_commit(index)?],
     )?;
     Ok(repo.find_commit(id)?)
+}
+
+/// libgit2 stamps a stash's commits with one signature, `sig`; git makes the
+/// author ident their author. Recommit them so, keeping one reflog entry.
+fn restamp_stash(repo: &Repository, sig: &git2::Signature) -> Result<(), GitError> {
+    let author = stash_signature(repo, false)?;
+    if author.name_bytes() == sig.name_bytes() && author.email_bytes() == sig.email_bytes() {
+        return Ok(());
+    }
+    let recommit = |c: &git2::Commit, parents: &[git2::Commit]| -> Result<Oid, GitError> {
+        let parents: Vec<&git2::Commit> = parents.iter().collect();
+        let msg = c.message_raw().unwrap_or("");
+        Ok(repo.commit(None, &author, sig, msg, &c.tree()?, &parents)?)
+    };
+    let w = repo.find_reference("refs/stash")?.peel_to_commit()?;
+    let mut parents = vec![w.parent(0)?];
+    for p in w.parents().skip(1) {
+        let id = recommit(&p, &p.parents().collect::<Vec<_>>())?;
+        parents.push(repo.find_commit(id)?);
+    }
+    let new = recommit(&w, &parents)?;
+    let mut log = repo.reflog("refs/stash")?;
+    let msg = log
+        .get(0)
+        .and_then(|e| e.message().ok().flatten().map(str::to_owned))
+        .unwrap_or_default();
+    repo.reference("refs/stash", new, true, &msg)?;
+    log = repo.reflog("refs/stash")?;
+    log.remove(1, true)?;
+    log.write()?;
+    Ok(())
 }
 
 /// Point `refs/stash` at `id`, logging `message` in its reflog.
@@ -9169,7 +9225,7 @@ fn head_branch_ref(repo: &Repository) -> Result<String, GitError> {
 fn reword_commit(repo: &Repository, target: Oid, new_message: &str) -> Result<(), GitError> {
     let branch_ref = head_branch_ref(repo)?;
     let chain = first_parent_chain(repo, target)?; // [HEAD, ..., target]
-    let sig = repo.signature()?;
+    let sig = ident_signature(repo, true)?;
     let mut new_tip = target;
     // Rebuild bottom-up (target first).
     for commit in chain.iter().rev() {
@@ -9227,7 +9283,7 @@ fn index_set(index: &mut git2::Index, path: &str, id: Oid, mode: i32) -> Result<
 /// (only dangling objects are written), so the caller's op-log snapshot fully
 /// recovers. Each replayed commit keeps its author and message.
 fn replay_onto(repo: &Repository, commits: &[&git2::Commit], base: Oid) -> Result<Oid, GitError> {
-    let sig = repo.signature()?;
+    let sig = ident_signature(repo, true)?;
     let mut tip = base;
     for c in commits {
         let our = repo.find_commit(tip)?;

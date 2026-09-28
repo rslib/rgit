@@ -6,12 +6,13 @@ use clap::{CommandFactory, FromArgMatches};
 use rgit_git::{Git2Backend, GitBackend};
 use serde_json::Value;
 
-use crate::cli::{Cli, CliError, Command, HooksCmd, OutputMode};
+use crate::cli::{Cli, CliError, Command, OutputMode};
 use crate::output::Output;
 use crate::toon::{Node, Obj};
 
 mod add_interactive;
 mod add_patch;
+mod agent;
 mod axi;
 mod clean;
 mod cli;
@@ -36,9 +37,55 @@ mod pretty;
 mod prompt;
 mod render;
 mod scalar;
-mod setup;
 mod stack;
 mod toon;
+
+/// git's top-level usage, printed when rgit runs with no command and no TUI.
+const GIT_USAGE: &str = "\
+usage: rgit [-v | --version] [-h | --help] [-C <path>] [-c <name>=<value>]
+            [--exec-path[=<path>]] [--html-path] [--man-path] [--info-path]
+            [-p | --paginate | -P | --no-pager] [--no-replace-objects] [--no-lazy-fetch]
+            [--no-optional-locks] [--no-advice] [--bare] [--git-dir=<path>]
+            [--work-tree=<path>] [--namespace=<name>] [--config-env=<name>=<envvar>]
+            <command> [<args>]
+
+These are common Git commands used in various situations:
+
+start a working area (see also: git help tutorial)
+   clone      Clone a repository into a new directory
+   init       Create an empty Git repository or reinitialize an existing one
+
+work on the current change (see also: git help everyday)
+   add        Add file contents to the index
+   mv         Move or rename a file, a directory, or a symlink
+   restore    Restore working tree files
+   rm         Remove files from the working tree and from the index
+
+examine the history and state (see also: git help revisions)
+   bisect     Use binary search to find the commit that introduced a bug
+   diff       Show changes between commits, commit and working tree, etc
+   grep       Print lines matching a pattern
+   log        Show commit logs
+   show       Show various types of objects
+   status     Show the working tree status
+
+grow, mark and tweak your common history
+   branch     List, create, or delete branches
+   commit     Record changes to the repository
+   merge      Join two or more development histories together
+   rebase     Reapply commits on top of another base tip
+   reset      Reset current HEAD to the specified state
+   switch     Switch branches
+   tag        Create, list, delete or verify a tag object signed with GPG
+
+collaborate (see also: git help workflows)
+   fetch      Download objects and refs from another repository
+   pull       Fetch from and integrate with another repository or a local branch
+   push       Update remote refs along with associated objects
+
+'rgit help -a' lists available subcommands.
+See 'rgit help <command>' to read about a specific subcommand.
+";
 
 /// How results are printed for this invocation.
 struct Emit {
@@ -76,13 +123,9 @@ fn main() -> ! {
     let structured_output = output_mode != OutputMode::Text;
     let mut cli = cli;
     if !structured_output && cli.command.is_none() && !stdout_is_terminal {
-        // No terminal for the TUI: a human gets the status instead.
-        cli.command = Some(Command::Status {
-            fmt: Default::default(),
-            untracked: None,
-            ignored: None,
-            paths: Vec::new(),
-        });
+        // No terminal for the TUI: print the usage, as git with no arguments.
+        print!("{GIT_USAGE}");
+        exit(1);
     }
     if !structured_output && !cli.compact {
         cli.command = cli.command.map(|c| cli::git_defaults(c, compact_config));
@@ -90,7 +133,7 @@ fn main() -> ! {
     if !structured_output
         && !matches!(
             cli.command,
-            None | Some(Command::Mcp | Command::Serve { .. })
+            None | Some(Command::Mcp | Command::Tool { .. } | Command::Serve { .. })
         )
     {
         rgit_git::stream_hooks();
@@ -115,7 +158,18 @@ fn main() -> ! {
     match cli.command {
         // The MCP server takes over stdio for the process lifetime.
         Some(Command::Mcp) => exit(mcp::serve(discover_or_exit())),
-        Some(Command::Skills { cmd }) => finish(cli::run_skills(cmd), &emit),
+        Some(Command::Agent { cmd }) => finish(agent::run(cmd), &emit),
+        Some(Command::Tool { name }) => exit(mcp::call(discover_or_exit(), &name)),
+        // What agent session hooks run: the home view, as TOON, repo or not.
+        Some(Command::Hook {
+            cmd: cli::HookCmd::SessionStart,
+        }) => finish(
+            Ok(home()),
+            &Emit {
+                mode: OutputMode::Porcelain,
+                ..emit
+            },
+        ),
         Some(Command::ForEachRepo {
             config,
             keep_going,
@@ -131,13 +185,6 @@ fn main() -> ! {
             | Command::CredentialCacheDaemon { .. }),
         ) => exit(credential::run(cmd)),
         Some(Command::Scalar { cmd }) => finish(scalar::run(cmd), &emit),
-        Some(Command::Hooks { cmd }) => finish(
-            match cmd {
-                HooksCmd::Install { user, app } => setup::install(app, user),
-                HooksCmd::Status => setup::status(),
-            },
-            &emit,
-        ),
         // Repo creation runs before discovery (there is no repo yet); both use
         // libgit2 directly rather than shelling out.
         Some(Command::Init {

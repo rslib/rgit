@@ -791,7 +791,7 @@ fn save(repo: &Repository, state: &LanesState) -> Result<(), GitError> {
 /// A signature for lanes commits: the repo's configured identity, else a stable
 /// fallback so lanes work in a bare-config test repo.
 fn signature(repo: &Repository) -> Result<Signature<'static>, GitError> {
-    match repo.signature() {
+    match crate::git_repo::ident_signature(repo, true) {
         Ok(sig) => Ok(sig),
         Err(_) => Ok(Signature::now("rgit", "rgit@localhost")?),
     }

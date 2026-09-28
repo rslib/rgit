@@ -399,3 +399,28 @@ fn alias_pager_and_color_pager() {
     assert_eq!((err(&o), o.status.code()), (err(&g), g.status.code()));
     assert_eq!(out(&rgit(&r, &["cl"])), out(&git(&r, &["cl"])));
 }
+
+#[test]
+fn no_command_without_terminal_prints_usage_like_git() {
+    let top = setup("usage");
+    let r = top.join("r");
+    let bare = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .current_dir(&r)
+        .env("RGIT_OPLOG", "0")
+        .output()
+        .unwrap();
+    let want = git(&r, &[]);
+    assert_eq!(bare.status.code(), want.status.code());
+    assert!(out(&bare).starts_with("usage: rgit "), "{}", out(&bare));
+    assert!(out(&bare).contains("These are common Git commands"));
+
+    let toon = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .current_dir(&r)
+        .env("RGIT_OPLOG", "0")
+        .arg("--toon")
+        .output()
+        .unwrap();
+    assert!(toon.status.success(), "{}", err(&toon));
+    assert!(!out(&toon).contains("usage:"), "{}", out(&toon));
+    let _ = std::fs::remove_dir_all(&top);
+}

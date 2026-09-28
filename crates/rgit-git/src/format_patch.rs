@@ -267,7 +267,7 @@ pub fn format_patch(repo: &Repository, o: &FormatPatchOpts) -> Result<Vec<PatchM
             }
         }
     }
-    let me = repo.signature()?;
+    let me = crate::git_repo::ident_signature(repo, true)?;
     let me_ident = format!(
         "{} <{}>",
         String::from_utf8_lossy(me.name_bytes()),

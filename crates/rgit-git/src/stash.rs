@@ -90,12 +90,13 @@ pub fn push_paths(repo: &Repository, paths: &[String], o: &Opts) -> Result<Strin
         "{branch}: {short} {}",
         head.summary().ok().flatten().unwrap_or("")
     );
-    let sig = repo.signature()?;
+    let author = crate::git_repo::stash_signature(repo, false)?;
+    let sig = crate::git_repo::stash_signature(repo, true)?;
 
     let i_tree = repo.find_tree(index.write_tree()?)?;
     let i_commit = repo.find_commit(repo.commit(
         None,
-        &sig,
+        &author,
         &sig,
         &format!("index on {on}\n"),
         &i_tree,
@@ -111,7 +112,7 @@ pub fn push_paths(repo: &Repository, paths: &[String], o: &Opts) -> Result<Strin
         let tree = repo.find_tree(u.write_tree_to(repo)?)?;
         let id = repo.commit(
             None,
-            &sig,
+            &author,
             &sig,
             &format!("untracked files on {on}\n"),
             &tree,
@@ -147,7 +148,14 @@ pub fn push_paths(repo: &Repository, paths: &[String], o: &Opts) -> Result<Strin
     };
     let mut parents = vec![&head, &i_commit];
     parents.extend(u_commit.as_ref());
-    let w_id = repo.commit(None, &sig, &sig, &format!("{message}\n"), &w_tree, &parents)?;
+    let w_id = repo.commit(
+        None,
+        &author,
+        &sig,
+        &format!("{message}\n"),
+        &w_tree,
+        &parents,
+    )?;
     repo.reference_ensure_log("refs/stash")?;
     repo.reference("refs/stash", w_id, true, &message)?;
 

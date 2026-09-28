@@ -153,7 +153,7 @@ fn pipe(prog: &str, args: &[&str], input: &[u8]) -> Result<(bool, String, String
 
 /// `Name <email>` of the committer, gpg's default key.
 fn committer_ident(repo: &Repository) -> Result<String, GitError> {
-    let sig = repo.signature()?;
+    let sig = crate::git_repo::ident_signature(repo, true)?;
     Ok(format!(
         "{} <{}>",
         sig.name().unwrap_or(""),

@@ -381,8 +381,8 @@ fn tip(repo: &Repository, stack: &str) -> Result<Option<Oid>, GitError> {
 }
 
 fn signature(repo: &Repository) -> Result<Signature<'static>, GitError> {
-    match repo.signature() {
-        Ok(sig) => Ok(sig.to_owned()),
+    match crate::git_repo::ident_signature(repo, true) {
+        Ok(sig) => Ok(sig),
         Err(_) => Ok(Signature::now("rgit", "rgit@localhost")?),
     }
 }

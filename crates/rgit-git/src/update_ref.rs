@@ -155,7 +155,7 @@ pub(crate) fn update_refs(
         return Ok(rejected);
     }
     let msg = message.unwrap_or("update-ref");
-    let sig = repo.signature()?;
+    let sig = crate::git_repo::ident_signature(repo, true)?;
     let mut tx = repo.transaction()?;
     for (name, _) in &plan {
         tx.lock_ref(name)?;

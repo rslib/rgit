@@ -1156,6 +1156,13 @@ const EXAMPLES: &[Entry] = &[
     ("git", &["rgit git status", "rgit git log --oneline -5"]),
     ("mcp", &["rgit mcp"]),
     (
+        "tool",
+        &[
+            "echo '{}' | rgit tool git_status",
+            "echo '{\"limit\": 5}' | rgit tool git_log",
+        ],
+    ),
+    (
         "serve",
         &[
             "rgit serve",
@@ -1447,18 +1454,26 @@ const EXAMPLES: &[Entry] = &[
     ("lanes push", &["rgit lanes push <lane>"]),
     ("lanes pr", &["rgit lanes pr <lane>"]),
     ("lanes restack", &["rgit lanes restack"]),
-    ("skills", &["rgit skills list"]),
-    ("skills list", &["rgit skills list"]),
+    ("agent", &["rgit agent install", "rgit agent status"]),
     (
-        "skills show",
-        &["rgit skills show", "rgit skills show --reference"],
+        "agent install",
+        &[
+            "rgit agent install",
+            "rgit agent install claude codex --mcp",
+            "rgit agent install --project codex opencode",
+        ],
+    ),
+    ("agent status", &["rgit agent status"]),
+    (
+        "agent uninstall",
+        &[
+            "rgit agent uninstall codex",
+            "rgit agent uninstall --mcp-only",
+        ],
     ),
     (
-        "skills install",
-        &[
-            "rgit skills install --project",
-            "rgit skills install --user --target claude",
-        ],
+        "agent skill",
+        &["rgit agent skill", "rgit agent skill --reference"],
     ),
     ("index", &["rgit index status"]),
     (
@@ -1474,6 +1489,7 @@ const EXAMPLES: &[Entry] = &[
     ),
     ("index status", &["rgit index status"]),
     ("index code", &["rgit index code \"<query>\""]),
+    ("hook session-start", &["rgit hook session-start"]),
     (
         "hook run",
         &[
@@ -1481,16 +1497,6 @@ const EXAMPLES: &[Entry] = &[
             "rgit hook run --to-stdin=refs.txt reference-transaction -- committed",
         ],
     ),
-    ("hooks", &["rgit hooks install", "rgit hooks status"]),
-    (
-        "hooks install",
-        &[
-            "rgit hooks install",
-            "rgit hooks install --app codex",
-            "rgit hooks install --user --app all",
-        ],
-    ),
-    ("hooks status", &["rgit hooks status"]),
     (
         "diff-pairs",
         &[

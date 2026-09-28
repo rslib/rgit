@@ -2100,7 +2100,7 @@ pub(crate) fn start(
         }
     };
     if dirty {
-        let sig = repo.signature()?;
+        let sig = crate::git_repo::stash_signature(repo, true)?;
         let stash = repo.stash_save2(&sig, Some("autostash"), None)?;
         repo.stash_drop(0)?;
         write(&dir, "autostash", format!("{stash}\n"))?;

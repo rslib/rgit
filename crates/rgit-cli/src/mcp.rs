@@ -565,6 +565,61 @@ fn tool(name: &'static str, description: &'static str, props: &[(&str, &str, boo
     Tool::new(name, description, schema(props))
 }
 
+/// Every tool as `{name, description, inputSchema}`, the shape MCP lists, for
+/// harnesses that register rgit's tools natively (the pi and omp extension).
+pub fn definitions() -> Vec<Value> {
+    tools()
+        .into_iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": Value::Object((*t.input_schema).clone()),
+            })
+        })
+        .collect()
+}
+
+/// Run one tool with its arguments as a JSON object on stdin, as the pi and
+/// omp extension does, and print its TOON result. Returns the exit code: 0,
+/// or 1 when the tool failed.
+pub fn call(backend: Arc<dyn GitBackend>, name: &str) -> i32 {
+    crate::render::set_color(false);
+    let mut input = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+    let args: Value = if input.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str(&input) {
+            Ok(v @ Value::Object(_)) => v,
+            _ => {
+                let bad = CliError::usage("the tool arguments on stdin must be a JSON object");
+                println!("{}", crate::toon::encode(&failure(&bad)));
+                return 1;
+            }
+        }
+    };
+    if !tools().iter().any(|t| t.name == name) {
+        let bad = anyhow::anyhow!("unknown tool: {name}");
+        println!("{}", crate::toon::encode(&failure(&bad)));
+        return 1;
+    }
+    let result = Registry::new(backend)
+        .resolve(args.get("repo").and_then(Value::as_str))
+        .map_err(|e| anyhow::anyhow!(e))
+        .and_then(|b| dispatch(&b, name, &args));
+    match result {
+        Ok(value) => {
+            println!("{}", crate::toon::encode(&value));
+            0
+        }
+        Err(error) => {
+            println!("{}", crate::toon::encode(&failure(&error)));
+            1
+        }
+    }
+}
+
 /// The tool catalog as plain data for the web `/agent` reference page, derived
 /// from the same [`tools`] declarations the MCP server serves. The implicit
 /// `repo` argument is dropped here (the page documents it once, globally).

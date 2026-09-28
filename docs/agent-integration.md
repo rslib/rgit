@@ -27,50 +27,66 @@ an existing branch, deleting a missing tag) succeed with a `(no-op)` note.
 `rgit --toon` with no subcommand prints a home view of the repository in the
 current directory: binary, description, status and help. Outside a repository
 it says so and still exits 0. Without `--toon` and without a terminal, `rgit`
-prints `git status`.
+prints git's usage text and exits 1, as `git` does.
 
 ## Integrations
 
-You need only one of these. The hook is the better choice where the app
-supports it.
-
-### 1. Session hook (preferred)
-
 ```sh
-rgit hooks install            # this project, all apps
-rgit hooks install --user     # your home directory
-rgit hooks install --app claude
-rgit hooks status
+rgit agent install              # every agent app found on this machine
+rgit agent install claude pi    # just these
+rgit agent install --mcp        # also rgit's MCP tools
+rgit agent install --project    # this project's Codex and OpenCode config
+rgit agent status               # what each app has, and whether it is current
+rgit agent uninstall            # remove it all again (or --mcp-only, --hook-only, --skill-only)
 ```
 
-This runs `rgit --toon` at session start, so the agent sees the repo state
-without asking, with a hint to pass `--toon` to every rgit command:
+With no app named, `install` sets up each app whose program is on PATH or
+whose config folder exists. Each app gets what it supports of three parts:
 
-| App         | Project file                   | User file                           |
-| ----------- | ------------------------------ | ----------------------------------- |
-| Claude Code | `.claude/settings.json`        | `~/.claude/settings.json`           |
-| Codex       | `.codex/hooks.json`, `.codex/config.toml` | `~/.codex/hooks.json`, `~/.codex/config.toml` |
-| OpenCode    | `.opencode/plugins/rgit.js`    | `~/.config/opencode/plugins/rgit.js` |
+- **Skill**: the rgit Agent Skill (`SKILL.md` plus `references/commands.md`),
+  which tells the agent how to use rgit, including that it must pass
+  `--toon` or `--json`.
+- **Session hook**: runs `rgit hook session-start` when a session starts, so
+  the agent sees the repository state (`rgit --toon`'s home view) without
+  asking.
+- **MCP tools**, only with `--mcp`: `rgit mcp`, a stdio server that the app
+  starts once per session (no daemon). Pi and omp get the same tools as
+  native tools that run `rgit tool <name>`. Once installed, a later `install`
+  without `--mcp` keeps them.
 
-Claude Code and Codex get a `SessionStart` command hook. For Codex, rgit also
-sets `[features].hooks = true`, and Codex asks you to trust project hooks with
-`/hooks` before they run. OpenCode gets a small managed plugin that listens for
-`session.created` and adds the same text to the new session as a context-only
-message (`noReply: true`), so it does not start a model reply.
+| App         | What rgit writes (user scope)                                                                                  | Skill                   | Hook                                  | MCP                              |
+| ----------- | -------------------------------------------------------------------------------------------------------------- | ----------------------- | ------------------------------------- | -------------------------------- |
+| Claude Code | A plugin in a local marketplace, `$XDG_DATA_HOME/rgit/claude-plugin`, installed with `claude plugin install rgit@rgit` | in the plugin           | plugin `hooks/hooks.json`, `SessionStart` | plugin `.mcp.json`               |
+| Codex       | `~/.agents/skills/rgit`, `~/.codex/hooks.json`, `~/.codex/config.toml`                                          | `~/.agents/skills/rgit` | `SessionStart` in `hooks.json`        | `[mcp_servers.rgit]`             |
+| OpenCode    | `~/.config/opencode/skills/rgit`, `plugins/rgit.js`, `opencode.json`                                           | `skills/rgit`           | a plugin on `session.created`         | `mcp.rgit` (`type: local`)       |
+| pi          | `~/.pi/agent/skills/rgit`, `~/.pi/agent/extensions/rgit.ts`                                                    | `skills/rgit`           | the extension, on `session_start`     | the extension's native tools     |
+| omp         | `~/.omp/agent/skills/rgit`, `~/.omp/agent/extensions/rgit.ts`                                                  | `skills/rgit`           | the extension, on `session_start`     | the extension's native tools     |
 
-Installing again is safe. It changes nothing when the hook is current, fixes
-the executable path when rgit has moved, and leaves your other settings and
-hooks alone. The hook uses the bare name `rgit` when that is on PATH, else the
-absolute path.
+`--project` writes the Codex and OpenCode files into the current project
+instead (`.agents/skills/rgit`, `.codex/`, `.opencode/`, `opencode.json`);
+Codex asks you to trust project hooks with `/hooks` before they run. Claude
+Code, pi and omp load plugins and extensions per user, so they have no
+project scope.
 
-### 2. Agent Skill
+The plugin version carries a hash of its files, so after rgit changes (a new
+skill, or rgit moved), `rgit agent install` runs `claude plugin update`;
+restart Claude Code to load it. For Claude Code, install also removes what
+older rgit versions wrote into `settings.json` and `~/.claude/skills/rgit`.
+For Codex, rgit turns `[features].hooks` back on only when you set it to
+false. The pi and omp extension is built from
+[`extensions/rgit/src/rgit.ts`](../extensions/rgit/src/rgit.ts).
 
-```sh
-rgit skills install           # or: npx skills add rslib/rgit --skill rgit
-```
+Installing again is safe. It changes nothing when everything is current,
+repairs entries that point at an old rgit path, and leaves your other
+settings, hooks and servers alone. Hooks and entries use the bare name
+`rgit` when that is on PATH, else the absolute path. rgit edits plain JSON
+only: when a config file has comments (`opencode.jsonc`), it stops and asks
+you to make the change by hand. `uninstall` removes only files and entries
+rgit wrote.
 
-This installs `skills/rgit/SKILL.md` plus `references/commands.md`, which tells the agent how to use rgit when
-the task needs it, including that it must pass `--toon` or `--json`.
+`rgit agent skill` prints the skill (`--reference` for the command
+reference). You can also install it with
+`npx skills add rslib/rgit --skill rgit`.
 
 ## Session history
 

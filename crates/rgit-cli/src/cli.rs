@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use rgit_git::{GitBackend, GitError, LogOptions, OpProgress, ResetMode};
 
 use crate::render;
@@ -2791,15 +2791,16 @@ pub enum Command {
     },
     /// Run the Model Context Protocol server over stdio.
     Mcp,
-    /// Install session hooks so Claude Code, Codex, and OpenCode start with rgit context.
-    Hooks {
-        #[command(subcommand)]
-        cmd: HooksCmd,
+    /// Run one MCP tool with its arguments as a JSON object on stdin and print
+    /// its TOON result, as the pi and omp extension does.
+    Tool {
+        /// The tool, e.g. git_status.
+        name: String,
     },
-    /// Install the rgit Agent Skill for Claude Code, Codex, and other agents.
-    Skills {
+    /// Set agent apps (Claude Code, Codex, OpenCode, pi, omp) up for rgit.
+    Agent {
         #[command(subcommand)]
-        cmd: SkillsCmd,
+        cmd: AgentCmd,
     },
     /// Semantic code search: build the on-disk vector index or query it.
     Index {
@@ -4199,66 +4200,57 @@ pub enum HookCmd {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// What agent session hooks run: the repository state as TOON.
+    #[command(hide = true)]
+    SessionStart,
 }
 
 #[derive(Subcommand)]
-pub enum HooksCmd {
-    /// Install or repair the session-start hook (project scope by default).
+pub enum AgentCmd {
+    /// Install or repair the rgit skill and session hook in agent apps (the
+    /// ones found on this machine by default); with --mcp also rgit's MCP
+    /// tools (for pi and omp, as native tools).
     Install {
-        /// Install into the user's home config instead of this project.
+        /// Apps to set up; by default every one found on PATH or by its config folder.
+        #[arg(value_enum)]
+        apps: Vec<crate::agent::App>,
+        /// This project's config instead of your user config (codex and opencode only).
         #[arg(long)]
-        user: bool,
-        /// Which agent app to configure.
-        #[arg(long, value_enum, default_value_t = crate::setup::HookApp::All)]
-        app: crate::setup::HookApp,
+        project: bool,
+        /// Also add rgit's MCP tools: `rgit mcp` for Claude Code, Codex and
+        /// OpenCode, native tools running `rgit tool` for pi and omp.
+        #[arg(long, overrides_with = "no_mcp")]
+        mcp: bool,
+        /// Add no MCP tools (the default); tools already installed stay.
+        #[arg(long, overrides_with = "mcp")]
+        no_mcp: bool,
     },
-    /// Show which agent apps have the rgit hook and whether it is current.
+    /// Show each app's plugin or extension, skill, hook and MCP state.
     Status,
-}
-
-#[derive(Subcommand)]
-pub enum SkillsCmd {
-    /// List embedded skills and install targets.
-    List,
+    /// Remove what `rgit agent install` added (from every app by default).
+    Uninstall {
+        /// Apps to remove rgit from; by default all of them.
+        #[arg(value_enum)]
+        apps: Vec<crate::agent::App>,
+        /// This project's config instead of your user config (codex and opencode only).
+        #[arg(long)]
+        project: bool,
+        /// Remove only the skill.
+        #[arg(long, group = "only")]
+        skill_only: bool,
+        /// Remove only the session hook.
+        #[arg(long, group = "only")]
+        hook_only: bool,
+        /// Remove only the MCP tools.
+        #[arg(long, group = "only")]
+        mcp_only: bool,
+    },
     /// Print the rgit SKILL.md, or its command reference.
-    Show {
+    Skill {
         /// Print references/commands.md instead of SKILL.md.
         #[arg(long)]
         reference: bool,
     },
-    /// Install embedded skills into user or project skill directories.
-    Install {
-        /// Install into this project.
-        #[arg(long)]
-        project: bool,
-        /// Install into the current user's home directory.
-        #[arg(long)]
-        user: bool,
-        /// Which client layout to write.
-        #[arg(long, value_enum, default_value_t = SkillTarget::All)]
-        target: SkillTarget,
-    },
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-pub enum SkillTarget {
-    /// Portable Agent Skills path used by Pi, Codex, and other clients.
-    #[value(alias = "pi", alias = "codex")]
-    Agents,
-    /// Claude Code native skill path.
-    Claude,
-    /// Both portable and Claude Code paths.
-    All,
-}
-
-impl std::fmt::Display for SkillTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            SkillTarget::Agents => "agents",
-            SkillTarget::Claude => "claude",
-            SkillTarget::All => "all",
-        })
-    }
 }
 
 #[derive(Subcommand)]
@@ -7249,7 +7241,7 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Agent integration and servers",
-        &["hooks", "skills", "mcp", "serve"],
+        &["agent", "mcp", "tool", "serve"],
     ),
 ];
 
@@ -7348,77 +7340,6 @@ fn skill_entry(out: &mut String, cmd: &clap::Command, path: &str, depth: usize) 
     for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
         skill_entry(out, sub, &format!("{path} {}", sub.get_name()), depth + 1);
     }
-}
-
-pub fn run_skills(cmd: SkillsCmd) -> anyhow::Result<String> {
-    match cmd {
-        SkillsCmd::List => Ok("rgit\ntargets: agents, claude, all".to_owned()),
-        SkillsCmd::Show { reference } => Ok(if reference {
-            skill_reference()
-        } else {
-            skill_markdown()
-        }
-        .trim_end()
-        .to_owned()),
-        SkillsCmd::Install {
-            project,
-            user,
-            target,
-        } => install_skills(project || !user, user, target),
-    }
-}
-
-fn install_skills(project: bool, user: bool, target: SkillTarget) -> anyhow::Result<String> {
-    let mut installed = Vec::new();
-    if project {
-        install_target(&std::env::current_dir()?, target, &mut installed)?;
-    }
-    if user {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
-        install_target(&home, target, &mut installed)?;
-    }
-    Ok(installed.join("\n"))
-}
-
-fn install_target(
-    root: &std::path::Path,
-    target: SkillTarget,
-    out: &mut Vec<String>,
-) -> anyhow::Result<()> {
-    match target {
-        SkillTarget::Agents => write_skill(&root.join(".agents/skills/rgit"), out),
-        SkillTarget::Claude => write_skill(&root.join(".claude/skills/rgit"), out),
-        SkillTarget::All => {
-            write_skill(&root.join(".agents/skills/rgit"), out)?;
-            write_skill(&root.join(".claude/skills/rgit"), out)
-        }
-    }
-}
-
-/// The skill's files, relative to its directory.
-fn skill_files() -> [(&'static str, String); 2] {
-    [
-        ("SKILL.md", skill_markdown()),
-        ("references/commands.md", skill_reference()),
-    ]
-}
-
-fn write_skill(dir: &std::path::Path, out: &mut Vec<String>) -> anyhow::Result<()> {
-    for (name, contents) in skill_files() {
-        let path = dir.join(name);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if std::fs::read_to_string(&path).is_ok_and(|cur| cur == contents) {
-            out.push(format!("unchanged {}", path.display()));
-            continue;
-        }
-        std::fs::write(&path, contents)?;
-        out.push(format!("installed {}", path.display()));
-    }
-    Ok(())
 }
 
 /// Parse a 1-based `START,END` line range (git's -L).
@@ -7708,7 +7629,11 @@ fn run_command(
     };
     Ok(match command {
         Command::Index { action } => index_cmd(backend, action)?,
-        Command::Skills { .. } | Command::Hooks { .. } => unreachable!("handled before dispatch"),
+        Command::Agent { .. }
+        | Command::Tool { .. }
+        | Command::Hook {
+            cmd: HookCmd::SessionStart,
+        } => unreachable!("handled before dispatch"),
         Command::Status {
             untracked,
             ignored,
@@ -16203,13 +16128,13 @@ mod tests {
         assert_eq!(
             include_str!("../../../skills/rgit/SKILL.md"),
             super::skill_markdown(),
-            "skills/rgit/SKILL.md is stale; run `rgit --human skills show > skills/rgit/SKILL.md`"
+            "skills/rgit/SKILL.md is stale; run `rgit --human agent skill > skills/rgit/SKILL.md`"
         );
         assert_eq!(
             include_str!("../../../skills/rgit/references/commands.md"),
             super::skill_reference(),
             "skills/rgit/references/commands.md is stale; run \
-             `rgit --human skills show --reference > skills/rgit/references/commands.md`"
+             `rgit --human agent skill --reference > skills/rgit/references/commands.md`"
         );
     }
 }

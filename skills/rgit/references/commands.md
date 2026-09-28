@@ -330,12 +330,11 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 
 ## Agent integration and servers
 
-- `hooks`: Install session hooks so Claude Code, Codex, and OpenCode start with rgit context. e.g. `rgit hooks install`, `rgit hooks status`
-  - `hooks install`: Install or repair the session-start hook (project scope by default). e.g. `rgit hooks install`, `rgit hooks install --app codex`, `rgit hooks install --user --app all`
-  - `hooks status`: Show which agent apps have the rgit hook and whether it is current. e.g. `rgit hooks status`
-- `skills`: Install the rgit Agent Skill for Claude Code, Codex, and other agents. e.g. `rgit skills list`
-  - `skills list`: List embedded skills and install targets. e.g. `rgit skills list`
-  - `skills show`: Print the rgit SKILL.md, or its command reference. e.g. `rgit skills show`, `rgit skills show --reference`
-  - `skills install`: Install embedded skills into user or project skill directories. e.g. `rgit skills install --project`, `rgit skills install --user --target claude`
+- `agent`: Set agent apps (Claude Code, Codex, OpenCode, pi, omp) up for rgit. e.g. `rgit agent install`, `rgit agent status`
+  - `agent install`: Install or repair the rgit skill and session hook in agent apps (the ones found on this machine by default); with --mcp also rgit's MCP tools (for pi and omp, as native tools). e.g. `rgit agent install`, `rgit agent install claude codex --mcp`, `rgit agent install --project codex opencode`
+  - `agent status`: Show each app's plugin or extension, skill, hook and MCP state. e.g. `rgit agent status`
+  - `agent uninstall`: Remove what `rgit agent install` added (from every app by default). e.g. `rgit agent uninstall codex`, `rgit agent uninstall --mcp-only`
+  - `agent skill`: Print the rgit SKILL.md, or its command reference. e.g. `rgit agent skill`, `rgit agent skill --reference`
 - `mcp`: Run the Model Context Protocol server over stdio. e.g. `rgit mcp`
+- `tool`: Run one MCP tool with its arguments as a JSON object on stdin and print its TOON result, as the pi and omp extension does. e.g. `echo '{}' | rgit tool git_status`, `echo '{"limit": 5}' | rgit tool git_log`
 - `serve`: Serve the web viewer for this repository, or a directory of repositories. e.g. `rgit serve`, `rgit serve --port 9000`, `rgit serve --root ~/code --clone-base https://git.example.dev`
