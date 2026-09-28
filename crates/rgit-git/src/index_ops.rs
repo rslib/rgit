@@ -2,6 +2,7 @@
 //! update-index, checkout-index, mktree and mktag, over libgit2's index and
 //! object database, with git's rules and messages.
 
+use crate::rev::RevParse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -207,7 +208,7 @@ pub fn commit_tree(
 ) -> Result<Report, GitError> {
     let repo = Repository::open(git_dir)?;
     let tree_id = repo
-        .revparse_single(tree)
+        .rev_single(tree)
         .map_err(|_| other(format!("not a valid object name {tree}")))?;
     if tree_id.kind() != Some(ObjectType::Tree) {
         return Err(other(format!(
@@ -219,7 +220,7 @@ pub fn commit_tree(
     let mut seen: Vec<Oid> = Vec::new();
     for p in parents {
         let id = repo
-            .revparse_single(p)
+            .rev_single(p)
             .and_then(|o| o.peel_to_commit())
             .map_err(|_| other(format!("not a valid object name {p}")))?
             .id();
@@ -570,8 +571,12 @@ pub struct ReadTreeOpts {
     pub index_only: bool,
     pub dry_run: bool,
     pub aggressive: bool,
+    /// Fail rather than leave a conflict needing a file-level merge.
+    pub trivial: bool,
     pub prefix: Option<String>,
     pub empty: bool,
+    /// Write the resulting index to this file instead.
+    pub index_output: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -594,7 +599,7 @@ fn same(a: Option<Ent>, b: Option<Ent>) -> bool {
 /// A tree's files by path.
 fn flatten(repo: &Repository, rev: &str) -> Result<BTreeMap<Vec<u8>, Ent>, GitError> {
     let tree = repo
-        .revparse_single(rev)
+        .rev_single(rev)
         .and_then(|o| o.peel_to_tree())
         .map_err(|_| other(format!("Not a valid object name {rev}")))?;
     let mut files = BTreeMap::new();
@@ -625,6 +630,7 @@ struct Unpack<'a> {
     update: Vec<String>,
     remove: Vec<String>,
     errors: Vec<String>,
+    nontrivial: bool,
 }
 
 impl Unpack<'_> {
@@ -778,17 +784,18 @@ impl Unpack<'_> {
         &mut self,
         path: &[u8],
         index: Option<&IndexEntry>,
-        base: Option<Ent>,
+        bases: &[Option<Ent>],
         head: Option<Ent>,
         remote: Option<Ent>,
     ) {
         let idx = index.map(ent);
         let (mut head_match, mut remote_match) = (false, false);
         if !same(remote, head) {
-            head_match = same(base, head);
-            remote_match = same(base, remote);
+            head_match = bases.iter().any(|b| same(*b, head));
+            remote_match = bases.iter().any(|b| same(*b, remote));
         }
-        let no_anc = base.is_none();
+        let no_anc = bases.iter().all(Option::is_none);
+        let any_anc_missing = bases.iter().any(Option::is_none);
         if let Some(r) = remote
             && head_match
             && !remote_match
@@ -806,7 +813,7 @@ impl Unpack<'_> {
         {
             return self.merged(path, h, index);
         }
-        if head.is_none() && remote.is_none() && no_anc {
+        if head.is_none() && remote.is_none() && any_anc_missing {
             return;
         }
         if self.o.aggressive {
@@ -830,10 +837,11 @@ impl Unpack<'_> {
         {
             return;
         }
-        if let Some(b) = base
+        self.nontrivial = true;
+        if let Some(b) = bases.iter().flatten().next()
             && (!head_match || !remote_match)
         {
-            self.keep_stage(path, b, 1);
+            self.keep_stage(path, *b, 1);
         }
         if let Some(h) = head {
             self.keep_stage(path, h, 2);
@@ -856,7 +864,25 @@ pub fn read_tree(git_dir: &Path, trees: &[String], o: &ReadTreeOpts) -> Result<(
     {
         return fatal("Which one? -m, --reset, or --prefix?");
     }
+    if o.prefix.as_deref().is_some_and(|p| p.starts_with('/')) {
+        return fatal("Invalid prefix, prefix cannot start with '/'");
+    }
     let merge = o.merge || o.reset || o.prefix.is_some();
+    let (repo, mut index) = open(git_dir)?;
+    let old: Vec<IndexEntry> = index.iter().collect();
+    if (o.merge || o.prefix.is_some()) && old.iter().any(|e| stage(e) != 0) {
+        return fatal("You need to resolve your current index first");
+    }
+    let maps = trees
+        .iter()
+        .map(|t| flatten(&repo, t))
+        .collect::<Result<Vec<_>, _>>()?;
+    if maps.len() > 8 {
+        return fatal("I cannot read more than 8 trees");
+    }
+    if o.empty && !trees.is_empty() {
+        return fatal("passing trees as arguments contradicts --empty");
+    }
     if o.update && o.index_only {
         return fatal("-u and -i at the same time makes no sense");
     }
@@ -866,27 +892,12 @@ pub fn read_tree(git_dir: &Path, trees: &[String], o: &ReadTreeOpts) -> Result<(
             "{flag} is meaningless without -m, --reset, or --prefix"
         )));
     }
-    if o.empty && !trees.is_empty() {
-        return fatal("passing trees as arguments contradicts --empty");
-    }
-    if trees.is_empty() && !o.empty {
+    if merge && trees.is_empty() {
         return fatal("you must specify at least one tree to merge");
-    }
-    if merge && trees.len() > 3 {
-        return fatal("rgit read-tree merges at most three trees");
     }
     if o.prefix.is_some() && trees.len() > 1 {
         return fatal("--prefix takes one tree");
     }
-    let (repo, mut index) = open(git_dir)?;
-    let old: Vec<IndexEntry> = index.iter().collect();
-    if merge && !o.reset && old.iter().any(|e| stage(e) != 0) {
-        return fatal("You need to resolve your current index first");
-    }
-    let maps = trees
-        .iter()
-        .map(|t| flatten(&repo, t))
-        .collect::<Result<Vec<_>, _>>()?;
     let mut u = Unpack {
         o,
         repo: &repo,
@@ -895,6 +906,7 @@ pub fn read_tree(git_dir: &Path, trees: &[String], o: &ReadTreeOpts) -> Result<(
         update: Vec::new(),
         remove: Vec::new(),
         errors: Vec::new(),
+        nontrivial: false,
     };
     if !merge {
         let mut all = BTreeMap::new();
@@ -937,25 +949,41 @@ pub fn read_tree(git_dir: &Path, trees: &[String], o: &ReadTreeOpts) -> Result<(
         for p in paths {
             let cur = current.get(p).copied();
             let at = |i: usize| maps[i].get(p).copied();
-            match maps.len() {
+            let n = maps.len();
+            match n {
                 1 => u.oneway(p, cur, at(0)),
                 2 => u.twoway(p, cur, at(0), at(1), initial),
-                _ => u.threeway(p, cur, at(0), at(1), at(2)),
+                _ => {
+                    let bases: Vec<Option<Ent>> = (0..n - 2).map(at).collect();
+                    u.threeway(p, cur, &bases, at(n - 2), at(n - 1))
+                }
             }
         }
     }
     if !u.errors.is_empty() {
         return Err(other(u.errors.join("\n")));
     }
+    if o.trivial && u.nontrivial {
+        return fatal("error: Merge requires file-level merging");
+    }
     if o.dry_run {
         return Ok(());
     }
     let (result, update, remove) = (u.result, u.update, u.remove);
-    index.clear()?;
-    for e in &result {
-        index.add(e)?;
+    if let Some(file) = &o.index_output {
+        let mut out = Index::open(&top(&repo).unwrap_or_default().join(file))?;
+        out.clear()?;
+        for e in &result {
+            out.add(e)?;
+        }
+        out.write()?;
+    } else {
+        index.clear()?;
+        for e in &result {
+            index.add(e)?;
+        }
+        index.write()?;
     }
-    index.write()?;
     if o.update {
         let top = top(&repo)?;
         for p in &remove {
@@ -974,87 +1002,226 @@ pub struct CheckoutIndexOpts {
     pub update_index: bool,
     pub quiet: bool,
     pub no_create: bool,
+    /// Prepended to each path, from the top: a folder when it ends in `/`.
     pub prefix: Option<String>,
+    /// `--stage`: the entries of this stage, [`ALL_STAGES`] for 1 to 3.
+    pub stage: u16,
+    /// `--temp`: write temporary files and list them.
+    pub temp: bool,
+    /// NUL-terminate the `--temp` lines.
+    pub z: bool,
 }
 
+/// `--stage=all`.
+pub const ALL_STAGES: u16 = 4;
+
 /// `git checkout-index`: write index files into the working tree (or under
-/// `--prefix`). `paths` are relative to the folder `cwd`.
+/// `--prefix`, or to temporary files). `paths` are relative to the folder
+/// `cwd`.
 pub fn checkout_index(
     git_dir: &Path,
     cwd: &str,
     paths: &[String],
     o: &CheckoutIndexOpts,
 ) -> Result<Report, GitError> {
-    let (repo, index) = open(git_dir)?;
+    let (repo, mut index) = open(git_dir)?;
     let top = top(&repo)?;
     let mut report = Report::default();
     let entries: Vec<IndexEntry> = index.iter().collect();
-    let mut chosen: Vec<&IndexEntry> = Vec::new();
-    if o.all {
-        chosen.extend(
-            entries
-                .iter()
-                .filter(|e| stage(e) == 0 && e.flags_extended & SKIP_WORKTREE == 0),
-        );
-    }
+    let temp = o.temp || o.stage == ALL_STAGES;
+    let wanted = |e: &IndexEntry| stage(e) == o.stage || (o.stage == ALL_STAGES && stage(e) != 0);
+    let mut groups: Vec<Vec<&IndexEntry>> = Vec::new();
     for p in paths {
         let name = from_top(cwd, p)?;
-        match entries
+        let same: Vec<&IndexEntry> = entries
             .iter()
-            .find(|e| stage(e) == 0 && e.path == name.as_bytes())
-        {
-            Some(e) => chosen.push(e),
-            None => {
-                if !o.quiet {
-                    report
-                        .err
-                        .push_str(&format!("git checkout-index: {name} is not in the cache\n"));
-                }
-                report.failed = true;
-            }
-        }
-    }
-    let (base, target) = match &o.prefix {
-        Some(p) if !p.ends_with('/') => {
-            return Err(other(
-                "rgit checkout-index: --prefix must name a folder (end in /)",
-            ));
-        }
-        Some(p) => (p.clone(), Some(std::path::absolute(p)?)),
-        None => (String::new(), None),
-    };
-    let root = target.clone().unwrap_or_else(|| top.clone());
-    let mut write = Vec::new();
-    for e in chosen {
-        let name = Unpack::path(&e.path);
-        if std::fs::symlink_metadata(root.join(&name)).is_ok() {
-            let clean =
-                target.is_none() && matches!(worktree_state(&repo, &top, e)?, Some((true, _)));
-            if clean && !o.force {
-                continue;
-            }
-            if !o.force {
-                if !o.quiet {
-                    report
-                        .err
-                        .push_str(&format!("{base}{name} already exists, no checkout\n"));
-                }
-                report.failed = true;
-                continue;
-            }
-        } else if o.no_create {
+            .filter(|e| e.path == name.as_bytes())
+            .collect();
+        let chosen: Vec<&IndexEntry> = same.iter().copied().filter(|e| wanted(e)).collect();
+        if !chosen.is_empty() {
+            groups.push(chosen);
             continue;
         }
-        write.push(name);
+        if !o.quiet {
+            let why = if same.is_empty() {
+                "is not in the cache".to_owned()
+            } else if o.stage != 0 {
+                format!("does not exist at stage {}", o.stage)
+            } else {
+                "is unmerged".to_owned()
+            };
+            report
+                .err
+                .push_str(&format!("git checkout-index: {name} {why}\n"));
+        }
+        report.failed = true;
     }
-    write.dedup();
-    checkout_paths(
-        &repo,
-        &write,
-        target.as_deref(),
-        o.update_index && target.is_none(),
-    )?;
+    if o.all {
+        let from = groups.len();
+        for e in entries.iter().filter(|e| {
+            e.path.starts_with(cwd.as_bytes()) && e.flags_extended & SKIP_WORKTREE == 0 && wanted(e)
+        }) {
+            match groups[from..].last_mut() {
+                Some(g) if g[0].path == e.path => g.push(e),
+                _ => groups.push(vec![e]),
+            }
+        }
+    }
+    let base = o.prefix.clone().unwrap_or_default();
+    let symlinks = repo
+        .config()
+        .and_then(|c| c.get_bool("core.symlinks"))
+        .unwrap_or(true);
+    let mut refreshed = false;
+    for group in groups {
+        let name = Unpack::path(&group[0].path);
+        if temp {
+            let mut names = [".", ".", ".", "."].map(str::to_owned);
+            for e in group {
+                let link = e.mode & 0o170000 == 0o120000;
+                let stem = if link { ".merge_link_" } else { ".merge_file_" };
+                let (tmp, mut file) = temp_file(&top, stem)?;
+                std::io::Write::write_all(&mut file, &entry_bytes(&repo, e, &name, link)?)?;
+                names[stage(e) as usize] = tmp;
+            }
+            let shown = if o.stage == ALL_STAGES {
+                names[1..].join(" ")
+            } else {
+                names[o.stage as usize].clone()
+            };
+            let rel = crate::clean::relative(&name, cwd);
+            if o.z {
+                report.out.push_str(&format!("{shown}\t{rel}\0"));
+            } else {
+                let rel = crate::text::quote_path(&rel);
+                report.out.push_str(&format!("{shown}\t{rel}\n"));
+            }
+            continue;
+        }
+        let e = group[0];
+        let shown = format!("{base}{name}");
+        let dest = top.join(&shown);
+        match std::fs::symlink_metadata(&dest) {
+            Ok(meta) => {
+                let clean = o.prefix.is_none()
+                    && matches!(worktree_state(&repo, &top, e)?, Some((true, _)));
+                if clean {
+                    continue;
+                }
+                if !o.force {
+                    if !o.quiet {
+                        report
+                            .err
+                            .push_str(&format!("{shown} already exists, no checkout\n"));
+                    }
+                    report.failed = true;
+                    continue;
+                }
+                if meta.is_dir() {
+                    std::fs::remove_dir_all(&dest)?;
+                } else {
+                    std::fs::remove_file(&dest)?;
+                }
+            }
+            Err(_) if o.no_create => continue,
+            Err(_) => {}
+        }
+        write_entry(&repo, e, &name, &dest, symlinks)?;
+        if o.update_index && o.prefix.is_none() && stage(e) == 0 {
+            let mut fresh = dup(e);
+            fill_stat(&mut fresh, &std::fs::symlink_metadata(&dest)?);
+            index.add(&fresh)?;
+            refreshed = true;
+        }
+    }
+    if refreshed {
+        index.write()?;
+    }
     Ok(report)
+}
+
+/// An index entry's content as checked out to `path`: a symlink's target,
+/// or the blob through its filters.
+fn entry_bytes(
+    repo: &Repository,
+    e: &IndexEntry,
+    path: &str,
+    link: bool,
+) -> Result<Vec<u8>, GitError> {
+    let blob = repo.find_blob(e.id)?;
+    if link {
+        Ok(blob.content().to_vec())
+    } else {
+        crate::plumbing::smudge(repo, path, blob.content())
+    }
+}
+
+/// Write an index entry to `dest`, as git's write_entry does: a symlink (or,
+/// without core.symlinks, a file holding its target), a submodule's empty
+/// folder, or a file with the entry's executable bit.
+fn write_entry(
+    repo: &Repository,
+    e: &IndexEntry,
+    path: &str,
+    dest: &Path,
+    symlinks: bool,
+) -> Result<(), GitError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let kind = e.mode & 0o170000;
+    if kind == 0o160000 {
+        std::fs::create_dir_all(dest)?;
+        return Ok(());
+    }
+    let link = kind == 0o120000;
+    let data = entry_bytes(repo, e, path, link)?;
+    if link && symlinks {
+        use std::os::unix::ffi::OsStrExt;
+        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&data), dest)?;
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(if e.mode == 0o100755 { 0o777 } else { 0o666 })
+        .open(dest)?;
+    std::io::Write::write_all(&mut file, &data)?;
+    Ok(())
+}
+
+/// A new file `<stem>XXXXXX` in `dir` readable only by its owner, as git's
+/// mkstemp makes them, and its name.
+fn temp_file(dir: &Path, stem: &str) -> Result<(String, std::fs::File), GitError> {
+    use std::hash::{BuildHasher, Hasher};
+    use std::os::unix::fs::OpenOptionsExt;
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let seed = std::collections::hash_map::RandomState::new();
+    let mut n = 0u64;
+    loop {
+        let mut h = seed.build_hasher();
+        h.write_u64(n);
+        let mut v = h.finish();
+        let suffix: String = (0..6)
+            .map(|_| {
+                let c = CHARS[(v % 62) as usize] as char;
+                v /= 62;
+                c
+            })
+            .collect();
+        let name = format!("{stem}{suffix}");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(&name))
+        {
+            Ok(f) => return Ok((name, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// Refresh the index's stat data from the working tree as git's

@@ -88,6 +88,8 @@ mod tests {
                 header: String::new(),
                 similarity: 0,
                 sizes: (0, 0),
+                modes: (0, 0),
+                ids: Default::default(),
                 hunks: vec![Hunk {
                     header: "@@ -1,2 +1,2 @@".into(),
                     new_start: 1,
@@ -145,6 +147,8 @@ mod tests {
                 header: String::new(),
                 similarity: 0,
                 sizes: (0, 0),
+                modes: (0, 0),
+                ids: Default::default(),
                 hunks: vec![Hunk {
                     header: "@@ -0,0 +1,2 @@".into(),
                     new_start: 1,

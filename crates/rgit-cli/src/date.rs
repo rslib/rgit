@@ -87,6 +87,8 @@ struct Tm {
     min: i64,
     sec: i64,
     wday: i64,
+    /// tm_isdst, which git's mktime calls carry over from `now`: -1 unknown.
+    isdst: i32,
 }
 
 fn localtime(t: i64) -> Tm {
@@ -99,7 +101,24 @@ fn localtime(t: i64) -> Tm {
         min,
         sec,
         wday: (days_from_civil(y, m, d) + 4).rem_euclid(7),
+        isdst: isdst(t),
     }
+}
+
+#[cfg(unix)]
+fn isdst(t: i64) -> i32 {
+    // SAFETY: localtime_r only writes the tm we own.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = t as libc::time_t;
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return -1;
+    }
+    tm.tm_isdst
+}
+
+#[cfg(not(unix))]
+fn isdst(_: i64) -> i32 {
+    -1
 }
 
 fn gmtime(t: i64) -> Tm {
@@ -131,6 +150,22 @@ fn gmtime(t: i64) -> Tm {
 }
 
 fn mktime(tm: &Tm) -> i64 {
+    #[cfg(unix)]
+    if tm.isdst >= 0 {
+        // SAFETY: mktime only reads and normalizes the tm we own.
+        let mut c: libc::tm = unsafe { std::mem::zeroed() };
+        c.tm_year = tm.year as i32;
+        c.tm_mon = tm.mon as i32;
+        c.tm_mday = tm.mday as i32;
+        c.tm_hour = tm.hour as i32;
+        c.tm_min = tm.min as i32;
+        c.tm_sec = tm.sec as i32;
+        c.tm_isdst = tm.isdst;
+        let t = unsafe { libc::mktime(&mut c) };
+        if t != -1 {
+            return t as i64;
+        }
+    }
     local_time(tm.year + 1900, tm.mon + 1, tm.mday, tm.hour, tm.min, tm.sec)
 }
 
@@ -411,6 +446,7 @@ fn parse_date_basic(s: &[u8], now: i64) -> Option<i64> {
         min: -1,
         sec: -1,
         wday: 0,
+        isdst: -1,
     };
     let mut offset = None;
     let mut gmt = false;

@@ -2,6 +2,7 @@
 //! attributes (`export-ignore`, `export-subst`), and the client side of the
 //! upload-archive protocol for `--remote`.
 
+use crate::rev::RevParse;
 use std::path::Path;
 
 use git2::{Commit, Oid, Repository, Tree};
@@ -40,7 +41,8 @@ struct Rule {
     pattern: regex::Regex,
     /// Matched against the whole path below `base`, not just the name.
     anchored: bool,
-    attrs: Vec<(String, bool)>,
+    /// Each attribute: set (`attr`), unset (`-attr`) or a value (`attr=v`).
+    attrs: Vec<(String, Result<bool, String>)>,
 }
 
 /// The attribute rules that apply to `tree`, lowest precedence first: the
@@ -87,18 +89,21 @@ impl Attributes {
                 let Some(pat) = words.next().filter(|p| !p.starts_with('#')) else {
                     continue;
                 };
-                let mut attrs: Vec<(String, bool)> = Vec::new();
+                let mut attrs: Vec<(String, Result<bool, String>)> = Vec::new();
                 for w in words.filter(|w| !w.starts_with('!')) {
                     match w.strip_prefix('-') {
-                        Some(name) => attrs.push((name.to_owned(), false)),
+                        Some(name) => attrs.push((name.to_owned(), Ok(false))),
                         // The built-in macro: binary is -diff -merge -text.
                         None if w == "binary" => attrs.extend(
                             [("binary", true), ("diff", false), ("merge", false)]
                                 .into_iter()
                                 .chain([("text", false)])
-                                .map(|(n, on)| (n.to_owned(), on)),
+                                .map(|(n, on)| (n.to_owned(), Ok(on))),
                         ),
-                        None => attrs.push((w.split('=').next().unwrap_or(w).to_owned(), true)),
+                        None => attrs.push(match w.split_once('=') {
+                            Some((n, v)) => (n.to_owned(), Err(v.to_owned())),
+                            None => (w.to_owned(), Ok(true)),
+                        }),
                     }
                 }
                 let anchored = pat.trim_start_matches('/').contains('/') || pat.starts_with('/');
@@ -121,8 +126,13 @@ impl Attributes {
         self.state(path, attr) == Some(true)
     }
 
-    /// `attr` for `path`: set, unset (`-attr`) or unspecified.
+    /// `attr` for `path`: set, unset (`-attr`) or unspecified (or a value).
     fn state(&self, path: &str, attr: &str) -> Option<bool> {
+        self.value(path, attr).and_then(Result::ok)
+    }
+
+    /// `attr` for `path`: Ok(set or unset), Err(its value), or unspecified.
+    fn value(&self, path: &str, attr: &str) -> Option<Result<bool, String>> {
         let mut set = None;
         for rule in &self.0 {
             let Some(rel) = path.strip_prefix(&rule.base) else {
@@ -136,7 +146,7 @@ impl Attributes {
             if rule.pattern.is_match(subject)
                 && let Some((_, on)) = rule.attrs.iter().rfind(|(n, _)| n == attr)
             {
-                set = Some(*on);
+                set = Some(on.clone());
             }
         }
         set
@@ -183,6 +193,210 @@ fn glob(pat: &str) -> String {
     }
     re.push('$');
     re
+}
+
+/// convert.c's crlf actions, once the attributes and config resolve them.
+#[derive(Clone, Copy, PartialEq)]
+enum CrlfAction {
+    Binary,
+    Text,
+    TextInput,
+    TextCrlf,
+    Auto,
+    AutoInput,
+    AutoCrlf,
+}
+
+/// convert_to_working_tree for an archived file at tree path `path`: ident,
+/// then LF to CRLF, then the smudge filter, as its `ident`, `text`/`crlf`,
+/// `eol` and `filter` attributes and core.autocrlf / core.eol say.
+// ponytail: filter.<driver>.process and working-tree-encoding are not run.
+fn to_worktree(
+    repo: &Repository,
+    attrs: &Attributes,
+    path: &str,
+    mut data: Vec<u8>,
+) -> Result<Vec<u8>, GitError> {
+    let config = repo.config()?.snapshot()?;
+    if attrs.state(path, "ident") == Some(true) {
+        data = ident(&data);
+    }
+    let autocrlf = match config.get_string("core.autocrlf").as_deref() {
+        Ok("input") => Some(false),
+        _ => config
+            .get_bool("core.autocrlf")
+            .unwrap_or(false)
+            .then_some(true),
+    };
+    let eol_is_crlf = match autocrlf {
+        Some(crlf) => crlf,
+        None => match config.get_string("core.eol").as_deref() {
+            Ok("crlf") => true,
+            Ok("lf") => false,
+            _ => cfg!(windows),
+        },
+    };
+    let crlf_attr = |name: &str| match attrs.value(path, name) {
+        Some(Ok(true)) => Some(CrlfAction::Text),
+        Some(Ok(false)) => Some(CrlfAction::Binary),
+        Some(Err(v)) if v == "input" => Some(CrlfAction::TextInput),
+        Some(Err(v)) if v == "auto" => Some(CrlfAction::Auto),
+        _ => None,
+    };
+    let mut action = crlf_attr("text").or_else(|| crlf_attr("crlf"));
+    if action != Some(CrlfAction::Binary) {
+        let eol = attrs.value(path, "eol").and_then(Result::err);
+        action = match (action, eol.as_deref()) {
+            (Some(CrlfAction::Auto), Some("lf")) => Some(CrlfAction::AutoInput),
+            (Some(CrlfAction::Auto), Some("crlf")) => Some(CrlfAction::AutoCrlf),
+            (_, Some("lf")) => Some(CrlfAction::TextInput),
+            (_, Some("crlf")) => Some(CrlfAction::TextCrlf),
+            (a, _) => a,
+        };
+    }
+    let action = match action {
+        Some(CrlfAction::Text) if eol_is_crlf => CrlfAction::TextCrlf,
+        Some(CrlfAction::Text) => CrlfAction::TextInput,
+        Some(a) => a,
+        None => match autocrlf {
+            None => CrlfAction::Binary,
+            Some(true) => CrlfAction::AutoCrlf,
+            Some(false) => CrlfAction::AutoInput,
+        },
+    };
+    let out_crlf = match action {
+        CrlfAction::Binary | CrlfAction::TextInput | CrlfAction::AutoInput => false,
+        CrlfAction::TextCrlf | CrlfAction::AutoCrlf => true,
+        CrlfAction::Text | CrlfAction::Auto => eol_is_crlf,
+    };
+    if out_crlf && !data.is_empty() {
+        let (mut crlf, mut lone_cr, mut lone_lf, mut nul) = (0, 0, 0, 0);
+        let (mut printable, mut nonprintable) = (0usize, 0usize);
+        let mut i = 0;
+        while i < data.len() {
+            match data[i] {
+                b'\r' if data.get(i + 1) == Some(&b'\n') => {
+                    crlf += 1;
+                    i += 1;
+                }
+                b'\r' => lone_cr += 1,
+                b'\n' => lone_lf += 1,
+                127 => nonprintable += 1,
+                8 | 9 | 0o33 | 0o14 => printable += 1,
+                0 => {
+                    nul += 1;
+                    nonprintable += 1;
+                }
+                c if c < 32 => nonprintable += 1,
+                _ => printable += 1,
+            }
+            i += 1;
+        }
+        if data.last() == Some(&0o32) {
+            nonprintable = nonprintable.saturating_sub(1);
+        }
+        let auto = matches!(
+            action,
+            CrlfAction::Auto | CrlfAction::AutoInput | CrlfAction::AutoCrlf
+        );
+        let binary = lone_cr > 0 || nul > 0 || (printable >> 7) < nonprintable;
+        if lone_lf > 0 && !(auto && (lone_cr > 0 || crlf > 0 || binary)) {
+            let mut out = Vec::with_capacity(data.len() + lone_lf);
+            for (i, &b) in data.iter().enumerate() {
+                if b == b'\n' && (i == 0 || data[i - 1] != b'\r') {
+                    out.push(b'\r');
+                }
+                out.push(b);
+            }
+            data = out;
+        }
+    }
+    let Some(Err(driver)) = attrs.value(path, "filter") else {
+        return Ok(data);
+    };
+    let key = |k: &str| config.get_string(&format!("filter.{driver}.{k}")).ok();
+    let required = config
+        .get_bool(&format!("filter.{driver}.required"))
+        .unwrap_or(false);
+    let Some(cmd) = key("smudge").filter(|c| !c.is_empty()) else {
+        if required && key("process").is_none() {
+            return Err(GitError::Other(format!(
+                "{path}: smudge filter {driver} failed"
+            )));
+        }
+        return Ok(data);
+    };
+    let cmd = cmd.replace("%f", &crate::smart::sq_quote(path));
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .current_dir(repo.workdir().unwrap_or(repo.path()))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take();
+    let input = data.clone();
+    let writer = std::thread::spawn(move || {
+        if let Some(s) = stdin.as_mut() {
+            let _ = std::io::Write::write_all(s, &input);
+        }
+    });
+    let out = child.wait_with_output()?;
+    let _ = writer.join();
+    if out.status.success() {
+        return Ok(out.stdout);
+    }
+    eprintln!(
+        "error: external filter '{cmd}' failed {}",
+        out.status.code().unwrap_or(-1)
+    );
+    eprintln!("error: external filter '{cmd}' failed");
+    if required {
+        return Err(GitError::Other(format!(
+            "{path}: smudge filter {driver} failed"
+        )));
+    }
+    Ok(data)
+}
+
+/// ident_to_worktree: `$Id$` (or an expanded `$Id: ... $` without spaces)
+/// becomes `$Id: <blob id> $`.
+fn ident(src: &[u8]) -> Vec<u8> {
+    let id = Oid::hash_object(git2::ObjectType::Blob, src)
+        .map_or_else(|_| String::new(), |o| o.to_string());
+    let mut out = Vec::with_capacity(src.len());
+    let mut s = src;
+    let mut changed = false;
+    while let Some(d) = s.iter().position(|&b| b == b'$') {
+        out.extend_from_slice(&s[..=d]);
+        s = &s[d + 1..];
+        if s.len() < 3 || &s[..2] != b"Id" {
+            continue;
+        }
+        if s[2] == b'$' {
+            s = &s[3..];
+        } else if s[2] == b':' {
+            let Some(end) = s[3..].iter().position(|&b| b == b'$').map(|p| p + 3) else {
+                break;
+            };
+            if s[3..end].contains(&b'\n') {
+                continue;
+            }
+            if end >= 4
+                && let Some(sp) = s[4..end].iter().position(|&b| b == b' ').map(|p| p + 4)
+                && sp < end - 1
+            {
+                continue;
+            }
+            s = &s[end + 1..];
+        } else {
+            continue;
+        }
+        out.extend_from_slice(format!("Id: {id} $").as_bytes());
+        changed = true;
+    }
+    out.extend_from_slice(s);
+    if changed { out } else { src.to_vec() }
 }
 
 /// `$Format:<fmt>$` placeholders in `data` expanded for `commit`, as git's
@@ -332,6 +546,8 @@ struct Member {
     /// Names long paths' pax headers, as git's do.
     oid: Oid,
     data: Vec<u8>,
+    /// A blob past core.bigFileThreshold, which git streams.
+    stream: bool,
 }
 
 /// git's formats, in `git archive -l` order: tar, the tar filters
@@ -410,7 +626,7 @@ fn from_cwd(cwd: &str, path: &str) -> String {
 /// `git archive` natively: the tar, zip or filtered tar git writes, byte for
 /// byte.
 pub(crate) fn archive(repo: &Repository, o: &ArchiveOpts) -> Result<Vec<u8>, GitError> {
-    let obj = repo.revparse_single(&o.rev)?;
+    let obj = repo.rev_single(&o.rev)?;
     let tree = obj.peel_to_tree()?;
     let commit = obj.peel_to_commit().ok();
     let time = o.mtime.unwrap_or_else(|| match &commit {
@@ -472,12 +688,18 @@ pub(crate) fn archive(repo: &Repository, o: &ArchiveOpts) -> Result<Vec<u8>, Git
             mode: 0o040777,
             oid: tree.id(),
             data: Vec::new(),
+            stream: false,
         });
     }
     // Folders are written only once a file inside them is.
     let mut pending: Vec<(String, Oid)> = Vec::new();
     let mut failed = None;
-    let mut add = |tree_path: String, mode: u32, oid: Oid, data: Vec<u8>| {
+    let mut convert_failed = None;
+    let big_file = config
+        .as_ref()
+        .and_then(|c| c.get_i64("core.bigFileThreshold").ok())
+        .map_or(512 << 20, |v| v as u64);
+    let mut add = |tree_path: String, mode: u32, oid: Oid, data: Vec<u8>, stream: bool| {
         let rel = if cwd.is_empty() {
             &tree_path[..]
         } else {
@@ -494,9 +716,10 @@ pub(crate) fn archive(repo: &Repository, o: &ArchiveOpts) -> Result<Vec<u8>, Git
             mode,
             oid,
             data,
+            stream,
         });
     };
-    tree.walk(git2::TreeWalkMode::PreOrder, |root, e| {
+    let walked = tree.walk(git2::TreeWalkMode::PreOrder, |root, e| {
         let Ok(name) = e.name() else {
             return git2::TreeWalkResult::Ok;
         };
@@ -521,13 +744,13 @@ pub(crate) fn archive(repo: &Repository, o: &ArchiveOpts) -> Result<Vec<u8>, Git
         // Like git's, a file's folders are written before its own
         // export-ignore is looked at.
         for (dir, id) in pending.drain(..) {
-            add(dir, 0o040000, id, Vec::new());
+            add(dir, 0o040000, id, Vec::new(), false);
         }
         if attrs.is_set(&path, "export-ignore") {
             return git2::TreeWalkResult::Ok;
         }
         if mode == 0o160000 {
-            add(format!("{path}/"), mode, e.id(), Vec::new());
+            add(format!("{path}/"), mode, e.id(), Vec::new(), false);
             return git2::TreeWalkResult::Ok;
         }
         let mut data = match repo.find_blob(e.id()) {
@@ -537,18 +760,34 @@ pub(crate) fn archive(repo: &Repository, o: &ArchiveOpts) -> Result<Vec<u8>, Git
                 return git2::TreeWalkResult::Abort;
             }
         };
-        if let Some(c) = commit
+        // Regular files are converted as a checkout would, except big ones
+        // git streams unconverted when nothing is substituted in them.
+        let subst = commit
             .as_ref()
-            .filter(|_| mode != 0o120000 && attrs.is_set(&path, "export-subst"))
-        {
+            .filter(|_| mode != 0o120000 && attrs.is_set(&path, "export-subst"));
+        let stream = mode & 0o170000 == 0o100000 && subst.is_none() && data.len() as u64 > big_file;
+        if mode & 0o170000 == 0o100000 && !stream {
+            data = match to_worktree(repo, &attrs, &path, data) {
+                Ok(d) => d,
+                Err(err) => {
+                    convert_failed = Some(err);
+                    return git2::TreeWalkResult::Abort;
+                }
+            };
+        }
+        if let Some(c) = subst {
             data = export_subst(repo, c, &data);
         }
-        add(path, mode, e.id(), data);
+        add(path, mode, e.id(), data, stream);
         git2::TreeWalkResult::Ok
-    })?;
+    });
+    if let Some(err) = convert_failed {
+        return Err(err);
+    }
     if let Some(err) = failed {
         return Err(err.into());
     }
+    walked?;
     if o.verbose {
         for n in names {
             eprintln!("{n}");
@@ -563,6 +802,7 @@ pub(crate) fn archive(repo: &Repository, o: &ArchiveOpts) -> Result<Vec<u8>, Git
             mode: *mode as u32,
             oid: Oid::from_bytes(&fake)?,
             data: data.clone(),
+            stream: false,
         });
     }
     let commit_id = commit.as_ref().map(Commit::id);
@@ -846,8 +1086,10 @@ fn dos_time(secs: i64) -> (u16, u16) {
     (time as u16, date as u16)
 }
 
-/// The zip git writes: stored or deflated entries with an extended mtime,
-/// and the commit id as the archive comment.
+/// The zip git writes (archive-zip.c): stored or deflated entries with an
+/// extended mtime, the commit id as the archive comment, zip64 records past
+/// 4 GiB or 65535 entries, and big blobs (`stream`) written as git streams
+/// them, sizes and crc in a data descriptor after the data.
 fn zip(
     members: &[Member],
     time: i64,
@@ -855,15 +1097,20 @@ fn zip(
     commit: Option<Oid>,
     attrs: &Attributes,
 ) -> Vec<u8> {
+    const MAX32: u64 = 0xffff_ffff;
     let (dtime, ddate) = dos_time(time);
     let mut out = Vec::new();
     let mut dir = Vec::new();
-    let le16 = |v: &mut Vec<u8>, n: u32| v.extend((n as u16).to_le_bytes());
-    let le32 = |v: &mut Vec<u8>, n: u32| v.extend(n.to_le_bytes());
+    let le = |v: &mut Vec<u8>, n: u64, width: usize| v.extend(&n.to_le_bytes()[..width]);
+    let clamp32 = |n: u64| n.min(MAX32);
+    let mut max_creator = 0;
     for m in members {
-        let offset = out.len() as u32;
+        let offset = out.len() as u64;
         let path = m.path.as_bytes();
-        let flags = if m.path.is_ascii() { 0 } else { 1 << 11 };
+        let mut flags = if m.path.is_ascii() { 0 } else { 1 << 11 };
+        if m.stream {
+            flags |= 1 << 3;
+        }
         let kind = m.mode & 0o170000;
         let (mut method, attr2, creator, binary) = match kind {
             0o040000 | 0o160000 => (0, 16, 0, None),
@@ -877,9 +1124,11 @@ fn zip(
                 } else {
                     0
                 };
+                // A streamed blob is judged by its first 16 KiB read.
+                let head = &m.data[..m.data.len().min(if m.stream { 16384 } else { usize::MAX })];
                 let binary = match attrs.state(&m.tree_path, "diff") {
                     Some(false) => true,
-                    _ => m.data[..m.data.len().min(8000)].contains(&0),
+                    _ => head[..head.len().min(8000)].contains(&0),
                 };
                 let method = if !link && level != 0 && !m.data.is_empty() {
                     8
@@ -894,6 +1143,7 @@ fn zip(
                 )
             }
         };
+        max_creator = max_creator.max(creator);
         let mut crc = flate2::Crc::new();
         if binary.is_some() {
             crc.update(&m.data);
@@ -903,60 +1153,122 @@ fn zip(
         } else {
             m.data.clone()
         };
-        if method == 8 && (body.is_empty() || body.len() >= m.data.len()) {
+        if method == 8 && !m.stream && (body.is_empty() || body.len() >= m.data.len()) {
             method = 0;
             body = m.data.clone();
         }
         if binary.is_none() {
             body.clear();
         }
-        let size = if binary.is_some() { m.data.len() } else { 0 } as u32;
+        let size = if binary.is_some() { m.data.len() } else { 0 } as u64;
+        let compressed = body.len() as u64;
+        // What the local header knows before a streamed blob is read.
+        let (head_crc, head_compressed) = match (m.stream, method) {
+            (true, 8) => (0, 0),
+            (true, _) => (0, size),
+            _ => (crc.sum(), compressed),
+        };
+        let zip64 = size > MAX32 || head_compressed > MAX32 || (m.stream && size > 0x7fff_ffff);
+        let version = if zip64 { 45 } else { 10 };
         let mut extra = vec![0x55, 0x54, 5, 0, 1];
         extra.extend((time as u32).to_le_bytes());
-        le32(&mut out, 0x04034b50);
-        le16(&mut out, 10);
-        le16(&mut out, flags);
-        le16(&mut out, method);
-        le16(&mut out, u32::from(dtime));
-        le16(&mut out, u32::from(ddate));
-        le32(&mut out, crc.sum());
-        le32(&mut out, body.len() as u32);
-        le32(&mut out, size);
-        le16(&mut out, path.len() as u32);
-        le16(&mut out, extra.len() as u32);
+        le(&mut out, 0x04034b50, 4);
+        le(&mut out, version, 2);
+        le(&mut out, flags, 2);
+        le(&mut out, method, 2);
+        le(&mut out, u64::from(dtime), 2);
+        le(&mut out, u64::from(ddate), 2);
+        le(&mut out, u64::from(head_crc), 4);
+        if zip64 {
+            le(&mut out, MAX32, 4);
+            le(&mut out, MAX32, 4);
+        } else {
+            le(&mut out, head_compressed, 4);
+            le(&mut out, size, 4);
+        }
+        le(&mut out, path.len() as u64, 2);
+        le(&mut out, extra.len() as u64 + if zip64 { 20 } else { 0 }, 2);
         out.extend(path);
         out.extend(&extra);
+        if zip64 {
+            le(&mut out, 1, 2);
+            le(&mut out, 16, 2);
+            le(&mut out, size, 8);
+            le(&mut out, head_compressed, 8);
+        }
         out.extend(&body);
-        le32(&mut dir, 0x02014b50);
-        le16(&mut dir, creator);
-        le16(&mut dir, 10);
-        le16(&mut dir, flags);
-        le16(&mut dir, method);
-        le16(&mut dir, u32::from(dtime));
-        le16(&mut dir, u32::from(ddate));
-        le32(&mut dir, crc.sum());
-        le32(&mut dir, body.len() as u32);
-        le32(&mut dir, size);
-        le16(&mut dir, path.len() as u32);
-        le16(&mut dir, extra.len() as u32);
-        le16(&mut dir, 0);
-        le16(&mut dir, 0);
-        le16(&mut dir, u32::from(binary == Some(false)));
-        le32(&mut dir, attr2);
-        le32(&mut dir, offset);
+        if m.stream {
+            le(&mut out, 0x08074b50, 4);
+            le(&mut out, u64::from(crc.sum()), 4);
+            let width = if size >= MAX32 || compressed >= MAX32 {
+                8
+            } else {
+                4
+            };
+            le(&mut out, compressed, width);
+            le(&mut out, size, width);
+        }
+        let mut dir_extra = Vec::new();
+        if compressed > MAX32 || size > MAX32 || offset > MAX32 {
+            for (n, _) in [(size, 0), (compressed, 1), (offset, 2)] {
+                if n >= MAX32 {
+                    le(&mut dir_extra, n, 8);
+                }
+            }
+            let payload = dir_extra.len() as u64;
+            let mut head = Vec::new();
+            le(&mut head, 1, 2);
+            le(&mut head, payload, 2);
+            dir_extra.splice(0..0, head);
+        }
+        le(&mut dir, 0x02014b50, 4);
+        le(&mut dir, creator, 2);
+        le(&mut dir, version, 2);
+        le(&mut dir, flags, 2);
+        le(&mut dir, method, 2);
+        le(&mut dir, u64::from(dtime), 2);
+        le(&mut dir, u64::from(ddate), 2);
+        le(&mut dir, u64::from(crc.sum()), 4);
+        le(&mut dir, clamp32(compressed), 4);
+        le(&mut dir, clamp32(size), 4);
+        le(&mut dir, path.len() as u64, 2);
+        le(&mut dir, (extra.len() + dir_extra.len()) as u64, 2);
+        le(&mut dir, 0, 2);
+        le(&mut dir, 0, 2);
+        le(&mut dir, u64::from(binary == Some(false)), 2);
+        le(&mut dir, u64::from(attr2), 4);
+        le(&mut dir, clamp32(offset), 4);
         dir.extend(path);
         dir.extend(&extra);
+        dir.extend(&dir_extra);
     }
-    let start = out.len() as u32;
+    let start = out.len() as u64;
+    let entries = members.len() as u64;
     out.extend(&dir);
-    le32(&mut out, 0x06054b50);
-    le16(&mut out, 0);
-    le16(&mut out, 0);
-    le16(&mut out, members.len() as u32);
-    le16(&mut out, members.len() as u32);
-    le32(&mut out, dir.len() as u32);
-    le32(&mut out, start);
-    le16(&mut out, if commit.is_some() { 40 } else { 0 });
+    if entries > 0xffff || start > MAX32 {
+        le(&mut out, 0x06064b50, 4);
+        le(&mut out, 44, 8);
+        le(&mut out, max_creator, 2);
+        le(&mut out, 45, 2);
+        le(&mut out, 0, 4);
+        le(&mut out, 0, 4);
+        le(&mut out, entries, 8);
+        le(&mut out, entries, 8);
+        le(&mut out, dir.len() as u64, 8);
+        le(&mut out, start, 8);
+        le(&mut out, 0x07064b50, 4);
+        le(&mut out, 0, 4);
+        le(&mut out, start + dir.len() as u64, 8);
+        le(&mut out, 1, 4);
+    }
+    le(&mut out, 0x06054b50, 4);
+    le(&mut out, 0, 2);
+    le(&mut out, 0, 2);
+    le(&mut out, entries.min(0xffff), 2);
+    le(&mut out, entries.min(0xffff), 2);
+    le(&mut out, dir.len() as u64, 4);
+    le(&mut out, clamp32(start), 4);
+    le(&mut out, if commit.is_some() { 40 } else { 0 }, 2);
     if let Some(id) = commit {
         out.extend(id.to_string().as_bytes());
     }

@@ -3,6 +3,7 @@
 //! report dangling, unreachable, missing and broken objects in git's words
 //! and in git's order (its object hash table, simulated).
 
+use crate::rev::RevParse;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -1565,7 +1566,7 @@ pub fn fsck(repo: &Repository, o: &FsckOptions) -> Result<FsckReport, GitError> 
     f.check_special_blobs();
     let mut heads = 0;
     for arg in &o.objects {
-        match repo.revparse_single(arg) {
+        match repo.rev_single(arg) {
             Ok(obj) => {
                 let oid = obj.id();
                 if !f.table.objs.get(&oid).is_some_and(|x| x.has) {

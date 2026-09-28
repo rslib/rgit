@@ -1608,3 +1608,585 @@ fn rebase_empty_stop_and_rebase_cousins() {
     );
     assert_eq!(refs(&a), refs(&b));
 }
+
+/// stdout and stderr apart, and success, of `git` (`tool` "git") or rgit.
+fn run3(tool: &str, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String, bool) {
+    let mut cmd = if tool == "git" {
+        let mut c = Command::new("git");
+        c.arg("-C").arg(dir);
+        c
+    } else {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_rgit"));
+        c.arg("--human").current_dir(dir).env("RGIT_OPLOG", "0");
+        c
+    };
+    let out = cmd
+        .args(args)
+        .env("GIT_AUTHOR_DATE", DATE)
+        .env("GIT_COMMITTER_DATE", DATE)
+        .env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true")
+        .envs(isolated())
+        .envs(env.iter().copied())
+        .output()
+        .unwrap();
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    (text(&out.stdout), text(&out.stderr), out.status.success())
+}
+
+/// Every rr-cache file with its content.
+fn rr_cache(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let cache = std::fs::read_dir(dir.join(".git/rr-cache"));
+    for e in cache.into_iter().flatten().flatten() {
+        for f in std::fs::read_dir(e.path()).unwrap().flatten() {
+            let name = f.file_name().to_string_lossy().into_owned();
+            let text = std::fs::read_to_string(f.path()).unwrap_or_default();
+            out.push(format!("{}/{name}:{text}", e.file_name().to_string_lossy()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `conflicting` with rerere on.
+fn rerere_repo(dir: &Path) {
+    conflicting(dir);
+    git(dir, &["config", "rerere.enabled", "true"]);
+}
+
+#[test]
+fn rerere_records_and_replays_like_git_both_ways() {
+    let (a, b) = twins("rerere", rerere_repo);
+    let (_, gerr, _) = run3("git", &a, &["merge", "side"], &[]);
+    let (_, rerr, done) = run3("rgit", &b, &["merge", "side"], &[]);
+    assert!(!done);
+    assert!(gerr.contains("Recorded preimage for 'f'"), "{gerr}");
+    assert!(rerr.contains("Recorded preimage for 'f'"), "{rerr}");
+    assert_eq!(rr_cache(&a), rr_cache(&b));
+    assert_eq!(
+        std::fs::read(a.join(".git/MERGE_RR")).unwrap(),
+        std::fs::read(b.join(".git/MERGE_RR")).unwrap()
+    );
+    for sub in ["status", "remaining", "diff"] {
+        let g = run3("git", &a, &["rerere", sub], &[]);
+        let r = run3("rgit", &b, &["rerere", sub], &[]);
+        assert_eq!(g.0, r.0, "rerere {sub}");
+    }
+    for d in [&a, &b] {
+        std::fs::write(d.join("f"), "resolved\n").unwrap();
+    }
+    assert_eq!(
+        run3("git", &a, &["rerere", "diff"], &[]).0,
+        run3("rgit", &b, &["rerere", "diff"], &[]).0
+    );
+    for d in [&a, &b] {
+        git(d, &["add", "f"]);
+    }
+    let (_, gerr, _) = run3("git", &a, &["commit", "--no-edit"], &[]);
+    let (_, rerr, _) = run3("rgit", &b, &["commit", "-m", "merge"], &[]);
+    assert!(gerr.contains("Recorded resolution for 'f'."), "{gerr}");
+    assert!(rerr.contains("Recorded resolution for 'f'."), "{rerr}");
+    assert_eq!(rr_cache(&a), rr_cache(&b));
+
+    // Each replays what the other recorded: swap the caches.
+    let cache = |d: &Path| d.join(".git/rr-cache");
+    std::fs::rename(cache(&a), a.join("cache")).unwrap();
+    std::fs::rename(cache(&b), cache(&a)).unwrap();
+    std::fs::rename(a.join("cache"), cache(&b)).unwrap();
+    for d in [&a, &b] {
+        git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+    }
+    let (_, gerr, _) = run3("git", &a, &["merge", "side"], &[]);
+    let (_, rerr, _) = run3("rgit", &b, &["merge", "side"], &[]);
+    let replayed = "Resolved 'f' using previous resolution.";
+    assert!(gerr.contains(replayed), "{gerr}");
+    assert!(rerr.contains(replayed), "{rerr}");
+    for d in [&a, &b] {
+        assert_eq!(std::fs::read_to_string(d.join("f")).unwrap(), "resolved\n");
+        assert!(git(d, &["status", "--short"]).contains("UU f"));
+    }
+
+    // forget, clear, abort and gc leave what git leaves.
+    let g = run3("git", &a, &["rerere", "forget", "f"], &[]);
+    let r = run3("rgit", &b, &["rerere", "forget", "f"], &[]);
+    assert_eq!(g.1, r.1);
+    assert_eq!(rr_cache(&a), rr_cache(&b));
+    for args in [&["rerere", "clear"][..], &["merge", "--abort"]] {
+        run3("git", &a, args, &[]);
+        run3("rgit", &b, args, &[]);
+        assert_eq!(rr_cache(&a), rr_cache(&b), "{args:?}");
+    }
+    for d in [&a, &b] {
+        git(d, &["config", "gc.rerereResolved", "-1"]);
+    }
+    run3("git", &a, &["rerere", "gc"], &[]);
+    run3("rgit", &b, &["rerere", "gc"], &[]);
+    assert_eq!(rr_cache(&a), rr_cache(&b));
+}
+
+#[test]
+fn rerere_autoupdate_and_every_sequencer_hook() {
+    let (a, b) = twins("rerere-auto", rerere_repo);
+    for d in [&a, &b] {
+        git_try(d, &["merge", "side"]);
+        std::fs::write(d.join("f"), "resolved\n").unwrap();
+        git(d, &["add", "f"]);
+        git(d, &["commit", "-q", "--no-edit"]);
+        git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+    }
+    let args = ["cherry-pick", "--rerere-autoupdate", "side~1"];
+    let (_, gerr, _) = run3("git", &a, &args, &[]);
+    let (_, rerr, _) = run3("rgit", &b, &args, &[]);
+    let staged = "Staged 'f' using previous resolution.";
+    assert!(gerr.contains(staged), "{gerr}");
+    assert!(rerr.contains(staged), "{rerr}");
+    for d in [&a, &b] {
+        assert_eq!(git(d, &["diff", "--name-only", "--diff-filter=U"]), "");
+        assert_eq!(std::fs::read_to_string(d.join("f")).unwrap(), "resolved\n");
+    }
+    run3("git", &a, &["cherry-pick", "--abort"], &[]);
+    run3("rgit", &b, &["cherry-pick", "--abort"], &[]);
+
+    // A rebase step and a stash apply go through rerere too.
+    for d in [&a, &b] {
+        git(d, &["checkout", "-q", "side~1"]);
+    }
+    let (_, gerr, _) = run3("git", &a, &["rebase", "main"], &[]);
+    let (_, rerr, _) = run3("rgit", &b, &["rebase", "main"], &[]);
+    let replayed = "Resolved 'f' using previous resolution.";
+    assert!(gerr.contains(replayed), "{gerr}");
+    assert!(rerr.contains(replayed), "{rerr}");
+    run3("git", &a, &["rebase", "--abort"], &[]);
+    run3("rgit", &b, &["rebase", "--abort"], &[]);
+    for d in [&a, &b] {
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("f"), "side\n").unwrap();
+        git(d, &["stash", "-q"]);
+        commit(d, "f", "other\n", "other");
+    }
+    let (_, gerr, _) = run3("git", &a, &["stash", "apply"], &[]);
+    let (_, rerr, done) = run3("rgit", &b, &["stash", "apply"], &[]);
+    assert!(!done);
+    assert!(gerr.contains("Recorded preimage for 'f'"), "{gerr}");
+    assert!(rerr.contains("Recorded preimage for 'f'"), "{rerr}");
+    assert_eq!(rr_cache(&a), rr_cache(&b));
+    assert_eq!(git(&b, &["stash", "list"]).lines().count(), 1);
+}
+
+/// Two merge bases: main and side each merge the other's first commit.
+fn criss_cross(dir: &Path) {
+    commit(dir, "f", "1\n2\n3\n4\n5\n", "base");
+    git(dir, &["checkout", "-qb", "side"]);
+    commit(dir, "f", "1\nS\n3\n4\n5\n", "s1");
+    git(dir, &["checkout", "-q", "main"]);
+    commit(dir, "f", "1\n2\n3\n4\nM\n", "m1");
+    git(dir, &["branch", "m1"]);
+    git(dir, &["merge", "-q", "--no-edit", "side"]);
+    commit(dir, "f", "1\nS\n3\nX\nM\n", "m2");
+    git(dir, &["checkout", "-q", "side"]);
+    git(dir, &["merge", "-q", "--no-edit", "m1"]);
+    commit(dir, "g", "g\n", "s2");
+    git(dir, &["checkout", "-q", "main"]);
+}
+
+#[test]
+fn merges_with_several_bases_use_a_virtual_base_like_git() {
+    let (a, b) = twins("criss-cross", criss_cross);
+    let bases = git(&a, &["merge-base", "--all", "main", "side"]);
+    assert_eq!(bases.lines().count(), 2);
+    git(&a, &["merge", "--no-edit", "side"]);
+    ok(&b, &["merge", "side"]);
+    assert_eq!(result(&a, 1), result(&b, 1));
+}
+
+fn sorted_lines(s: &str) -> Vec<String> {
+    let mut v: Vec<String> = s.lines().map(str::to_owned).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn conflict_reports_match_git_word_for_word() {
+    for (tag, args) in [
+        ("say-pick", &["cherry-pick", "side~1"][..]),
+        ("say-revert", &["revert", "--no-edit", "main~1"]),
+        ("say-merge", &["merge", "side"]),
+    ] {
+        let (a, b) = twins(tag, conflicting);
+        let (gout, gerr, _) = run3("git", &a, args, &[]);
+        let (rout, rerr, done) = run3("rgit", &b, args, &[]);
+        assert!(!done, "{tag}: {rout}{rerr}");
+        // rgit adds its own closing line and hint on a merge stop.
+        let mut rgit_lines = sorted_lines(&(rout + &rerr));
+        rgit_lines.retain(|l| !l.contains("rgit"));
+        assert_eq!(sorted_lines(&(gout + &gerr)), rgit_lines, "{tag}");
+        for file in ["f", ".git/MERGE_MSG"] {
+            assert_eq!(
+                std::fs::read_to_string(a.join(file)).unwrap(),
+                std::fs::read_to_string(b.join(file)).unwrap(),
+                "{tag} {file}"
+            );
+        }
+    }
+    let (a, b) = twins("say-rebase", conflicting);
+    for d in [&a, &b] {
+        git(d, &["checkout", "-q", "side"]);
+    }
+    let (gout, gerr, _) = run3("git", &a, &["rebase", "main"], &[]);
+    let (rout, rerr, _) = run3("rgit", &b, &["rebase", "main"], &[]);
+    let git_text = (gout + &gerr).replace("Rebasing (1/2)\r", "");
+    assert_eq!(sorted_lines(&git_text), sorted_lines(&(rout + &rerr)));
+}
+
+/// A sequence editor that copies the todo it is given to `out`.
+fn todo_copy(out: &Path) -> String {
+    format!("f() {{ cp \"$1\" '{}'; }}; f", out.display())
+}
+
+#[test]
+fn rebase_todo_text_matches_git_byte_for_byte() {
+    for config in [
+        &[][..],
+        &[("rebase.abbreviateCommands", "true")],
+        &[("rebase.instructionFormat", "%s (%an <%ae>) %h")],
+        &[("rebase.missingCommitsCheck", "error")],
+    ] {
+        let (a, b) = twins("todo-text", side_branch);
+        for d in [&a, &b] {
+            git(d, &["checkout", "-q", "side"]);
+            for (k, v) in config {
+                git(d, &["config", k, v]);
+            }
+        }
+        let (ga, rb) = (a.join("todo"), b.join("todo"));
+        let args = ["rebase", "-i", "--exec", "true", "main"];
+        run3(
+            "git",
+            &a,
+            &args,
+            &[("GIT_SEQUENCE_EDITOR", &todo_copy(&ga))],
+        );
+        run3(
+            "rgit",
+            &b,
+            &args,
+            &[("GIT_SEQUENCE_EDITOR", &todo_copy(&rb))],
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ga).unwrap(),
+            std::fs::read_to_string(&rb).unwrap(),
+            "{config:?}"
+        );
+        assert_eq!(refs(&a), refs(&b));
+    }
+    let (a, b) = twins("todo-root", side_branch);
+    for d in [&a, &b] {
+        git(d, &["checkout", "-q", "side"]);
+    }
+    let (ga, rb) = (a.join("todo"), b.join("todo"));
+    let args = ["rebase", "-i", "--root"];
+    run3(
+        "git",
+        &a,
+        &args,
+        &[("GIT_SEQUENCE_EDITOR", &todo_copy(&ga))],
+    );
+    run3(
+        "rgit",
+        &b,
+        &args,
+        &[("GIT_SEQUENCE_EDITOR", &todo_copy(&rb))],
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ga).unwrap(),
+        std::fs::read_to_string(&rb).unwrap()
+    );
+}
+
+#[test]
+fn missing_commits_check_warns_stops_and_resumes_like_git() {
+    let drop_s2 = [("GIT_SEQUENCE_EDITOR", "sed -i.bak -e /s2/d")];
+    for level in ["warn", "error"] {
+        let (a, b) = twins(&format!("missing-{level}"), side_branch);
+        for d in [&a, &b] {
+            git(d, &["checkout", "-q", "side"]);
+            git(d, &["config", "rebase.missingCommitsCheck", level]);
+        }
+        let g = run3("git", &a, &["rebase", "-i", "main"], &drop_s2);
+        let r = run3("rgit", &b, &["rebase", "-i", "main"], &drop_s2);
+        assert_eq!(g.2, r.2, "{level}");
+        let warning = &g.1[g.1.find("Warning").unwrap()..];
+        let warning = &warning[..warning.find("rebase --abort'.\n").unwrap() + 17];
+        assert!(r.1.contains(warning), "{}\n{}", g.1, r.1);
+        if level == "warn" {
+            assert_eq!(refs(&a), refs(&b));
+            continue;
+        }
+        assert!(b.join(".git/rebase-merge/dropped").exists());
+        // Still missing: --continue refuses, as git's.
+        assert!(!run3("git", &a, &["rebase", "--continue"], &[]).2);
+        assert!(!run3("rgit", &b, &["rebase", "--continue"], &[]).2);
+        // --edit-todo shows git's text; dropping it explicitly lets it go on.
+        let (ga, rb) = (a.join("todo"), b.join("todo"));
+        let args = ["rebase", "--edit-todo"];
+        run3(
+            "git",
+            &a,
+            &args,
+            &[("GIT_SEQUENCE_EDITOR", &todo_copy(&ga))],
+        );
+        run3(
+            "rgit",
+            &b,
+            &args,
+            &[("GIT_SEQUENCE_EDITOR", &todo_copy(&rb))],
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ga).unwrap(),
+            std::fs::read_to_string(&rb).unwrap()
+        );
+        let s2 = git(&a, &["rev-parse", "--short", "side~1"]);
+        let add_drop = format!("f() {{ echo 'drop {}' >> \"$1\"; }}; f", s2.trim());
+        let env = [("GIT_SEQUENCE_EDITOR", add_drop.as_str())];
+        assert!(run3("git", &a, &args, &env).2);
+        assert!(run3("rgit", &b, &args, &env).2);
+        assert!(run3("git", &a, &["rebase", "--continue"], &[]).2);
+        assert!(run3("rgit", &b, &["rebase", "--continue"], &[]).2);
+        assert_eq!(refs(&a), refs(&b));
+    }
+}
+
+#[test]
+fn squash_chain_editor_opens_after_continue_like_git() {
+    let (a, b) = twins("squash-edit", |d| {
+        commit(d, "base", "base\n", "base");
+        git(d, &["checkout", "-qb", "work"]);
+        commit(d, "f", "a\n", "a");
+        commit(d, "f", "b\n", "squash! a");
+        git(d, &["checkout", "-q", "main"]);
+        commit(d, "f", "main\n", "m");
+        git(d, &["checkout", "-q", "work"]);
+    });
+    let edit = [("GIT_EDITOR", "f() { printf 'edited\\n' > \"$1\"; }; f")];
+    let args = ["rebase", "-i", "--autosquash", "main"];
+    assert!(!run3("git", &a, &args, &edit).2);
+    assert!(!run3("rgit", &b, &args, &edit).2);
+    for text in ["a\n", "b\n"] {
+        for d in [&a, &b] {
+            std::fs::write(d.join("f"), text).unwrap();
+            git(d, &["add", "f"]);
+        }
+        let g = run3("git", &a, &["rebase", "--continue"], &edit);
+        let r = run3("rgit", &b, &["rebase", "--continue"], &edit);
+        assert_eq!(g.2, r.2, "{}{}\n{}{}", g.0, g.1, r.0, r.1);
+    }
+    assert_eq!(git(&a, &["log", "-1", "--format=%B"]), "edited\n\n");
+    assert_eq!(refs(&a), refs(&b));
+}
+
+#[test]
+fn am_reads_hg_stgit_series_and_maildirs_like_git() {
+    let (a, b) = twins("am-formats", |d| commit(d, "f", "a\n", "base"));
+    let patch =
+        |line: &str| format!("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1,2 @@\n a\n+{line}\n");
+    let hg = format!(
+        "# HG changeset patch\n# User Foo Bar <foo@bar.org>\n# Date 1577836800 -3600\n#      \
+         Wed Jan 01 01:00:00 2020 +0100\n# Node ID 0123\nhg subject\n\nhg body\n\n{}",
+        patch("hg")
+    );
+    let stg = format!(
+        "stgit subject\n\nAuthor: Stg Er <s@t.g>\nDate: Wed, 1 Jan 2020 00:00:00 +0000\n\nstgit \
+         body\n---\n\n{}",
+        patch("stg")
+    );
+    for d in [&a, &b] {
+        std::fs::write(d.join("hg.patch"), &hg).unwrap();
+        std::fs::write(d.join("st.patch"), &stg).unwrap();
+        std::fs::create_dir_all(d.join("series-dir")).unwrap();
+        std::fs::write(d.join("series-dir/st.patch"), &stg).unwrap();
+        let series = "# This series applies on GIT commit 0000\nst.patch\n";
+        std::fs::write(d.join("series-dir/series"), series).unwrap();
+    }
+    let log = |d: &Path| git(d, &["log", "--format=%an|%ae|%ad|%s|%b|%T"]);
+    for args in [
+        &["am", "hg.patch"][..],
+        &["am", "st.patch"],
+        &["am", "series-dir/series"],
+    ] {
+        let g = run3("git", &a, args, &[]);
+        let r = run3("rgit", &b, args, &[]);
+        assert!(g.2 && r.2, "{args:?}: {}{}", r.0, r.1);
+        assert_eq!(g.0, r.0, "{args:?}");
+        assert_eq!(log(&a), log(&b), "{args:?}");
+        for d in [&a, &b] {
+            git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+        }
+    }
+
+    // A maildir's mails go in git's order: digit runs by value, dot files out.
+    for d in [&a, &b] {
+        std::fs::create_dir_all(d.join("md/cur")).unwrap();
+        std::fs::create_dir_all(d.join("md/new")).unwrap();
+        for name in ["2", "10", "1:2,S"] {
+            let file = name.replace([':', ','], "");
+            let mail = format!(
+                "From: M <m@m>\nDate: Wed, 1 Jan 2020 00:00:00 +0000\nSubject: [PATCH] mail \
+                 {name}\n\n---\ndiff --git a/{file} \
+                 b/{file}\nnew file mode 100644\n--- /dev/null\n+++ b/{file}\n@@ -0,0 +1 @@\n+x\n"
+            );
+            std::fs::write(d.join("md/cur").join(name), mail).unwrap();
+        }
+        std::fs::write(d.join("md/new/3"), "junk").unwrap();
+        std::fs::write(d.join("md/cur/.hidden"), "junk").unwrap();
+        std::fs::remove_file(d.join("md/new/3")).unwrap();
+    }
+    let g = run3("git", &a, &["am", "md"], &[]);
+    let r = run3("rgit", &b, &["am", "md"], &[]);
+    assert!(g.2 && r.2, "{}{}", r.0, r.1);
+    assert_eq!(g.0, r.0);
+    assert_eq!(log(&a), log(&b));
+}
+
+#[test]
+fn am_three_way_reports_like_git_and_mailinfo_keeps_the_inbody_subject() {
+    let (a, b) = twins("am-3way", |d| {
+        commit(d, "f", "a\n", "base");
+        git(d, &["checkout", "-qb", "side"]);
+        commit(d, "f", "a\nSIDE\n", "side");
+        git(d, &["format-patch", "-q", "-1", "-o", "p"]);
+        git(d, &["checkout", "-q", "main"]);
+        commit(d, "f", "a\nMAIN\n", "main");
+    });
+    let args = ["am", "-3", "p/0001-side.patch"];
+    let g = run3("git", &a, &args, &[]);
+    let r = run3("rgit", &b, &args, &[]);
+    assert!(!g.2 && !r.2);
+    let lines = |s: String| {
+        let mut v: Vec<String> = s.lines().map(str::to_owned).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(lines(g.0 + &g.1), lines(r.0 + &r.1));
+    assert_eq!(
+        std::fs::read_to_string(a.join("f")).unwrap(),
+        std::fs::read_to_string(b.join("f")).unwrap()
+    );
+
+    let mail = "From: A <a@b>\nSubject: [PATCH] outer\n\nSubject: inner\nFrom: B <b@c>\n\n\
+                body\n---\ndiff --git a/f b/f\n";
+    std::fs::write(a.join("mail"), mail).unwrap();
+    let info = |program: &str, args: &[&str]| {
+        let out = Command::new(program)
+            .args(args)
+            .current_dir(&a)
+            .stdin(std::fs::File::open(a.join("mail")).unwrap())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let git_info = info("git", &["mailinfo", "-k", "msg", "patch"]);
+    assert!(
+        git_info.contains("Subject: inner\nSubject: \n"),
+        "{git_info}"
+    );
+    let rgit_info = info(
+        env!("CARGO_BIN_EXE_rgit"),
+        &["--human", "mailinfo", "-k", "msg", "patch"],
+    );
+    assert_eq!(git_info, rgit_info);
+}
+
+/// An octopus merge follows git's git-merge-octopus.sh: the same lines, exit
+/// code and resulting tree, including a criss-cross history and a strategy
+/// failure that git undoes.
+#[test]
+fn octopus_merges_like_gits_script() {
+    fn build(dir: &Path, case: &str) {
+        let sh = |script: &str| {
+            let ok = Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+                .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{script}");
+        };
+        sh("printf '1\\n2\\n3\\n' > f && git add f && git commit -qm base");
+        sh(match case {
+            "clean" => {
+                "for b in a b c; do git checkout -qb $b main && echo $b > $b.txt && git add \
+                 $b.txt && git commit -qm $b; done; git checkout -q main"
+            }
+            "last" => {
+                "git checkout -qb a main && echo a > a.txt && git add a.txt && git commit -qm a \
+                 && git checkout -qb b main && printf '1\\nB\\n3\\n' > f && git commit -qam b \
+                 && git checkout -qb c main && printf '1\\nC\\n3\\n' > f && git commit -qam c \
+                 && git checkout -q main"
+            }
+            "middle" => {
+                "git checkout -qb a main && printf '1\\nA\\n3\\n' > f && git commit -qam a \
+                 && git checkout -qb b main && printf '1\\nB\\n3\\n' > f && git commit -qam b \
+                 && git checkout -qb c main && echo c > c.txt && git add c.txt && git commit -qm \
+                 c && git checkout -q main"
+            }
+            _ => {
+                "git checkout -qb a main && printf '1\\n2\\n3\\nx\\n' > f && git commit -qam x1 \
+                 && git checkout -qb b main && printf 'y\\n1\\n2\\n3\\n' > f && git commit -qam \
+                 y1 && git checkout -q a && git merge -q --no-edit b && git checkout -q b && git \
+                 merge -q --no-edit a~1 && printf 'y\\n1\\nY\\n3\\n' > f && git commit -qam y2 \
+                 && git checkout -q a && printf '1\\nX\\n3\\nx\\n' > f && git commit -qam x2 && \
+                 git checkout -qb c main && echo z > z.txt && git add z.txt && git commit -qm z \
+                 && git checkout -q main"
+            }
+        });
+    }
+    let run = |dir: &Path, bin: &str, extra: &[&str]| {
+        let out = Command::new(bin)
+            .args(extra)
+            .args(["merge", "a", "b", "c"])
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
+            .env("GIT_EDITOR", "true")
+            .env("RGIT_OPLOG", "0")
+            .output()
+            .unwrap();
+        let file = std::fs::read_to_string(dir.join("f")).unwrap();
+        // git names the conflict sides after random temp files.
+        let file: String = file
+            .lines()
+            .map(|l| l.split(".merge_file_").next().unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            out.status.code(),
+            git(dir, &["status", "--porcelain"]),
+            file,
+            git(dir, &["log", "-1", "--format=%T %P"]),
+        )
+    };
+    for case in ["clean", "last", "middle", "criss-cross"] {
+        let (g, r) = (
+            repo(&format!("oct-{case}-git")),
+            repo(&format!("oct-{case}-rgit")),
+        );
+        build(&g, case);
+        build(&r, case);
+        assert_eq!(
+            run(&r, env!("CARGO_BIN_EXE_rgit"), &["--human"]),
+            run(&g, "git", &[]),
+            "{case}"
+        );
+    }
+}

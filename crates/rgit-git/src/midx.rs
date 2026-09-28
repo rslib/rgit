@@ -121,16 +121,14 @@ pub fn write(repo: &Repository, preferred: Option<&str>) -> Result<(), GitError>
         )));
     }
     let mut best: HashMap<Oid, (u32, u64)> = HashMap::new();
-    // Sub-second mtimes, so a pack written just now beats older ones.
-    let mtimes: Vec<Option<std::time::SystemTime>> = packs
-        .iter()
-        .map(|p| std::fs::metadata(&p.path).and_then(|m| m.modified()).ok())
-        .collect();
+    // git compares whole-second mtimes, then the order it met the packs in
+    // the directory.
+    let met = maintenance::dir_order(repo);
     let rank = |i: usize| {
         (
             Some(packs[i].name.as_str()) == preferred,
-            mtimes[i],
-            std::cmp::Reverse(i),
+            packs[i].mtime,
+            std::cmp::Reverse(met.get(&packs[i].name).copied()),
         )
     };
     for (i, p) in packs.iter().enumerate() {

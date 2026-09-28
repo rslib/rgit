@@ -16,6 +16,10 @@ pub struct FileDiff {
     pub similarity: u16,
     /// Old and new sizes in bytes, for a binary file's `Bin A -> B bytes`.
     pub sizes: (u64, u64),
+    /// Old and new modes (0 for a missing side), for `--raw`.
+    pub modes: (u32, u32),
+    /// Old and new object ids (zeros for a missing side), for `--raw`.
+    pub ids: (String, String),
 }
 
 /// One `@@ ... @@` hunk.

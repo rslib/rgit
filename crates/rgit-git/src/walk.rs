@@ -2,6 +2,7 @@
 //! in which order, with history simplification, symmetric-range marks,
 //! cherry-pick detection, boundary commits and parent rewriting.
 
+use crate::rev::RevParse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -20,6 +21,7 @@ pub(crate) struct Walked {
 }
 
 /// A commit the walk started from, or (`bottom`) whose history it excludes.
+#[derive(Clone)]
 struct Tip {
     id: Oid,
     bottom: bool,
@@ -43,7 +45,7 @@ struct Node {
 }
 
 fn commit_of(repo: &Repository, rev: &str) -> Result<Oid, GitError> {
-    Ok(repo.revparse_single(rev)?.peel_to_commit()?.id())
+    Ok(repo.rev_single(rev)?.peel_to_commit()?.id())
 }
 
 /// The commits a walk starts from and excludes, in the order git queues them:
@@ -369,8 +371,8 @@ impl<'r> Walker<'r> {
             }
         }
         let mut dopts = DiffOptions::new();
-        for p in self.opts.paths.iter().filter(|p| *p != ".") {
-            dopts.pathspec(p);
+        if crate::pathspec::limit_diff(&mut dopts, &self.opts.paths).is_err() {
+            return false;
         }
         let old = parent.and_then(|p| p.tree().ok());
         let Ok(tree) = commit.tree() else {
@@ -536,7 +538,11 @@ impl<'r> Walker<'r> {
         }
         let mut ids: HashMap<Oid, Vec<Oid>> = HashMap::new();
         for &(id, _) in &sides {
-            let pid = crate::format_patch::patch_id(self.repo, &self.repo.find_commit(id)?)?;
+            let pid = crate::format_patch::patch_id_in(
+                self.repo,
+                &self.repo.find_commit(id)?,
+                &self.opts.paths,
+            )?;
             ids.entry(pid).or_default().push(id);
         }
         for group in ids.values() {
@@ -817,6 +823,7 @@ impl<'r> Walker<'r> {
 
 /// The commits a log shows for `opts`, in order, after its skip and limit.
 pub(crate) fn walk(repo: &Repository, opts: &LogOptions) -> Result<Vec<Walked>, GitError> {
+    crate::pathspec::check_pathspecs(&opts.paths)?;
     let mut opts = std::borrow::Cow::Borrowed(opts);
     if opts.merge && opts.paths.is_empty() {
         let conflicted: Vec<String> = repo
@@ -925,8 +932,30 @@ pub(crate) fn walk(repo: &Repository, opts: &LogOptions) -> Result<Vec<Walked>, 
             }
         }
     } else if w.limited {
-        if !bottoms.is_empty() {
+        if !bottoms.is_empty() || opts.since.is_some() {
             w.allowed = Some(interesting(repo, &tips)?);
+        }
+        // git's limit_list makes a commit older than --since uninteresting,
+        // and so every commit behind it.
+        if let (Some(since), Some(allowed)) = (opts.since, &w.allowed) {
+            let old: Vec<Tip> = allowed
+                .iter()
+                .filter(|id| {
+                    repo.find_commit(**id)
+                        .is_ok_and(|c| c.time().seconds() < since)
+                })
+                .map(|&id| Tip {
+                    id,
+                    bottom: true,
+                    left: false,
+                    name: Rc::from(""),
+                })
+                .collect();
+            if !old.is_empty() {
+                let mut all = tips.clone();
+                all.extend(old);
+                w.allowed = Some(interesting(repo, &all)?);
+            }
         }
         let mut list = w.walk(&tips, None)?;
         if opts.cherry.is_some() {

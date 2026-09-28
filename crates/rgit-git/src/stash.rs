@@ -1,10 +1,11 @@
 //! `git stash push -- <pathspec>`: the stash commits git builds for a
 //! pathspec, and the reset of only those paths.
 
+use crate::pathspec::Pathspec;
 use std::path::Path;
 
 use git2::build::CheckoutBuilder;
-use git2::{DiffOptions, IndexEntry, IndexTime, Oid, Pathspec, Repository, Status};
+use git2::{DiffOptions, IndexEntry, IndexTime, Oid, Repository, Status};
 
 use crate::error::GitError;
 
@@ -18,7 +19,7 @@ pub struct Opts<'a> {
 /// Stash the changes under `paths` as git does, returning git's report line.
 pub fn push_paths(repo: &Repository, paths: &[String], o: &Opts) -> Result<String, GitError> {
     let spec = Pathspec::new(paths.iter())?;
-    let hit = |p: &str| spec.matches_path(Path::new(p), crate::pathspec_flags());
+    let hit = |p: &str| spec.matches_path(Path::new(p));
     let head = repo
         .head()
         .ok()
@@ -35,19 +36,22 @@ pub fn push_paths(repo: &Repository, paths: &[String], o: &Opts) -> Result<Strin
         .recurse_ignored_dirs(o.all)
         .include_unmodified(true)
         .exclude_submodules(true);
-    for p in paths {
-        status.pathspec(p);
+    if spec.is_plain() {
+        for p in paths {
+            status.pathspec(p);
+        }
     }
     let entries: Vec<(String, Status)> = repo
         .statuses(Some(&mut status))?
         .iter()
         .filter_map(|e| Some((e.path().ok()?.to_owned(), e.status())))
+        .filter(|(p, _)| hit(p))
         .collect();
     for p in paths {
         let one = Pathspec::new([p])?;
         if !entries
             .iter()
-            .any(|(path, _)| one.matches_path(Path::new(path), crate::pathspec_flags()))
+            .any(|(path, _)| one.matches_path(Path::new(path)))
         {
             return Err(GitError::Other(format!(
                 "pathspec '{p}' did not match any file(s) known to git\n\
@@ -55,6 +59,14 @@ pub fn push_paths(repo: &Repository, paths: &[String], o: &Opts) -> Result<Strin
             )));
         }
     }
+    // Magic pathspecs go on as the paths they match.
+    let expanded: Vec<String>;
+    let paths = if spec.is_plain() {
+        paths
+    } else {
+        expanded = entries.iter().map(|(p, _)| p.clone()).collect();
+        &expanded[..]
+    };
     let untracked: Vec<&str> = entries
         .iter()
         .filter(|(_, s)| s.intersects(Status::WT_NEW | Status::IGNORED))
@@ -113,9 +125,7 @@ pub fn push_paths(repo: &Repository, paths: &[String], o: &Opts) -> Result<Strin
     let mut w = git2::Index::new()?;
     w.read_tree(&i_tree)?;
     let mut dopts = DiffOptions::new();
-    for p in paths {
-        dopts.pathspec(p);
-    }
+    crate::pathspec::limit_diff(&mut dopts, paths)?;
     let diff = repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut dopts))?;
     for d in diff.deltas() {
         let Some(path) = d.new_file().path().and_then(|p| p.to_str()) else {

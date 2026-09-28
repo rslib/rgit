@@ -1,6 +1,7 @@
 //! git's combined diff of a merge against all its parents (`-c`, `--cc`),
 //! ported from combine-diff.c.
 
+use crate::rev::RevParse;
 use git2::{Delta, DiffOptions, Oid, Repository};
 
 use crate::GitError;
@@ -11,6 +12,10 @@ pub struct CombinedFile {
     pub path: String,
     /// git's status letter against each parent.
     pub status: Vec<char>,
+    /// The file's mode and id in each parent, then in the merge (0 and the
+    /// zero id where it is missing).
+    pub modes: Vec<u32>,
+    pub ids: Vec<Oid>,
     /// The `diff --cc` (or `--combined`) header and hunks, each line
     /// newline-terminated; empty when `--cc` finds nothing worth showing.
     pub patch: String,
@@ -49,14 +54,12 @@ pub(crate) fn combined(
     paths: &[String],
     dense: bool,
 ) -> Result<Vec<CombinedFile>, GitError> {
-    let commit = repo.revparse_single(commit)?.peel_to_commit()?;
+    let commit = repo.rev_single(commit)?.peel_to_commit()?;
     let tree = commit.tree()?;
     let mut per_parent: Vec<Vec<(String, Side, Oid, u32)>> = Vec::new();
     for parent in commit.parents() {
         let mut opts = DiffOptions::new();
-        for p in paths.iter().filter(|p| *p != ".") {
-            opts.pathspec(p);
-        }
+        crate::pathspec::limit_diff(&mut opts, paths)?;
         let diff = repo.diff_tree_to_tree(Some(&parent.tree()?), Some(&tree), Some(&mut opts))?;
         let mut list = Vec::new();
         for d in diff.deltas() {
@@ -114,6 +117,8 @@ pub(crate) fn combined(
         out.push(CombinedFile {
             path: path.clone(),
             status: sides.iter().map(|s| s.status).collect(),
+            modes: sides.iter().map(|s| s.mode).chain([*mode]).collect(),
+            ids: sides.iter().map(|s| s.oid).chain([*oid]).collect(),
             patch,
         });
     }

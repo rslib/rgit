@@ -1705,46 +1705,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "git2-hooks"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e21a2c5eee3085f2b622805d4f4c878d9519bf70fa76bed0923b82a25f24199"
-dependencies = [
- "git2",
- "gix-path",
- "log",
- "shellexpand",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "gix-path"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8fd1fe596dc393b538e1d5492c5585971a9311475b3255f7b889023df208476"
-dependencies = [
- "bstr",
- "gix-trace",
- "gix-validate",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "gix-trace"
-version = "0.1.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be3eb81d9dc914335923e50d52829c551feefd6a72d176c4130c546b67a60814"
-
-[[package]]
-name = "gix-validate"
-version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dae8780f63ed8a803b8bdabbd7aa5f5c5d74592c8b50eed875c1bb4f6545a6a"
-dependencies = [
- "bstr",
-]
-
-[[package]]
 name = "globset"
 version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4381,7 +4341,6 @@ dependencies = [
  "fancy-regex 0.16.2",
  "flate2",
  "git2",
- "git2-hooks",
  "grep",
  "home",
  "ignore",
@@ -5141,15 +5100,6 @@ name = "shell-words"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
-
-[[package]]
-name = "shellexpand"
-version = "3.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
-dependencies = [
- "dirs",
-]
 
 [[package]]
 name = "shlex"

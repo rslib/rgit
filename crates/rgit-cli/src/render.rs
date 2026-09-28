@@ -24,6 +24,11 @@ pub fn color_on() -> bool {
 static TEXT: AtomicBool = AtomicBool::new(false);
 static FLAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Whether output is human text rather than an agent format.
+pub fn text_mode() -> bool {
+    TEXT.load(Ordering::Relaxed)
+}
+
 /// Record whether output is human text and the `--color`/`--no-color` flag,
 /// then turn color on for a terminal unless the flag says otherwise.
 pub fn init_color(text: bool, flag: Option<&str>) {
@@ -43,7 +48,7 @@ pub fn want_color(config: Option<&str>) -> bool {
     match FLAG.get().map(String::as_str).or(config) {
         Some("always") => true,
         Some("never" | "false" | "no" | "off" | "0") => false,
-        _ => crate::globals::stdout_tty(),
+        _ => crate::globals::color_tty(),
     }
 }
 
@@ -494,6 +499,13 @@ pub fn blame(lines: &[BlameLine], author: bool) -> String {
 /// own patch from the backend).
 pub fn patch(files: &[FileDiff]) -> String {
     use rgit_git::LineOrigin;
+    let r = crate::diffopts::current();
+    let words_on = WORDS.lock().expect("words lock").is_some();
+    if !words_on
+        && (color_on() || r.allow_external || r.submodule.as_deref().is_some_and(|s| s != "short"))
+    {
+        return crate::diffcolor::patch(files, &r, color_on());
+    }
     let mut out = String::new();
     for f in files {
         let color = color_on();
@@ -512,17 +524,47 @@ pub fn patch(files: &[FileDiff]) -> String {
             }
             out.push('\n');
         }
+        let words = WORDS.lock().expect("words lock");
+        let words = words.as_ref().map(|w| {
+            let old = (f.status != rgit_git::StatusCode::Added)
+                .then(|| f.old_path.as_deref().unwrap_or(&f.path));
+            let re = (w.regex)(old, &f.path).map(|re| {
+                rgit_git::userdiff::Regex::new(
+                    &re,
+                    rgit_git::userdiff::EXTENDED | rgit_git::userdiff::NEWLINE,
+                )
+                .unwrap_or_else(|_| {
+                    crate::globals::fatal(
+                        &format!(
+                            "invalid regular expression: {}",
+                            String::from_utf8_lossy(&re)
+                        ),
+                        128,
+                    )
+                })
+            });
+            (w.style, re)
+        });
         for h in &f.hunks {
             let (frag, func) = match h.header.match_indices("@@").nth(1) {
                 Some((i, _)) => h.header.split_at(i + 2),
                 None => (h.header.as_str(), ""),
             };
             out.push_str(&paint(frag, CYAN));
-            if !func.is_empty() {
-                out.push_str(func);
-                out.push_str(reset);
+            // git resets after the blank before the function name, then
+            // after the name.
+            let name = func.trim_start_matches([' ', '\t']);
+            for part in [&func[..func.len() - name.len()], name] {
+                if !part.is_empty() {
+                    out.push_str(part);
+                    out.push_str(reset);
+                }
             }
             out.push('\n');
+            if let Some((style, re)) = &words {
+                out.push_str(&word_hunk(&h.lines, *style, re.as_ref(), color));
+                continue;
+            }
             for l in &h.lines {
                 let text = l.text.trim_matches('\n');
                 match l.origin {
@@ -543,6 +585,81 @@ pub fn patch(files: &[FileDiff]) -> String {
         }
     }
     out
+}
+
+/// A file pair's word regex, from its old and new paths.
+pub type WordRegex = Box<dyn Fn(Option<&str>, &str) -> Option<Vec<u8>> + Send>;
+
+/// `--word-diff`: its style and word regexes, set per run.
+pub struct Words {
+    pub style: rgit_git::userdiff::WordStyle,
+    pub regex: WordRegex,
+}
+
+static WORDS: std::sync::Mutex<Option<Words>> = std::sync::Mutex::new(None);
+
+/// Print patches word by word (git's --word-diff), or line by line with None.
+pub fn set_words(words: Option<Words>) {
+    *WORDS.lock().expect("words lock") = words;
+}
+
+/// One hunk's lines as git's word diff prints them: context lines as they
+/// are, each run of removed and added lines diffed by words.
+fn word_hunk(
+    lines: &[rgit_git::DiffLine],
+    style: rgit_git::userdiff::WordStyle,
+    re: Option<&rgit_git::userdiff::Regex>,
+    color: bool,
+) -> String {
+    use rgit_git::LineOrigin;
+    let mut out = Vec::new();
+    let (mut minus, mut plus) = (Vec::new(), Vec::new());
+    let flush = |out: &mut Vec<u8>, minus: &mut Vec<u8>, plus: &mut Vec<u8>| {
+        if !minus.is_empty() || !plus.is_empty() {
+            out.extend(rgit_git::userdiff::word_diff(minus, plus, re, style, color));
+            minus.clear();
+            plus.clear();
+        }
+    };
+    // Every line keeps a newline, as xdiff hands them over, and the "no
+    // newline" marker is dropped.
+    for l in lines {
+        match l.origin {
+            LineOrigin::Removed => {
+                minus.extend_from_slice(l.text.as_bytes());
+                minus.push(b'\n');
+            }
+            LineOrigin::Added => {
+                plus.extend_from_slice(l.text.as_bytes());
+                plus.push(b'\n');
+            }
+            LineOrigin::Meta => {}
+            LineOrigin::Context => {
+                flush(&mut out, &mut minus, &mut plus);
+                let porcelain = style == rgit_git::userdiff::WordStyle::Porcelain;
+                let text = if porcelain {
+                    format!(" {}", l.text)
+                } else {
+                    l.text.clone()
+                };
+                let (body, cr) = match text.strip_suffix('\r') {
+                    Some(b) => (b, "\r"),
+                    None => (text.as_str(), ""),
+                };
+                out.extend_from_slice(body.as_bytes());
+                if color && !body.is_empty() {
+                    out.extend_from_slice(b"\x1b[m");
+                }
+                out.extend_from_slice(cr.as_bytes());
+                out.push(b'\n');
+                if porcelain {
+                    out.extend_from_slice(b"~\n");
+                }
+            }
+        }
+    }
+    flush(&mut out, &mut minus, &mut plus);
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A combined diff (`diff --cc`) of `parents` parents in git's colors.
@@ -653,14 +770,25 @@ pub fn stat_summary(files: &[FileDiff]) -> String {
 /// git's `--stat`: ` name | count +++--` per file, scaled to the terminal
 /// width (80 when piped), then the summary line.
 pub fn stat(files: &[FileDiff], indent: usize) -> String {
-    let width = term_columns().saturating_sub(indent);
+    let o = crate::diffopts::current();
+    let width = o
+        .stat_width
+        .filter(|&w| w > 0)
+        .unwrap_or_else(|| term_columns().saturating_sub(indent));
+    let count = o.stat_count.filter(|&c| c > 0).unwrap_or(files.len());
     let rows: Vec<(String, usize, usize, bool)> = files
         .iter()
+        .take(count)
         .map(|f| {
-            let name = match &f.old_path {
+            let mut name = match &f.old_path {
                 Some(old) => rename_name(old, &f.path),
                 None => f.path.clone(),
             };
+            if o.compact_summary
+                && let Some(c) = compact_summary(f)
+            {
+                name.push_str(&format!(" ({c})"));
+            }
             // A binary file counts bytes, new then old, as git's does.
             let (a, d) = if f.binary {
                 (f.sizes.1 as usize, f.sizes.0 as usize)
@@ -693,11 +821,20 @@ pub fn stat(files: &[FileDiff], indent: usize) -> String {
     } else {
         bin_width - 4
     };
-    let mut name_width = max_len;
+    if let Some(g) = o.stat_graph_width.filter(|&g| g > 0 && g < graph_width) {
+        graph_width = g;
+    }
+    let mut name_width = match o.stat_name_width {
+        Some(n) if n > 0 && n < max_len => n,
+        _ => max_len,
+    };
     if name_width + number_width + 6 + graph_width > width {
         let cap = (width * 3 / 8).saturating_sub(number_width + 6);
         if graph_width > cap {
             graph_width = cap.max(6);
+        }
+        if let Some(g) = o.stat_graph_width.filter(|&g| g > 0 && graph_width > g) {
+            graph_width = g;
         }
         if name_width > width.saturating_sub(number_width + 6 + graph_width) {
             name_width = width.saturating_sub(number_width + 6 + graph_width);
@@ -767,8 +904,45 @@ pub fn stat(files: &[FileDiff], indent: usize) -> String {
             paint(&"-".repeat(del), RED),
         ));
     }
+    if files.len() > rows.len() {
+        out.push_str(" ...\n");
+    }
     out.push_str(&stat_summary(files));
     out
+}
+
+/// git's get_compact_summary: `new`, `gone` or a mode change, from the
+/// file header's mode lines.
+fn compact_summary(f: &FileDiff) -> Option<&'static str> {
+    let mode = |key: &str| {
+        f.header
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .and_then(|m| u32::from_str_radix(m.trim(), 8).ok())
+    };
+    let link = |m: u32| m & 0o170000 == 0o120000;
+    if f.old_path.is_none() {
+        if let Some(m) = mode("new file mode ") {
+            return Some(if link(m) {
+                "new +l"
+            } else if m & 0o777 == 0o755 {
+                "new +x"
+            } else {
+                "new"
+            });
+        }
+        if mode("deleted file mode ").is_some() {
+            return Some("gone");
+        }
+    }
+    let (a, b) = (mode("old mode ")?, mode("new mode ")?);
+    Some(match (link(a), link(b), a & 0o777, b & 0o777) {
+        (true, false, ..) => "mode -l",
+        (false, true, ..) => "mode +l",
+        (_, _, 0o644, 0o755) => "mode +x",
+        (_, _, 0o755, 0o644) => "mode -x",
+        _ => return None,
+    })
 }
 
 /// The terminal's width as git's term_columns finds it: `COLUMNS`, else the

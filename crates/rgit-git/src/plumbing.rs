@@ -1,9 +1,11 @@
 //! Read-only plumbing over libgit2 for rgit's git-compatible commands
 //! (rev-parse, ls-files, ls-tree, cat-file, for-each-ref, rev-list, grep, ...).
 
+use crate::pathspec::Pathspec;
+use crate::rev::RevParse;
 use std::path::Path;
 
-use git2::{ObjectType, Oid, Pathspec, Repository, Status, StatusOptions};
+use git2::{ObjectType, Oid, Repository, Status, StatusOptions};
 
 use crate::error::GitError;
 
@@ -60,6 +62,10 @@ pub struct IndexItem {
     pub id: String,
     pub stage: u8,
     pub path: String,
+    /// The skip-worktree bit (a file a sparse checkout leaves out).
+    pub skip_worktree: bool,
+    /// The assume-unchanged bit.
+    pub assume_unchanged: bool,
 }
 
 /// How a working-tree path differs from the index (`git ls-files -o/-i/-m/-d`).
@@ -105,6 +111,7 @@ pub struct WalkCommit {
 }
 
 /// A reflog entry, newest first.
+#[derive(Clone)]
 pub struct ReflogItem {
     pub id: String,
     pub message: String,
@@ -219,21 +226,8 @@ fn kind_name(kind: Option<ObjectType>) -> &'static str {
     }
 }
 
-/// libgit2's revparse, plus git's `:path` and `:<stage>:path` index entries.
 fn revparse<'r>(repo: &'r Repository, rev: &str) -> Result<git2::Object<'r>, GitError> {
-    if let Some(rest) = rev.strip_prefix(':')
-        && !rest.is_empty()
-        && !rest.starts_with('/')
-    {
-        let (stage, path) = match rest.split_once(':') {
-            Some((n @ ("0" | "1" | "2" | "3"), p)) => (n.parse().unwrap_or(0), p),
-            _ => (0, rest),
-        };
-        if let Some(e) = repo.index()?.get_path(Path::new(path), stage) {
-            return Ok(repo.find_object(e.id, None)?);
-        }
-    }
-    Ok(repo.revparse_single(rev)?)
+    Ok(repo.rev_single(rev)?)
 }
 
 pub(crate) fn resolve(repo: &Repository, rev: &str) -> Result<String, GitError> {
@@ -319,6 +313,9 @@ pub(crate) fn abbrev(repo: &Repository, id: &str, min: usize) -> Result<String, 
 }
 
 pub(crate) fn full_ref_name(repo: &Repository, rev: &str) -> Result<Option<String>, GitError> {
+    if let Some(branch) = rev.strip_suffix("@{push}") {
+        return Ok(Some(crate::rev::push_ref(repo, branch)?));
+    }
     let (_, reference) = repo.revparse_ext(rev)?;
     let Some(reference) = reference else {
         return Ok(None);
@@ -357,7 +354,7 @@ pub(crate) fn ls_tree(
     paths: &[String],
     opts: TreeWalk,
 ) -> Result<Vec<TreeItem>, GitError> {
-    let tree = repo.revparse_single(rev)?.peel_to_tree()?;
+    let tree = repo.rev_single(rev)?.peel_to_tree()?;
     let mut out = Vec::new();
     walk_tree(repo, &tree, "", paths, opts, &mut out)?;
     Ok(out)
@@ -427,6 +424,8 @@ pub(crate) fn index_entries(repo: &Repository) -> Result<Vec<IndexItem>, GitErro
             id: e.id.to_string(),
             stage: ((e.flags >> 12) & 3) as u8,
             path: String::from_utf8_lossy(&e.path).into_owned(),
+            skip_worktree: e.flags_extended & (1 << 14) != 0,
+            assume_unchanged: e.flags & 0x8000 != 0,
         })
         .collect())
 }
@@ -522,7 +521,7 @@ fn object_detail(obj: &git2::Object, name: String) -> RefDetail {
 }
 
 fn commit_id(repo: &Repository, rev: &str) -> Result<Oid, GitError> {
-    Ok(repo.revparse_single(rev)?.peel_to_commit()?.id())
+    Ok(repo.rev_single(rev)?.peel_to_commit()?.id())
 }
 
 pub(crate) fn rev_walk(
@@ -747,54 +746,6 @@ fn eval(e: &GrepExpr, atoms: &[Pattern], line: &[u8]) -> bool {
     }
 }
 
-/// A `diff.<driver>.xfuncname` (or `funcname`) pattern list: the first
-/// matching line decides, and a `!` line rejects.
-type Funcname = Vec<(bool, regex::bytes::Regex)>;
-
-fn funcname_driver(repo: &Repository, path: &str) -> Option<Funcname> {
-    let driver = match git2::AttrValue::from_string(
-        repo.get_attr(Path::new(path), "diff", git2::AttrCheckFlags::default())
-            .ok()
-            .flatten(),
-    ) {
-        git2::AttrValue::String(s) => s.to_owned(),
-        _ => return None,
-    };
-    let config = repo.config().ok()?;
-    let (text, basic) = match config.get_string(&format!("diff.{driver}.xfuncname")) {
-        Ok(t) => (t, false),
-        Err(_) => (
-            config.get_string(&format!("diff.{driver}.funcname")).ok()?,
-            true,
-        ),
-    };
-    // ponytail: git's built-in drivers (cpp, rust, ...) need their patterns
-    // copied in; until then an attribute without config uses the default.
-    text.split('\n')
-        .map(|l| {
-            let (neg, l) = l.strip_prefix('!').map_or((false, l), |l| (true, l));
-            let l = if basic {
-                basic_to_extended(l)
-            } else {
-                l.to_owned()
-            };
-            regex::bytes::Regex::new(&l).ok().map(|re| (neg, re))
-        })
-        .collect()
-}
-
-fn is_funcname(driver: Option<&Funcname>, line: &[u8]) -> bool {
-    match driver {
-        Some(pats) => pats
-            .iter()
-            .find(|(_, re)| re.is_match(line))
-            .is_some_and(|(neg, _)| !neg),
-        None => line
-            .first()
-            .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_' || b == b'$'),
-    }
-}
-
 fn is_blank(line: &[u8]) -> bool {
     line.iter()
         .all(|b| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
@@ -806,14 +757,14 @@ struct FileSearch<'a> {
     atoms: &'a [Pattern],
     path: &'a str,
     lines: Vec<&'a [u8]>,
-    driver: Option<&'a Funcname>,
+    driver: Option<&'a crate::userdiff::Funcname>,
     last_shown: usize,
     hits: Vec<GrepHit>,
 }
 
 impl FileSearch<'_> {
     fn func(&self, lno: usize) -> bool {
-        is_funcname(self.driver, self.lines[lno - 1])
+        crate::userdiff::is_func(self.driver, self.lines[lno - 1])
     }
 
     fn show(&mut self, lno: usize, sign: char) {
@@ -1042,8 +993,7 @@ fn submodule_active(repo: &Repository, path: &str) -> bool {
         let _ = entries.for_each(|e| specs.extend(e.value().map(str::to_owned)));
     }
     if !specs.is_empty() {
-        return Pathspec::new(specs.iter())
-            .is_ok_and(|s| s.matches_path(Path::new(path), crate::pathspec_flags()));
+        return Pathspec::new(specs.iter()).is_ok_and(|s| s.matches_path(Path::new(path)));
     }
     config.get_string(&format!("submodule.{name}.url")).is_ok()
 }
@@ -1091,10 +1041,7 @@ fn keeper(q: &GitGrep) -> Result<impl Fn(&str) -> bool, GitError> {
     let spec = (!q.paths.is_empty())
         .then(|| Pathspec::new(q.paths.iter()))
         .transpose()?;
-    Ok(move |p: &str| {
-        spec.as_ref()
-            .is_none_or(|s| s.matches_path(Path::new(p), crate::pathspec_flags()))
-    })
+    Ok(move |p: &str| spec.as_ref().is_none_or(|s| s.matches_path(Path::new(p))))
 }
 
 pub(crate) fn grep(
@@ -1106,7 +1053,7 @@ pub(crate) fn grep(
     let rev = q
         .rev
         .as_deref()
-        .map(|r| repo.revparse_single(r).map(|o| o.id()))
+        .map(|r| repo.rev_single(r).map(|o| o.id()))
         .transpose()?;
     let mut files = Vec::new();
     tracked(repo, workdir, "", rev, q, &keep, &mut files)?;
@@ -1152,11 +1099,15 @@ fn search(
     };
     let chain = or_chain(&expr);
     let funcnames = q.show_function || q.function_context;
-    let drivers: Vec<Option<Funcname>> = files
+    let drivers: Vec<Option<crate::userdiff::Funcname>> = files
         .iter()
         .map(|(p, _)| {
-            repo.filter(|_| funcnames)
-                .and_then(|r| funcname_driver(r, p))
+            repo.filter(|_| funcnames).and_then(|r| {
+                crate::userdiff::driver(r, p, crate::userdiff::Fallback::Default)
+                    .ok()
+                    .flatten()?
+                    .funcname
+            })
         })
         .collect();
     Ok(files
@@ -1439,33 +1390,11 @@ struct PackIdx {
 }
 
 impl PackIdx {
-    /// Read a v2 index (git has written nothing older since 1.5.2).
+    /// Read a v1 or v2 index.
     fn read(idx: &Path) -> Option<PackIdx> {
         let data = std::fs::read(idx).ok()?;
-        if data.get(..8)? != b"\xfftOc\0\0\0\x02" {
-            return None;
-        }
-        let u32_at = |at: usize| Some(u32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?));
-        let n = u32_at(8 + 255 * 4)? as usize;
-        let ids_at = 8 + 256 * 4;
-        let offsets_at = ids_at + n * 24;
-        let large_at = offsets_at + n * 4;
-        let mut ids = Vec::with_capacity(n);
-        let mut offsets = Vec::with_capacity(n);
-        for i in 0..n {
-            ids.push(
-                data.get(ids_at + i * 20..ids_at + i * 20 + 20)?
-                    .try_into()
-                    .ok()?,
-            );
-            let off = u32_at(offsets_at + i * 4)?;
-            offsets.push(if off & 0x8000_0000 == 0 {
-                u64::from(off)
-            } else {
-                let at = large_at + (off & 0x7fff_ffff) as usize * 8;
-                u64::from_be_bytes(data.get(at..at + 8)?.try_into().ok()?)
-            });
-        }
+        let (ids, offsets): (Vec<[u8; 20]>, Vec<u64>) =
+            crate::maintenance::idx_entries(&data)?.into_iter().unzip();
         let mut by_offset: Vec<(u64, usize)> = offsets.iter().copied().zip(0..).collect();
         by_offset.sort_unstable();
         let pack = idx.with_extension("pack");
@@ -1596,15 +1525,9 @@ pub(crate) fn count_objects(repo: &Repository) -> Result<ObjectCounts, GitError>
                 continue;
             }
             let idx = std::fs::read(p.with_extension("idx"))?;
-            // idx v2: magic, version, 256 fanout counts, then the sorted ids.
-            let n = u32::from_be_bytes(idx[1028..1032].try_into().unwrap_or_default()) as usize;
-            for i in 0..n {
-                let at = 1032 + i * 20;
-                if let Some(raw) = idx.get(at..at + 20) {
-                    packed.insert(raw.to_vec());
-                }
-            }
-            in_pack += n;
+            let entries = crate::maintenance::idx_entries(&idx).unwrap_or_default();
+            in_pack += entries.len();
+            packed.extend(entries.into_iter().map(|(id, _)| id.to_vec()));
             packs += 1;
             size_pack += e.metadata()?.len() + idx.len() as u64;
         }
@@ -1685,8 +1608,48 @@ pub(crate) fn clean(repo: &Repository, path: &str, data: &[u8]) -> Result<Vec<u8
 /// A blob as git would check it out to `path`: libgit2's ident and crlf/eol
 /// filters, then its smudge filter driver (`cat-file --filters`).
 pub(crate) fn smudge(repo: &Repository, path: &str, data: &[u8]) -> Result<Vec<u8>, GitError> {
-    let data = builtin_filters(repo, path, data.to_vec(), false)?;
+    let ident = repo.get_attr(Path::new(path), "ident", git2::AttrCheckFlags::default())?;
+    let data = match git2::AttrValue::from_string(ident) {
+        git2::AttrValue::True => ident_to_worktree(data)?,
+        _ => data.to_vec(),
+    };
+    let data = builtin_filters(repo, path, data, false)?;
     filter_driver(repo, path, data, "smudge")
+}
+
+/// git's ident_to_worktree: `$Id$` and `$Id: ... $` name the blob.
+fn ident_to_worktree(data: &[u8]) -> Result<Vec<u8>, GitError> {
+    let id = Oid::hash_object(ObjectType::Blob, data)?;
+    let mut out = Vec::with_capacity(data.len());
+    let mut src = data;
+    while let Some(d) = src.iter().position(|&b| b == b'$') {
+        out.extend_from_slice(&src[..=d]);
+        src = &src[d + 1..];
+        if src.len() > 3 && src.starts_with(b"Id:") {
+            let Some(end) = src[3..].iter().position(|&b| b == b'$').map(|i| i + 3) else {
+                break;
+            };
+            if src[3..end].contains(&b'\n') {
+                continue;
+            }
+            // Spaces inside are some other system's id; keep it.
+            if src[4.min(end)..end]
+                .iter()
+                .position(|&b| b == b' ')
+                .is_some_and(|i| 4 + i < end - 1)
+            {
+                continue;
+            }
+            src = &src[end + 1..];
+        } else if src.len() > 2 && src.starts_with(b"Id$") {
+            src = &src[3..];
+        } else {
+            continue;
+        }
+        out.extend_from_slice(format!("Id: {id} $").as_bytes());
+    }
+    out.extend_from_slice(src);
+    Ok(out)
 }
 
 /// A blob through `path`'s `diff.<driver>.textconv` command, or unchanged

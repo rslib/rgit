@@ -183,7 +183,11 @@ fn capture_tree(repo: &Repository) -> Result<(Oid, Oid), GitError> {
     // since the backend last touched the index.
     index.read(true)?;
     let saved = index.write_tree()?;
-    index.add_all(["*"], IndexAddOption::DEFAULT, None)?;
+    index.add_all(
+        ["*"],
+        IndexAddOption::DEFAULT,
+        Some(&mut crate::sparse::keep_skipped(repo, &index)),
+    )?;
     let tree = index.write_tree()?;
     // Restore the in-memory index to what was staged before, and persist it so
     // the caller's staging area is untouched.

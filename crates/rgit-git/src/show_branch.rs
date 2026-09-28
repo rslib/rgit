@@ -1,6 +1,7 @@
 //! `git show-branch`: builtin/show-branch.c's walk, naming and layout, byte
 //! for byte.
 
+use crate::rev::RevParse;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -45,6 +46,8 @@ pub struct ShowBranchOpts {
     pub topics: bool,
     /// `-g`: how many entries, and the `,<base>` after it.
     pub reflog: Option<(usize, Option<String>)>,
+    /// The time a `<base>` that is not a count names (approxidate).
+    pub reflog_date: Option<i64>,
     pub color: bool,
 }
 
@@ -364,7 +367,7 @@ pub fn show_branch(
             .ok()
             .map(|c| c.id())
     };
-    let get_oid = |rev: &str| repo.revparse_single(rev).ok().map(|x| x.id());
+    let get_oid = |rev: &str| repo.rev_single(rev).ok().map(|x| x.id());
     let mut names: Vec<(String, Oid)> = Vec::new();
     let append = |names: &mut Vec<(String, Oid)>, name: &str, id: Oid, dups: bool| {
         let Some(c) = commit_of(id) else {
@@ -442,10 +445,32 @@ pub fn show_branch(
             .map(|p| format!("{p}{arg}"))
             .find(|n| repo.find_reference(n).is_ok())
             .ok_or_else(|| GitError::Other(format!("no such ref {arg}")))?;
-        // ponytail: a date as the base (`-g4,yesterday`) is not read; only
-        // a count.
-        let base: usize = base.as_deref().and_then(|b| b.parse().ok()).unwrap_or(0);
+        if *count > MAX_REVS {
+            return Err(GitError::Other(format!(
+                "only {MAX_REVS} entries can be shown at one time."
+            )));
+        }
         let log = repo.reflog(&full)?;
+        // A base that is not all digits is a date: start at the newest
+        // entry made at or before it (read_ref_at), or past the oldest.
+        let base = base.as_deref().unwrap_or("");
+        let digits = base.len() - base.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let mut base: usize = base[..digits].parse().unwrap_or(0);
+        if digits
+            < o.reflog
+                .as_ref()
+                .and_then(|r| r.1.as_ref())
+                .map_or(0, String::len)
+            && let Some(at) = o.reflog_date
+        {
+            if log.is_empty() {
+                return Err(GitError::Other(format!("log for {full} is empty")));
+            }
+            base = log
+                .iter()
+                .position(|e| e.committer().when().seconds() <= at)
+                .unwrap_or(log.len());
+        }
         for i in 0..*count {
             let Some(e) = log.get(base + i) else {
                 break;

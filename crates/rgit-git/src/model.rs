@@ -182,6 +182,9 @@ pub struct PickOptions {
     /// How to clean up each message: strip, whitespace, verbatim, scissors or
     /// default (git's `--cleanup`).
     pub cleanup: Option<String>,
+    /// Stage what rerere resolves (git's `--[no-]rerere-autoupdate`); `None`
+    /// follows rerere.autoUpdate.
+    pub rerere_autoupdate: Option<bool>,
 }
 
 /// What a cherry-pick does with a commit whose change is already in HEAD.
@@ -237,6 +240,8 @@ pub struct MergeOptions {
     /// How to clean up the message: strip, whitespace, verbatim, scissors or
     /// default (git's `--cleanup`).
     pub cleanup: Option<String>,
+    /// Stage what rerere resolves (git's `--[no-]rerere-autoupdate`).
+    pub rerere_autoupdate: Option<bool>,
 }
 
 /// `rebase` options, as git's.
@@ -292,6 +297,8 @@ pub struct RebaseOptions {
     pub sign: Option<String>,
     /// Do not sign, whatever commit.gpgSign says (git's `--no-gpg-sign`).
     pub no_sign: bool,
+    /// Stage what rerere resolves (git's `--[no-]rerere-autoupdate`).
+    pub rerere_autoupdate: Option<bool>,
 }
 
 impl RepoStatus {
@@ -617,6 +624,8 @@ pub struct DiffSpec {
     pub ignore_space_change: bool,
     /// Swap the two sides (git's -R).
     pub reverse: bool,
+    /// Stretch hunks over whole functions (git's -W).
+    pub function_context: bool,
 }
 
 impl Default for LogOptions {
@@ -1133,6 +1142,21 @@ pub struct PullArgs {
     pub all: bool,
     /// Limit fetched history to this many commits (`--depth`).
     pub depth: i32,
+}
+
+/// One change of git's raw diff format, as `git diff-pairs` reads it.
+#[derive(Debug, Clone, Default)]
+pub struct RawPair {
+    pub old_mode: u32,
+    pub new_mode: u32,
+    pub old_id: String,
+    pub new_id: String,
+    /// `A`, `C`, `D`, `M`, `R` or `T`.
+    pub status: char,
+    /// The rename or copy score in percent.
+    pub score: u16,
+    pub old_path: String,
+    pub new_path: String,
 }
 
 /// `git push` flags beyond the remote and refspecs.

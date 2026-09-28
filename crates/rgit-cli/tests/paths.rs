@@ -289,3 +289,166 @@ fn clean_lists_and_removes_what_git_clean_does() {
         assert_eq!(tree(&b), tree(&a), "{flags} {input:?}");
     }
 }
+
+/// `tool args` in `dir` with `env`, the user's config kept out: stdout and
+/// whether it succeeded.
+fn stdout_of(tool: &str, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, bool) {
+    let home = dir.with_extension("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let out = Command::new(tool)
+        .args(args)
+        .current_dir(dir)
+        .envs(env.iter().copied())
+        .env("HOME", &home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("RGIT_OPLOG", "0")
+        .output()
+        .unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.success(),
+    )
+}
+
+/// `rgit --human args` and `git args` in `dir` give the same stdout and
+/// success.
+fn same(dir: &Path, args: &[&str], env: &[(&str, &str)]) {
+    let mut rargs = vec!["--human"];
+    rargs.extend(args);
+    let got = stdout_of(env!("CARGO_BIN_EXE_rgit"), dir, &rargs, env);
+    assert_eq!(got, stdout_of("git", dir, args, env), "{args:?} {env:?}");
+}
+
+/// [`repo`] with `*.txt` marked `text`, edits, a staged change and untracked
+/// files.
+fn magic_repo(tag: &str) -> PathBuf {
+    let dir = repo(tag);
+    std::fs::write(dir.join("dir/t.txt"), "t\n").unwrap();
+    std::fs::write(dir.join(".gitattributes"), "*.txt text\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-qm", "attrs"]);
+    for p in ["dir/a", "dir/sub/b", "c.txt", "other/o", "dir/t.txt"] {
+        std::fs::write(dir.join(p), "2\n").unwrap();
+    }
+    std::fs::write(dir.join("new.txt"), "n\n").unwrap();
+    std::fs::write(dir.join("dir/new"), "m\n").unwrap();
+    git(&dir, &["add", "dir/sub/b", "c.txt"]);
+    dir
+}
+
+const MAGIC: &[&str] = &[
+    ":!dir",
+    ":^dir/sub",
+    ":(exclude)*.txt",
+    ":(icase)DIR/A",
+    ":(glob)*.txt",
+    ":(glob)**/b",
+    ":(glob)dir/*",
+    ":(literal)*.txt",
+    ":/c.txt",
+    ":(top,icase)C.TXT",
+    ":(attr:text)",
+    ":(attr:-text)",
+];
+
+#[test]
+fn pathspec_magic_selects_what_git_selects() {
+    let dir = magic_repo("magic-read");
+    for spec in MAGIC.iter().chain(&[":(bogus)x", ":(literal,glob)x"]) {
+        for args in [
+            &["status", "--short", "--"][..],
+            &["diff", "--stat", "--"],
+            &["ls-files", "--"],
+            &["log", "--format=%s", "--"],
+            &["grep", "-n", ".", "--"],
+        ] {
+            let mut args = args.to_vec();
+            args.push(spec);
+            same(&dir, &args, &[]);
+        }
+    }
+    let sub = dir.join("dir");
+    for spec in [":!a", ":(icase)T.TXT", ":(top)c.txt", ":!sub"] {
+        same(&sub, &["status", "--short", "--", spec], &[]);
+        same(&sub, &["ls-files", "--", spec], &[]);
+        same(&sub, &["grep", "-n", ".", "--", spec], &[]);
+    }
+    for (env, spec) in [
+        (("GIT_GLOB_PATHSPECS", "1"), "*.txt"),
+        (("GIT_NOGLOB_PATHSPECS", "1"), "*.txt"),
+        (("GIT_ICASE_PATHSPECS", "1"), "DIR"),
+        (("GIT_LITERAL_PATHSPECS", "1"), ":/c.txt"),
+    ] {
+        same(&dir, &["status", "--short", "--", spec], &[env]);
+        same(&dir, &["ls-files", "--", spec], &[env]);
+        same(&dir, &["diff", "--stat", "--", spec], &[env]);
+    }
+    let both = [("GIT_GLOB_PATHSPECS", "1"), ("GIT_NOGLOB_PATHSPECS", "1")];
+    same(&dir, &["status", "--short", "--", "c.txt"], &both);
+    same(&dir, &["--glob-pathspecs", "ls-files", "--", "*.txt"], &[]);
+    same(
+        &dir,
+        &["--icase-pathspecs", "status", "--short", "--", "C.TXT"],
+        &[],
+    );
+}
+
+#[test]
+fn pathspec_magic_changes_what_git_changes() {
+    let state = |dir: &Path| {
+        let stashes = stdout_of("git", dir, &["stash", "list", "--format=stash"], &[]);
+        git(dir, &["status", "--short"]) + &stashes.0
+    };
+    let list = std::env::temp_dir().join(format!("rgit-paths-{}-list", std::process::id()));
+    std::fs::write(&list, "c.txt\n:(glob)dir/*\n").unwrap();
+    let from_file = format!("--pathspec-from-file={}", list.display());
+    for spec in [
+        ":!dir",
+        ":(exclude)*.txt",
+        ":(icase)DIR/A",
+        ":(glob)dir/*",
+        ":(attr:text)",
+    ] {
+        for cmd in [
+            &["add"][..],
+            &["add", "-u"],
+            &["rm", "-q", "-r", "--cached"],
+            &["restore"],
+            &["restore", "--staged"],
+            &["checkout"],
+            &["reset", "-q"],
+            &["stash", "push", "-q"],
+            &["commit", "-qm", "x"],
+        ] {
+            let (a, b) = (magic_repo("magic-git"), magic_repo("magic-rgit"));
+            let mut args = cmd.to_vec();
+            args.extend(["--", spec]);
+            let want = stdout_of("git", &a, &args, &[]).1;
+            let mut rargs = vec!["--human"];
+            rargs.extend(&args);
+            let got = stdout_of(env!("CARGO_BIN_EXE_rgit"), &b, &rargs, &[]).1;
+            assert_eq!((got, state(&b)), (want, state(&a)), "{args:?}");
+            if spec == ":!dir" {
+                let (a, b) = (magic_repo("magic-git"), magic_repo("magic-rgit"));
+                let mut args = cmd.to_vec();
+                args.push(&from_file);
+                stdout_of("git", &a, &args, &[]);
+                let mut rargs = vec!["--human"];
+                rargs.extend(&args);
+                stdout_of(env!("CARGO_BIN_EXE_rgit"), &b, &rargs, &[]);
+                assert_eq!(state(&b), state(&a), "{args:?}");
+            }
+        }
+    }
+    let (a, b) = (magic_repo("magic-git"), magic_repo("magic-rgit"));
+    let sub = |d: &Path| d.join("dir");
+    stdout_of("git", &sub(&a), &["add", "--", ":!new", ":(top)c.txt"], &[]);
+    stdout_of(
+        env!("CARGO_BIN_EXE_rgit"),
+        &sub(&b),
+        &["--human", "add", "--", ":!new", ":(top)c.txt"],
+        &[],
+    );
+    assert_eq!(state(&b), state(&a));
+}

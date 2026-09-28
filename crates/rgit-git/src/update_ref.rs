@@ -1,6 +1,7 @@
 //! `git update-ref`'s all-or-nothing transactions, with its `symref-*`
 //! commands and `--batch-updates` rejections.
 
+use crate::rev::RevParse;
 use std::collections::HashSet;
 
 use git2::{Oid, Repository};
@@ -32,7 +33,7 @@ pub(crate) fn update_refs(
         if v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Ok(Oid::from_str(v)?);
         }
-        let obj = repo.revparse_single(v)?;
+        let obj = repo.rev_single(v)?;
         Ok(obj.peel_to_commit().map_or(obj.id(), |c| c.id()))
     };
     let head = repo

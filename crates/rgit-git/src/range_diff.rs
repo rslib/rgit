@@ -184,9 +184,7 @@ fn entry(
         _ => Some(c.parent(0)?.tree()?),
     };
     let mut limit = git2::DiffOptions::new();
-    for p in paths {
-        limit.pathspec(p);
-    }
+    crate::pathspec::limit_diff(&mut limit, paths)?;
     let mut diff = repo.diff_tree_to_tree(parent.as_ref(), Some(&c.tree()?), Some(&mut limit))?;
     diff.find_similar(Some(DiffFindOptions::new().renames(true)))?;
     let mut diff_size = 0;

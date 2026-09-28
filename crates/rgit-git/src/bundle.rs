@@ -1,6 +1,7 @@
 //! `git bundle`: a ref list plus a packfile in one file, made and read with
 //! libgit2's pack builder and pack writer.
 
+use crate::rev::RevParse;
 use std::path::Path;
 
 use git2::{Oid, Repository};
@@ -103,13 +104,13 @@ pub(crate) fn create(repo: &Repository, path: &Path, args: &[String]) -> Result<
             "--tags" => add_refs("refs/tags/", &mut refs)?,
             "--remotes" => add_refs("refs/remotes/", &mut refs)?,
             a if a.starts_with('^') => {
-                walk.hide(repo.revparse_single(&a[1..])?.peel_to_commit()?.id())?
+                walk.hide(repo.rev_single(&a[1..])?.peel_to_commit()?.id())?
             }
             a if a.contains("..") => {
                 let (from, to) = a.split_once("..").unwrap_or((a, ""));
                 let to = if to.is_empty() { "HEAD" } else { to };
                 if !from.is_empty() {
-                    walk.hide(repo.revparse_single(from)?.peel_to_commit()?.id())?;
+                    walk.hide(repo.rev_single(from)?.peel_to_commit()?.id())?;
                 }
                 refs.extend(ref_of(repo, to)?);
             }

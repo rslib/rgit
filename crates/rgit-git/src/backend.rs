@@ -7,6 +7,9 @@ pub type RemoteHeads = (Vec<(String, String)>, Option<String>);
 /// The read/mutation surface the TUI drives, kept abstract so a gix-native or
 /// libgit2 implementation can back each operation independently.
 ///
+/// The refs a fetch-pack fetched (id, name) and the names the remote lacks.
+pub type FetchedRefs = (Vec<(String, String)>, Vec<String>);
+
 /// Send + Sync so a handle can be shared with blocking refresh tasks.
 pub trait GitBackend: Send + Sync {
     /// The repository's working directory, e.g. to watch for changes.
@@ -252,6 +255,29 @@ pub trait GitBackend: Send + Sync {
         report: &dyn Fn(crate::OpProgress),
     ) -> Result<(), GitError>;
 
+    /// `git fetch-pack`: fetch `refs` (full names, or every ref with `all`)
+    /// from the repository at `url` into the object store, updating no ref.
+    /// Returns each fetched ref's id and name in the remote's order, and the
+    /// names it does not have.
+    fn fetch_pack(
+        &self,
+        url: &str,
+        refs: &[String],
+        all: bool,
+        depth: Option<i32>,
+    ) -> Result<FetchedRefs, GitError>;
+
+    /// `git send-pack`: push `refspecs` (with none, the branches both sides
+    /// have) to the repository at `url`, with no remote config, hooks or
+    /// remote-tracking refs; the report goes to `report`.
+    fn send_pack(
+        &self,
+        url: &str,
+        refspecs: &[String],
+        args: &crate::PushArgs,
+        report: &dyn Fn(crate::OpProgress),
+    ) -> Result<(), GitError>;
+
     /// Push all local tags to `remote` (or the upstream's remote), like
     /// `git push --tags`.
     fn push_tags(
@@ -415,6 +441,10 @@ pub trait GitBackend: Send + Sync {
     /// limited to pathspecs, with git's context and whitespace options.
     fn diff(&self, spec: &crate::DiffSpec) -> Result<Vec<crate::FileDiff>, GitError>;
 
+    /// The regex `--word-diff` splits a file pair into words with: the
+    /// drivers' `wordRegex` (old path first), else `diff.wordRegex`.
+    fn word_regex(&self, old: Option<&str>, new: &str) -> Result<Option<Vec<u8>>, GitError>;
+
     /// The working-tree diff for one file: unstaged (index vs workdir) when
     /// `staged` is false, staged (HEAD vs index) when true. None if unchanged.
     fn file_diff(&self, path: &str, staged: bool) -> Result<Option<crate::FileDiff>, GitError>;
@@ -575,6 +605,11 @@ pub trait GitBackend: Send + Sync {
     /// continue it. Returns what git prints.
     fn bisect(&self, args: &[String]) -> Result<String, GitError>;
 
+    /// Run `git rerere` (no argument, `clear`, `forget <paths>`, `status`,
+    /// `remaining`, `diff` or `gc`) on git's rr-cache; `autoupdate` is
+    /// `--[no-]rerere-autoupdate`. Returns what git prints on stdout.
+    fn rerere(&self, args: &[String], autoupdate: Option<bool>) -> Result<String, GitError>;
+
     /// Config entries as `(name, value)`: every entry when `name` is `None`,
     /// else each value of `name` (a multivar has several), oldest first.
     fn config_entries(
@@ -617,19 +652,26 @@ pub trait GitBackend: Send + Sync {
     /// The note attached to `rev`.
     fn note_show(&self, notes_ref: Option<&str>, rev: &str) -> Result<String, GitError>;
 
-    /// Attach `message` as the note of `rev`. `append` adds it as a new
-    /// paragraph to an existing note; otherwise an existing note needs `force`.
+    /// Set `message` as the note of `rev`, committing as `git notes <cmd>`
+    /// (add, append, edit) does.
     fn note_add(
         &self,
         notes_ref: Option<&str>,
         rev: &str,
         message: &str,
-        force: bool,
-        append: bool,
+        cmd: &str,
     ) -> Result<(), GitError>;
 
-    /// Remove the note of `rev`.
-    fn note_remove(&self, notes_ref: Option<&str>, rev: &str) -> Result<(), GitError>;
+    /// Remove the notes of `revs` in one commit as `git notes <cmd>` does,
+    /// returning which had a note; with `all_or_nothing` nothing is committed
+    /// when one had none.
+    fn note_remove(
+        &self,
+        notes_ref: Option<&str>,
+        revs: &[String],
+        all_or_nothing: bool,
+        cmd: &str,
+    ) -> Result<Vec<bool>, GitError>;
 
     /// Copy the note of `from` to `to`; an existing note on `to` needs `force`.
     fn note_copy(
@@ -1290,6 +1332,29 @@ pub trait GitBackend: Send + Sync {
     /// An object's size on disk and the id of its delta base, if stored as
     /// a delta (cat-file's `%(objectsize:disk)` and `%(deltabase)`).
     fn object_disk(&self, id: &str) -> Result<(u64, Option<String>), GitError>;
+
+    /// One `git diff-pairs` record as a [`crate::FileDiff`] with git's
+    /// header: the diff of its blobs.
+    fn diff_pair(
+        &self,
+        pair: &crate::RawPair,
+        context: Option<u32>,
+    ) -> Result<crate::FileDiff, GitError>;
+
+    /// An object's type and size, from its header alone.
+    fn object_header(&self, id: &str) -> Result<(String, u64), GitError>;
+
+    /// rev-list's `--bisect` over `tips ^hidden -- paths`: the best commit
+    /// first (every one, best first, with `all`) with its distance from the
+    /// ends, how many commits the best reaches and how many there are.
+    fn rev_list_bisect(
+        &self,
+        tips: &[String],
+        hidden: &[String],
+        first_parent: bool,
+        paths: &[String],
+        all: bool,
+    ) -> Result<crate::BisectPick<String>, GitError>;
 
     /// A blob's content as checked out to `path` (cat-file's `--filters`), or
     /// with `textconv` through its diff driver's textconv command.

@@ -361,4 +361,41 @@ fn info_options() {
     assert_eq!(out(&o), "/x/y\n");
     assert!(rgit(&top, &["--version"]).status.success());
     assert!(rgit(&top, &["--man-path"]).status.success());
+    // rgit has no manuals of its own, so it names git's.
+    for flag in ["--html-path", "--man-path", "--info-path"] {
+        assert_eq!(out(&rgit(&top, &[flag])), out(&git(&top, &[flag])));
+    }
+}
+
+#[test]
+fn alias_pager_and_color_pager() {
+    let top = setup("aliaspager");
+    let r = top.join("r");
+    for (k, v) in [
+        ("alias.l", "log -1 --format=%s"),
+        ("alias.st", "status --short"),
+        ("alias.sh1", "!echo hi"),
+        ("alias.pl", "-p status --short"),
+        ("alias.np", "--no-pager log"),
+        ("alias.cl", "-c log.showRoot=true log -1 --format=%s"),
+    ] {
+        git(&r, &["config", k, v]);
+    }
+    assert!(paged(&r, &["l"], &[]).is_some());
+    assert!(paged(&r, &["-c", "pager.l=false", "l"], &[]).is_none());
+    assert!(paged(&r, &["st"], &[]).is_none());
+    let text = paged(&r, &["-c", "pager.sh1=true", "sh1"], &[]).expect("paged");
+    assert!(text.contains("hi"), "{text:?}");
+    assert!(paged(&r, &["pl"], &[]).is_some());
+    let color = [("TERM", "xterm")];
+    let fmt = ["log", "-1", "--format=%C(red)%s"];
+    let text = paged(&r, &fmt, &color).expect("paged");
+    assert!(text.contains("\x1b[31m"), "{text:?}");
+    let off = [&["-c", "color.pager=false"][..], &fmt].concat();
+    let text = paged(&r, &off, &color).expect("paged");
+    assert!(!text.contains('\x1b'), "{text:?}");
+
+    let (o, g) = (rgit(&r, &["np"]), git(&r, &["np"]));
+    assert_eq!((err(&o), o.status.code()), (err(&g), g.status.code()));
+    assert_eq!(out(&rgit(&r, &["cl"])), out(&git(&r, &["cl"])));
 }

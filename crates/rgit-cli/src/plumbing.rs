@@ -228,8 +228,16 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             z,
             full_name,
             error_unmatch,
+            tags,
+            valid_tags,
             mut paths,
         } => {
+            let tags = tags || valid_tags;
+            let tag = |t: &str, lower: bool| match (tags, lower && valid_tags) {
+                (false, _) => String::new(),
+                (true, false) => format!("{t} "),
+                (true, true) => format!("{} ", t.to_ascii_lowercase()),
+            };
             if ignored && !others && !cached {
                 return Err(CliError::usage(
                     "ls-files -i must be used with either -o or -c",
@@ -237,7 +245,8 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             }
             let (_, prefix) = top_and_prefix(backend)?;
             let typed = paths.clone();
-            if paths.is_empty() && !prefix.is_empty() {
+            rgit_git::check_pathspecs(&paths)?;
+            if (paths.is_empty() || rgit_git::only_excludes(&paths)) && !prefix.is_empty() {
                 paths.push(prefix.clone());
             }
             let keep = |p: &str| paths.is_empty() || rgit_git::pathspec_matches(&paths, p);
@@ -273,7 +282,7 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                         push(
                             crate::obj! { "path" => path, "state" => if *state == PathState::Ignored { "ignored" } else { "untracked" } },
                             path,
-                            name(path),
+                            format!("{}{}", tag("?", false), name(path)),
                         );
                     }
                 }
@@ -297,10 +306,16 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                     continue;
                 }
                 if show_cached && !unmerged || unmerged && e.stage != 0 {
+                    let t = match (e.stage, e.skip_worktree) {
+                        (0, false) => "H",
+                        (0, true) => "S",
+                        _ => "M",
+                    };
+                    let t = tag(t, e.assume_unchanged);
                     let line = if stage || unmerged {
-                        format!("{:06o} {} {}\t{}", e.mode, e.id, e.stage, name(&e.path))
+                        format!("{t}{:06o} {} {}\t{}", e.mode, e.id, e.stage, name(&e.path))
                     } else {
-                        name(&e.path)
+                        format!("{t}{}", name(&e.path))
                     };
                     push(
                         crate::obj! { "path" => e.path, "mode" => format!("{:06o}", e.mode), "object" => e.id, "stage" => e.stage as usize },
@@ -312,19 +327,23 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                     continue;
                 }
                 last = &e.path;
-                let state = changed.get(e.path.as_str()).copied();
+                // A skip-worktree file is left out on purpose, not deleted.
+                let state = changed
+                    .get(e.path.as_str())
+                    .copied()
+                    .filter(|_| !e.skip_worktree);
                 if deleted && state == Some(PathState::Deleted) {
                     push(
                         crate::obj! { "path" => e.path, "state" => "deleted" },
                         &e.path,
-                        name(&e.path),
+                        format!("{}{}", tag("R", e.assume_unchanged), name(&e.path)),
                     );
                 }
                 if modified && matches!(state, Some(PathState::Modified | PathState::Deleted)) {
                     push(
                         crate::obj! { "path" => e.path, "state" => "modified" },
                         &e.path,
-                        name(&e.path),
+                        format!("{}{}", tag("C", e.assume_unchanged), name(&e.path)),
                     );
                 }
             }
@@ -756,184 +775,7 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                 )
             }
         }
-        Plumbing::RevList {
-            max_count,
-            count,
-            all,
-            reverse,
-            first_parent,
-            merges,
-            no_merges,
-            parents,
-            skip,
-            branches,
-            tags,
-            remotes,
-            abbrev_commit,
-            since,
-            until,
-            author,
-            committer,
-            grep,
-            ignore_case,
-            objects,
-            objects_edge,
-            missing,
-            walk,
-            revs,
-            paths,
-        } => {
-            let mut globs = Vec::new();
-            for (pattern, base) in [
-                (branches, "refs/heads/"),
-                (tags, "refs/tags/"),
-                (remotes, "refs/remotes/"),
-            ] {
-                if let Some(p) = pattern {
-                    let p = if p.is_empty() { "*" } else { p.as_str() };
-                    let slash = if p.contains(['*', '?', '[']) {
-                        ""
-                    } else {
-                        "/*"
-                    };
-                    globs.push(format!("{base}{p}{slash}"));
-                }
-            }
-            if revs.is_empty() && !all && globs.is_empty() && !walk.merge {
-                return Err(CliError::usage("rev-list needs a revision, e.g. HEAD"));
-            }
-            let missing = missing.as_deref().unwrap_or("error");
-            if !["error", "allow-any", "allow-promisor", "print"].contains(&missing) {
-                return Err(fatal(format!("invalid argument to --missing: '{missing}'")));
-            }
-            let objects = objects || objects_edge;
-            let mut opts = rgit_git::LogOptions {
-                limit: max_count.unwrap_or(usize::MAX),
-                offset: skip.unwrap_or(0),
-                all,
-                revs: revs.clone(),
-                paths,
-                first_parent,
-                merges: (merges || no_merges).then_some(merges),
-                reverse,
-                globs,
-                since: since.as_deref().map(crate::cli::parse_date).transpose()?,
-                until: until.as_deref().map(crate::cli::parse_date).transpose()?,
-                author,
-                committer,
-                grep,
-                grep_ignore_case: ignore_case,
-                rewrite_parents: parents,
-                ..Default::default()
-            };
-            walk.apply(&mut opts);
-            opts.boundary |= objects;
-            let mut commits = backend.rev_walk(&opts)?;
-            if objects && !walk.boundary {
-                commits.retain(|c| c.mark != Some('-'));
-            }
-            // The edges are the excluded parents of the whole range, not only
-            // of the commits -n and --skip leave.
-            let mut edges: Vec<String> = Vec::new();
-            if objects {
-                let all = backend.rev_walk(&rgit_git::LogOptions {
-                    limit: usize::MAX,
-                    offset: 0,
-                    boundary: false,
-                    ..opts.clone()
-                })?;
-                let ids: std::collections::HashSet<&str> =
-                    all.iter().map(|c| c.id.as_str()).collect();
-                for p in all.iter().flat_map(|c| &c.parents) {
-                    if !ids.contains(p.as_str()) && !edges.contains(p) {
-                        edges.push(p.clone());
-                    }
-                }
-            }
-            if count {
-                let (mut left, mut right, mut same) = (0usize, 0usize, 0usize);
-                for c in &commits {
-                    match c.mark {
-                        Some('=') => same += 1,
-                        Some('<') => left += 1,
-                        _ => right += 1,
-                    }
-                }
-                let cherry = walk.cherry_mark || walk.cherry;
-                let text = match (walk.left_right, cherry) {
-                    (true, true) => format!("{left}\t{right}\t{same}\n"),
-                    (true, false) => format!("{left}\t{right}\n"),
-                    (false, true) => format!("{}\t{same}\n", left + right),
-                    (false, false) => format!("{}\n", left + right + same),
-                };
-                return Ok(lines(text).with("count", left + right + same));
-            }
-            let id = |id: &str| -> anyhow::Result<String> {
-                Ok(if abbrev_commit {
-                    backend.abbrev_id(id, 0)?
-                } else {
-                    id.to_owned()
-                })
-            };
-            let mut out = Vec::new();
-            if objects_edge {
-                out.extend(edges.iter().map(|e| format!("-{e}")));
-            }
-            for c in &commits {
-                let mut line = walk.mark(c.mark).map(String::from).unwrap_or_default();
-                line.push_str(&id(&c.id)?);
-                if parents {
-                    for p in &c.parents {
-                        line.push(' ');
-                        line.push_str(&id(p)?);
-                    }
-                }
-                out.push(line);
-            }
-            if objects {
-                // Annotated tags the walk starts from come first, by their names.
-                let mut tips: Vec<String> = revs
-                    .iter()
-                    .filter(|r| !r.starts_with('^') && !r.contains(".."))
-                    .cloned()
-                    .collect();
-                if all {
-                    tips.splice(0..0, backend.ref_details()?.into_iter().map(|r| r.name));
-                }
-                let mut tagged = std::collections::HashSet::new();
-                for tip in tips {
-                    let Ok(obj) = backend.read_object(&tip) else {
-                        continue;
-                    };
-                    if obj.kind != "tag" || !tagged.insert(obj.id.clone()) {
-                        continue;
-                    }
-                    let text = String::from_utf8_lossy(&obj.data);
-                    let name = text
-                        .lines()
-                        .find_map(|l| l.strip_prefix("tag "))
-                        .unwrap_or_default();
-                    out.push(format!("{} {name}", obj.id));
-                }
-                let ids: Vec<String> = commits
-                    .iter()
-                    .filter(|c| c.mark != Some('-'))
-                    .map(|c| c.id.clone())
-                    .collect();
-                let mut absent = Vec::new();
-                for (oid, path, gone) in backend.list_objects(&ids, &edges)? {
-                    if !gone {
-                        out.push(format!("{oid} {path}"));
-                    } else if missing == "error" {
-                        return Err(fatal(format!("missing object {oid}")));
-                    } else if missing == "print" {
-                        absent.push(format!("?{oid}"));
-                    }
-                }
-                out.extend(absent);
-            }
-            lines(terminated(out, false))
-        }
+        c @ Plumbing::RevList { .. } => rev_list(backend, c)?,
         Plumbing::MergeBase {
             all,
             is_ancestor,
@@ -967,6 +809,30 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
         }
         Plumbing::Reflog { max_count, args } => {
             let args: Vec<&String> = args.iter().skip_while(|a| *a == "show").collect();
+            if args.len() > 1 || args.iter().any(|a| a.starts_with('-') || a.contains("@{")) {
+                // `git reflog show` is `git log -g --abbrev-commit --pretty=oneline`.
+                let mut argv: Vec<String> = ["rgit", "log", "-g", "--abbrev-commit"]
+                    .map(str::to_owned)
+                    .into();
+                if !args.iter().any(|a| {
+                    a.starts_with("--pretty") || a.starts_with("--format") || *a == "--oneline"
+                }) {
+                    argv.push("--pretty=oneline".to_owned());
+                }
+                if let Some(n) = max_count {
+                    argv.push(format!("-n{n}"));
+                }
+                argv.extend(args.into_iter().map(|a| match a.strip_prefix('-') {
+                    Some(n) if n.parse::<usize>().is_ok() => format!("-n{n}"),
+                    _ => a.clone(),
+                }));
+                let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(argv)
+                    .map_err(|e| CliError::usage(e.to_string()))?;
+                let Some(command) = cli.command else {
+                    unreachable!("log parses to a command")
+                };
+                return Ok(lines(crate::cli::reflog_log(backend, &command)?));
+            }
             let name = match args.as_slice() {
                 [] => "HEAD",
                 [name] => name.as_str(),
@@ -1315,6 +1181,8 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             root,
             no_commit_id,
             stdin,
+            combined,
+            dense_combined,
             mut args,
             mut paths,
         } => {
@@ -1343,10 +1211,11 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                 None
             };
             let o = rgit_git::DiffTreeOpts {
-                fmt: raw_diff_fmt(backend, &format, args)?,
+                fmt: raw_diff_fmt(backend, &format, args, dense_combined)?,
                 revs,
                 root,
                 no_commit_id,
+                combined: (combined || dense_combined).then_some(dense_combined),
             };
             let got = rgit_git::diff_tree(&backend.git_dir(), &o, input.as_deref())?;
             raw_diff_done(&format, got)
@@ -1363,44 +1232,286 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             }
             on_disk(backend, &args)?;
             args.append(&mut paths);
-            let fmt = raw_diff_fmt(backend, &format, args)?;
+            let fmt = raw_diff_fmt(backend, &format, args, false)?;
             let got = rgit_git::diff_index(&backend.git_dir(), &rev, cached, &fmt)?;
             raw_diff_done(&format, got)
         }
         Plumbing::DiffFiles { format, paths } => {
-            let fmt = raw_diff_fmt(backend, &format, paths)?;
+            let fmt = raw_diff_fmt(backend, &format, paths, false)?;
             raw_diff_done(&format, rgit_git::diff_files(&backend.git_dir(), &fmt)?)
         }
-        Plumbing::MergeTree {
-            name_only,
-            messages,
-            no_messages,
-            z,
-            allow_unrelated_histories,
-            merge_base,
-            branch1,
-            branch2,
-            ..
+        m @ Plumbing::MergeTree { .. } => merge_tree(backend, m, raw)?,
+        Plumbing::FastExport { args } => {
+            if raw {
+                let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+                rgit_git::fast_export(&backend.git_dir(), &args, &mut out)
+                    .map_err(|e| fatal(e.to_string()))?;
+                return Ok(Output::new(String::new()));
+            }
+            let mut out = Vec::new();
+            rgit_git::fast_export(&backend.git_dir(), &args, &mut out)
+                .map_err(|e| fatal(e.to_string()))?;
+            let text = String::from_utf8_lossy(&out).into_owned();
+            Output::new(text.clone())
+                .with("bytes", out.len())
+                .long("stream", text)
+        }
+        Plumbing::FastImport { args } => {
+            let quiet = args.iter().any(|a| a == "--quiet");
+            let mut stdin = std::io::stdin().lock();
+            let mut replies = Vec::new();
+            let report = if raw {
+                let mut out = std::io::stdout().lock();
+                rgit_git::fast_import(&backend.git_dir(), &args, &mut stdin, &mut out)
+            } else {
+                rgit_git::fast_import(&backend.git_dir(), &args, &mut stdin, &mut replies)
+            }
+            .map_err(|e| fatal(e.to_string()))?;
+            if raw && !quiet {
+                eprint!("{}", report.stats);
+            }
+            crate::cli::set_exit(!report.ok);
+            let text = String::from_utf8_lossy(&replies).into_owned();
+            Output::new(text.clone())
+                .with("ok", report.ok)
+                .with("replies", text.lines().collect::<Vec<_>>())
+                .long("stats", report.stats)
+        }
+        Plumbing::Replay {
+            onto,
+            advance,
+            contained,
+            revs,
         } => {
-            let o = rgit_git::MergeTreeOpts {
-                branch1,
-                branch2,
-                merge_base,
-                allow_unrelated: allow_unrelated_histories,
-                name_only,
-                messages: (messages || no_messages).then_some(messages),
-                z,
+            match (&onto, &advance) {
+                (None, None) => {
+                    return Err(CliError::usage("option --onto or --advance is mandatory"));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(fatal(
+                        "options '--onto' and '--advance' cannot be used together",
+                    ));
+                }
+                (None, Some(_)) if contained => {
+                    return Err(fatal(
+                        "options '--advance' and '--contained' cannot be used together",
+                    ));
+                }
+                _ => {}
+            }
+            let o = rgit_git::ReplayOpts {
+                onto,
+                advance,
+                contained,
+                revs,
             };
             let (text, clean) =
-                rgit_git::merge_tree(&backend.git_dir(), &o).map_err(|e| fatal(e.to_string()))?;
+                rgit_git::replay(&backend.git_dir(), &o).map_err(|e| fatal(e.to_string()))?;
             crate::cli::set_exit(!clean);
-            lines(text)
+            let updates: Vec<String> = text.lines().map(str::to_owned).collect();
+            lines(text).with("updates", updates).with("clean", clean)
         }
         m @ Plumbing::MergeFile { .. } => merge_file(Some(backend), m, raw)?,
         Plumbing::InterpretTrailers { args, input } => {
             interpret_trailers(Some(&backend.git_dir()), args, input)?
         }
         c @ Plumbing::ShowBranch { .. } => show_branch(backend, c, raw, true)?,
+        Plumbing::FetchPack {
+            all,
+            stdin,
+            depth,
+            repository,
+            mut refs,
+            ..
+        } => {
+            if stdin {
+                let mut input = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+                refs.extend(input.lines().filter(|l| !l.is_empty()).map(str::to_owned));
+            }
+            let (got, absent) = backend.fetch_pack(&repository, &refs, all, depth)?;
+            let text = terminated(got.iter().map(|(id, name)| format!("{id} {name}")), false);
+            if !absent.is_empty() {
+                print!("{text}");
+                for name in &absent {
+                    eprintln!("error: no such remote ref {name}");
+                }
+                return Err(fail(raw, true, ""));
+            }
+            let rows = got
+                .iter()
+                .map(|(id, name)| crate::obj! { "ref" => name, "id" => id })
+                .collect();
+            table(text, "refs", rows, &["ref", "id"], "0 refs fetched")
+        }
+        Plumbing::DiffPairs {
+            z,
+            patch,
+            no_patch,
+            stat,
+            shortstat,
+            numstat,
+            name_only,
+            name_status,
+            unified,
+        } => {
+            if !z {
+                return Err(anyhow::Error::new(CliError {
+                    message: "usage: working without -z is not supported".to_owned(),
+                    help: None,
+                    code: 129,
+                }));
+            }
+            let mut input = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut input)?;
+            let render = |batch: &[rgit_git::RawPair], text: &mut String| -> anyhow::Result<()> {
+                if batch.is_empty() {
+                    return Ok(());
+                }
+                let files = batch
+                    .iter()
+                    .map(|p| backend.diff_pair(p, unified))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| fatal(e.to_string()))?;
+                for (p, f) in batch.iter().zip(&files) {
+                    let paths = if matches!(p.status, 'R' | 'C') {
+                        format!("{}\0{}\0", p.old_path, p.new_path)
+                    } else {
+                        format!("{}\0", p.new_path)
+                    };
+                    if name_only {
+                        text.push_str(&format!("{}\0", p.new_path));
+                    } else if name_status {
+                        let score = if p.score > 0 {
+                            format!("{:03}", p.score)
+                        } else {
+                            String::new()
+                        };
+                        text.push_str(&format!("{}{score}\0{paths}", p.status));
+                    } else if numstat {
+                        let (add, del) = crate::axi::line_counts(f);
+                        let counts = if f.binary {
+                            "-\t-".to_owned()
+                        } else {
+                            format!("{add}\t{del}")
+                        };
+                        let sep = if matches!(p.status, 'R' | 'C') {
+                            "\t\0"
+                        } else {
+                            "\t"
+                        };
+                        text.push_str(&format!("{counts}{sep}{paths}"));
+                    }
+                }
+                if name_only || name_status || numstat || no_patch {
+                    return Ok(());
+                }
+                if shortstat {
+                    text.push_str(&crate::render::stat_summary(&files));
+                    text.push('\n');
+                    return Ok(());
+                }
+                if stat {
+                    text.push_str(&crate::render::stat(&files, 0));
+                    text.push('\n');
+                    if !patch {
+                        return Ok(());
+                    }
+                    text.push('\0');
+                }
+                text.push_str(&crate::render::patch(&files));
+                Ok(())
+            };
+            let mut text = String::new();
+            let mut batch = Vec::new();
+            let mut fields = input
+                .split(|b| *b == 0)
+                .map(|f| String::from_utf8_lossy(f).into_owned())
+                .peekable();
+            while let Some(meta) = fields.next() {
+                if meta.is_empty() {
+                    // An empty record flushes the batch and is echoed.
+                    if fields.peek().is_some() {
+                        render(&batch, &mut text)?;
+                        batch.clear();
+                        text.push('\0');
+                    }
+                    continue;
+                }
+                let bad = || fatal(format!("unable to parse raw diff: {meta}"));
+                let words: Vec<&str> = meta.strip_prefix(':').ok_or_else(bad)?.split(' ').collect();
+                let [old_mode, new_mode, old_id, new_id, status] = words[..] else {
+                    return Err(bad());
+                };
+                let mode = |m: &str| u32::from_str_radix(m, 8).map_err(|_| bad());
+                let letter = status.chars().next().ok_or_else(bad)?;
+                let path = fields.next().ok_or_else(bad)?;
+                let new_path = if matches!(letter, 'R' | 'C') {
+                    fields.next().ok_or_else(bad)?
+                } else {
+                    path.clone()
+                };
+                batch.push(rgit_git::RawPair {
+                    old_mode: mode(old_mode)?,
+                    new_mode: mode(new_mode)?,
+                    old_id: old_id.to_owned(),
+                    new_id: new_id.to_owned(),
+                    status: letter,
+                    score: status[1..].parse().unwrap_or(0),
+                    old_path: path,
+                    new_path,
+                });
+            }
+            render(&batch, &mut text)?;
+            lines(text)
+        }
+        Plumbing::SendPack {
+            all,
+            mirror,
+            dry_run,
+            force,
+            atomic,
+            verbose,
+            repository,
+            refs,
+            ..
+        } => {
+            let args = rgit_git::PushArgs {
+                all,
+                mirror,
+                dry_run,
+                force,
+                atomic,
+                verbose,
+                ..Default::default()
+            };
+            let lines_out = std::sync::Mutex::new(Vec::new());
+            let pushed = backend.send_pack(&repository, &refs, &args, &|p| {
+                if let rgit_git::OpProgress::Line(l) = p {
+                    lines_out.lock().expect("lines").push(l);
+                }
+            });
+            let report = lines_out.into_inner().expect("lines");
+            match pushed {
+                Ok(()) => {
+                    for l in &report {
+                        eprintln!("{l}");
+                    }
+                    Output::new(String::new()).with("report", report.join("\n"))
+                }
+                Err(rgit_git::GitError::PushFailed(text)) => {
+                    // send-pack reports the refs without push's advice.
+                    for l in text
+                        .lines()
+                        .take_while(|l| !l.starts_with("error: failed to push some refs"))
+                    {
+                        eprintln!("{l}");
+                    }
+                    return Err(fail(raw, true, text));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
         command => index_plumbing(backend, command, raw)?,
     })
 }
@@ -1710,11 +1821,19 @@ fn index_plumbing(
             index_only,
             dry_run,
             aggressive,
+            trivial,
+            index_output,
+            no_sparse_checkout: _,
             prefix,
             empty,
             verbose: _,
             trees,
         } => {
+            if trees.is_empty() && !empty && !merge && !reset && prefix.is_none() && raw {
+                eprintln!(
+                    "warning: read-tree: emptying the index with no arguments is deprecated; use --empty"
+                );
+            }
             let opts = rgit_git::ReadTreeOpts {
                 merge,
                 reset,
@@ -1722,8 +1841,10 @@ fn index_plumbing(
                 index_only,
                 dry_run,
                 aggressive,
+                trivial,
                 prefix,
                 empty,
+                index_output,
             };
             rgit_git::read_tree(git_dir, &trees, &opts).map_err(fatal_of)?;
             Output::new(String::new()).with(
@@ -1739,6 +1860,20 @@ fn index_plumbing(
             let mut input = stdin;
             done(rgit_git::update_index(git_dir, &cwd, &args, &mut input).map_err(fatal_of)?)
         }
+        Plumbing::SparseCheckout { args } => {
+            let mut input = stdin;
+            let usage = |e: rgit_git::GitError| match e {
+                rgit_git::GitError::Other(m) if m.contains("\nusage: ") => {
+                    anyhow::Error::new(CliError {
+                        message: m,
+                        help: None,
+                        code: 129,
+                    })
+                }
+                e => fatal_of(e),
+            };
+            done(rgit_git::sparse_checkout(git_dir, &cwd, &args, &mut input).map_err(usage)?)
+        }
         Plumbing::CheckoutIndex {
             all,
             force,
@@ -1746,6 +1881,8 @@ fn index_plumbing(
             quiet,
             no_create,
             prefix,
+            stage,
+            temp,
             stdin: from_stdin,
             z,
             mut paths,
@@ -1767,6 +1904,13 @@ fn index_plumbing(
                 quiet,
                 no_create,
                 prefix,
+                stage: match stage.as_deref() {
+                    Some("all") => rgit_git::ALL_STAGES,
+                    Some(n) => n.parse().unwrap_or(0),
+                    None => 0,
+                },
+                temp,
+                z,
             };
             done(rgit_git::checkout_index(git_dir, &cwd, &paths, &opts).map_err(fatal_of)?)
         }
@@ -1970,8 +2114,17 @@ fn show_branch(
         "auto" => raw && std::io::IsTerminal::is_terminal(&std::io::stdout()),
         _ => false,
     };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let reflog_date = reflog
+        .as_ref()
+        .and_then(|r| r.1.as_deref())
+        .filter(|b| !b.bytes().all(|c| c.is_ascii_digit()))
+        .map(|b| crate::date::approxidate_at(b, now).unwrap_or(now));
     let o = rgit_git::ShowBranchOpts {
         revs,
+        reflog_date,
         all,
         remotes,
         current,
@@ -2386,6 +2539,140 @@ pub fn get_tar_commit_id() -> anyhow::Result<Output> {
     Ok(lines(String::from_utf8_lossy(&rest[..len]).into_owned()))
 }
 
+/// `git merge-tree`: a real merge of two commits, a batch of them from
+/// stdin, or the old trivial merge of three trees.
+fn merge_tree(backend: &Arc<dyn GitBackend>, m: Plumbing, raw: bool) -> anyhow::Result<Output> {
+    let Plumbing::MergeTree {
+        write_tree,
+        trivial_merge,
+        quiet,
+        stdin,
+        xopts,
+        name_only,
+        messages,
+        no_messages,
+        z,
+        allow_unrelated_histories,
+        merge_base,
+        args,
+    } = m
+    else {
+        unreachable!()
+    };
+    let usage = || {
+        CliError::usage(
+            "usage: git merge-tree [--write-tree] [<options>] <branch1> <branch2>\n   \
+             or: git merge-tree [--trivial-merge] <base-tree> <branch1> <branch2>",
+        )
+    };
+    let incompatible = || fatal("--trivial-merge is incompatible with all other options");
+    // An unknown branch exits 1, as git's help_unknown_ref does.
+    let merge_error = |e: rgit_git::GitError| {
+        let message = e.to_string();
+        let code = if message.ends_with("not something we can merge") {
+            1
+        } else {
+            128
+        };
+        anyhow::Error::new(CliError {
+            message,
+            help: None,
+            code,
+        })
+    };
+    if quiet {
+        for (on, name) in [
+            (messages, "--messages"),
+            (name_only, "--name-only"),
+            (stdin, "--stdin"),
+            (z, "-z"),
+        ] {
+            if on {
+                return Err(fatal(format!(
+                    "options '--quiet' and '{name}' cannot be used together"
+                )));
+            }
+        }
+    }
+    if trivial_merge && !xopts.is_empty() {
+        return Err(incompatible());
+    }
+    let git_dir = backend.git_dir();
+    let mut o = rgit_git::MergeTreeOpts {
+        merge_base,
+        allow_unrelated: allow_unrelated_histories,
+        name_only,
+        messages: if quiet {
+            Some(false)
+        } else {
+            (messages || no_messages).then_some(messages)
+        },
+        z,
+        xopts,
+        prefix: top_and_prefix(backend).map(|(_, p)| p).unwrap_or_default(),
+        ..Default::default()
+    };
+    if stdin {
+        if trivial_merge {
+            return Err(incompatible());
+        }
+        if o.merge_base.is_some() {
+            return Err(fatal(
+                "options '--merge-base' and '--stdin' cannot be used together",
+            ));
+        }
+        (o.z, o.batch) = (true, true);
+        let mut text = String::new();
+        let mut stdout = std::io::stdout();
+        for line in std::io::BufRead::split(std::io::stdin().lock(), b'\n') {
+            let line = String::from_utf8_lossy(&line?).into_owned();
+            let parts: Vec<&str> = line.split_inclusive(' ').map(str::trim_end).collect();
+            let malformed = || fatal(format!("malformed input line: '{line}'."));
+            let (base, b1, b2) = match parts[..] {
+                [base, "--", b1, b2] => (Some(base), b1, b2),
+                [b1, b2] if b2 != "--" => (None, b1, b2),
+                _ => return Err(malformed()),
+            };
+            o.merge_base = base.map(str::to_owned);
+            (o.branch1, o.branch2) = (b1.to_owned(), b2.to_owned());
+            let (out, _) = rgit_git::merge_tree(&git_dir, &o).map_err(merge_error)?;
+            if raw {
+                stdout.write_all(out.as_bytes())?;
+                stdout.flush()?;
+            } else {
+                text.push_str(&out);
+            }
+        }
+        return Ok(lines(text));
+    }
+    if trivial_merge || (!write_tree && args.len() == 3) {
+        if args.len() != 3 {
+            return Err(usage());
+        }
+        if quiet
+            || name_only
+            || messages
+            || no_messages
+            || z
+            || allow_unrelated_histories
+            || o.merge_base.is_some()
+            || !o.xopts.is_empty()
+        {
+            return Err(incompatible());
+        }
+        let (text, warnings) =
+            rgit_git::merge_tree_trivial(&git_dir, [&args[0], &args[1], &args[2]])
+                .map_err(|e| fatal(e.to_string()))?;
+        eprint!("{warnings}");
+        return Ok(lines(text));
+    }
+    let [b1, b2] = <[String; 2]>::try_from(args).map_err(|_| usage())?;
+    (o.branch1, o.branch2) = (b1, b2);
+    let (text, clean) = rgit_git::merge_tree(&git_dir, &o).map_err(merge_error)?;
+    crate::cli::set_exit(!clean);
+    Ok(lines(if quiet { String::new() } else { text }))
+}
+
 /// Exit 128 with `message`, as git's `fatal:` does.
 fn fatal(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(CliError {
@@ -2403,6 +2690,28 @@ fn ambiguous(arg: &str) -> anyhow::Error {
     ))
 }
 
+/// Errors of `@{upstream}` and `@{push}` that git reports as they are.
+const GIT_ONLY: [&str; 6] = [
+    "no upstream configured",
+    "not stored as a remote-tracking",
+    "no such branch:",
+    "has no local tracking branch",
+    "cannot resolve 'simple'",
+    "push has no destination",
+];
+
+/// Whether a revision error is one git dies with while parsing (a missing
+/// upstream), before it would call the argument ambiguous.
+pub(crate) fn rev_dies(message: &str) -> bool {
+    GIT_ONLY.iter().any(|m| message.contains(m))
+}
+
+/// The parents of the commit `rev` names.
+fn parent_ids(backend: &Arc<dyn GitBackend>, rev: &str) -> anyhow::Result<Vec<String>> {
+    let obj = backend.read_object(&backend.rev_parse(rev)?)?;
+    Ok(crate::pretty::parse(&obj).parents)
+}
+
 /// Paths given before `--` must exist, as git checks.
 fn on_disk(backend: &Arc<dyn GitBackend>, paths: &[String]) -> anyhow::Result<()> {
     let (top, prefix) = top_and_prefix(backend)?;
@@ -2417,13 +2726,12 @@ fn raw_diff_fmt(
     backend: &Arc<dyn GitBackend>,
     f: &RawDiffArgs,
     paths: Vec<String>,
+    default_patch: bool,
 ) -> anyhow::Result<rgit_git::DiffFmt> {
     use rgit_git::DiffMode;
     let (top, prefix) = top_and_prefix(backend)?;
     let mode = if f.quiet || f.no_patch {
         DiffMode::Nothing
-    } else if f.patch {
-        DiffMode::Patch
     } else if f.name_only {
         DiffMode::NameOnly
     } else if f.name_status {
@@ -2431,16 +2739,45 @@ fn raw_diff_fmt(
     } else {
         DiffMode::Raw
     };
+    let stat = f.stat.is_some();
+    let patch = f.patch || (default_patch && !f.raw && !stat && !f.summary);
+    let score = f
+        .find_copies
+        .iter()
+        .rev()
+        .chain(&f.find_renames)
+        .find(|s| !s.is_empty())
+        .cloned();
     Ok(rgit_git::DiffFmt {
         mode,
         z: f.z,
-        recursive: f.recursive || f.trees,
+        recursive: f.recursive
+            || f.trees
+            || (mode == DiffMode::Raw && (patch || stat || f.summary)),
         trees: f.trees,
         paths: paths
             .iter()
             .map(|p| crate::cli::repo_path(&top, Path::new(&prefix), p))
             .filter(|p| p != ".")
             .collect(),
+        raw: f.raw || !(patch || stat || f.summary),
+        stat,
+        summary: f.summary,
+        patch,
+        detect: if f.find_copies_harder || f.find_copies.len() > 1 {
+            3
+        } else if !f.find_copies.is_empty() {
+            2
+        } else {
+            u8::from(f.find_renames.is_some())
+        },
+        score,
+        abbrev: f.abbrev,
+        stat_width: f
+            .stat
+            .as_deref()
+            .and_then(|s| s.split(',').next()?.parse().ok())
+            .unwrap_or_else(crate::render::term_columns),
     })
 }
 
@@ -2500,6 +2837,7 @@ pub(crate) fn merge_file(
         style: (diff3 || zdiff3).then(|| if zdiff3 { "zdiff3" } else { "diff3" }.to_owned()),
         marker_size,
         alnum: true,
+        ..Default::default()
     };
     let (merged, conflicts) = rgit_git::merge_file(&a, &b, &c, &o)?;
     crate::cli::set_exit_code(conflicts.min(127) as i32);
@@ -2605,7 +2943,9 @@ fn rev_parse(
     // A revision as (name, negated) items: `A..B` is B and ^A.
     let expand = |rev: &str, not: bool| -> anyhow::Result<Vec<(String, bool)>> {
         let or_head = |s: &str| if s.is_empty() { "HEAD" } else { s }.to_owned();
-        let items = if let Some((a, b)) = rev.split_once("...") {
+        let items = if !rev.starts_with('^') && backend.resolve_object(rev).is_ok() {
+            vec![(rev.to_owned(), not)]
+        } else if let Some((a, b)) = rev.split_once("...") {
             let (a, b) = (or_head(a), or_head(b));
             let bases = backend.merge_bases(&a, &b, true)?;
             let mut items = vec![(b, not), (a, not)];
@@ -2615,6 +2955,21 @@ fn rev_parse(
             vec![(or_head(b), not), (or_head(a), !not)]
         } else if let Some(r) = rev.strip_prefix('^') {
             vec![(r.to_owned(), !not)]
+        } else if let Some(base) = rev.strip_suffix("^@") {
+            (1..=parent_ids(backend, base)?.len())
+                .map(|i| (format!("{base}^{i}"), not))
+                .collect()
+        } else if let Some(base) = rev.strip_suffix("^!") {
+            let mut items = vec![(base.to_owned(), not)];
+            let n = parent_ids(backend, base)?.len();
+            items.extend((1..=n).map(|i| (format!("{base}^{i}"), !not)));
+            items
+        } else if let Some((base, n)) = rev
+            .rsplit_once("^-")
+            .filter(|(_, n)| n.is_empty() || n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            let n = if n.is_empty() { "1" } else { n };
+            vec![(base.to_owned(), not), (format!("{base}^{n}"), !not)]
         } else {
             vec![(rev.to_owned(), not)]
         };
@@ -2693,7 +3048,18 @@ fn rev_parse(
             "--is-shallow-repository" => {
                 out.push(common_dir.join("shallow").exists().to_string());
             }
-            "--show-object-format" | "--show-object-format=storage" => out.push("sha1".to_owned()),
+            "--show-object-format"
+            | "--show-object-format=storage"
+            | "--show-object-format=input"
+            | "--show-object-format=output" => {
+                out.push(
+                    backend
+                        .config_get("extensions.objectformat")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| "sha1".to_owned()),
+                );
+            }
             "--local-env-vars" => out.extend(LOCAL_ENV_VARS.iter().map(|v| v.to_string())),
             "--sq-quote" => out.push(it.by_ref().map(|a| format!(" {}", sq_quote(&a))).collect()),
             a @ ("--all" | "--branches" | "--tags" | "--remotes") => {
@@ -2733,10 +3099,17 @@ fn rev_parse(
                         out.push(arg);
                         paths = true;
                     }
-                    Err(_) => {
-                        return Err(fatal(format!(
-                            "ambiguous argument '{a}': unknown revision or path not in the working tree."
-                        )));
+                    Err(e) => {
+                        let e = e.to_string();
+                        return Err(fatal(
+                            if a.contains("@{") && GIT_ONLY.iter().any(|m| e.contains(m)) {
+                                e
+                            } else {
+                                format!(
+                                    "ambiguous argument '{a}': unknown revision or path not in the working tree."
+                                )
+                            },
+                        ));
                     }
                 }
             }
@@ -2744,7 +3117,12 @@ fn rev_parse(
     }
     if verify {
         let found = match verified.as_slice() {
-            [(r, neg)] => one(r, *neg, show, short).ok(),
+            [(r, neg)] => match one(r, *neg, show, short) {
+                Err(e) if !quiet && rev_dies(&e.to_string()) => {
+                    return Err(fatal(e.to_string()));
+                }
+                found => found.ok(),
+            },
             _ => None,
         };
         match found {
@@ -3602,7 +3980,7 @@ pub(crate) fn grep(
             None => paths.push(a),
         }
     }
-    if paths.is_empty() && !prefix.is_empty() {
+    if (paths.is_empty() || rgit_git::only_excludes(&paths)) && !prefix.is_empty() {
         paths.push(prefix.clone());
     }
     let syntax = if fixed {
@@ -3783,6 +4161,703 @@ pub(crate) fn grep(
         &["path", "line", "text"],
         &format!("0 matches for {:?}", patterns.join("|")),
     ))
+}
+
+/// `%XX` escapes decoded, as combine: filter parts are written.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = b
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok());
+        match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            Some(v) if b[i] == b'%' => {
+                out.push(v);
+                i += 3;
+            }
+            _ => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A `--filter` spec of rev-list's object walk.
+enum ObjectFilter {
+    BlobNone,
+    BlobLimit(u64),
+    Tree(usize),
+    Type(String),
+    Combine(Vec<ObjectFilter>),
+}
+
+impl ObjectFilter {
+    fn parse(spec: &str) -> anyhow::Result<ObjectFilter> {
+        let bad = || fatal(format!("invalid filter-spec '{spec}'"));
+        if spec == "blob:none" {
+            return Ok(ObjectFilter::BlobNone);
+        }
+        if let Some(n) = spec.strip_prefix("blob:limit=") {
+            let (digits, unit) =
+                n.split_at(n.find(|c: char| !c.is_ascii_digit()).unwrap_or(n.len()));
+            let scale = match unit.to_ascii_lowercase().as_str() {
+                "" => 1,
+                "k" => 1 << 10,
+                "m" => 1 << 20,
+                "g" => 1 << 30,
+                _ => return Err(bad()),
+            };
+            return Ok(ObjectFilter::BlobLimit(
+                digits.parse::<u64>().map_err(|_| bad())? * scale,
+            ));
+        }
+        if let Some(n) = spec.strip_prefix("tree:") {
+            return Ok(ObjectFilter::Tree(n.parse().map_err(|_| bad())?));
+        }
+        if let Some(t) = spec.strip_prefix("object:type=") {
+            if !["blob", "tree", "commit", "tag"].contains(&t) {
+                return Err(bad());
+            }
+            return Ok(ObjectFilter::Type(t.to_owned()));
+        }
+        if let Some(list) = spec.strip_prefix("combine:") {
+            return Ok(ObjectFilter::Combine(
+                list.split('+')
+                    .map(|s| ObjectFilter::parse(&percent_decode(s)))
+                    .collect::<anyhow::Result<_>>()?,
+            ));
+        }
+        Err(bad())
+    }
+
+    /// Whether commits the walk reaches (not those named) are listed.
+    fn keeps_commits(&self) -> bool {
+        match self {
+            ObjectFilter::Type(t) => t == "commit",
+            ObjectFilter::Combine(all) => all.iter().all(ObjectFilter::keeps_commits),
+            _ => true,
+        }
+    }
+
+    /// Whether an object of `kind` and `size` at `depth` (0 for a commit's
+    /// tree) is listed.
+    fn keeps(&self, kind: &str, size: u64, depth: usize) -> bool {
+        match self {
+            ObjectFilter::BlobNone => kind != "blob",
+            ObjectFilter::BlobLimit(n) => kind != "blob" || size < *n,
+            ObjectFilter::Tree(n) => depth < *n,
+            ObjectFilter::Type(t) => kind == t,
+            ObjectFilter::Combine(all) => all.iter().all(|f| f.keeps(kind, size, depth)),
+        }
+    }
+}
+
+/// The order git's oidset (a khash set) iterates `ids` inserted in this
+/// order: bucket order, as klib places and rehashes them.
+fn oidset_order(ids: &[String]) -> Vec<String> {
+    fn hash(id: &str) -> u32 {
+        let b: Vec<u8> = (0..4)
+            .map(|i| u8::from_str_radix(id.get(2 * i..2 * i + 2).unwrap_or("0"), 16).unwrap_or(0))
+            .collect();
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+    // rev-list sizes its sets for 16k objects up front (DEFAULT_OIDSET_SIZE).
+    let mut slots: Vec<Option<String>> = vec![None; 16 * 1024];
+    let mut size = 0usize;
+    let mut upper = (16.0 * 1024.0 * 0.77 + 0.5) as usize;
+    let mut seen = std::collections::HashSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            continue;
+        }
+        if size >= upper {
+            let old = slots.len();
+            let n = (old + 1).next_power_of_two().max(4);
+            // kh_resize in place: each old key in bucket order goes to its
+            // new bucket, kicking out an old key not yet moved from there.
+            let mut unmoved: Vec<bool> = slots.iter().map(Option::is_some).collect();
+            let mut taken = vec![false; n];
+            slots.resize(n, None);
+            for j in 0..old {
+                if !unmoved[j] {
+                    continue;
+                }
+                unmoved[j] = false;
+                let mut key = slots[j].take().unwrap_or_default();
+                loop {
+                    let mut i = hash(&key) as usize & (n - 1);
+                    let mut step = 0;
+                    while taken[i] {
+                        step += 1;
+                        i = (i + step) & (n - 1);
+                    }
+                    taken[i] = true;
+                    if i < old && unmoved[i] {
+                        unmoved[i] = false;
+                        key = slots[i].replace(key).unwrap_or_default();
+                    } else {
+                        slots[i] = Some(key);
+                        break;
+                    }
+                }
+            }
+            upper = (n as f64 * 0.77 + 0.5) as usize;
+        }
+        let mask = slots.len() - 1;
+        let mut i = hash(id) as usize & mask;
+        let mut step = 0;
+        while slots[i].is_some() {
+            step += 1;
+            i = (i + step) & mask;
+        }
+        slots[i] = Some(id.clone());
+        size += 1;
+    }
+    slots.into_iter().flatten().collect()
+}
+
+/// What the other worktrees' HEADs name (a ref, or a detached commit id),
+/// which git's `--all` walks too.
+fn other_worktree_heads(git_dir: &Path) -> Vec<String> {
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(c) => git_dir.join(c.trim()),
+        Err(_) => git_dir.to_path_buf(),
+    };
+    let mut dirs = vec![common.clone()];
+    if let Ok(entries) = std::fs::read_dir(common.join("worktrees")) {
+        let mut linked: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        linked.sort();
+        dirs.extend(linked);
+    }
+    let here = git_dir
+        .canonicalize()
+        .unwrap_or_else(|_| git_dir.to_path_buf());
+    dirs.into_iter()
+        .filter(|d| d.canonicalize().unwrap_or_else(|_| d.clone()) != here)
+        .filter_map(|d| {
+            let head = std::fs::read_to_string(d.join("HEAD")).ok()?;
+            let head = head.trim();
+            Some(head.strip_prefix("ref: ").unwrap_or(head).to_owned())
+        })
+        .collect()
+}
+
+/// git's strbuf_humanise_bytes.
+fn humanise_bytes(bytes: u64) -> String {
+    if bytes > 1 << 30 {
+        format!(
+            "{}.{:02} GiB",
+            bytes >> 30,
+            (bytes & ((1 << 30) - 1)) / 10737419
+        )
+    } else if bytes > 1 << 20 {
+        let x = bytes + 5243;
+        format!("{}.{:02} MiB", x >> 20, ((x & ((1 << 20) - 1)) * 100) >> 20)
+    } else if bytes > 1 << 10 {
+        let x = bytes + 5;
+        format!("{}.{:02} KiB", x >> 10, ((x & ((1 << 10) - 1)) * 100) >> 10)
+    } else {
+        format!("{bytes} {}", if bytes == 1 { "byte" } else { "bytes" })
+    }
+}
+
+/// `git rev-list`.
+fn rev_list(backend: &Arc<dyn GitBackend>, command: Plumbing) -> anyhow::Result<Output> {
+    let Plumbing::RevList {
+        max_count,
+        count,
+        mut all,
+        reverse,
+        first_parent,
+        merges,
+        no_merges,
+        parents,
+        skip,
+        branches,
+        tags,
+        remotes,
+        abbrev_commit,
+        since,
+        until,
+        author,
+        committer,
+        grep,
+        ignore_case,
+        objects,
+        objects_edge,
+        missing,
+        walk,
+        more,
+        mut revs,
+        mut paths,
+    } = command
+    else {
+        unreachable!()
+    };
+    if more.stdin {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+        let mut lines = input.lines();
+        for line in lines.by_ref() {
+            match line {
+                "--" => break,
+                "" => {}
+                l => revs.push(l.to_owned()),
+            }
+        }
+        paths.extend(lines.filter(|l| !l.is_empty()).map(str::to_owned));
+    }
+    let mut globs = Vec::new();
+    for (pattern, base) in [
+        (branches, "refs/heads/"),
+        (tags, "refs/tags/"),
+        (remotes, "refs/remotes/"),
+    ] {
+        if let Some(p) = pattern {
+            let p = if p.is_empty() { "*" } else { p.as_str() };
+            let slash = if p.contains(['*', '?', '[']) {
+                ""
+            } else {
+                "/*"
+            };
+            globs.push((base, format!("{base}{p}{slash}")));
+        }
+    }
+    // --exclude: expand the ref sets here, leaving out what it names (the
+    // name below the set's base, or the full name for --all).
+    if !more.exclude.is_empty() && (all || !globs.is_empty()) {
+        let names: Vec<String> = backend.ref_details()?.into_iter().map(|r| r.name).collect();
+        let kept = |base: &str, name: &str| {
+            let short = name.strip_prefix(base).unwrap_or(name);
+            !more
+                .exclude
+                .iter()
+                .any(|e| glob(e.as_bytes(), short.as_bytes()))
+        };
+        let mut expanded: Vec<String> = Vec::new();
+        if all {
+            expanded.extend(names.iter().filter(|n| kept("", n)).cloned());
+            expanded.push("HEAD".to_owned());
+            expanded.extend(other_worktree_heads(&backend.git_dir()));
+        }
+        for (base, g) in &globs {
+            expanded.extend(
+                names
+                    .iter()
+                    .filter(|n| glob(g.as_bytes(), n.as_bytes()) && kept(base, n))
+                    .cloned(),
+            );
+        }
+        revs.splice(0..0, expanded);
+        all = false;
+        globs.clear();
+    }
+    if revs.is_empty() && !all && globs.is_empty() && !walk.merge {
+        if more.stdin {
+            return Ok(lines(if count { "0\n" } else { "" }.to_owned()));
+        }
+        return Err(CliError::usage("rev-list needs a revision, e.g. HEAD"));
+    }
+    let missing = missing.as_deref().unwrap_or("error");
+    if !["error", "allow-any", "allow-promisor", "print"].contains(&missing) {
+        return Err(fatal(format!("invalid argument to --missing: '{missing}'")));
+    }
+    let filters: Vec<ObjectFilter> = if more.no_filter {
+        Vec::new()
+    } else {
+        more.filter
+            .iter()
+            .map(|f| ObjectFilter::parse(f))
+            .collect::<anyhow::Result<_>>()?
+    };
+    let objects = objects || objects_edge;
+    if !filters.is_empty() && !objects {
+        return Err(fatal("object filtering requires --objects"));
+    }
+    if parents && more.children {
+        return Err(fatal(
+            "options '--parents' and '--children' cannot be used together",
+        ));
+    }
+    // The commits named on the command line show even when a filter
+    // leaves commits out.
+    let mut given = std::collections::HashSet::new();
+    if !filters.iter().all(ObjectFilter::keeps_commits) {
+        for rev in &revs {
+            let or_head = |s: &str| if s.is_empty() { "HEAD" } else { s }.to_owned();
+            let named: Vec<String> = if rev.starts_with('^') {
+                Vec::new()
+            } else if let Some((a, b)) = rev.split_once("...") {
+                vec![or_head(a), or_head(b)]
+            } else if let Some((_, b)) = rev.split_once("..") {
+                vec![or_head(b)]
+            } else {
+                vec![rev.clone()]
+            };
+            for n in named {
+                if let Ok(id) = backend.rev_parse(&format!("{n}^{{commit}}")) {
+                    given.insert(id);
+                }
+            }
+        }
+        if all || !globs.is_empty() {
+            for r in backend.ref_details()? {
+                let hit = all
+                    || globs
+                        .iter()
+                        .any(|(_, g)| glob(g.as_bytes(), r.name.as_bytes()));
+                if hit && let Ok(id) = backend.rev_parse(&format!("{}^{{commit}}", r.name)) {
+                    given.insert(id);
+                }
+            }
+        }
+    }
+    let mut opts = rgit_git::LogOptions {
+        limit: max_count.unwrap_or(usize::MAX),
+        offset: skip.unwrap_or(0),
+        all,
+        revs: revs.clone(),
+        paths,
+        first_parent,
+        merges: (merges || no_merges).then_some(merges),
+        reverse,
+        globs: globs.into_iter().map(|(_, g)| g).collect(),
+        since: since.as_deref().map(crate::cli::parse_date).transpose()?,
+        until: until.as_deref().map(crate::cli::parse_date).transpose()?,
+        author,
+        committer,
+        grep,
+        grep_ignore_case: ignore_case,
+        rewrite_parents: parents || more.children,
+        ..Default::default()
+    };
+    walk.apply(&mut opts);
+    if more.bisect || more.bisect_vars || more.bisect_all {
+        return rev_list_bisect(backend, &opts, &more);
+    }
+    opts.boundary |= objects;
+    let mut commits = backend.rev_walk(&opts)?;
+    if objects && !walk.boundary {
+        commits.retain(|c| c.mark != Some('-'));
+    }
+    // The edges are the excluded parents of the whole range, not only
+    // of the commits -n and --skip leave; the children are among them too.
+    let whole = if objects || more.children {
+        backend.rev_walk(&rgit_git::LogOptions {
+            limit: usize::MAX,
+            offset: 0,
+            boundary: false,
+            ..opts.clone()
+        })?
+    } else {
+        Vec::new()
+    };
+    let mut edges: Vec<String> = Vec::new();
+    if objects {
+        let ids: std::collections::HashSet<&str> = whole.iter().map(|c| c.id.as_str()).collect();
+        for p in whole.iter().flat_map(|c| &c.parents) {
+            if !ids.contains(p.as_str()) && !edges.contains(p) {
+                edges.push(p.clone());
+            }
+        }
+    }
+    if count {
+        let (mut left, mut right, mut same) = (0usize, 0usize, 0usize);
+        for c in &commits {
+            match c.mark {
+                Some('=') => same += 1,
+                Some('<') => left += 1,
+                _ => right += 1,
+            }
+        }
+        let cherry = walk.cherry_mark || walk.cherry;
+        let text = match (walk.left_right, cherry) {
+            (true, true) => format!("{left}\t{right}\t{same}\n"),
+            (true, false) => format!("{left}\t{right}\n"),
+            (false, true) => format!("{}\t{same}\n", left + right),
+            (false, false) => format!("{}\n", left + right + same),
+        };
+        return Ok(lines(text).with("count", left + right + same));
+    }
+    let abbrev = abbrev_commit || more.oneline;
+    let id = |id: &str| -> anyhow::Result<String> {
+        Ok(if abbrev {
+            backend.abbrev_id(id, more.abbrev.unwrap_or(0))?
+        } else {
+            id.to_owned()
+        })
+    };
+    let mut children: std::collections::HashMap<&str, Vec<&str>> = Default::default();
+    if more.children {
+        for c in &whole {
+            for p in &c.parents {
+                children
+                    .entry(p.as_str())
+                    .or_default()
+                    .insert(0, c.id.as_str());
+            }
+        }
+    }
+    let spec = more
+        .format
+        .clone()
+        .map(|f| {
+            if f.is_empty() {
+                "tformat:".to_owned()
+            } else {
+                f
+            }
+        })
+        .or(more.pretty.clone())
+        .or(more.oneline.then(|| "oneline".to_owned()))
+        .or(more.header.then(|| "raw".to_owned()));
+    let pretty = match &spec {
+        Some(spec) => crate::pretty::Pretty::new(
+            backend,
+            &crate::cli::PrettyArgs {
+                pretty: Some(spec.clone()),
+                date: more.date.clone(),
+                ..Default::default()
+            },
+            None,
+        )?,
+        None => None,
+    };
+    let user = pretty
+        .as_ref()
+        .is_some_and(|p| matches!(p.fmt, crate::pretty::Fmt::User(_)));
+    let oneline = pretty
+        .as_ref()
+        .is_some_and(|p| matches!(p.fmt, crate::pretty::Fmt::Oneline));
+    let formatted = more.format.is_some() || more.pretty.is_some() || more.oneline;
+    let header_line = !(user && more.no_commit_header);
+    let prefix = if formatted && !oneline && header_line {
+        "commit "
+    } else {
+        ""
+    };
+    // --header alone ends each commit with a NUL.
+    let term = if formatted { '\n' } else { '\0' };
+    let mut out = String::new();
+    let mut disk = 0u64;
+    if objects_edge && more.disk_usage.is_none() {
+        for e in &edges {
+            out.push_str(&format!("-{e}\n"));
+        }
+    }
+    for c in &commits {
+        if !filters.iter().all(ObjectFilter::keeps_commits) && !given.contains(&c.id) {
+            continue;
+        }
+        if more.disk_usage.is_some() {
+            disk += backend.object_disk(&c.id)?.0;
+            continue;
+        }
+        if more.timestamp {
+            out.push_str(&format!("{} ", c.committer.time));
+        }
+        out.push_str(prefix);
+        if header_line {
+            if let Some(m) = walk.mark(c.mark) {
+                out.push(m);
+            }
+            out.push_str(&id(&c.id)?);
+        }
+        if parents {
+            for p in &c.parents {
+                out.push(' ');
+                out.push_str(p);
+            }
+        }
+        for child in children.get(c.id.as_str()).into_iter().flatten() {
+            out.push(' ');
+            out.push_str(child);
+        }
+        let Some(pretty) = &pretty else {
+            out.push('\n');
+            continue;
+        };
+        if oneline {
+            out.push(' ');
+        } else if header_line {
+            out.push('\n');
+        }
+        let mut commit = crate::pretty::parse(&backend.read_object(&c.id)?);
+        commit.mark = c.mark;
+        let (_, body) = pretty.parts(&commit);
+        if !user || !body.is_empty() {
+            out.push_str(&body);
+            out.push(term);
+        }
+    }
+    if objects {
+        let mut listed = Vec::new();
+        // Annotated tags the walk starts from come first, by their names.
+        let mut tips: Vec<String> = revs
+            .iter()
+            .filter(|r| !r.starts_with('^') && !r.contains(".."))
+            .cloned()
+            .collect();
+        if all {
+            tips.splice(0..0, backend.ref_details()?.into_iter().map(|r| r.name));
+        }
+        let mut tagged = std::collections::HashSet::new();
+        for tip in tips {
+            let Ok(obj) = backend.read_object(&tip) else {
+                continue;
+            };
+            if obj.kind != "tag" || !tagged.insert(obj.id.clone()) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&obj.data);
+            let name = text
+                .lines()
+                .find_map(|l| l.strip_prefix("tag "))
+                .unwrap_or_default()
+                .to_owned();
+            listed.push((obj.id, name));
+        }
+        let ids: Vec<String> = commits
+            .iter()
+            .filter(|c| c.mark != Some('-'))
+            .map(|c| c.id.clone())
+            .collect();
+        let (mut absent, mut omitted) = (Vec::new(), Vec::new());
+        for (oid, path, gone) in backend.list_objects(&ids, &edges)? {
+            if gone {
+                match missing {
+                    "error" => return Err(fatal(format!("missing object {oid}"))),
+                    "print" => absent.push(oid),
+                    _ => {}
+                }
+                continue;
+            }
+            if !filters.is_empty() {
+                let (kind, size) = backend.object_header(&oid)?;
+                let depth = if path.is_empty() {
+                    0
+                } else {
+                    path.split('/').count()
+                };
+                if !filters.iter().all(|f| f.keeps(&kind, size, depth)) {
+                    omitted.push(oid);
+                    continue;
+                }
+            }
+            listed.push((oid, path));
+        }
+        for (oid, path) in listed {
+            if more.disk_usage.is_some() {
+                disk += backend.object_disk(&oid)?.0;
+            } else if more.no_object_names && !more.object_names {
+                out.push_str(&format!("{oid}\n"));
+            } else {
+                out.push_str(&format!("{oid} {path}\n"));
+            }
+        }
+        if more.filter_print_omitted && more.disk_usage.is_none() {
+            for oid in oidset_order(&omitted) {
+                out.push_str(&format!("~{oid}\n"));
+            }
+        }
+        if more.disk_usage.is_none() {
+            for oid in oidset_order(&absent) {
+                out.push_str(&format!("?{oid}\n"));
+            }
+        }
+    }
+    if let Some(style) = &more.disk_usage {
+        out = match style.as_str() {
+            "" => format!("{disk}\n"),
+            "human" => format!("{}\n", humanise_bytes(disk)),
+            s => {
+                return Err(fatal(format!(
+                    "invalid value for '--disk-usage=<format>': '{s}', the only allowed format is 'human'"
+                )));
+            }
+        };
+    }
+    if more.quiet {
+        out.clear();
+    }
+    Ok(lines(out))
+}
+
+/// `rev-list --bisect`, `--bisect-vars` and `--bisect-all`.
+fn rev_list_bisect(
+    backend: &Arc<dyn GitBackend>,
+    opts: &rgit_git::LogOptions,
+    more: &crate::cli::RevListArgs,
+) -> anyhow::Result<Output> {
+    let (mut tips, mut hidden) = (Vec::new(), Vec::new());
+    // `--bisect` also walks the bisection's own refs, as in git.
+    if more.bisect && backend.rev_parse("refs/bisect/bad").is_ok() {
+        tips.push("refs/bisect/bad".to_owned());
+        for r in backend.ref_details()? {
+            if r.name.starts_with("refs/bisect/good-") {
+                hidden.push(r.name);
+            }
+        }
+    }
+    for rev in &opts.revs {
+        if let Some(h) = rev.strip_prefix('^') {
+            hidden.push(h.to_owned());
+        } else if let Some((a, b)) = rev.split_once("..") {
+            let or_head = |s: &str| if s.is_empty() { "HEAD" } else { s }.to_owned();
+            hidden.push(or_head(a));
+            tips.push(or_head(b.trim_start_matches('.')));
+        } else {
+            tips.push(rev.clone());
+        }
+    }
+    let (list, reaches, nr) = backend.rev_list_bisect(
+        &tips,
+        &hidden,
+        opts.first_parent,
+        &opts.paths,
+        more.bisect_all,
+    )?;
+    let mut out = String::new();
+    if more.bisect_all {
+        let decorations = crate::pretty::decorations(backend);
+        for (c, dist) in &list {
+            let mut labels: Vec<String> = decorations
+                .get(c)
+                .into_iter()
+                .flatten()
+                .map(|(_, l)| l.clone())
+                .collect();
+            labels.push(format!("dist={dist}"));
+            out.push_str(&format!("{c} ({})\n", labels.join(", ")));
+        }
+        if !more.bisect_vars {
+            return Ok(lines(out));
+        }
+        out.push_str("------\n");
+    }
+    if !more.bisect_vars {
+        if let Some((c, _)) = list.first() {
+            out.push_str(&format!("{c}\n"));
+        }
+        return Ok(lines(out));
+    }
+    if list.is_empty() {
+        return Err(fail(true, true, ""));
+    }
+    let cnt = (nr - reaches).max(reaches);
+    let rev = list.first().map(|(c, _)| c.as_str()).unwrap_or("");
+    out.push_str(&format!(
+        "bisect_rev='{rev}'\nbisect_nr={}\nbisect_good={}\nbisect_bad={}\nbisect_all={nr}\nbisect_steps={}\n",
+        cnt - 1,
+        nr - reaches - 1,
+        reaches - 1,
+        rgit_git::bisect_steps(nr)
+    ));
+    Ok(lines(out))
 }
 
 #[cfg(test)]

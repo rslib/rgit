@@ -2,6 +2,7 @@
 //! `refs/bisect/*`) and git's choice of commit at each step, so git and rgit
 //! can take turns on the same bisect.
 
+use crate::rev::RevParse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -98,14 +99,7 @@ impl Bisect<'_> {
     }
 
     fn commit(&self, rev: &str) -> Option<Oid> {
-        Some(
-            self.repo
-                .revparse_single(rev)
-                .ok()?
-                .peel_to_commit()
-                .ok()?
-                .id(),
-        )
+        Some(self.repo.rev_single(rev).ok()?.peel_to_commit().ok()?.id())
     }
 
     fn subject(&self, oid: Oid) -> String {
@@ -355,7 +349,7 @@ impl Bisect<'_> {
         };
         let oid = self
             .repo
-            .revparse_single(rev)
+            .rev_single(rev)
             .map_err(|_| fail(format!("couldn't get the oid of the rev '{rev}'")))?
             .id();
         self.repo.reference(&tag, oid, true, "")?;
@@ -404,7 +398,7 @@ impl Bisect<'_> {
         for rev in revs {
             let obj = self
                 .repo
-                .revparse_single(rev)
+                .rev_single(rev)
                 .map_err(|_| fail(format!("Bad rev input: {rev}")))?;
             let commit = obj
                 .peel_to_commit()
@@ -438,7 +432,7 @@ impl Bisect<'_> {
             let tip = self
                 .commit(if to.is_empty() { "HEAD" } else { to })
                 .ok_or_else(|| fail(format!("bad revision '{arg}'")))?;
-            let walk = Graph::walk(self.repo, tip, &hide, false, &[])?;
+            let walk = Graph::walk(self.repo, &[tip], &hide, false, &[])?;
             words.extend(walk.list.iter().rev().map(Oid::to_string));
             self.hidden.extend(hide);
         }
@@ -537,7 +531,7 @@ impl Bisect<'_> {
                 let (_, goods, _) = self.bisect_refs(terms)?;
                 let mut log = "# only skipped commits left to test\n".to_owned();
                 let hide: Vec<Oid> = goods.iter().chain(&self.hidden).copied().collect();
-                for oid in Graph::walk(self.repo, bad, &hide, false, &[])?
+                for oid in Graph::walk(self.repo, &[bad], &hide, false, &[])?
                     .list
                     .into_iter()
                     .rev()
@@ -573,8 +567,8 @@ impl Bisect<'_> {
             .flat_map(|l| sq_dequote(l.trim()).unwrap_or_default())
             .collect();
         let hide: Vec<Oid> = goods.iter().chain(&self.hidden).copied().collect();
-        let graph = Graph::walk(self.repo, bad, &hide, first_parent, &paths)?;
-        let (list, reaches, all) = graph.find_bisection(find_all, first_parent);
+        let graph = Graph::walk(self.repo, &[bad], &hide, first_parent, &paths)?;
+        let (list, reaches, all, _) = graph.find_bisection(find_all, first_parent);
         let (list, tried) = managed_skipped(list, &skips, bad);
         let Some(&rev) = list.first() else {
             if !tried.is_empty() {
@@ -712,7 +706,7 @@ impl Bisect<'_> {
         let refname = format!("refs/heads/{name}");
         let branch = self.repo.find_reference(&refname).is_ok();
         let rev = if branch { refname.as_str() } else { name };
-        let commit = self.repo.revparse_single(rev)?.peel_to_commit()?;
+        let commit = self.repo.rev_single(rev)?.peel_to_commit()?;
         self.repo.checkout_tree(
             commit.as_object(),
             Some(git2::build::CheckoutBuilder::new().safe()),
@@ -987,17 +981,19 @@ struct Graph {
 }
 
 impl Graph {
-    /// git's `limit_list` over `bad ^goods -- paths`: commits in date order
+    /// git's `limit_list` over `tips ^goods -- paths`: commits in date order
     /// (ties first come, first served), each with its parents simplified.
     fn walk(
         repo: &Repository,
-        bad: Oid,
+        tips: &[Oid],
         goods: &[Oid],
         first_parent: bool,
         paths: &[String],
     ) -> Result<Self, GitError> {
         let mut walk = repo.revwalk()?;
-        walk.push(bad)?;
+        for t in tips {
+            walk.push(*t)?;
+        }
         for g in goods {
             walk.hide(*g)?;
         }
@@ -1008,7 +1004,7 @@ impl Graph {
             treesame: HashSet::new(),
             interesting,
         };
-        if !g.interesting.contains(&bad) {
+        if !tips.iter().any(|t| g.interesting.contains(t)) {
             return Ok(g);
         }
         let mut dates = HashMap::new();
@@ -1021,15 +1017,26 @@ impl Graph {
             Ok(d)
         };
         let mut spec_opts = git2::DiffOptions::new();
-        for p in paths {
-            spec_opts.pathspec(p);
-        }
+        crate::pathspec::limit_diff(&mut spec_opts, paths)?;
         let mut same = |a: Option<&git2::Tree>, b: &git2::Tree| -> Result<bool, GitError> {
             let diff = repo.diff_tree_to_tree(a, Some(b), Some(&mut spec_opts))?;
             Ok(diff.deltas().len() == 0)
         };
-        let mut seen: HashSet<Oid> = goods.iter().copied().chain([bad]).collect();
-        let mut queue = VecDeque::from([bad]);
+        let mut seen: HashSet<Oid> = goods.iter().copied().collect();
+        let mut queue = VecDeque::new();
+        for t in tips {
+            if seen.insert(*t) && g.interesting.contains(t) {
+                let d = date(*t)?;
+                let mut at = queue.len();
+                for (i, q) in queue.iter().enumerate() {
+                    if date(*q)? < d {
+                        at = i;
+                        break;
+                    }
+                }
+                queue.insert(at, *t);
+            }
+        }
         while let Some(oid) = queue.pop_front() {
             let commit = repo.find_commit(oid)?;
             let mut parents: Vec<Oid> = commit.parent_ids().collect();
@@ -1127,7 +1134,11 @@ impl Graph {
     /// bisect.c's `find_bisection`: the best commit to test (or, to step
     /// around skipped ones, every commit best first), how many commits it
     /// reaches and how many are left.
-    fn find_bisection(&self, find_all: bool, first_parent: bool) -> (Vec<Oid>, i64, i64) {
+    fn find_bisection(
+        &self,
+        find_all: bool,
+        first_parent: bool,
+    ) -> (Vec<Oid>, i64, i64, HashMap<Oid, i64>) {
         let list = &self.list;
         let nr = list.iter().filter(|c| !self.treesame.contains(c)).count() as i64;
         let mut weight: HashMap<Oid, i64> = HashMap::new();
@@ -1145,7 +1156,8 @@ impl Graph {
             };
             weight.insert(*c, w);
         }
-        let done = |best: Oid, weight: &HashMap<Oid, i64>| (vec![best], weight[&best], nr);
+        let done =
+            |best: Oid, weight: &HashMap<Oid, i64>| (vec![best], weight[&best], nr, weight.clone());
         for c in list {
             if weight[c] != -2 {
                 continue;
@@ -1185,7 +1197,7 @@ impl Graph {
             }
         }
         let Some(&head) = list.first() else {
-            return (Vec::new(), 0, nr);
+            return (Vec::new(), 0, nr, weight);
         };
         let mut dist: Vec<(i64, Oid)> = list
             .iter()
@@ -1207,8 +1219,40 @@ impl Graph {
             false => dist.into_iter().map(|d| d.1).collect(),
         };
         let reaches = weight[&sorted[0]];
-        (sorted, reaches, nr)
+        (sorted, reaches, nr, weight)
     }
+}
+
+/// Commits best first with their distances, how many commits the best
+/// reaches and how many there are.
+pub type BisectPick<T> = (Vec<(T, i64)>, i64, i64);
+
+/// rev-list's `--bisect` over `tips ^hidden -- paths`: the best commit first
+/// (every commit, best first, with `all`), each with its distance from the
+/// ends, how many commits the best reaches and how many there are.
+pub(crate) fn rev_list_bisect(
+    repo: &Repository,
+    tips: &[Oid],
+    hidden: &[Oid],
+    first_parent: bool,
+    paths: &[String],
+    all: bool,
+) -> Result<BisectPick<Oid>, GitError> {
+    let graph = Graph::walk(repo, tips, hidden, first_parent, paths)?;
+    let (list, reaches, nr, weight) = graph.find_bisection(all, first_parent);
+    let list = list
+        .into_iter()
+        .map(|c| {
+            let w = weight.get(&c).copied().unwrap_or(0);
+            (c, w.min(nr - w))
+        })
+        .collect();
+    Ok((list, reaches, nr))
+}
+
+/// bisect.c's `estimate_bisect_steps`.
+pub fn bisect_steps(all: i64) -> i64 {
+    estimate_steps(all)
 }
 
 /// bisect.c's `managed_skipped`: the commits to choose from with skipped ones

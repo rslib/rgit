@@ -792,7 +792,7 @@ fn deleted_paths_from_a_subfolder() {
     assert_eq!(read(&dir, "d/c"), "1\n");
     git(&dir, &["rm", "-q", "--cached", "d/c"]);
     std::fs::remove_file(dir.join("d/c")).unwrap();
-    ok(&dir.join("d"), &["reset", "c"]);
+    ok(&dir.join("d"), &["reset", "--", "c"]);
     assert_eq!(short(&dir), " D d/c\n");
 }
 
@@ -943,6 +943,17 @@ fn commit_same(tag: &str, setup: impl Fn(&Path), args: &[&str]) {
     std::fs::write(&editor, "#!/bin/sh\ncp \"$1\" \"$1.seen\"\n").unwrap();
     std::fs::set_permissions(&editor, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let run = |dir: &Path, bin: &str, extra: &[&str]| {
+        // The twins were made seconds apart; --amend shows HEAD's date.
+        git(
+            dir,
+            &[
+                "commit",
+                "-q",
+                "--amend",
+                "--no-edit",
+                "--date=2020-01-01T00:00:00Z",
+            ],
+        );
         setup(dir);
         let out = Command::new(bin)
             .args(extra)

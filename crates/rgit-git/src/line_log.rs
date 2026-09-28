@@ -2,6 +2,7 @@
 //! ranges of files back through history and show how each commit changed
 //! them.
 
+use crate::rev::RevParse;
 use std::collections::HashMap;
 
 use git2::{Delta, DiffFindOptions, DiffOptions, Oid, Repository};
@@ -29,20 +30,16 @@ fn blob(repo: &Repository, oid: Oid) -> Result<Vec<u8>, GitError> {
     Ok(repo.find_blob(oid)?.content().to_vec())
 }
 
-/// git's default funcname rule: a line starting with a letter, `_` or `$`.
-fn is_funcname(line: &[u8]) -> bool {
-    line.first()
-        .is_some_and(|&c| c.is_ascii_alphabetic() || c == b'_' || c == b'$')
-}
-
 fn bad(spec: &str) -> GitError {
     GitError::Other(format!(
         "-L argument not 'start,end:file' or ':funcname:file': {spec}"
     ))
 }
 
-fn regex(re: &str) -> Result<regex::bytes::Regex, GitError> {
-    regex::bytes::Regex::new(re).map_err(|e| GitError::Other(format!("-L: bad regex {re}: {e}")))
+/// A `-L` regex as git compiles it: basic, `^` and `$` at each line.
+fn regex(re: &str) -> Result<crate::userdiff::Regex, GitError> {
+    crate::userdiff::Regex::new(re.as_bytes(), crate::userdiff::NEWLINE)
+        .map_err(|e| GitError::Other(format!("-L parameter '{re}': {e}")))
 }
 
 /// Split `/re/rest` into `re` and `rest`, honouring `\/`.
@@ -78,10 +75,17 @@ fn parse_spec(
         let data = data_of(path)?;
         let ls = lines(&data);
         let re = regex(func)?;
+        let driver = crate::userdiff::driver(repo, path, crate::userdiff::Fallback::None)?
+            .and_then(|d| d.funcname);
+        let is_funcname = |l: &[u8]| crate::userdiff::is_func(driver.as_ref(), l);
         let begin = ls
             .iter()
             .position(|l| re.is_match(l) && is_funcname(l))
-            .ok_or_else(|| GitError::Other(format!("-L parameter '{func}': no match")))?;
+            .ok_or_else(|| {
+                GitError::Other(format!(
+                    "-L parameter '{func}' starting at line 1: no match"
+                ))
+            })?;
         let end = (begin + 1..ls.len())
             .find(|&i| is_funcname(ls[i]))
             .unwrap_or(ls.len());
@@ -98,11 +102,17 @@ fn parse_spec(
         .ok_or_else(|| bad(spec))?;
     let data = data_of(path)?;
     let ls = lines(&data);
-    let find = |re: &str, from: usize| -> Result<usize, GitError> {
-        let re = regex(re)?;
+    let find = |pattern: &str, from: usize| -> Result<usize, GitError> {
+        let re = regex(pattern)?;
         (from..ls.len())
             .find(|&i| re.is_match(ls[i]))
-            .ok_or_else(|| GitError::Other(format!("-L parameter '{re}': no match")))
+            .ok_or_else(|| {
+                GitError::Other(format!(
+                    "-L parameter '{pattern}' starting at line {}: {}",
+                    from + 1,
+                    re.no_match()
+                ))
+            })
     };
     // 1-based inclusive lines, as git's parse_range_arg works them out.
     let begin = match start {
@@ -440,6 +450,8 @@ fn dump(pair: &Pair, rs: &Ranges, diff: &DiffRanges, old: Option<&[u8]>, new: &[
         header,
         similarity: 0,
         sizes: (0, 0),
+        modes: (0, 0),
+        ids: Default::default(),
     }
 }
 
@@ -453,7 +465,7 @@ pub(crate) fn line_log(
     specs: &[String],
     first_parent: bool,
 ) -> Result<Vec<Option<Vec<FileDiff>>>, GitError> {
-    let tip = repo.revparse_single(tip)?.peel_to_commit()?;
+    let tip = repo.rev_single(tip)?.peel_to_commit()?;
     let mut start: Tracked = Vec::new();
     for spec in specs {
         let (path, range) = parse_spec(repo, &tip, spec)?;

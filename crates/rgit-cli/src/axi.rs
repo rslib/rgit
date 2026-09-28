@@ -10,9 +10,9 @@ use rgit_git::{
 };
 
 use crate::cli::{
-    ApplyArgs, BranchCmd, BundleCmd, Command, CommitGraphCmd, ConfigArgs, FlowCmd, IndexCmd,
-    LanesCmd, MaintenanceCmd, MidxCmd, NotesCmd, RemoteCmd, StackCmd, StashCmd, SubmoduleCmd,
-    WorkspaceCmd, WorktreeCmd,
+    ApplyArgs, BranchCmd, BundleCmd, Command, CommitGraphCmd, ConfigArgs, FlowCmd, HookCmd,
+    IndexCmd, LanesCmd, MaintenanceCmd, MidxCmd, NotesCmd, RemoteCmd, StackCmd, StashCmd,
+    SubmoduleCmd, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::render;
@@ -25,6 +25,10 @@ pub fn run(
     command: Command,
     interactive: bool,
 ) -> anyhow::Result<Output> {
+    let color = crate::render::color_on();
+    crate::cli::set_word_diff(backend, &command);
+    crate::render::set_color(color);
+    crate::cli::apply_diff_opts(backend, &command)?;
     let done = done_message(&command);
     let next = next_steps(&command);
     let restores = matches!(&command, Command::Checkout { pathspec, paths, .. }
@@ -37,6 +41,25 @@ pub fn run(
         })
     };
     Ok(match command {
+        Command::Hook {
+            cmd:
+                HookCmd::Run {
+                    ignore_missing,
+                    to_stdin,
+                    name,
+                    args,
+                },
+        } => {
+            let code = rgit_git::hook_run(
+                &backend.git_dir(),
+                &name,
+                &args,
+                to_stdin.as_deref().map(std::path::Path::new),
+                ignore_missing,
+            )?;
+            anyhow::ensure!(code == 0, "the {name} hook exited with status {code}");
+            Output::from(format!("ran the {name} hook"))
+        }
         Command::Status {
             fmt,
             untracked,
@@ -174,6 +197,7 @@ pub fn run(
             blame(&all.lines, &path, start, end)
         }
         Command::Plumbing(c) => crate::plumbing::run(backend, c, false)?,
+        Command::Extra(c) => crate::extra::run(backend, c, false)?,
         command @ Command::LsRemote { .. } => {
             crate::plumbing::ls_remote(Some(backend.workdir()), command, false)?
         }

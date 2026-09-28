@@ -2,6 +2,7 @@
 //! each patch goes through rgit's apply, and progress lives in git's
 //! `.git/rebase-apply`, so git and rgit can each continue what the other began.
 
+use crate::rev::RevParse;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +44,7 @@ struct Args {
     apply: Vec<String>,
     gpg_sign: Option<String>,
     no_gpg_sign: bool,
+    rerere: Option<bool>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GitError> {
@@ -81,6 +83,8 @@ fn parse_args(args: &[String]) -> Result<Args, GitError> {
             "-n" | "--no-verify" => a.no_verify = true,
             "-q" | "--quiet" => a.quiet = true,
             "--no-gpg-sign" => a.no_gpg_sign = true,
+            "--rerere-autoupdate" => a.rerere = Some(true),
+            "--no-rerere-autoupdate" => a.rerere = Some(false),
             s if s.starts_with("--gpg-sign") || s.starts_with("-S") => {
                 let key = s
                     .strip_prefix("--gpg-sign")
@@ -180,6 +184,7 @@ pub(crate) fn am(
         apply: a.apply.clone(),
         run: RunOpts::from(&a),
         msg: String::new(),
+        rerere: a.rerere,
     };
     s.setup(repo, &mails)?;
     let result = s.run(repo, false, &mut out);
@@ -239,6 +244,8 @@ struct Session {
     run: RunOpts,
     /// The current patch's commit message.
     msg: String,
+    /// `--[no-]rerere-autoupdate`.
+    rerere: Option<bool>,
 }
 
 /// Why a patch stopped the run: git's hints follow.
@@ -290,6 +297,9 @@ impl Session {
         self.write("messageid", tf(self.message_id))?;
         self.write("scissors", self.scissors.map_or("", tf))?;
         self.write("quoted-cr", "")?;
+        if let Some(auto) = self.rerere {
+            self.write("rerere-autoupdate", tf(auto))?;
+        }
         let opts: String = self.apply.iter().map(|o| format!(" {}", sq(o))).collect();
         self.write("apply-opt", &opts)?;
         self.write("applying", "")?;
@@ -338,6 +348,10 @@ impl Session {
             apply: sq_dequote_all(read("apply-opt").trim()),
             run: RunOpts::from(a),
             msg: read("final-commit"),
+            rerere: dir
+                .join("rerere-autoupdate")
+                .exists()
+                .then(|| t("rerere-autoupdate")),
         };
         if a.signoff && !s.sign {
             s.sign = true;
@@ -459,9 +473,14 @@ impl Session {
         }
         let _ = write!(
             s,
-            "hint: To restore the original branch and stop patching, run \"{cmd} --abort\"."
+            "hint: To restore the original branch and stop patching, run \"{cmd} --abort\".\n\
+             hint: Disable this message with \"git config set advice.mergeConflict false\""
         );
-        s
+        let off = repo
+            .config()
+            .and_then(|c| c.get_bool("advice.mergeConflict"))
+            .is_ok_and(|on| !on);
+        if off { String::new() } else { s }
     }
 
     /// Split the current mail into info, msg and patch and write the author
@@ -545,34 +564,29 @@ impl Session {
             .unwrap_or_else(|| "warn".into());
         let mut files = apply::parse_patch(&std::fs::read(self.path("patch"))?, &opts)
             .map_err(|e| GitError::Other(format!("error: {e}")))?;
-        let warning = apply::check_whitespace(&mut files, &action)?;
-        if !warning.is_empty() {
-            out.push_str(&warning);
-            out.push('\n');
+        let ws = apply::check_whitespace(&mut files, &action, Some(repo.path()), false, true);
+        if ws.fatal {
+            return Err(GitError::Other(
+                ws.summary
+                    .trim_end()
+                    .trim_start_matches("error: ")
+                    .to_owned(),
+            ));
         }
+        out.push_str(&ws.summary);
         let mut merged = false;
         let result = match apply::apply(repo, &files, &opts) {
             Err(_) if self.threeway => {
-                out.push_str("Using index info to reconstruct a base tree...\n");
-                out.push_str("Falling back to patching base and 3-way merge...\n");
-                opts.three_way = true;
-                opts.quiet = false;
                 merged = true;
-                apply::apply(repo, &files, &opts)
+                self.fall_back(repo, &files, &opts, out)
+                    .map(|()| String::new())
             }
             r => r,
         };
         repo.index()?.read(true)?;
         match result {
             Ok(_) => Ok(merged),
-            Err(GitError::Conflict(log)) => {
-                for line in log.lines().filter(|l| l.starts_with("U ")) {
-                    let _ = writeln!(out, "CONFLICT (content): Merge conflict in {}", &line[2..]);
-                }
-                Err(GitError::Other(
-                    "error: Failed to merge in the changes.".into(),
-                ))
-            }
+            Err(e) if merged => Err(e),
             Err(e) => {
                 // git names the file and the hunk's line before the failure.
                 let e = e.to_string();
@@ -594,6 +608,78 @@ impl Session {
                 Err(GitError::Other(text))
             }
         }
+    }
+
+    /// git's fall_back_threeway: rebuild the patch's base from the blobs its
+    /// `index` lines name, apply it there, and merge that into HEAD as ort
+    /// would, with its report.
+    fn fall_back(
+        &self,
+        repo: &Repository,
+        files: &[apply::FilePatch],
+        opts: &ApplyOpts,
+        out: &mut String,
+    ) -> Result<(), GitError> {
+        let idx = self.path("patch-merge-index");
+        let fake = ApplyOpts {
+            fake_ancestor: Some(idx.clone()),
+            ..opts.clone()
+        };
+        apply::apply(repo, files, &fake)
+            .map_err(|_| GitError::Other("error: could not build fake ancestor".into()))?;
+        let base = git2::Index::open(&idx)?.write_tree_to(repo)?;
+        let _ = std::fs::remove_file(&idx);
+        let base = repo.find_tree(base)?;
+        self.say(out, "Using index info to reconstruct a base tree...");
+        let ours = match repo.head().ok().and_then(|h| h.peel_to_tree().ok()) {
+            Some(t) => t,
+            None => repo.find_tree(repo.treebuilder(None)?.write()?)?,
+        };
+        if !self.quiet {
+            for d in repo
+                .diff_tree_to_tree(Some(&ours), Some(&base), None)?
+                .deltas()
+            {
+                let kind = match d.status() {
+                    git2::Delta::Added => 'A',
+                    git2::Delta::Modified => 'M',
+                    _ => continue,
+                };
+                let path = d.new_file().path().unwrap_or(Path::new("")).display();
+                let _ = writeln!(out, "{kind}\t{path}");
+            }
+        }
+        let text: String = files.iter().map(apply::FilePatch::render).collect();
+        let theirs = git2::Diff::from_buffer(text.as_bytes())
+            .and_then(|d| repo.apply_to_tree(&base, &d, None))
+            .and_then(|mut i| i.write_tree_to(repo))
+            .map_err(|_| {
+                GitError::Other(
+                    "error: Did you hand edit your patch?\nIt does not apply to blobs recorded \
+                     in its index."
+                        .into(),
+                )
+            })?;
+        let theirs = repo.find_tree(theirs)?;
+        self.say(out, "Falling back to patching base and 3-way merge...");
+        let mut merged = repo.merge_trees(&base, &ours, &theirs, None)?;
+        let label = first_line(&self.msg).to_owned();
+        for line in crate::git_repo::merge_report(repo, &merged, [&base, &ours, &theirs], &label)? {
+            self.say(out, &line);
+        }
+        let labels = [
+            "constructed merge base".to_owned(),
+            "HEAD".to_owned(),
+            label,
+        ];
+        crate::git_repo::checkout_merged(repo, &mut merged, &ours, "am", Some(&labels))?;
+        if merged.has_conflicts() {
+            out.push_str(&crate::rerere::report(repo, self.rerere));
+            return Err(GitError::Other(
+                "error: Failed to merge in the changes.".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Commit the index with the patch's author and message.
@@ -724,6 +810,7 @@ impl Session {
             );
             return Err(stop(self.resolve_hint(repo)));
         }
+        crate::rerere::say(repo, None);
         if !self.run.interactive || self.interactive(repo)? {
             self.commit(repo, out)?;
         }
@@ -733,6 +820,7 @@ impl Session {
 
     /// `--skip`: drop the current patch's changes and go on.
     fn skip(&mut self, repo: &Repository, out: &mut String) -> Result<(), GitError> {
+        crate::rerere::clear(repo)?;
         if let Some(head) = repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
             reset_touched(repo, &head)?;
         }
@@ -744,6 +832,7 @@ impl Session {
     fn abort(&self, repo: &Repository, out: &mut String) -> Result<(), GitError> {
         let head = repo.head().ok().and_then(|h| h.target());
         let safety = Oid::from_str(self.read("abort-safety").trim()).ok();
+        crate::rerere::clear(repo)?;
         if self.path("dirtyindex").exists() {
             return self.destroy();
         }
@@ -758,7 +847,7 @@ impl Session {
             reset_touched(repo, &repo.find_commit(h)?)?;
         }
         match repo
-            .revparse_single("ORIG_HEAD")
+            .rev_single("ORIG_HEAD")
             .and_then(|o| o.peel_to_commit())
         {
             Ok(orig) => {
@@ -938,15 +1027,6 @@ fn read_mails(
     stdin: Option<&[u8]>,
     keep_cr: bool,
 ) -> Result<Vec<Vec<u8>>, GitError> {
-    let mboxrd = a.patch_format.as_deref() == Some("mboxrd");
-    if let Some(f) = a
-        .patch_format
-        .as_deref()
-        .filter(|f| !matches!(*f, "mbox" | "mboxrd"))
-    {
-        return Err(GitError::Other(format!("Invalid patch format: {f}")));
-    }
-    let mut mails = Vec::new();
     let workdir = repo.workdir().unwrap_or(repo.path());
     let sources: Vec<Option<PathBuf>> = if a.mboxes.is_empty() {
         vec![None]
@@ -956,51 +1036,142 @@ fn read_mails(
             .map(|m| (m != "-").then(|| workdir.join(m)))
             .collect()
     };
-    for src in sources {
+    let format = match &a.patch_format {
+        Some(f) => f.clone(),
+        None => detect_format(sources[0].as_deref())?
+            .ok_or_else(|| GitError::Other("Patch format detection failed.".into()))?
+            .to_owned(),
+    };
+    let read = |src: &Option<PathBuf>| -> Result<Vec<u8>, GitError> {
         match src {
-            Some(p) if p.is_dir() => {
-                for sub in ["cur", "new"] {
-                    let Ok(entries) = std::fs::read_dir(p.join(sub)) else {
-                        continue;
-                    };
-                    let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-                    files.sort();
-                    for f in files {
-                        mails.extend(split_mbox(&std::fs::read(f)?, keep_cr, mboxrd, true));
-                    }
-                }
-            }
-            Some(p) => {
-                let data = std::fs::read(&p).map_err(|e| {
-                    GitError::Other(format!("could not open '{}': {e}", p.display()))
-                })?;
-                if a.patch_format.is_none() && !looks_like_mail(&data) {
-                    return Err(GitError::Other("Patch format detection failed.".into()));
-                }
-                mails.extend(split_mbox(&data, keep_cr, mboxrd, false));
-            }
-            None => mails.extend(split_mbox(
-                stdin.unwrap_or_default(),
-                keep_cr,
-                mboxrd,
-                false,
-            )),
+            Some(p) => std::fs::read(p).map_err(|e| {
+                GitError::Other(format!("could not open '{}' for reading: {e}", p.display()))
+            }),
+            None => Ok(stdin.unwrap_or_default().to_vec()),
         }
+    };
+    let mut mails = Vec::new();
+    match format.as_str() {
+        "mbox" | "mboxrd" => {
+            let mboxrd = format == "mboxrd";
+            for src in &sources {
+                match src {
+                    Some(p) if p.is_dir() => {
+                        for f in maildir(p)? {
+                            mails.extend(split_mbox(&std::fs::read(f)?, keep_cr, mboxrd, true));
+                        }
+                    }
+                    src => mails.extend(split_mbox(&read(src)?, keep_cr, mboxrd, false)),
+                }
+            }
+        }
+        "stgit" => {
+            for src in &sources {
+                mails.push(stgit_to_mail(&read(src)?));
+            }
+        }
+        "stgit-series" => {
+            for src in &sources {
+                let series = String::from_utf8_lossy(&read(src)?).into_owned();
+                let dir = src.as_deref().and_then(Path::parent).unwrap_or(workdir);
+                for name in series.lines().map(str::trim) {
+                    if name.is_empty() || name.starts_with('#') {
+                        continue;
+                    }
+                    mails.push(stgit_to_mail(&read(&Some(dir.join(name)))?));
+                }
+            }
+        }
+        "hg" => {
+            for src in &sources {
+                mails.push(hg_to_mail(&read(src)?)?);
+            }
+        }
+        f => return Err(GitError::Other(format!("Invalid patch format: {f}"))),
     }
     Ok(mails)
 }
 
-/// git's patch format detection for a file: an mbox `From ` line, a `From:`
-/// header, or a first block of header lines.
-fn looks_like_mail(data: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(data);
-    let mut lines = text.lines().skip_while(|l| l.is_empty());
-    let Some(first) = lines.next() else {
-        return true;
-    };
-    if first.starts_with("From ") || first.starts_with("From: ") {
-        return true;
+/// A maildir's mails, `cur` and `new` together, in git's order (digit runs
+/// compared as numbers), skipping dot files.
+fn maildir(dir: &Path) -> Result<Vec<PathBuf>, GitError> {
+    let mut names = Vec::new();
+    for sub in ["cur", "new"] {
+        let Ok(entries) = std::fs::read_dir(dir.join(sub)) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.starts_with('.') {
+                names.push(format!("{sub}/{name}"));
+            }
+        }
     }
+    names.sort_by(|a, b| maildir_cmp(a.as_bytes(), b.as_bytes()));
+    Ok(names.into_iter().map(|n| dir.join(n)).collect())
+}
+
+/// git's maildir_filename_cmp.
+fn maildir_cmp(mut a: &[u8], mut b: &[u8]) -> std::cmp::Ordering {
+    let digits = |s: &[u8]| s.iter().take_while(|c| c.is_ascii_digit()).count();
+    while let (Some(&x), Some(&y)) = (a.first(), b.first()) {
+        if x.is_ascii_digit() && y.is_ascii_digit() {
+            let (i, j) = (digits(a), digits(b));
+            let num = |s: &[u8]| String::from_utf8_lossy(s).parse::<u128>().unwrap_or(0);
+            let ord = num(&a[..i]).cmp(&num(&b[..j]));
+            if ord.is_ne() {
+                return ord;
+            }
+            (a, b) = (&a[i..], &b[j..]);
+        } else {
+            if x != y {
+                return x.cmp(&y);
+            }
+            (a, b) = (&a[1..], &b[1..]);
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// git's detect_patch_format for the first input (stdin and maildirs are
+/// mbox); `None` when it cannot tell.
+fn detect_format(first: Option<&Path>) -> Result<Option<&'static str>, GitError> {
+    let Some(path) = first.filter(|p| !p.is_dir()) else {
+        return Ok(Some("mbox"));
+    };
+    let data = std::fs::read(path).map_err(|e| {
+        GitError::Other(format!(
+            "could not open '{}' for reading: {e}",
+            path.display()
+        ))
+    })?;
+    let text = String::from_utf8_lossy(&data);
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(at) = lines.iter().position(|l| !l.is_empty()) else {
+        return Ok(None);
+    };
+    let (l1, l2, l3) = (
+        lines[at],
+        lines.get(at + 1).copied().unwrap_or(""),
+        lines.get(at + 2).copied().unwrap_or(""),
+    );
+    if l1.starts_with("From ") || l1.starts_with("From: ") {
+        return Ok(Some("mbox"));
+    }
+    if l1.starts_with("# This series applies on GIT commit") {
+        return Ok(Some("stgit-series"));
+    }
+    if l1 == "# HG changeset patch" {
+        return Ok(Some("hg"));
+    }
+    if l2.is_empty()
+        && ["From:", "Author:", "Date:"]
+            .iter()
+            .any(|p| l3.starts_with(p))
+    {
+        return Ok(Some("stgit"));
+    }
+    // git's is_mail: every line up to the first blank one a header, from the top.
     let header = |l: &str| {
         l.find(':').is_some_and(|i| {
             i > 0
@@ -1009,12 +1180,79 @@ fn looks_like_mail(data: &[u8]) -> bool {
                     .all(|b| (33..=57).contains(&b) || (59..=126).contains(&b))
         })
     };
-    header(first)
-        && text
-            .lines()
-            .skip_while(|l| l.is_empty())
-            .take_while(|l| !l.is_empty())
-            .all(|l| header(l) || l.starts_with([' ', '\t']))
+    let mail = lines
+        .iter()
+        .take_while(|l| !l.is_empty())
+        .all(|l| l.starts_with([' ', '\t']) || header(l));
+    Ok(mail.then_some("mbox"))
+}
+
+fn split_line(data: &[u8]) -> (&[u8], &[u8]) {
+    match data.iter().position(|&b| b == b'\n') {
+        Some(i) => (&data[..i], &data[i + 1..]),
+        None => (data, &[]),
+    }
+}
+
+/// git's stgit_patch_to_mail: the header lines become mail headers, the
+/// first other line the subject.
+fn stgit_to_mail(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut subject = false;
+    let mut rest = data;
+    while !rest.is_empty() {
+        let (line, next) = split_line(rest);
+        rest = next;
+        let s = String::from_utf8_lossy(line);
+        if s.trim().is_empty() {
+            continue;
+        } else if let Some(x) = s.strip_prefix("Author:") {
+            out.extend(format!("From:{x}\n").bytes());
+        } else if s.starts_with("From") || s.starts_with("Date") {
+            out.extend(format!("{s}\n").bytes());
+        } else if !subject {
+            out.extend(format!("Subject: {s}\n").bytes());
+            subject = true;
+        } else {
+            out.extend(format!("\n{s}\n").bytes());
+            break;
+        }
+    }
+    out.extend(rest);
+    out
+}
+
+/// git's hg_patch_to_mail: `# User` and `# Date` become From and Date.
+fn hg_to_mail(data: &[u8]) -> Result<Vec<u8>, GitError> {
+    let bad = |what: &str| GitError::Other(format!("error: {what}\nFailed to split patches."));
+    let mut out = Vec::new();
+    let mut rest = data;
+    while !rest.is_empty() {
+        let (line, next) = split_line(rest);
+        rest = next;
+        let s = String::from_utf8_lossy(line);
+        if let Some(user) = s.strip_prefix("# User ") {
+            out.extend(format!("From: {user}\n").bytes());
+        } else if let Some(date) = s.strip_prefix("# Date ") {
+            let (secs, tz) = date
+                .split_once(' ')
+                .ok_or_else(|| bad("invalid Date line"))?;
+            let secs: i64 = secs.parse().map_err(|_| bad("invalid timestamp"))?;
+            let tz: i64 = tz.parse().map_err(|_| bad("invalid Date line"))?;
+            // hg's zone is seconds west of UTC; git's east, in whole minutes.
+            let minutes = (tz.abs() / 3600 * 60 + tz.abs() % 3600 / 60) as i32;
+            let offset = if tz > 0 { -minutes } else { minutes };
+            let when = crate::git_repo::rfc2822_date(git2::Time::new(secs, offset));
+            out.extend(format!("Date: {when}\n").bytes());
+        } else if s.starts_with("# ") {
+            continue;
+        } else {
+            out.extend(format!("\n{s}\n").bytes());
+            break;
+        }
+    }
+    out.extend(rest);
+    Ok(out)
 }
 
 /// git's `is_from_line`: `From ` and something that ends like a date.
@@ -1359,7 +1597,10 @@ fn flush_inbody(acc: &mut Vec<u8>, sec: &mut Headers) {
     }
     let h = trim_end(acc).to_vec();
     for (i, n) in HEADERS.iter().enumerate() {
-        if let Some(v) = header_value(&h, n)
+        // git keeps the subject's line end, which `-k` then prints as an
+        // extra empty `Subject: ` line.
+        let from: &[u8] = if *n == "Subject" { acc } else { &h };
+        if let Some(v) = header_value(from, n)
             && sec.slot(i).is_none()
         {
             *sec.slot(i) = Some(decode_header(v));
@@ -1387,7 +1628,7 @@ fn inbody_header(line: &[u8], acc: &mut Vec<u8>, sec: &mut Headers, scissors: bo
         return is_format_patch_separator(&line[1..]);
     }
     if line.starts_with(b"[PATCH]") && line.get(7).is_some_and(u8::is_ascii_whitespace) {
-        sec.subject = Some(String::from_utf8_lossy(trim_end(line)).into_owned());
+        sec.subject = Some(String::from_utf8_lossy(line).into_owned());
         return true;
     }
     if HEADERS.iter().any(|n| header_value(line, n).is_some()) {

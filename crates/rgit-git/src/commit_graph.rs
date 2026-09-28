@@ -6,6 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use git2::{ObjectType, Oid, Repository};
+
+use crate::rev::RevParse;
 use sha1::Digest;
 
 use crate::GitError;
@@ -209,6 +211,11 @@ fn layers(repo: &Repository) -> Vec<Layer> {
         .lines()
         .filter_map(|h| read_layer(&dir.join(format!("graph-{}.graph", h.trim()))))
         .collect()
+}
+
+/// Every commit the commit-graph (file or chain) lists.
+pub(crate) fn listed(repo: &Repository) -> std::collections::HashSet<Oid> {
+    layers(repo).into_iter().flat_map(|l| l.ids).collect()
 }
 
 /// Write the commit-graph for everything the refs reach (git's
@@ -489,7 +496,7 @@ fn sources(repo: &Repository, o: &CommitGraphWrite) -> Result<Vec<Oid>, GitError
         return revs
             .iter()
             .map(|r| {
-                repo.revparse_single(r)
+                repo.rev_single(r)
                     .and_then(|obj| obj.peel_to_commit())
                     .map(|c| c.id())
                     .map_err(|_| GitError::Other(format!("unexpected non-hex object ID: {r}")))

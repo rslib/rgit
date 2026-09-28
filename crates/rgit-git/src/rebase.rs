@@ -1,6 +1,7 @@
 //! A native rebase sequencer. Its state is git's `.git/rebase-merge`, so a
 //! rebase rgit starts can be continued by git and the other way round.
 
+use crate::rev::RevParse;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -10,8 +11,8 @@ use git2::{Commit, Oid, Repository, Signature};
 
 use crate::error::GitError;
 use crate::git_repo::{
-    checked_out_at, checkout, checkout_merged, edit_message, file_favor, short_ref, short7,
-    signoff, store_stash,
+    checked_out_at, checkout, checkout_merged, edit_message, file_favor, pick_labels, short_ref,
+    short7, signoff, store_stash,
 };
 
 const STOP_FILES: [&str; 5] = ["stopped-sha", "message", "author-script", "amend", "patch"];
@@ -75,13 +76,15 @@ impl Cmd {
 }
 
 /// One todo line: `flag` is fixup's or merge's `C`/`c`, `arg` the exec
-/// command, label, ref or merge parent.
+/// command, label, ref or merge parent, `note` what follows a commit id
+/// (`# subject`) as the user left it.
 #[derive(Clone, Debug)]
 struct Item {
     cmd: Cmd,
     flag: Option<char>,
     oid: Option<Oid>,
     arg: String,
+    note: Option<String>,
 }
 
 impl Item {
@@ -91,6 +94,7 @@ impl Item {
             flag: None,
             oid: Some(oid),
             arg: String::new(),
+            note: None,
         }
     }
 
@@ -100,8 +104,87 @@ impl Item {
             flag: None,
             oid: None,
             arg: arg.to_owned(),
+            note: None,
         }
     }
+}
+
+/// How todo lines are written: rebase.abbreviateCommands and
+/// rebase.instructionFormat.
+#[derive(Default)]
+struct Style {
+    abbreviate: bool,
+    format: Option<String>,
+}
+
+impl Style {
+    fn load(repo: &Repository) -> Self {
+        let cfg = repo.config().ok();
+        Style {
+            abbreviate: cfg
+                .as_ref()
+                .and_then(|c| c.get_bool("rebase.abbreviateCommands").ok())
+                .unwrap_or(false),
+            format: cfg
+                .and_then(|c| c.get_string("rebase.instructionFormat").ok())
+                .filter(|f| !f.is_empty()),
+        }
+    }
+}
+
+/// A commit through a pretty format's common placeholders (git's
+/// rebase.instructionFormat).
+// ponytail: the placeholders todo lines use; the full pretty engine lives in
+// rgit-cli.
+fn pretty(repo: &Repository, oid: Oid, format: &str) -> String {
+    let Ok(c) = repo.find_commit(oid) else {
+        return String::new();
+    };
+    // git makes the todo with abbreviation off, so %h is the full id too.
+    let short = |o: Oid| o.to_string();
+    let msg = message(&c);
+    let (subj, body) = match msg.split_once("\n\n") {
+        Some((s, b)) => (s.replace('\n', " "), b.to_owned()),
+        None => (msg.trim_end().replace('\n', " "), String::new()),
+    };
+    let (a, m) = (c.author(), c.committer());
+    let mut out = String::new();
+    let mut rest = format;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 1..];
+        let two = rest.get(..2).unwrap_or("");
+        let (text, used) = match two {
+            "an" => (a.name().unwrap_or("").to_owned(), 2),
+            "ae" => (a.email().unwrap_or("").to_owned(), 2),
+            "cn" => (m.name().unwrap_or("").to_owned(), 2),
+            "ce" => (m.email().unwrap_or("").to_owned(), 2),
+            _ => match rest.chars().next() {
+                Some('H') => (oid.to_string(), 1),
+                Some('h') => (short(oid), 1),
+                Some('T') => (c.tree_id().to_string(), 1),
+                Some('t') => (short(c.tree_id()), 1),
+                Some('P') => (
+                    c.parent_ids()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    1,
+                ),
+                Some('p') => (c.parent_ids().map(short).collect::<Vec<_>>().join(" "), 1),
+                Some('s') => (subj.clone(), 1),
+                Some('b') => (body.clone(), 1),
+                Some('B') => (msg.clone(), 1),
+                Some('n') => ("\n".to_owned(), 1),
+                Some('%') => ("%".to_owned(), 1),
+                _ => ("%".to_owned(), 0),
+            },
+        };
+        out.push_str(&text);
+        rest = &rest[used..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn parse(repo: &Repository, line: &str) -> Result<Option<Item>, GitError> {
@@ -119,7 +202,7 @@ fn parse(repo: &Repository, line: &str) -> Result<Option<Item>, GitError> {
     let rest = rest.trim();
     let commit = |rev: &str| -> Result<Oid, GitError> {
         Ok(repo
-            .revparse_single(rev)
+            .rev_single(rev)
             .and_then(|o| o.peel_to_commit())
             .map_err(|_| bad())?
             .id())
@@ -150,14 +233,21 @@ fn parse(repo: &Repository, line: &str) -> Result<Option<Item>, GitError> {
                 .to_owned();
         }
         _ => {
+            let mut body = rest;
             if cmd == Cmd::Fixup
-                && let Some(f) = words.peek().and_then(|w| w.strip_prefix('-'))
+                && let Some(f) = body.strip_prefix('-')
             {
                 item.flag = f.chars().next().filter(|c| matches!(c, 'C' | 'c'));
                 item.flag.ok_or_else(bad)?;
-                words.next();
+                body = f[1..].trim_start();
             }
-            item.oid = Some(commit(words.next().ok_or_else(bad)?)?);
+            let (id, note) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+            if id.is_empty() {
+                return Err(bad());
+            }
+            item.oid = Some(commit(id)?);
+            let note = note.trim();
+            item.note = (!note.is_empty()).then(|| note.to_owned());
         }
     }
     Ok(Some(item))
@@ -171,14 +261,14 @@ fn subject(repo: &Repository, oid: Oid) -> String {
 }
 
 /// A todo line; `short` abbreviates the commit ids, as the editor shows them.
-fn render(repo: &Repository, item: &Item, short: bool) -> String {
+fn render(repo: &Repository, item: &Item, short: bool, style: &Style) -> String {
+    let verb = |cmd: Cmd| match VERBS.iter().find(|v| v.2 == cmd) {
+        Some(v) if style.abbreviate => v.1,
+        _ => cmd.verb(),
+    };
     let id = |oid: Oid| {
         if short {
-            repo.find_object(oid, None)
-                .ok()
-                .and_then(|o| o.short_id().ok())
-                .and_then(|b| b.as_str().ok().map(str::to_owned))
-                .unwrap_or_else(|| short7(oid))
+            abbrev(repo, oid)
         } else {
             oid.to_string()
         }
@@ -190,12 +280,134 @@ fn render(repo: &Repository, item: &Item, short: bool) -> String {
             let about = oid
                 .map(|o| format!(" # {}", subject(repo, o)))
                 .unwrap_or_default();
-            format!("merge {from}{}{about}", item.arg)
+            format!("{} {from}{}{about}", verb(Cmd::Merge), item.arg)
         }
-        (cmd, Some(oid)) => format!("{} {flag}{} # {}", cmd.verb(), id(oid), subject(repo, oid)),
-        (Cmd::Break | Cmd::Noop, None) => item.cmd.verb().to_owned(),
-        (cmd, None) => format!("{} {}", cmd.verb(), item.arg),
+        (cmd, Some(oid)) => format!(
+            "{} {flag}{} {}",
+            verb(cmd),
+            id(oid),
+            note(repo, item, oid, style)
+        ),
+        (Cmd::Break | Cmd::Noop, None) => verb(item.cmd).to_owned(),
+        (cmd, None) => format!("{} {}", verb(cmd), item.arg),
     }
+}
+
+/// `oid` abbreviated as git's find_unique_abbrev does (core.abbrev).
+fn abbrev(repo: &Repository, oid: Oid) -> String {
+    repo.find_object(oid, None)
+        .ok()
+        .and_then(|o| o.short_id().ok())
+        .and_then(|b| b.as_str().ok().map(str::to_owned))
+        .unwrap_or_else(|| short7(oid))
+}
+
+/// What follows a todo line's commit id: the user's text, else `# ` and the
+/// commit in rebase.instructionFormat (default its subject).
+fn note(repo: &Repository, item: &Item, oid: Oid, style: &Style) -> String {
+    match (&item.note, &style.format) {
+        (Some(n), _) => n.clone(),
+        (None, Some(f)) => format!("# {}", pretty(repo, oid, f)),
+        (None, None) => format!("# {}", subject(repo, oid)),
+    }
+}
+
+/// git's append_todo_help: `shortrevisions` and `shortonto` for the first
+/// edit, `None` for `--edit-todo`.
+fn todo_help(repo: &Repository, count: usize, range: Option<(&str, &str)>) -> String {
+    let mut out = String::new();
+    if let Some((revs, onto)) = range {
+        let s = if count == 1 { "" } else { "s" };
+        out.push_str(&format!(
+            "\n# Rebase {revs} onto {onto} ({count} command{s})\n"
+        ));
+    }
+    out.push_str(HELP);
+    out.push_str(if check_level(repo) == Check::Error {
+        "#\n# Do not remove any line. Use 'drop' explicitly to remove a commit.\n"
+    } else {
+        "#\n# If you remove a line here THAT COMMIT WILL BE LOST.\n"
+    });
+    out.push_str(if range.is_some() {
+        "#\n# However, if you remove everything, the rebase will be aborted.\n#\n"
+    } else {
+        "#\n# You are editing the todo file of an ongoing interactive rebase.\n# To continue \
+         rebase after editing, run:\n#     git rebase --continue\n#\n"
+    });
+    out
+}
+
+#[derive(PartialEq, Eq)]
+enum Check {
+    Ignore,
+    Warn,
+    Error,
+}
+
+fn check_level(repo: &Repository) -> Check {
+    let v = repo
+        .config()
+        .and_then(|c| c.get_string("rebase.missingCommitsCheck"))
+        .unwrap_or_default();
+    match v.to_ascii_lowercase().as_str() {
+        "warn" => Check::Warn,
+        "error" => Check::Error,
+        "ignore" | "" => Check::Ignore,
+        _ => {
+            eprintln!(
+                "warning: unrecognized setting {v} for option rebase.missingCommitsCheck. \
+                 Ignoring."
+            );
+            Check::Ignore
+        }
+    }
+}
+
+const EDIT_TODO_ADVICE: &str = "You can fix this with 'git rebase --edit-todo' and then run 'git \
+                                rebase --continue'.\nOr you can abort the rebase with 'git \
+                                rebase --abort'.\n";
+
+/// git's todo_list_check: warn about the commits of `old` that `new` lost;
+/// `true` when rebase.missingCommitsCheck=error makes that an error.
+fn missing_commits(repo: &Repository, old: &[Item], new: &[Item], style: &Style) -> bool {
+    let level = check_level(repo);
+    if level == Check::Ignore {
+        return false;
+    }
+    let mut seen: HashSet<Oid> = new.iter().filter_map(|i| i.oid).collect();
+    let mut missing = String::new();
+    for item in old.iter().rev() {
+        if let Some(oid) = item.oid.filter(|o| seen.insert(*o)) {
+            let note = note(repo, item, oid, style);
+            missing.push_str(&format!(" - {} {note}\n", abbrev(repo, oid)));
+        }
+    }
+    if missing.is_empty() {
+        return false;
+    }
+    eprint!(
+        "Warning: some commits may have been dropped accidentally.\nDropped commits (newer to \
+         older):\n{missing}To avoid this message, use \"drop\" to explicitly remove a \
+         commit.\n\nUse 'git config rebase.missingCommitsCheck' to change the level of \
+         warnings.\nThe possible behaviours are: ignore, warn, error.\n\n{EDIT_TODO_ADVICE}"
+    );
+    level == Check::Error
+}
+
+/// The todo lines of `text`, skipping comments.
+fn parse_all(repo: &Repository, text: &str) -> Result<Vec<Item>, GitError> {
+    let mut items = Vec::new();
+    for line in text.lines() {
+        items.extend(parse(repo, line)?);
+    }
+    Ok(items)
+}
+
+fn todo_body(repo: &Repository, items: &[Item], short: bool, style: &Style) -> String {
+    items
+        .iter()
+        .map(|i| format!("{}\n", render(repo, i, short, style)))
+        .collect()
 }
 
 fn read(dir: &Path, name: &str) -> Option<String> {
@@ -346,7 +558,7 @@ const HELP: &str = "#
 #                    keep only this commit's message; -c is same as -C but
 #                    opens the editor
 # x, exec <command> = run command (the rest of the line) using shell
-# b, break = stop here (continue rebase later with 'rgit rebase --continue')
+# b, break = stop here (continue rebase later with 'git rebase --continue')
 # d, drop <commit> = remove commit
 # l, label <label> = label current HEAD with a name
 # t, reset <label> = reset HEAD to a label
@@ -359,11 +571,6 @@ const HELP: &str = "#
 #                       updated at the end of the rebase
 #
 # These lines can be re-ordered; they are executed from top to bottom.
-#
-# If you remove a line here THAT COMMIT WILL BE LOST.
-#
-# However, if you remove everything, the rebase will be aborted.
-#
 ";
 
 /// Run hook `name` if there is one, its output on stderr; whether it passed.
@@ -563,7 +770,7 @@ impl<'r> Seq<'r> {
             return Ok(oid);
         }
         self.repo
-            .revparse_single(label)
+            .rev_single(label)
             .and_then(|o| o.peel_to_commit())
             .map(|c| c.id())
             .map_err(|_| GitError::Other(format!("could not resolve '{label}'")))
@@ -588,35 +795,23 @@ impl<'r> Seq<'r> {
         write(&self.dir, "author-script", author_script(author))
     }
 
-    fn conflict(&self, index: &git2::Index, commit: &Commit) -> Result<GitError, GitError> {
-        let theirs = format!(
-            "{} ({})",
-            short7(commit.id()),
-            commit.summary().ok().flatten().unwrap_or("")
-        );
-        let mut lines = Vec::new();
-        let mut paths = Vec::new();
-        for c in index.conflicts()? {
-            let c = c?;
-            let path = |e: &Option<git2::IndexEntry>| {
-                e.as_ref()
-                    .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-            };
-            let p = path(&c.our).or(path(&c.their)).unwrap_or_default();
-            lines.push(match (&c.ancestor, &c.our, &c.their) {
-                (None, Some(_), Some(_)) => format!("CONFLICT (add/add): Merge conflict in {p}"),
-                (_, Some(_), Some(_)) => format!("CONFLICT (content): Merge conflict in {p}"),
-                (_, None, _) => format!(
-                    "CONFLICT (modify/delete): {p} deleted in HEAD and modified in {theirs}.  \
-                     Version {theirs} of {p} left in tree."
-                ),
-                _ => format!(
-                    "CONFLICT (modify/delete): {p} deleted in {theirs} and modified in HEAD.  \
-                     Version HEAD of {p} left in tree."
-                ),
-            });
-            paths.push(p);
-        }
+    /// Stop for the conflicts `index` has from applying `commit` (`trees`:
+    /// base, ours, theirs), reporting as git does; `note` ends the todo line.
+    fn conflict(
+        &self,
+        index: &git2::Index,
+        commit: &Commit,
+        trees: [&git2::Tree; 3],
+        note: &str,
+    ) -> Result<GitError, GitError> {
+        let theirs = pick_labels(commit, false)[2].clone();
+        let mut lines = crate::git_repo::merge_report(self.repo, index, trees, &theirs)?;
+        let mut paths: Vec<String> = index
+            .conflicts()?
+            .flatten()
+            .filter_map(|c| c.our.or(c.their))
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+            .collect();
         paths.dedup();
         let msg = read(&self.dir, "message").unwrap_or_default();
         let mut msg = msg.trim_end().to_owned();
@@ -626,15 +821,15 @@ impl<'r> Seq<'r> {
         }
         write(&self.dir, "message", &msg)?;
         write(self.repo.path(), "MERGE_MSG", &msg)?;
-        lines.push(format!(
-            "Could not apply {}... {}",
-            short7(commit.id()),
-            commit.summary().ok().flatten().unwrap_or("")
-        ));
-        lines.push(
-            "resolve the conflicts, then run `rgit rebase --continue` (or --skip / --abort)"
-                .to_owned(),
-        );
+        let short = abbrev(self.repo, commit.id());
+        let subject = commit.summary().ok().flatten().unwrap_or("").to_owned();
+        lines.push(format!("error: could not apply {short}... {subject}"));
+        let auto =
+            read(&self.dir, "allow_rerere_autoupdate").map(|s| s.trim() == "--rerere-autoupdate");
+        let tail = crate::git_repo::conflict_advice(self.repo, "rebase", false)
+            + &crate::rerere::report(self.repo, auto);
+        lines.extend(tail.lines().map(str::to_owned));
+        lines.push(format!("Could not apply {short}... {note}"));
         Ok(GitError::Conflict(self.with_out(lines)))
     }
 
@@ -819,7 +1014,13 @@ impl<'r> Seq<'r> {
             self.author_of(&commit)?
         };
         if index.has_conflicts() {
-            checkout_merged(repo, &mut index, &head.tree()?, "rebase")?;
+            checkout_merged(
+                repo,
+                &mut index,
+                &head.tree()?,
+                "rebase",
+                Some(&pick_labels(&commit, false)),
+            )?;
             let text = if fixup {
                 write(&self.dir, "amend", format!("{}\n", head.id()))?;
                 cleanup(&self.squash_message(&head, &commit, item)?)
@@ -827,7 +1028,9 @@ impl<'r> Seq<'r> {
                 msg
             };
             self.record_stop(&commit, &text, &author)?;
-            return Err(self.conflict(&index, &commit)?);
+            let note = note(repo, item, commit.id(), &Style::load(repo));
+            let trees = [&base, &ours, &commit.tree()?];
+            return Err(self.conflict(&index, &commit, trees, &note)?);
         }
         let tree = index.write_tree_to(repo)?;
         let was_empty = base.id() == commit.tree_id();
@@ -891,10 +1094,8 @@ impl<'r> Seq<'r> {
                 .move_to(orig.id(), "rebase (merge): fast-forward")
                 .map(|()| None);
         }
-        let base = match repo.merge_base(head.id(), target.id()) {
-            Ok(b) => repo.find_commit(b)?.tree()?,
-            Err(_) => repo.find_tree(self.empty_tree()?)?,
-        };
+        let bases = crate::git_repo::all_merge_bases(repo, head.id(), target.id())?;
+        let base = crate::git_repo::merge_base_tree(repo, &bases)?;
         let mut index = repo.merge_trees(
             &base,
             &head.tree()?,
@@ -910,11 +1111,18 @@ impl<'r> Seq<'r> {
             None => committer(repo)?,
         };
         if index.has_conflicts() {
-            checkout_merged(repo, &mut index, &head.tree()?, "rebase")?;
+            let labels = [
+                "merged common ancestors".to_owned(),
+                "HEAD".to_owned(),
+                item.arg.clone(),
+            ];
+            checkout_merged(repo, &mut index, &head.tree()?, "rebase", Some(&labels))?;
             let shown = orig.as_ref().unwrap_or(&target);
             self.record_stop(shown, &msg, &author)?;
             write(repo.path(), "MERGE_HEAD", format!("{}\n", target.id()))?;
-            return Err(self.conflict(&index, shown)?);
+            let note = format!("{} # {}", item.arg, subject(repo, shown.id()));
+            let trees = [&base, &head.tree()?, &target.tree()?];
+            return Err(self.conflict(&index, shown, trees, &note)?);
         }
         let msg = if item.flag == Some('c') {
             self.reword(&msg)?
@@ -1370,6 +1578,7 @@ fn merges_todo(
                 flag: Some('C'),
                 oid: Some(oid),
                 arg: args.join(" "),
+                note: None,
             },
         );
     }
@@ -1460,7 +1669,7 @@ fn rearrange_squash(repo: &Repository, items: Vec<Item>) -> Vec<Item> {
                 if p.contains(' ') {
                     return None;
                 }
-                let oid = repo.revparse_single(&p).ok()?.peel_to_commit().ok()?.id();
+                let oid = repo.rev_single(&p).ok()?.peel_to_commit().ok()?.id();
                 items.iter().position(|it| it.oid == Some(oid))
             };
             let target = by_subject.get(&p).copied().or_else(by_id).or_else(|| {
@@ -1563,14 +1772,14 @@ fn resolve_onto(repo: &Repository, rev: &str) -> Result<Oid, GitError> {
     if let Some((a, b)) = rev.split_once("...") {
         let side = |r: &str| -> Result<Oid, GitError> {
             let r = if r.is_empty() { "HEAD" } else { r };
-            Ok(repo.revparse_single(r)?.peel_to_commit()?.id())
+            Ok(repo.rev_single(r)?.peel_to_commit()?.id())
         };
         return repo
             .merge_base(side(a)?, side(b)?)
             .map_err(|_| GitError::Other(format!("'{rev}': need exactly one merge base")));
     }
     Ok(repo
-        .revparse_single(rev)
+        .rev_single(rev)
         .and_then(|o| o.peel_to_commit())
         .map_err(|_| GitError::Other(format!("does not point to a valid commit: '{rev}'")))?
         .id())
@@ -1791,7 +2000,7 @@ pub(crate) fn start(
     };
 
     std::fs::create_dir_all(&dir)?;
-    let result = (|| -> Result<Option<Oid>, GitError> {
+    let result = (|| -> Result<(Oid, bool), GitError> {
         let root_onto = if onto.is_none() {
             let mut seq = Seq::load_partial(repo, &dir);
             Some(seq.new_root()?)
@@ -1825,38 +2034,49 @@ pub(crate) fn start(
         if let Some(key) = crate::sign::commit_key(repo, o.sign.as_deref(), o.no_sign) {
             write(&dir, "gpg_sign_opt", format!("-S{key}"))?;
         }
-        let body = |repo: &Repository, items: &[Item], short: bool| -> String {
-            items
-                .iter()
-                .map(|i| format!("{}\n", render(repo, i, short)))
-                .collect()
-        };
-        write(&dir, "git-rebase-todo", body(repo, &items, false))?;
-        if o.interactive {
-            let help = format!(
-                "\n# Rebase {}..{} onto {} ({} commands)\n{HELP}",
-                short7(bottom.unwrap_or(onto)),
-                short7(orig),
-                short7(onto),
-                items.len()
-            );
-            let path = dir.join("git-rebase-todo");
-            std::fs::write(&path, format!("{}{help}", body(repo, &items, true)))?;
+        if let Some(auto) = o.rerere_autoupdate {
+            let no = if auto { "" } else { "no-" };
             write(
                 &dir,
-                "git-rebase-todo.backup",
-                format!("{}{help}", body(repo, &items, false)),
+                "allow_rerere_autoupdate",
+                format!("--{no}rerere-autoupdate\n"),
             )?;
+        }
+        let style = Style::load(repo);
+        write(
+            &dir,
+            "git-rebase-todo",
+            todo_body(repo, &items, false, &style),
+        )?;
+        if o.interactive {
+            let revs = match upstream {
+                Some(u) => format!("{}..{}", abbrev(repo, u), abbrev(repo, orig)),
+                None => abbrev(repo, orig),
+            };
+            let help = todo_help(repo, items.len(), Some((&revs, &abbrev(repo, onto))));
+            let path = dir.join("git-rebase-todo");
+            let body = todo_body(repo, &items, true, &style);
+            std::fs::write(&path, format!("{body}{help}"))?;
+            let body = todo_body(repo, &items, false, &style);
+            write(&dir, "git-rebase-todo.backup", format!("{body}{help}"))?;
             edit_todo_file(repo, &path)?;
-            let mut edited = Vec::new();
-            for line in std::fs::read_to_string(&path)?.lines() {
-                edited.extend(parse(repo, line)?);
-            }
+            let edited = parse_all(repo, &std::fs::read_to_string(&path)?)?;
             if edited.is_empty() {
                 return Err(GitError::Other("nothing to do".into()));
             }
+            // git stops on onto with the todo as edited, for --edit-todo or
+            // --continue once the lost commits are back or dropped.
+            if missing_commits(repo, &items, &edited, &style) {
+                write(&dir, "dropped", "")?;
+                write(&dir, "end", format!("{}\n", edited.len()))?;
+                return Ok((onto, true));
+            }
             items = edited;
-            write(&dir, "git-rebase-todo", body(repo, &items, false))?;
+            write(
+                &dir,
+                "git-rebase-todo",
+                todo_body(repo, &items, false, &style),
+            )?;
         }
         write(&dir, "end", format!("{}\n", items.len()))?;
         let refs: Vec<UpdateRef> = items
@@ -1870,10 +2090,10 @@ pub(crate) fn start(
         if !refs.is_empty() {
             write_update_refs(&dir, &refs)?;
         }
-        Ok(Some(onto))
+        Ok((onto, false))
     })();
-    let onto = match result {
-        Ok(onto) => onto.expect("an onto commit"),
+    let (onto, dropped) = match result {
+        Ok(r) => r,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(e);
@@ -1895,6 +2115,9 @@ pub(crate) fn start(
         cleanup_state(repo)?;
         apply_autostash(repo, stash)?;
         return Err(e);
+    }
+    if dropped {
+        return Err(GitError::Conflict(out.join("\n")));
     }
     seq.allow_ff &= !force;
     seq.out = out;
@@ -1926,8 +2149,20 @@ impl<'r> Seq<'r> {
 pub(crate) fn resume(repo: &Repository, skip: bool) -> Result<String, GitError> {
     let seq = Seq::load(repo)?;
     crate::git_repo::sync_index(repo)?;
+    if seq.dir.join("dropped").exists() {
+        let backup = parse_all(
+            repo,
+            &read(&seq.dir, "git-rebase-todo.backup").unwrap_or_default(),
+        )?;
+        let todo = parse_all(repo, &read(&seq.dir, "git-rebase-todo").unwrap_or_default())?;
+        if !backup.is_empty() && missing_commits(repo, &backup, &todo, &Style::load(repo)) {
+            return Err(GitError::Conflict(String::new()));
+        }
+        let _ = std::fs::remove_file(seq.dir.join("dropped"));
+    }
     let head = seq.head()?;
     if skip {
+        crate::rerere::clear(repo)?;
         hard_reset(repo, &head)?;
         clear_stop(&seq.dir, repo);
         let _ = std::fs::remove_file(seq.dir.join("current-fixups"));
@@ -1954,6 +2189,7 @@ pub(crate) fn resume(repo: &Repository, skip: bool) -> Result<String, GitError> 
                 .into(),
         ));
     }
+    crate::rerere::say(repo, None);
     let tree = index.write_tree()?;
     let dir = seq.dir.clone();
     let stored = |f: &str| {
@@ -1991,7 +2227,15 @@ pub(crate) fn resume(repo: &Repository, skip: bool) -> Result<String, GitError> 
                         .into(),
                 ));
             }
+            // The chain's last fixup opens the editor on the whole squash
+            // message when a squash or `fixup -c` asked for it, as git does.
             let msg = match chain {
+                true if !seq.peek().is_some_and(Cmd::is_fixup) => {
+                    match read(&dir, "message-squash") {
+                        Some(buf) => seq.end_chain(&buf)?,
+                        None => stored("message").unwrap_or_else(|| message(&head)),
+                    }
+                }
                 true => stored("message").unwrap_or_else(|| message(&head)),
                 false => message(&head),
             };
@@ -2038,6 +2282,7 @@ pub(crate) fn abort(repo: &Repository) -> Result<String, GitError> {
     let head_name = read(&dir, "head-name").unwrap_or_default();
     let head_name = head_name.trim();
     let commit = repo.find_commit(orig)?;
+    crate::rerere::clear(repo)?;
     hard_reset(repo, &commit)?;
     if head_name.starts_with("refs/") {
         repo.set_head(head_name)?;
@@ -2062,18 +2307,49 @@ pub(crate) fn quit(repo: &Repository) -> Result<(), GitError> {
 /// `rebase --edit-todo`: the remaining todo in the sequence editor.
 pub(crate) fn edit_todo(repo: &Repository) -> Result<(), GitError> {
     let seq = Seq::load(repo)?;
+    let style = Style::load(repo);
     let path = seq.dir.join("git-rebase-todo");
     let text = read(&seq.dir, "git-rebase-todo").unwrap_or_default();
-    if !text.contains("\n# Commands:") {
-        std::fs::write(&path, format!("{text}\n{HELP}"))?;
+    let help = todo_help(repo, 0, None);
+    let old = parse_all(repo, &text);
+    let dropped = seq.dir.join("dropped");
+    let incorrect = old.is_err() || dropped.exists();
+    match &old {
+        Ok(items) => {
+            let body = todo_body(repo, items, true, &style);
+            std::fs::write(&path, format!("{body}{help}"))?;
+            if !incorrect {
+                let body = todo_body(repo, items, false, &style);
+                write(&seq.dir, "git-rebase-todo.backup", format!("{body}{help}"))?;
+            }
+        }
+        Err(_) => std::fs::write(&path, format!("{text}{help}"))?,
     }
     edit_todo_file(repo, &path)?;
-    let mut n = 0;
-    for line in std::fs::read_to_string(&path)?.lines() {
-        n += usize::from(parse(repo, line)?.is_some());
+    let new = parse_all(repo, &std::fs::read_to_string(&path)?).inspect_err(|_| {
+        eprint!("{EDIT_TODO_ADVICE}");
+    })?;
+    let lost = if incorrect {
+        let backup = parse_all(
+            repo,
+            &read(&seq.dir, "git-rebase-todo.backup").unwrap_or_default(),
+        )?;
+        missing_commits(repo, &backup, &new, &style)
+    } else {
+        missing_commits(repo, &old.unwrap_or_default(), &new, &style)
+    };
+    if lost {
+        write(&seq.dir, "dropped", "")?;
+        return Err(GitError::Conflict(String::new()));
     }
+    let _ = std::fs::remove_file(&dropped);
+    write(
+        &seq.dir,
+        "git-rebase-todo",
+        todo_body(repo, &new, false, &style),
+    )?;
     let done = seq.lines("done").len();
-    write(&seq.dir, "end", format!("{}\n", done + n))
+    write(&seq.dir, "end", format!("{}\n", done + new.len()))
 }
 
 /// Rebase HEAD onto `upstream` (or `--onto onto upstream`), undoing the

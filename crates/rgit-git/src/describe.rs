@@ -1,6 +1,7 @@
 //! `git describe`: the nearest tag (or ref) a commit descends from, found
 //! with git's own walk so the depth and the choice between tags match.
 
+use crate::rev::RevParse;
 use std::collections::HashMap;
 
 use git2::{Oid, Repository};
@@ -66,7 +67,7 @@ pub(crate) fn describe(
     rev: &str,
     o: &DescribeOptions,
 ) -> Result<String, GitError> {
-    let target = repo.revparse_single(rev)?.peel_to_commit()?.id();
+    let target = repo.rev_single(rev)?.peel_to_commit()?.id();
     let names = names(repo, o)?;
     if names.is_empty() && !o.always {
         return Err(err("No names found, cannot describe anything."));

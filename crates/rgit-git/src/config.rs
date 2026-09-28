@@ -545,12 +545,16 @@ pub(crate) fn default_config() -> Result<Config, GitError> {
 /// found from the current folder and the environment, if any), with `-c`.
 pub fn config_get(key: &str) -> Option<String> {
     let name = config_key(key).ok()?;
-    let repo = crate::git_repo::open_env(Path::new(".")).ok();
-    config_list(repo.as_ref().map(Repository::path), &ConfigScope::Any, true)
-        .ok()?
+    config_all()
         .into_iter()
         .rfind(|e| e.name == name)
         .map(|e| e.value.unwrap_or_else(|| "true".to_owned()))
+}
+
+/// Every entry git sees from the current directory, lowest priority first.
+pub fn config_all() -> Vec<ConfigEntry> {
+    let repo = crate::git_repo::open_env(Path::new(".")).ok();
+    config_list(repo.as_ref().map(Repository::path), &ConfigScope::Any, true).unwrap_or_default()
 }
 
 fn open_for_write(repo: Option<&Repository>, scope: &ConfigScope) -> Result<Config, GitError> {

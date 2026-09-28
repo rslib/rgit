@@ -2,6 +2,7 @@
 //! `-R` and whitespace fixes work on any patch, binary ones included), then
 //! applied through libgit2, with git's three-way and reject fallbacks.
 
+use crate::rev::RevParse;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -77,6 +78,10 @@ pub struct FilePatch {
     /// The `GIT binary patch` blocks (forward, then reverse), or `Binary
     /// files ... differ` when there is no data.
     pub binary: Option<Vec<String>>,
+    /// The patch input it came from, as whitespace reports name it.
+    pub source: String,
+    /// The whitespace rule (ws.rs bits) `--whitespace=fix` fixes by.
+    pub ws_rule: u32,
 }
 
 /// One `@@` hunk.
@@ -88,6 +93,8 @@ pub struct Hunk {
     pub tail: String,
     /// Lines with their `+`/`-`/` `/`\` prefix and newline.
     pub lines: Vec<String>,
+    /// Each line's number in the patch input, for whitespace reports.
+    pub linenrs: Vec<usize>,
 }
 
 impl FilePatch {
@@ -122,7 +129,7 @@ impl FilePatch {
     }
 
     /// The patch text in canonical `a/`/`b/` git form, for libgit2.
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let old = self.old.as_deref();
         let new = self.new.as_deref();
         let mut out = format!(
@@ -205,11 +212,11 @@ impl FilePatch {
             }
             // A `\ No newline` note belongs to the line before it, so each
             // -/+ run is swapped as a block to keep it in place.
-            let mut out: Vec<String> = Vec::with_capacity(h.lines.len());
+            let mut out: Vec<usize> = Vec::with_capacity(h.lines.len());
             let mut i = 0;
             while i < h.lines.len() {
                 if !h.lines[i].starts_with(['+', '-']) {
-                    out.push(h.lines[i].clone());
+                    out.push(i);
                     i += 1;
                     continue;
                 }
@@ -217,14 +224,14 @@ impl FilePatch {
                 while i < h.lines.len() && !h.lines[i].starts_with(' ') {
                     i += 1;
                 }
-                let run = &h.lines[start..i];
                 let side = |c: char| {
                     let mut v = Vec::new();
-                    for (j, l) in run.iter().enumerate() {
-                        if l.starts_with(c) {
-                            v.push(l.clone());
-                            if let Some(n) = run.get(j + 1).filter(|n| n.starts_with('\\')) {
-                                v.push(n.clone());
+                    for j in start..i {
+                        if h.lines[j].starts_with(c) {
+                            v.push(j);
+                            if h.lines.get(j + 1).is_some_and(|n| n.starts_with('\\')) && j + 1 < i
+                            {
+                                v.push(j + 1);
                             }
                         }
                     }
@@ -233,7 +240,10 @@ impl FilePatch {
                 out.extend(side('-'));
                 out.extend(side('+'));
             }
-            h.lines = out;
+            h.lines = out.iter().map(|&j| h.lines[j].clone()).collect();
+            if h.linenrs.len() == out.len() {
+                h.linenrs = out.iter().map(|&j| h.linenrs[j]).collect();
+            }
         }
         if let Some(b) = &mut self.binary
             && b.len() == 2
@@ -289,6 +299,11 @@ pub(crate) fn unquote(s: &str) -> String {
         match chars.next() {
             Some(b'n') => bytes.push(b'\n'),
             Some(b't') => bytes.push(b'\t'),
+            Some(b'a') => bytes.push(7),
+            Some(b'b') => bytes.push(8),
+            Some(b'v') => bytes.push(11),
+            Some(b'f') => bytes.push(12),
+            Some(b'r') => bytes.push(b'\r'),
             Some(d @ b'0'..=b'7') => {
                 let mut v = u32::from(d - b'0');
                 for _ in 0..2 {
@@ -413,6 +428,7 @@ pub fn parse_patch(text: &[u8], opts: &ApplyOpts) -> Result<Vec<FilePatch>, GitE
                 new: parse_range(n).ok_or_else(|| bad(l))?,
                 tail: tail.to_owned(),
                 lines: Vec::new(),
+                linenrs: Vec::new(),
             };
             i += 1;
             if opts.recount {
@@ -463,6 +479,7 @@ pub fn parse_patch(text: &[u8], opts: &ApplyOpts) -> Result<Vec<FilePatch>, GitE
                 } else {
                     (*l).to_owned()
                 });
+                h.linenrs.push(i + 1);
                 i += 1;
             }
             f.hunks.push(h);
@@ -575,45 +592,120 @@ pub(crate) fn wildmatch(glob: &str, path: &str) -> bool {
     regex::Regex::new(&re).is_ok_and(|r| r.is_match(path))
 }
 
-/// Check added lines for trailing whitespace; fix them (`fix`/`strip`), or
-/// report them as git does. Returns the warning for stderr, if any.
-pub fn check_whitespace(files: &mut [FilePatch], action: &str) -> Result<String, GitError> {
-    let mut bad = 0;
+/// What `git apply` says about a patch's whitespace: `report` (each error
+/// with its line, as the patch is read), then `summary` (after applying);
+/// `fatal` when `--whitespace=error` stops it.
+#[derive(Debug, Default)]
+pub struct WsCheck {
+    pub report: String,
+    pub summary: String,
+    pub fatal: bool,
+}
+
+/// git's whitespace checks of a patch under `action` (nowarn, warn, fix or
+/// strip, error, error-all): added lines, and context lines too when
+/// fixing, each against its file's rule (core.whitespace and the
+/// `whitespace` attribute). Fixing rewrites the added lines; context lines
+/// are fixed where the patch lands. `applying` is false for `--check` and
+/// the like.
+pub fn check_whitespace(
+    files: &mut [FilePatch],
+    action: &str,
+    git_dir: Option<&Path>,
+    reverse: bool,
+    applying: bool,
+) -> WsCheck {
+    let mut out = WsCheck::default();
+    if action == "nowarn" {
+        return out;
+    }
+    let fixing = matches!(action, "fix" | "strip");
+    let squelch = if action == "error-all" { 0 } else { 5 };
+    let mut errors = 0;
     for f in files.iter_mut() {
-        for h in &mut f.hunks {
-            for l in &mut h.lines {
-                if !l.starts_with('+') {
+        f.ws_rule =
+            crate::ws::rule_for(git_dir, f.new.as_deref().or(f.old.as_deref()).unwrap_or(""));
+        let old_side = if reverse { '+' } else { '-' };
+        let crlf = f
+            .hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .any(|l| (l.starts_with(' ') || l.starts_with(old_side)) && l.ends_with("\r\n"));
+        if crlf {
+            f.ws_rule |= crate::ws::CR_AT_EOL;
+        }
+        let source = if f.source.is_empty() || f.source == "-" {
+            "<stdin>"
+        } else {
+            &f.source
+        };
+        for h in &f.hunks {
+            for (k, l) in h.lines.iter().enumerate() {
+                if !(l.starts_with('+') || (fixing && !reverse && l.starts_with(' '))) {
                     continue;
                 }
-                let body = l.trim_end_matches(['\n', '\r']);
-                let trimmed = body.trim_end_matches([' ', '\t']);
-                if trimmed.len() != body.len() {
-                    bad += 1;
-                    if matches!(action, "fix" | "strip") {
-                        *l = format!("{trimmed}{}", &l[body.len()..]);
+                let bad = crate::ws::check(&l.as_bytes()[1..], f.ws_rule);
+                if bad == 0 {
+                    continue;
+                }
+                errors += 1;
+                if squelch == 0 || errors <= squelch {
+                    let body = l[1..].strip_suffix('\n').unwrap_or(&l[1..]);
+                    let _ = writeln!(
+                        out.report,
+                        "{source}:{}: {}.\n{body}",
+                        h.linenrs.get(k).copied().unwrap_or(0),
+                        crate::ws::error_string(bad)
+                    );
+                }
+            }
+        }
+    }
+    if errors == 0 {
+        return out;
+    }
+    let mut fixed = 0;
+    if fixing {
+        for f in files.iter_mut() {
+            for h in &mut f.hunks {
+                for l in h.lines.iter_mut().filter(|l| l.starts_with('+')) {
+                    let (new, changed) = crate::ws::fix(&l.as_bytes()[1..], f.ws_rule);
+                    if changed {
+                        fixed += 1;
+                        *l = format!("+{}", String::from_utf8_lossy(&new));
                     }
                 }
             }
         }
     }
-    if bad == 0 {
-        return Ok(String::new());
+    if squelch > 0 && errors > squelch {
+        let n = errors - squelch;
+        let _ = writeln!(
+            out.summary,
+            "warning: squelched {n} whitespace error{}",
+            if n == 1 { "" } else { "s" }
+        );
     }
-    let what = if bad == 1 {
-        "1 line adds whitespace errors.".to_owned()
-    } else {
-        format!("{bad} lines add whitespace errors.")
-    };
-    match action {
-        "error" | "error-all" => Err(GitError::Other(what)),
-        "fix" | "strip" => Ok(if bad == 1 {
-            "warning: 1 line applied after fixing whitespace errors.".to_owned()
+    let adds = |n: usize| {
+        if n == 1 {
+            "1 line adds whitespace errors.".to_owned()
         } else {
-            format!("warning: {bad} lines applied after fixing whitespace errors.")
-        }),
-        "warn" => Ok(format!("warning: {what}")),
-        _ => Ok(String::new()),
+            format!("{n} lines add whitespace errors.")
+        }
+    };
+    if action.starts_with("error") {
+        out.fatal = true;
+        let _ = writeln!(out.summary, "error: {}", adds(errors));
+    } else if fixed > 0 && applying {
+        let _ = writeln!(
+            out.summary,
+            "warning: {fixed} line{} applied after fixing whitespace errors.",
+            if fixed == 1 { "" } else { "s" }
+        );
+    } else {
+        let _ = writeln!(out.summary, "warning: {}", adds(errors));
     }
+    out
 }
 
 /// `git apply --stat`.
@@ -1023,8 +1115,9 @@ fn fit(image: &[u8], f: &FilePatch, opts: &ApplyOpts, log: &mut String) -> Vec<O
         let mut beginning = h.old.0 == 0 || (h.old.0 == 1 && !opts.unidiff_zero);
         let mut end = !opts.unidiff_zero && trailing == 0;
         let mut pos = h.new.0 as isize - 1;
+        let fix = matches!(opts.whitespace.as_deref(), Some("fix" | "strip")).then_some(f.ws_rule);
         let found = loop {
-            if let Some(found) = find_pos(&img, &parts, pos, beginning, end, opts) {
+            if let Some(found) = find_pos(&img, &parts, pos, beginning, end, opts, fix) {
                 break Some(found);
             }
             if lead <= limit && trail <= limit {
@@ -1045,7 +1138,7 @@ fn fit(image: &[u8], f: &FilePatch, opts: &ApplyOpts, log: &mut String) -> Vec<O
                 trail -= 1;
             }
         };
-        let Some((at, fuzzy)) = found else {
+        let Some((at, how)) = found else {
             out.push(None);
             continue;
         };
@@ -1071,13 +1164,18 @@ fn fit(image: &[u8], f: &FilePatch, opts: &ApplyOpts, log: &mut String) -> Vec<O
             );
         }
         // The preimage is what the image holds; with whitespace fuzz the
-        // context keeps the image's whitespace too.
+        // context keeps the image's whitespace too, and matched by fixing
+        // whitespace it takes the fixed line (update_pre_post_images).
         let mut k = at;
         for p in &mut parts {
             if let Some(pre) = &mut p.pre {
                 *pre = img[k].0.clone();
-                if fuzzy && p.post.is_some() {
-                    p.post = Some(pre.clone());
+                if p.post.is_some() {
+                    match (how, fix) {
+                        (Fit::Fuzzy, _) => p.post = Some(pre.clone()),
+                        (Fit::Fixed, Some(rule)) => p.post = Some(crate::ws::fix(pre, rule).0),
+                        _ => {}
+                    }
                 }
                 k += 1;
             }
@@ -1118,14 +1216,26 @@ fn fit(image: &[u8], f: &FilePatch, opts: &ApplyOpts, log: &mut String) -> Vec<O
             new: (start, new_len as u32),
             tail: h.tail.clone(),
             lines,
+            linenrs: Vec::new(),
         }));
     }
     out
 }
 
+/// How a hunk's preimage matched the image.
+#[derive(Clone, Copy)]
+enum Fit {
+    Exact,
+    /// Equal but for the amount of whitespace (`--ignore-whitespace`).
+    Fuzzy,
+    /// Equal once whitespace errors are fixed (`--whitespace=fix`).
+    Fixed,
+}
+
 /// git's `find_pos`: the line where `parts`' preimage matches `img`,
 /// trying `line`, then one after, one before, two after, and so on; and
-/// whether it matched only with whitespace fuzz.
+/// how it matched. With `fix` (`--whitespace=fix`'s rule) lines also match
+/// when fixing their whitespace errors makes them equal.
 fn find_pos(
     img: &[(Vec<u8>, bool)],
     parts: &[Part],
@@ -1133,7 +1243,8 @@ fn find_pos(
     beginning: bool,
     end: bool,
     opts: &ApplyOpts,
-) -> Option<(usize, bool)> {
+    fix: Option<u32>,
+) -> Option<(usize, Fit)> {
     let pre: Vec<&[u8]> = parts.iter().filter_map(|p| p.pre.as_deref()).collect();
     if pre.len() > img.len() {
         return None;
@@ -1146,7 +1257,7 @@ fn find_pos(
         // Before the start wraps around to the end, as in git.
         usize::try_from(line).map_or(img.len(), |l| l.min(img.len()))
     };
-    let matches = |at: usize| -> Option<bool> {
+    let matches = |at: usize| -> Option<Fit> {
         if at + pre.len() > img.len()
             || (end && at + pre.len() != img.len())
             || (beginning && at != 0)
@@ -1168,16 +1279,27 @@ fn find_pos(
                     && l[p.len()..].iter().all(u8::is_ascii_whitespace))
         });
         if exact {
-            return Some(false);
+            return Some(Fit::Exact);
         }
-        (opts.ignore_whitespace && lines.iter().zip(&pre).all(|((l, _), p)| fuzzy_eq(l, p)))
-            .then_some(true)
+        if opts.ignore_whitespace {
+            return lines
+                .iter()
+                .zip(&pre)
+                .all(|((l, _), p)| fuzzy_eq(l, p))
+                .then_some(Fit::Fuzzy);
+        }
+        let rule = fix?;
+        lines
+            .iter()
+            .zip(&pre)
+            .all(|((l, _), p)| crate::ws::fix(l, rule).0 == crate::ws::fix(p, rule).0)
+            .then_some(Fit::Fixed)
     };
     let (mut back, mut fwd, mut at) = (line, line, line);
     let mut i = 0usize;
     loop {
-        if let Some(fuzzy) = matches(at) {
-            return Some((at, fuzzy));
+        if let Some(how) = matches(at) {
+            return Some((at, how));
         }
         loop {
             if back == 0 && fwd == img.len() {
@@ -1303,7 +1425,7 @@ fn fake_ancestor(repo: &Repository, files: &[FilePatch], path: &Path) -> Result<
                 || GitError::Other(format!("sha1 information is lacking or useless ({name})."));
             let (pre, _, mode) = f.index.as_ref().ok_or_else(lacking)?;
             let id = repo
-                .revparse_single(pre)
+                .rev_single(pre)
                 .ok()
                 .filter(|o| o.kind() == Some(git2::ObjectType::Blob))
                 .ok_or_else(lacking)?
@@ -1347,7 +1469,7 @@ fn three_way_inputs(
         return None;
     }
     let (pre, ..) = f.index.as_ref()?;
-    let base = repo.revparse_single(pre).ok()?.peel_to_blob().ok()?;
+    let base = repo.rev_single(pre).ok()?.peel_to_blob().ok()?;
     let base = base.content().to_vec();
     let theirs = patch_blob(&base, &f.hunks)?;
     let path = f.old.as_deref()?;

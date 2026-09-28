@@ -2,6 +2,7 @@
 //! parents along the lines their diff leaves alone, with git's rename, move
 //! (`-M`), copy (`-C`), `--reverse` and ignored-revision handling.
 
+use crate::rev::RevParse;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -36,6 +37,9 @@ pub struct BlameOptions {
     /// Files of revisions to ignore, after blame.ignoreRevsFile; an empty
     /// name forgets those before it.
     pub ignore_revs_files: Vec<String>,
+    /// `--contents`: blame these bytes as the working tree's version, on
+    /// top of the commit given (else HEAD).
+    pub contents: Option<Vec<u8>>,
 }
 
 /// A blame's lines, the file's length and git's `--show-stats` counters.
@@ -45,6 +49,9 @@ pub struct Blame {
     pub total: usize,
     /// Blobs read, patches computed and commits examined.
     pub stats: [usize; 3],
+    /// Each group of lines as blame settled it, in that order: its first
+    /// line in the file and its length (git's `--incremental`).
+    pub found: Vec<(usize, usize)>,
 }
 
 struct Text {
@@ -130,6 +137,7 @@ struct Board<'r> {
     queue: BinaryHeap<(i64, Reverse<u64>, Oid)>,
     seq: u64,
     done: Vec<Entry>,
+    found: Vec<(usize, usize)>,
     boundary: HashSet<Oid>,
     children: HashMap<Oid, Vec<Oid>>,
     worktree_parents: Vec<Oid>,
@@ -153,9 +161,8 @@ pub(crate) fn blame(
     workdir: &Path,
     opts: &BlameOptions,
 ) -> Result<Blame, GitError> {
-    let commit_of = |rev: &str| -> Result<Oid, GitError> {
-        Ok(repo.revparse_single(rev)?.peel_to_commit()?.id())
-    };
+    let commit_of =
+        |rev: &str| -> Result<Oid, GitError> { Ok(repo.rev_single(rev)?.peel_to_commit()?.id()) };
     let (mut pos, mut neg) = (Vec::new(), Vec::new());
     for rev in &opts.revs {
         if let Some((a, b)) = rev.split_once("..") {
@@ -184,6 +191,7 @@ pub(crate) fn blame(
         queue: BinaryHeap::new(),
         seq: 0,
         done: Vec::new(),
+        found: Vec::new(),
         boundary: HashSet::new(),
         children: HashMap::new(),
         worktree_parents: Vec::new(),
@@ -224,15 +232,22 @@ pub(crate) fn blame(
         };
         board.children_between(start, end)?;
         (start, board.blob_at(start, &opts.path))
-    } else if let Some(c) = pos.first() {
+    } else if let (Some(c), None) = (pos.first(), &opts.contents) {
         (*c, board.blob_at(*c, &opts.path))
     } else {
-        let buf = std::fs::read(workdir.join(&opts.path))?;
+        let buf = match &opts.contents {
+            Some(buf) => buf.clone(),
+            None => std::fs::read(workdir.join(&opts.path))?,
+        };
         board.final_text = Rc::new(Text::new(buf));
-        if let Ok(head) = repo.head().and_then(|h| h.peel_to_commit()) {
+        if let Some(c) = pos.first() {
+            board.worktree_parents.push(*c);
+        } else if let Ok(head) = repo.head().and_then(|h| h.peel_to_commit()) {
             board.worktree_parents.push(head.id());
         }
-        if let Ok(merge) = std::fs::read_to_string(repo.path().join("MERGE_HEAD")) {
+        if opts.contents.is_none()
+            && let Ok(merge) = std::fs::read_to_string(repo.path().join("MERGE_HEAD"))
+        {
             board.worktree_parents.extend(
                 merge
                     .split_whitespace()
@@ -276,11 +291,18 @@ pub(crate) fn blame(
         .collect();
     board.queue_blames(o, entries);
     board.assign()?;
-    let lines = board.lines()?;
+    let mut lines = board.lines()?;
+    if opts.contents.is_some() {
+        for b in lines.iter_mut().filter(|b| b.id.is_empty()) {
+            b.author = "External file (--contents)".to_owned();
+            b.email = "external.file".to_owned();
+        }
+    }
     Ok(Blame {
         lines,
         total,
         stats: board.stats,
+        found: std::mem::take(&mut board.found),
     })
 }
 
@@ -325,7 +347,7 @@ fn ignored(
     }
     for rev in &opts.ignore_revs {
         let c = repo
-            .revparse_single(rev)
+            .rev_single(rev)
             .and_then(|o| o.peel_to_commit())
             .map_err(|_| err(format!("cannot find revision {rev} to ignore")))?;
         out.insert(c.id());
@@ -497,6 +519,7 @@ impl Board<'_> {
                 self.boundary.insert(commit);
             }
             let rest = std::mem::take(&mut self.origins[o].suspects);
+            self.found.extend(rest.iter().map(|e| (e.lno + 1, e.num)));
             self.done.extend(rest);
         }
         Ok(())
@@ -1243,11 +1266,9 @@ fn ranges(
     Ok(merged)
 }
 
-fn bre(pattern: &str) -> Result<regex::bytes::Regex, GitError> {
-    regex::bytes::RegexBuilder::new(&crate::plumbing::basic_to_extended(pattern))
-        .multi_line(true)
-        .build()
-        .map_err(|e| err(format!("-L parameter '{pattern}': {e}")))
+/// A `-L` regex as git compiles it: basic, `^` and `$` at each line.
+fn bre(pattern: &str) -> Result<crate::userdiff::Regex, String> {
+    crate::userdiff::Regex::new(pattern.as_bytes(), crate::userdiff::NEWLINE)
 }
 
 /// One end of a `-L` range; `begin` is where a regex search starts (negative:
@@ -1304,12 +1325,18 @@ fn loc<'s>(spec: &'s str, text: &Text, mut begin: i64, ret: &mut i64) -> Result<
     }
     let pattern = &body[..end];
     let from = text.starts[((begin - 1) as usize).min(text.len())];
-    let Some(m) = bre(pattern)?.find(&text.buf[from..]) else {
+    let re = bre(pattern);
+    let found = re
+        .as_ref()
+        .ok()
+        .and_then(|re| re.exec(&text.buf[from..])?[0]);
+    let Some((so, _)) = found else {
+        let why = re.map_or_else(|e| e, |re| re.no_match());
         return Err(err(format!(
-            "-L parameter '{pattern}' starting at line {begin}: No match"
+            "-L parameter '{pattern}' starting at line {begin}: {why}"
         )));
     };
-    let at = from + m.start();
+    let at = from + so;
     *ret = text.starts.partition_point(|&s| s <= at) as i64;
     Ok(&body[end + 1..])
 }
@@ -1341,27 +1368,20 @@ fn funcname(
     if i == 0 || i < bytes.len() {
         return Err(err(format!("invalid -L range '{spec}'")));
     }
-    let driver = funcname_driver(repo, path)?;
-    let is_func = |line: &[u8]| match &driver {
-        Some(rules) => rules
-            .iter()
-            .find(|(_, re)| re.is_match(line.strip_suffix(b"\n").unwrap_or(line)))
-            .is_some_and(|(negate, _)| !negate),
-        None => line
-            .first()
-            .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_' || *c == b'$'),
-    };
-    let re = bre(pattern)?;
+    let driver = crate::userdiff::driver(repo, path, crate::userdiff::Fallback::None)?
+        .and_then(|d| d.funcname);
+    let is_func = |line: &[u8]| crate::userdiff::is_func(driver.as_ref(), line);
+    let re = bre(pattern).map_err(|e| err(format!("-L parameter '{pattern}': {e}")))?;
     let lines = text.len();
     let mut line = ((anchor - 1) as usize).min(lines);
     let begin = loop {
         let from = text.starts[line];
-        let Some(m) = re.find(&text.buf[from..]) else {
+        let Some((so, _)) = re.exec(&text.buf[from..]).and_then(|m| m[0]) else {
             return Err(err(format!(
                 "-L parameter '{pattern}' starting at line {anchor}: no match"
             )));
         };
-        let at = text.starts.partition_point(|&s| s <= from + m.start()) - 1;
+        let at = text.starts.partition_point(|&s| s <= from + so) - 1;
         if is_func(text.span(at, at + 1)) {
             break at;
         }
@@ -1376,47 +1396,4 @@ fn funcname(
         .find(|&l| is_func(text.span(l, l + 1)))
         .unwrap_or(lines);
     Ok((begin as i64 + 1, end as i64))
-}
-
-/// The `diff.<driver>.xfuncname` (or `funcname`) rules for `path`'s diff
-/// attribute: each line a regex, `!` for lines that are not functions.
-fn funcname_driver(
-    repo: &Repository,
-    path: &str,
-) -> Result<Option<Vec<(bool, regex::bytes::Regex)>>, GitError> {
-    let Some(driver) = repo
-        .get_attr(Path::new(path), "diff", git2::AttrCheckFlags::default())
-        .ok()
-        .flatten()
-        .filter(|d| !matches!(*d, "set" | "unset" | "true" | "false"))
-        .map(str::to_owned)
-    else {
-        return Ok(None);
-    };
-    let config = repo.config()?;
-    let (pattern, extended) = match config.get_string(&format!("diff.{driver}.xfuncname")) {
-        Ok(p) => (p, true),
-        Err(_) => match config.get_string(&format!("diff.{driver}.funcname")) {
-            Ok(p) => (p, false),
-            Err(_) => return Ok(None),
-        },
-    };
-    let rules = pattern
-        .split('\n')
-        .map(|line| {
-            let (negate, line) = match line.strip_prefix('!') {
-                Some(l) => (true, l),
-                None => (false, line),
-            };
-            let re = if extended {
-                line.to_owned()
-            } else {
-                crate::plumbing::basic_to_extended(line)
-            };
-            regex::bytes::Regex::new(&re)
-                .map(|re| (negate, re))
-                .map_err(|e| err(format!("bad funcname pattern: {e}")))
-        })
-        .collect::<Result<_, _>>()?;
-    Ok(Some(rules))
 }

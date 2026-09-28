@@ -71,7 +71,7 @@ fn text(line: Vec<u8>) -> Result<String, GitError> {
 }
 
 /// `s` in single quotes for a POSIX shell, as git's sq_quote_buf writes it.
-fn sq_quote(s: &str) -> String {
+pub(crate) fn sq_quote(s: &str) -> String {
     let mut out = String::from("'");
     for c in s.chars() {
         match c {

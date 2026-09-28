@@ -148,6 +148,615 @@ fn repo(tag: &str) -> PathBuf {
     dir
 }
 
+/// `bin args` in `dir` with `input` on stdin and `env` set.
+fn piped(bin: &str, dir: &Path, args: &[&str], input: &[u8], env: &[(&str, &str)]) -> Output {
+    use std::io::Write;
+    let rgit = bin != "git";
+    let mut child = Command::new(bin)
+        .args(rgit.then_some("--human"))
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("RGIT_OPLOG", "0")
+        .envs(env.iter().copied())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// Each step's stdout and exit status, and the file `log` after it, are the
+/// same under git and rgit; `log` is cleared before each tool's run.
+fn same_steps(dir: &Path, log: &Path, steps: &[(&[&str], &str)], env: &[(&str, &str)]) {
+    let run_all = |bin: &str| {
+        let _ = std::fs::remove_file(log);
+        let mut out = Vec::new();
+        for (args, input) in steps {
+            let o = piped(bin, dir, args, input.as_bytes(), env);
+            out.push(format!(
+                "{args:?} {input:?}\n{} {}\n{}",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stdout),
+                std::fs::read_to_string(log).unwrap_or_default()
+            ));
+        }
+        out
+    };
+    let want = run_all("git");
+    let got = run_all(env!("CARGO_BIN_EXE_rgit"));
+    for (w, g) in want.iter().zip(&got) {
+        assert_eq!(g, w);
+    }
+}
+
+#[test]
+fn credential_fill_approve_reject_match_git() {
+    let dir = repo("credential");
+    let log = dir.join("helper.log");
+    let helper = dir.join("helper.sh");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> {0}\ncat >> {0}\n\
+             [ \"$1\" = get ] && printf 'capability[]=authtype\\nauthtype=Bearer\\n\
+             credential=tok\\nusername=u1\\npassword=p1\\nstate[]=s\\ncontinue=1\\n'\nexit 0\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    let user = dir.join("user.sh");
+    std::fs::write(
+        &user,
+        "#!/bin/sh\ncat >/dev/null\necho username=from-user\n",
+    )
+    .unwrap();
+    let h = format!("credential.helper=!sh {}", helper.display());
+    let u = format!("credential.helper=!sh {}", user.display());
+    let url_helper = format!(
+        "credential.https://*.example.com/p.helper=!sh {}",
+        helper.display()
+    );
+    let other = format!("credential.https://other.com.helper=!sh {}", user.display());
+    let steps: &[(&[&str], &str)] = &[
+        (
+            &["-c", &h, "credential", "fill"],
+            "protocol=https\nhost=example.com\npath=a/b\n",
+        ),
+        (
+            &["-c", &h, "credential", "fill"],
+            "capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=example.com\n\
+             wwwauth[]=Basic x\nstate[]=s0\n",
+        ),
+        (
+            &["-c", &u, "-c", &h, "credential", "fill"],
+            "capability[]=state\nprotocol=https\nhost=example.com\n",
+        ),
+        (
+            &[
+                "-c",
+                &u,
+                "-c",
+                "credential.helper=",
+                "-c",
+                &url_helper,
+                "-c",
+                &other,
+                "-c",
+                "credential.useHttpPath=true",
+                "credential",
+                "fill",
+            ],
+            "protocol=https\nhost=a.example.com:443\npath=p/q\n",
+        ),
+        (
+            &[
+                "-c",
+                &h,
+                "-c",
+                "credential.example.com.username=zed",
+                "credential",
+                "fill",
+            ],
+            "protocol=http\nhost=example.com\n",
+        ),
+        (
+            &["-c", &h, "credential", "approve"],
+            "url=https://me:pw@example.com:8080/x/y/\n",
+        ),
+        (
+            &["-c", &h, "credential", "reject"],
+            "url=https://me:pw@example.com/x\ncapability[]=authtype\nauthtype=Basic\n\
+             credential=zz\nephemeral=1\n",
+        ),
+        (
+            &["-c", &h, "credential", "approve"],
+            "protocol=https\nhost=example.com\nusername=a\npassword=b\npassword_expiry_utc=5\n",
+        ),
+        (
+            &["-c", &h, "credential", "approve"],
+            "protocol=https\nhost=example.com\nusername=a\n",
+        ),
+        (&["credential", "capability"], ""),
+        (&["credential", "fill"], "protocol=https\n"),
+        (&["credential", "fill"], "host=x\n"),
+        (&["credential", "fill"], "garbage\n"),
+        (&["credential", "fill"], "url=noscheme\n"),
+        (
+            &["credential", "fill"],
+            "protocol=https\nhost=x\r\nusername=a\r\npassword=b\r\n\r\nx=y\n",
+        ),
+        (
+            &["credential", "fill"],
+            "protocol=https\nhost=x\nusername=bob\n",
+        ),
+        (
+            &["-c", "credential.useHttpPath=1", "credential", "fill"],
+            "protocol=https\nhost=a_b%x y:8080\nusername=u/s er%\npath=p a/b%c\n",
+        ),
+        (&["credential", "fill"], "url=https://a%0db@x\n"),
+        (&["credential"], ""),
+        (&["credential", "bogus"], ""),
+    ];
+    same_steps(&dir, &log, steps, &[("GIT_ASKPASS", "echo")]);
+    same_steps(
+        &dir,
+        &log,
+        &[(&["credential", "fill"], "protocol=https\nhost=x\n")],
+        &[("GIT_TERMINAL_PROMPT", "0")],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn credential_store_matches_git() {
+    let dir = repo("credential-store");
+    let file = dir.join("store.txt");
+    let f = file.to_str().unwrap();
+    let helper = format!("credential.helper=store --file={f}");
+    let steps: &[(&[&str], &str)] = &[
+        (
+            &["credential-store", "--file", f, "store"],
+            "protocol=https\nhost=ex.com:8080\nusername=a b@c\npassword=p:w/%x\npath=x y/z\n",
+        ),
+        (
+            &["credential-store", "--file", f, "store"],
+            "protocol=https\nhost=other.com\nusername=bob\npassword=pw\n",
+        ),
+        (
+            &["credential-store", "--file", f, "store"],
+            "protocol=https\nhost=other.com\nusername=bob\npassword=pw2\n",
+        ),
+        (
+            &["credential-store", "--file", f, "get"],
+            "protocol=https\nhost=other.com\n",
+        ),
+        (
+            &["credential-store", "--file", f, "get"],
+            "protocol=https\nhost=ex.com:8080\n",
+        ),
+        (
+            &["credential-store", "--file", f, "get"],
+            "protocol=http\nhost=ex.com:8080\n",
+        ),
+        (
+            &["credential-store", "--file", f, "erase"],
+            "protocol=https\nhost=other.com\npassword=nope\n",
+        ),
+        (
+            &["credential-store", "--file", f, "erase"],
+            "protocol=https\nhost=other.com\npassword=pw2\n",
+        ),
+        (
+            &["credential-store", "--file", f, "store"],
+            "protocol=https\nusername=x\n",
+        ),
+        (&["credential-store", "--file", f, "bogus"], ""),
+        (&["credential-store", "--file", f, "capability"], ""),
+        (
+            &["-c", &helper, "credential", "approve"],
+            "protocol=https\nhost=h.com\nusername=a\npassword=b\n",
+        ),
+        (
+            &["-c", &helper, "credential", "fill"],
+            "protocol=https\nhost=h.com\n",
+        ),
+        (&["credential-store"], ""),
+    ];
+    same_steps(&dir, &file, steps, &[]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn credential_cache_speaks_git_daemon_protocol() {
+    let dir = repo("credential-cache");
+    // (client, daemon starter): every pairing of git's and rgit's must agree.
+    let rgit = env!("CARGO_BIN_EXE_rgit");
+    let mut runs = Vec::new();
+    for (client, starter) in [("git", "git"), (rgit, rgit), ("git", rgit), (rgit, "git")] {
+        let sock_dir = dir.join("sock");
+        let _ = std::fs::remove_dir_all(&sock_dir);
+        let sock = sock_dir.join("s");
+        let s = sock.to_str().unwrap();
+        let mut out = String::new();
+        let mut step = |bin: &str, args: &[&str], input: &str| {
+            let o = piped(bin, &dir, args, input.as_bytes(), &[]);
+            out.push_str(&format!(
+                "{args:?} {}\n{}",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stdout)
+            ));
+        };
+        step(
+            starter,
+            &["credential-cache", "--socket", s, "store"],
+            "protocol=https\nhost=ex.com\nusername=bob\npassword=pw\n",
+        );
+        step(
+            client,
+            &["credential-cache", "--socket", s, "store"],
+            "capability[]=authtype\nprotocol=https\nhost=ex2.com\nauthtype=Bearer\n\
+             credential=tok\npassword_expiry_utc=99999999999\n",
+        );
+        for input in [
+            "protocol=https\nhost=ex.com\n",
+            "protocol=https\nhost=ex2.com\n",
+            "capability[]=authtype\nprotocol=https\nhost=ex2.com\n",
+        ] {
+            step(client, &["credential-cache", "--socket", s, "get"], input);
+        }
+        step(
+            client,
+            &["credential-cache", "--socket", s, "erase"],
+            "protocol=https\nhost=ex.com\npassword=wrong\n",
+        );
+        step(
+            client,
+            &["credential-cache", "--socket", s, "get"],
+            "protocol=https\nhost=ex.com\n",
+        );
+        step(
+            client,
+            &["credential-cache", "--socket", s, "erase"],
+            "protocol=https\nhost=ex.com\n",
+        );
+        step(
+            client,
+            &["credential-cache", "--socket", s, "get"],
+            "protocol=https\nhost=ex.com\n",
+        );
+        let h = format!("credential.helper=cache --socket {s}");
+        step(
+            client,
+            &["-c", &h, "credential", "approve"],
+            "protocol=https\nhost=ex4.com\nusername=a\npassword=b\n",
+        );
+        step(
+            client,
+            &["-c", &h, "credential", "fill"],
+            "protocol=https\nhost=ex4.com\n",
+        );
+        step(
+            client,
+            &["credential-cache", "--socket", s, "capability"],
+            "",
+        );
+        step(client, &["credential-cache", "--socket", s, "exit"], "");
+        assert!(!sock.exists(), "the daemon removes its socket on exit");
+        step(
+            client,
+            &["credential-cache", "--socket", s, "get"],
+            "protocol=https\nhost=ex.com\n",
+        );
+        runs.push(out);
+    }
+    for run in &runs[1..] {
+        assert_eq!(run, &runs[0]);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hook_run_matches_git() {
+    let dir = repo("hook-run");
+    let hooks = dir.join(".git/hooks");
+    std::fs::write(
+        hooks.join("my-hook"),
+        "#!/bin/sh\necho \"out $# $*\"\necho err >&2\npwd\necho \"prefix=$GIT_PREFIX\"\ncat\nexit 3\n",
+    )
+    .unwrap();
+    std::fs::write(hooks.join("noexec"), "#!/bin/sh\necho hi\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        hooks.join("my-hook"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    write(&dir, "in.txt", b"stdin data\n");
+    std::fs::create_dir_all(dir.join("hk")).unwrap();
+    std::fs::copy(hooks.join("my-hook"), dir.join("hk/my-hook")).unwrap();
+    for cwd in [dir.clone(), dir.join("dir")] {
+        for args in [
+            &["hook", "run", "my-hook", "--", "a", "b c"][..],
+            &["hook", "run", "--to-stdin=in.txt", "my-hook"],
+            &["hook", "run", "--to-stdin=nope.txt", "my-hook"],
+            &["hook", "run", "nope"],
+            &["hook", "run", "--ignore-missing", "nope"],
+            &["hook", "run", "noexec"],
+            &["-c", "core.hooksPath=hk", "hook", "run", "my-hook"],
+        ] {
+            let want = piped("git", &cwd, args, b"ignored\n", &[]);
+            let got = piped(env!("CARGO_BIN_EXE_rgit"), &cwd, args, b"ignored\n", &[]);
+            assert_eq!(
+                (got.status.code(), String::from_utf8_lossy(&got.stderr)),
+                (want.status.code(), String::from_utf8_lossy(&want.stderr)),
+                "{args:?}"
+            );
+            assert_eq!(got.stdout, want.stdout, "{args:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn rev_list_output_options_match_git() {
+    let dir = repo("rev-list-more");
+    let cases: &[&[&str]] = &[
+        &["rev-list", "--objects", "--no-object-names", "main"],
+        &[
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            "--object-names",
+            "v1",
+        ],
+        &["rev-list", "--objects-edge", "main~1..main"],
+        &["rev-list", "--objects", "--filter=blob:none", "--all"],
+        &["rev-list", "--objects", "--filter=tree:0", "main"],
+        &["rev-list", "--objects", "--filter=tree:1", "main"],
+        &[
+            "rev-list",
+            "--objects",
+            "--filter=tree:2",
+            "--filter-print-omitted",
+            "main",
+        ],
+        &[
+            "rev-list",
+            "--objects",
+            "--filter=blob:limit=6",
+            "--filter-print-omitted",
+            "main",
+        ],
+        &["rev-list", "--objects", "--filter=blob:limit=1k", "main"],
+        &["rev-list", "--objects", "--filter=object:type=tree", "main"],
+        &[
+            "rev-list",
+            "--objects",
+            "--filter=object:type=blob",
+            "--all",
+        ],
+        &[
+            "rev-list",
+            "--objects",
+            "--filter=combine:blob:none+tree:2",
+            "main",
+        ],
+        &[
+            "rev-list",
+            "--objects",
+            "--filter=blob:none",
+            "--filter=tree:2",
+            "main",
+        ],
+        &[
+            "rev-list",
+            "--objects",
+            "--filter=blob:none",
+            "--no-filter",
+            "main",
+        ],
+        &["rev-list", "--filter=blob:none", "main"],
+        &["rev-list", "--objects", "--filter=nope", "main"],
+        &["rev-list", "--disk-usage", "main"],
+        &["rev-list", "--disk-usage=human", "--objects", "--all"],
+        &["rev-list", "--children", "--all"],
+        &["rev-list", "--children", "--parents", "main"],
+        &["rev-list", "--timestamp", "--parents", "main"],
+        &["rev-list", "--header", "main"],
+        &["rev-list", "--format=%h %s", "main"],
+        &[
+            "rev-list",
+            "--format=%an%n%b",
+            "--no-commit-header",
+            "--all",
+        ],
+        &["rev-list", "--format=", "main"],
+        &[
+            "rev-list",
+            "--format=%h",
+            "--left-right",
+            "--boundary",
+            "main...side",
+        ],
+        &["rev-list", "--pretty=format:%s", "--parents", "main"],
+        &["rev-list", "--pretty=oneline", "main"],
+        &["rev-list", "--oneline", "--left-right", "main...side"],
+        &["rev-list", "--pretty=short", "main"],
+        &["rev-list", "--pretty", "main"],
+        &["rev-list", "--pretty=raw", "main"],
+        &["rev-list", "--pretty=fuller", "--date=iso", "main"],
+        &["rev-list", "--abbrev-commit", "--abbrev=10", "main"],
+        &["rev-list", "--abbrev-commit", "--parents", "main"],
+        &["rev-list", "--bisect", "main"],
+        &["rev-list", "--bisect", "side..main"],
+        &["rev-list", "--bisect-vars", "main"],
+        &["rev-list", "--bisect-all", "main"],
+        &["rev-list", "--bisect-all", "--bisect-vars", "main"],
+        &["rev-list", "--quiet", "--objects", "main"],
+        &["rev-list", "--exclude=s*", "--branches"],
+        &["rev-list", "--exclude=refs/heads/main", "--all", "--count"],
+    ];
+    same(&dir, cases);
+    same_input(&dir, &["rev-list", "--stdin", "--count"], b"main\n^side\n");
+    same_input(&dir, &["rev-list", "--stdin"], b"");
+    same_input(&dir, &["rev-list", "--stdin", "main"], b"--\nc.txt\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fetch_pack_and_send_pack_match_git() {
+    let base = std::env::temp_dir().join(format!("rgit-plumbing-{}-packs", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let src = repo("packs-src");
+    let mut outs = Vec::new();
+    for bin in ["git", env!("CARGO_BIN_EXE_rgit")] {
+        let side = base.join(if bin == "git" { "g" } else { "r" });
+        std::fs::create_dir_all(&side).unwrap();
+        git(&side, &["init", "-q", "-b", "main", "dst"], &[]);
+        git(
+            &side,
+            &["clone", "-q", "--bare", src.to_str().unwrap(), "bare.git"],
+            &[],
+        );
+        let dst = side.join("dst");
+        let bare = side.join("bare.git");
+        let s = src.to_str().unwrap();
+        let url = format!("file://{s}");
+        let b = bare.to_str().unwrap();
+        let mut out = String::new();
+        let step = |dir: &Path, args: &[&str], input: &str| {
+            let o = piped(bin, dir, args, input.as_bytes(), &[]);
+            format!(
+                "{args:?} {}\n{}",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stdout)
+            )
+        };
+        out.push_str(&step(&dst, &["fetch-pack", s, "main"], ""));
+        out.push_str(&step(
+            &dst,
+            &["fetch-pack", s, "refs/heads/side", "refs/tags/v1"],
+            "",
+        ));
+        out.push_str(&step(&dst, &["fetch-pack", "--all", &url], ""));
+        out.push_str(&step(
+            &dst,
+            &["fetch-pack", "--stdin", s],
+            "refs/tags/lw\nnope\n",
+        ));
+        out.push_str(&step(&dst, &["fetch-pack", "-q", s, "HEAD"], ""));
+        out.push_str(&git(&dst, &["for-each-ref"], &[]));
+        out.push_str(&git(&dst, &["rev-list", "--all", "--count"], &[]));
+        let v1 = git(&src, &["rev-parse", "v1"], &[]);
+        out.push_str(&git(&dst, &["cat-file", "-t", v1.trim()], &[]));
+        out.push_str(&step(&src, &["send-pack", b, "side:refs/heads/new"], ""));
+        out.push_str(&step(&src, &["send-pack", b, "main~1:refs/heads/main"], ""));
+        out.push_str(&step(
+            &src,
+            &["send-pack", "--force", b, "main~1:refs/heads/main"],
+            "",
+        ));
+        out.push_str(&step(&src, &["send-pack", "--dry-run", "--all", b], ""));
+        out.push_str(&step(&src, &["send-pack", b, ":refs/heads/new"], ""));
+        out.push_str(&step(&src, &["send-pack", b], ""));
+        out.push_str(&git(&bare, &["for-each-ref"], &[]));
+        outs.push(out.replace(side.to_str().unwrap(), "SIDE"));
+    }
+    assert_eq!(outs[1], outs[0]);
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+#[test]
+fn diff_pairs_matches_git() {
+    let dir = repo("diff-pairs");
+    git(&dir, &["add", "-A"], &[]);
+    git(&dir, &["mv", "c.txt", "moved.txt"], &[]);
+    write(&dir, "bin.dat", b"a\0binary 2\n");
+    git(&dir, &["add", "-A"], &[]);
+    commit(&dir, 6, "sixth", "T");
+    let mut input = run(
+        "git",
+        &dir,
+        &["diff-tree", "-r", "-z", "-M", "HEAD~1", "HEAD"],
+        &[],
+    )
+    .stdout;
+    input.push(0);
+    input.extend(
+        run(
+            "git",
+            &dir,
+            &["diff-tree", "-r", "-z", "HEAD~2", "HEAD~1"],
+            &[],
+        )
+        .stdout,
+    );
+    for opts in [
+        &[][..],
+        &["-p"],
+        &["--stat"],
+        &["--stat", "-p"],
+        &["--numstat"],
+        &["--shortstat"],
+        &["--name-only"],
+        &["--name-status"],
+        &["-U1"],
+        &["-s"],
+    ] {
+        let mut args = vec!["diff-pairs", "-z"];
+        args.extend(opts);
+        same_input(&dir, &args, &input);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn whatchanged_and_raw_match_git() {
+    let dir = repo("whatchanged");
+    git(&dir, &["add", "-A"], &[]);
+    git(&dir, &["mv", "c.txt", "moved.txt"], &[]);
+    git(&dir, &["update-index", "--chmod=+x", "e.txt"], &[]);
+    commit(&dir, 6, "sixth", "T");
+    same(
+        &dir,
+        &[
+            &["whatchanged"][..],
+            &["whatchanged", "-2"],
+            &["whatchanged", "-p", "-1"],
+            &["whatchanged", "--oneline"],
+            &["whatchanged", "--stat", "-2"],
+            &["whatchanged", "--format=%h %s", "--", "c.txt"],
+            &["log", "--raw", "--oneline"],
+            &["log", "--raw", "--pretty=medium", "-p", "-2"],
+            &["show", "--raw", "--format=%h", "HEAD"],
+            &["diff", "--raw", "HEAD~2", "HEAD"],
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn version_is_shaped_like_git() {
+    let dir = std::env::temp_dir();
+    let out = rgit(&dir, &["version"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.starts_with("rgit version ") && text.lines().count() == 1,
+        "{text}"
+    );
+    let out = rgit(&dir, &["version", "--build-options"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("\nsizeof-size_t: ") && text.contains("\nshell-path: "),
+        "{text}"
+    );
+}
+
 #[test]
 fn rev_parse_matches_git() {
     let dir = repo("rev-parse");
@@ -545,7 +1154,12 @@ fn grep_expressions_and_functions_match_git() {
           static int helper(int x)\n{\n  bar only\n  foo only\n  return x;\n}\n",
     );
     write(&dir, "m.x", b"fn one\n  x foo\nhelper\n  y foo\n");
-    write(&dir, ".gitattributes", b"*.x diff=mine\n");
+    write(&dir, ".gitattributes", b"*.x diff=mine\n*.py diff=python\n");
+    write(
+        &dir,
+        "k.py",
+        b"class K:\n    x = 1\n\n    def m(self):\n        y = 2\n        return y\n",
+    );
     git(&dir, &["config", "diff.mine.xfuncname", "^fn (.*)$"], &[]);
     git(&dir, &["add", "."], &[]);
     commit(&dir, 6, "functions", "T");
@@ -603,6 +1217,8 @@ fn grep_expressions_and_functions_match_git() {
             &["grep", "-W", "-A1", "foo"],
             &["grep", "-p", "foo", "--", "m.x"],
             &["grep", "-W", "foo", "--", "m.x"],
+            &["grep", "-p", "return", "--", "k.py"],
+            &["grep", "-W", "y = 2", "--", "k.py"],
             &["grep", "-m1", "-A2", "foo"],
             &["grep", "-P", "foo(?= only)"],
             &["grep", "-P", "-w", "ba."],
@@ -869,6 +1485,48 @@ fn peeled_atoms_batch_command_and_filters_match_git() {
 }
 
 #[test]
+fn ident_and_v1_pack_indexes_read_like_git() {
+    let dir = repo("ident");
+    write(
+        &dir,
+        "id.txt",
+        b"a $Id$ b\n$Id: old $\n$Id: two words $\n$Id\n",
+    );
+    write(&dir, ".gitattributes", b"id.txt ident\n");
+    git(&dir, &["add", "id.txt", ".gitattributes"], &[]);
+    commit(&dir, 4, "ident", "T");
+    same(
+        &dir,
+        &[
+            &["cat-file", "--filters", "HEAD:id.txt"],
+            &["cat-file", "--filters", "--path=id.txt", "HEAD:c.txt"],
+            &["cat-file", "-p", "HEAD:id.txt"],
+        ],
+    );
+    git(&dir, &["repack", "-adq"], &[]);
+    let pack = std::fs::read_dir(dir.join(".git/objects/pack"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "pack"))
+        .unwrap();
+    std::fs::remove_file(pack.with_extension("idx")).unwrap();
+    let _ = std::fs::remove_file(pack.with_extension("rev"));
+    let pack = pack.to_string_lossy().into_owned();
+    git(&dir, &["index-pack", "--index-version=1", &pack], &[]);
+    same(
+        &dir,
+        &[
+            &["count-objects", "-v"],
+            &["rev-parse", "--short", "HEAD"],
+            &["log", "--oneline"],
+            &["cat-file", "-p", "HEAD:c.txt"],
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn agent_output_is_structured() {
     let dir = repo("toon");
     let toon = |args: &[&str]| {
@@ -947,6 +1605,279 @@ fn diff_plumbing_matches_git() {
     );
     assert_eq!(code(&["diff-tree", "--exit-code", "HEAD", "HEAD"]), Some(0));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn lines(from: u32, to: u32) -> Vec<u8> {
+    (from..=to)
+        .map(|n| format!("{n}\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// A repo whose history renames, copies and changes modes, and whose HEAD
+/// merges a side branch with conflicts resolved by hand; the index renames
+/// and copies and the working tree edits a file.
+fn rename_repo(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rgit-plumbing-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"], &[]);
+    git(&dir, &["config", "user.email", "t@example.com"], &[]);
+    git(&dir, &["config", "user.name", "T"], &[]);
+    write(&dir, "a", &lines(1, 20));
+    write(&dir, "b", &lines(100, 130));
+    write(&dir, "c", b"x\n");
+    write(&dir, "d/e/long", &lines(1, 40));
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 1, "one", "T");
+    git(&dir, &["mv", "a", "a2"], &[]);
+    git(&dir, &["mv", "d/e/long", "d/moved"], &[]);
+    write(
+        &dir,
+        "d/moved",
+        &[lines(1, 40), b"extra\n".to_vec()].concat(),
+    );
+    write(&dir, "b", &lines(100, 128));
+    write(&dir, "bcopy", &lines(100, 128));
+    write(&dir, "c", b"x\ny\n");
+    git(&dir, &["update-index", "--chmod=+x", "c"], &[]);
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 2, "two", "T");
+    git(&dir, &["checkout", "-q", "-b", "side", "HEAD~1"], &[]);
+    write(&dir, "a", &lines(1, 21));
+    write(&dir, "s", b"s\n");
+    write(&dir, "c", b"side\n");
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 3, "side", "T");
+    git(&dir, &["checkout", "-q", "main"], &[]);
+    let _ = run("git", &dir, &["merge", "-q", "side"], &[]);
+    write(&dir, "c", b"merged\n");
+    write(&dir, "a2", &lines(0, 20));
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 4, "merge", "T");
+    git(&dir, &["mv", "b", "b2"], &[]);
+    write(&dir, "b2", &lines(100, 129));
+    write(
+        &dir,
+        "newcopy",
+        &[lines(1, 40), b"extra\n".to_vec()].concat(),
+    );
+    git(&dir, &["add", "."], &[]);
+    write(&dir, "d/moved", b"changed\n");
+    dir
+}
+
+#[test]
+fn diff_plumbing_renames_stats_and_merges_match_git() {
+    let dir = rename_repo("diff-renames");
+    let cases: Vec<Vec<&str>> = [
+        "diff-tree -M HEAD~1",
+        "diff-tree -r -M HEAD~1",
+        "diff-tree -r -M --name-status HEAD~1",
+        "diff-tree -r -M -z --name-status HEAD~1",
+        "diff-tree -r -M --name-only HEAD~1",
+        "diff-tree -r -C HEAD~1",
+        "diff-tree -r -C -C HEAD~1",
+        "diff-tree -r --find-copies-harder HEAD~1",
+        "diff-tree -r -M50% HEAD~1",
+        "diff-tree -r -M99 HEAD~1",
+        "diff-tree -r -M -t HEAD~1",
+        "diff-tree -M -p HEAD~1",
+        "diff-tree -C --stat --summary -p HEAD~1",
+        "diff-tree --stat HEAD~1",
+        "diff-tree --stat=40 -M HEAD~1",
+        "diff-tree --summary HEAD~1",
+        "diff-tree -M --raw --stat HEAD~1",
+        "diff-tree -M -p --raw HEAD~1",
+        "diff-tree -z -M -p --raw HEAD~1",
+        "diff-tree -M --name-status -p HEAD~1",
+        "diff-tree -r --abbrev HEAD~1",
+        "diff-tree -r --abbrev=10 -M HEAD~1",
+        "diff-tree --root --stat --summary HEAD~2",
+        "diff-tree -r -M HEAD~2 HEAD~1 -- d",
+        "diff-tree HEAD",
+        "diff-tree -c HEAD",
+        "diff-tree --cc HEAD",
+        "diff-tree -c -p HEAD",
+        "diff-tree --cc --raw HEAD",
+        "diff-tree -c --name-status HEAD",
+        "diff-tree -c -z --name-only HEAD",
+        "diff-tree -c --stat HEAD",
+        "diff-tree --cc --summary HEAD",
+        "diff-tree -c --abbrev HEAD",
+        "diff-tree -c -z HEAD",
+        "diff-tree -c --stat -p HEAD",
+        "diff-tree --cc HEAD -- c",
+        "diff-index -M HEAD",
+        "diff-index --cached -M HEAD",
+        "diff-index --cached -C --name-status HEAD",
+        "diff-index --cached --find-copies-harder HEAD",
+        "diff-index --cached -M --stat --summary -p HEAD",
+        "diff-index -p --stat HEAD",
+        "diff-index --abbrev=8 HEAD",
+        "diff-files --stat",
+        "diff-files --summary -p",
+        "diff-files --abbrev",
+    ]
+    .iter()
+    .map(|c| c.split(' ').collect())
+    .collect();
+    let cases: Vec<&[&str]> = cases.iter().map(Vec::as_slice).collect();
+    same(&dir, &cases);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every file under `dir` but `.git`, with temporary names made stable:
+/// sorted `(name, mode, content)` rows.
+fn snapshot(dir: &Path) -> Vec<(String, u32, Vec<u8>)> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let path = e.path();
+            let name = path
+                .strip_prefix(dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if name == ".git" {
+                continue;
+            } else if meta.is_dir() {
+                stack.push(path);
+            } else if meta.file_type().is_symlink() {
+                let target = std::fs::read_link(&path).unwrap();
+                out.push((
+                    name,
+                    0o120000,
+                    target.as_os_str().as_encoded_bytes().to_vec(),
+                ));
+            } else {
+                let mode = meta.permissions().mode() & 0o777;
+                out.push((stable(&name), mode, std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `.merge_file_XXXXXX` for every temporary name.
+fn stable(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(".merge_") {
+        let (head, tail) = rest.split_at(at);
+        out.push_str(head);
+        let kind = if tail.starts_with(".merge_link_") {
+            ".merge_link_"
+        } else {
+            ".merge_file_"
+        };
+        out.push_str(kind);
+        out.push_str("XXXXXX");
+        rest = &tail[(kind.len() + 6).min(tail.len())..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[test]
+fn checkout_index_temp_stages_and_prefixes_match_git() {
+    let build = |tag: &str| {
+        let dir = std::env::temp_dir().join(format!("rgit-plumbing-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"], &[]);
+        git(&dir, &["config", "user.email", "t@example.com"], &[]);
+        git(&dir, &["config", "user.name", "T"], &[]);
+        write(&dir, "c", b"base\n");
+        write(&dir, "d/f", b"one\n");
+        write(&dir, "x", b"run\n");
+        write(&dir, "t.txt", b"crlf\n");
+        write(&dir, ".gitattributes", b"*.txt eol=crlf\n");
+        std::os::unix::fs::symlink("d/f", dir.join("link")).unwrap();
+        git(&dir, &["add", "."], &[]);
+        git(&dir, &["update-index", "--chmod=+x", "x"], &[]);
+        commit(&dir, 1, "one", "T");
+        git(&dir, &["checkout", "-q", "-b", "side"], &[]);
+        write(&dir, "c", b"theirs\n");
+        write(&dir, "del", b"gone\n");
+        git(&dir, &["add", "."], &[]);
+        commit(&dir, 2, "side", "T");
+        git(&dir, &["checkout", "-q", "main"], &[]);
+        write(&dir, "c", b"ours\n");
+        write(&dir, "del", b"mine\n");
+        git(&dir, &["add", "."], &[]);
+        commit(&dir, 3, "main", "T");
+        let _ = run("git", &dir, &["merge", "-q", "side"], &[]);
+        std::fs::remove_file(dir.join("del")).unwrap();
+        dir
+    };
+    let cases: &[(&str, &[&str], &[u8])] = &[
+        ("", &["--temp", "c"], b""),
+        ("", &["--temp", "x", "link", "t.txt"], b""),
+        ("", &["--stage=all", "c", "del"], b""),
+        ("", &["--stage=all", "-a"], b""),
+        ("", &["-f", "--temp", "--stage=all", "-z", "c"], b""),
+        ("", &["--temp", "-z", "--stdin"], b"x\0d/f\0"),
+        ("", &["--stage=2", "c"], b""),
+        ("", &["--stage=3", "-f", "c"], b""),
+        ("", &["--stage=1", "del"], b""),
+        ("", &["c"], b""),
+        ("", &["nope", "d"], b""),
+        (
+            "",
+            &["-f", "--prefix=out-", "d/f", "x", "link", "t.txt"],
+            b"",
+        ),
+        ("", &["--prefix=o/", "-a"], b""),
+        ("", &["--temp", "--prefix=o/", "x"], b""),
+        ("", &["-f", "-a"], b""),
+        ("d", &["--temp", "f", "../c", "../x"], b""),
+        ("d", &["--prefix=p/", "f"], b""),
+        ("d", &["--prefix=q-", "-a"], b""),
+        ("d", &["--stage=all", "../c"], b""),
+    ];
+    for (sub, args, input) in cases {
+        let (a, b) = (build("co-temp-git"), build("co-temp-rgit"));
+        let feed = |bin: &str, dir: &Path, args: &[&str]| {
+            use std::io::Write;
+            let mut child = Command::new(bin)
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("RGIT_OPLOG", "0")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(input).unwrap();
+            child.wait_with_output().unwrap()
+        };
+        let mut gargs = vec!["checkout-index"];
+        gargs.extend(*args);
+        let want = feed("git", &a.join(sub), &gargs);
+        let mut rargs = vec!["--human"];
+        rargs.extend(&gargs);
+        let got = feed(env!("CARGO_BIN_EXE_rgit"), &b.join(sub), &rargs);
+        let text = |o: &Output| {
+            (
+                stable(&String::from_utf8_lossy(&o.stdout)),
+                stable(&String::from_utf8_lossy(&o.stderr).replace("rgit", "git")),
+                o.status.success(),
+            )
+        };
+        assert_eq!(text(&got), text(&want), "{args:?} in {sub:?}");
+        assert_eq!(snapshot(&b), snapshot(&a), "{args:?} in {sub:?}");
+        let index = |d: &Path| git(d, &["ls-files", "-s"], &[]);
+        assert_eq!(index(&b), index(&a), "{args:?} in {sub:?}");
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
 }
 
 #[test]
@@ -1034,6 +1965,125 @@ fn merge_tree_and_merge_file_match_git() {
 
 fn commit_all(dir: &Path, message: &str) {
     git(dir, &["commit", "-q", "-am", message], &[]);
+}
+
+#[test]
+fn merge_tree_renames_and_tree_conflicts_match_git() {
+    let dir = std::env::temp_dir().join(format!("rgit-plumbing-{}-ort", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"], &[]);
+    git(&dir, &["config", "user.email", "t@example.com"], &[]);
+    git(&dir, &["config", "user.name", "T"], &[]);
+    let text = |tag: &str| -> Vec<u8> {
+        (1..=20)
+            .map(|i| format!("{tag} line {i}\n"))
+            .collect::<String>()
+            .into_bytes()
+    };
+    let edit = |tag: &str, n: usize, to: &str| -> Vec<u8> {
+        let mut lines: Vec<String> = String::from_utf8(text(tag))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines[n] = to.to_owned();
+        (lines.join("\n") + "\n").into_bytes()
+    };
+    for (p, t) in [
+        ("renmod", text("rm")),
+        ("rendel", text("rd")),
+        ("ren12", text("r12")),
+        ("x", text("x")),
+        ("y", text("y")),
+        ("a/1", text("a1")),
+        ("a/2", text("a2")),
+        ("a/3", text("a3")),
+        ("types", b"plain\n".to_vec()),
+        ("bin", b"a\0b".to_vec()),
+        ("content", text("c")),
+    ] {
+        write(&dir, p, &t);
+    }
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 1, "base", "T");
+    git(&dir, &["checkout", "-q", "-b", "A"], &[]);
+    for (from, to) in [
+        ("renmod", "renamed"),
+        ("rendel", "rd-new"),
+        ("ren12", "r-a"),
+        ("x", "t"),
+        ("a", "b"),
+    ] {
+        git(&dir, &["mv", from, to], &[]);
+    }
+    write(&dir, "content", &edit("c", 3, "A3"));
+    write(&dir, "df", b"file\n");
+    write(&dir, "bin", b"a\0c");
+    std::fs::remove_file(dir.join("types")).unwrap();
+    std::os::unix::fs::symlink("target", dir.join("types")).unwrap();
+    git(&dir, &["add", "-A"], &[]);
+    commit(&dir, 2, "a", "T");
+    git(&dir, &["checkout", "-q", "-b", "B", "main"], &[]);
+    write(&dir, "renmod", &edit("rm", 5, "B5"));
+    git(&dir, &["rm", "-q", "rendel"], &[]);
+    git(&dir, &["mv", "ren12", "r-b"], &[]);
+    git(&dir, &["mv", "y", "t"], &[]);
+    write(&dir, "a/new", b"new\n");
+    write(&dir, "content", &edit("c", 3, "B3"));
+    write(&dir, "df/inside", b"dir\n");
+    write(&dir, "bin", b"a\0d");
+    write(&dir, "types", b"changed\n");
+    git(&dir, &["add", "-A"], &[]);
+    commit(&dir, 3, "b", "T");
+    git(&dir, &["checkout", "-q", "-b", "C", "main"], &[]);
+    write(&dir, "content", &edit("c", 10, "C10"));
+    git(&dir, &["add", "-A"], &[]);
+    commit(&dir, 4, "c", "T");
+    same(
+        &dir,
+        &[
+            &["merge-tree", "A", "B"][..],
+            &["merge-tree", "B", "A"],
+            &["merge-tree", "--name-only", "A", "B"],
+            &["merge-tree", "-z", "A", "B"],
+            &["merge-tree", "--messages", "A", "C"],
+            &["merge-tree", "-z", "--messages", "A", "C"],
+            &["merge-tree", "--merge-base=main", "B", "A"],
+            &["merge-tree", "-Xours", "A", "B"],
+            &["merge-tree", "-Xno-renames", "A", "B"],
+            &["merge-tree", "--quiet", "A", "B"],
+            &["merge-tree", "main", "A", "B"],
+            &["merge-tree", "--trivial-merge", "main", "C", "B"],
+            &["merge-tree", "nope", "B"],
+        ],
+    );
+    let main = git(&dir, &["rev-parse", "main"], &[]);
+    let input = format!("A B\nA C\n{} -- B C\n", main.trim());
+    same_input(&dir, &["merge-tree", "--stdin"], input.as_bytes());
+    git(&dir, &["config", "merge.directoryRenames", "true"], &[]);
+    same(&dir, &[&["merge-tree", "A", "B"][..]]);
+    // A criss-cross: two merge bases, merged into a virtual one first.
+    git(&dir, &["checkout", "-q", "-b", "X", "C"], &[]);
+    write(&dir, "content", &edit("c", 0, "X0"));
+    commit_all(&dir, "x");
+    git(&dir, &["checkout", "-q", "-b", "Y", "C"], &[]);
+    write(&dir, "content", &edit("c", 0, "Y0"));
+    commit_all(&dir, "y");
+    let merge = |into: &str, from: &str, line: &str| {
+        git(&dir, &["checkout", "-q", into], &[]);
+        let _ = run("git", &dir, &["merge", "-q", "--no-commit", from], &[]);
+        write(&dir, "content", &edit("c", 0, line));
+        git(&dir, &["add", "-A"], &[]);
+        git(&dir, &["commit", "-q", "--no-edit"], &[]);
+    };
+    merge("X", "Y~0", "XY");
+    merge("Y", "X~1", "YX");
+    same(
+        &dir,
+        &[&["merge-tree", "X", "Y"][..], &["merge-tree", "Y", "X"]],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1149,6 +2199,32 @@ fn name_rev_matches_git() {
         &["name-rev", "--annotate-stdin", "--name-only"],
         text.as_bytes(),
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn name_rev_all_lists_in_git_order() {
+    let dir = repo("name-rev-all");
+    for n in 0..30 {
+        write(&dir, "n.txt", format!("{n}\n").as_bytes());
+        git(&dir, &["add", "."], &[]);
+        git(&dir, &["commit", "-qm", &format!("c{n}")], &[]);
+        if n % 7 == 0 {
+            git(&dir, &["branch", &format!("b{n}")], &[]);
+            git(&dir, &["tag", "-a", &format!("t{n}"), "-m", "t"], &[]);
+        }
+    }
+    git(&dir, &["merge", "-q", "--no-edit", "main"], &[]);
+    git(&dir, &["tag", "tree", "HEAD^{tree}"], &[]);
+    let cases: &[&[&str]] = &[
+        &["name-rev", "--all"],
+        &["name-rev", "--all", "--tags"],
+        &["name-rev", "--all", "--name-only", "--exclude=b*"],
+    ];
+    same(&dir, cases);
+    git(&dir, &["commit-graph", "write", "--reachable"], &[]);
+    git(&dir, &["commit", "-q", "--allow-empty", "-m", "past"], &[]);
+    same(&dir, cases);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1503,6 +2579,36 @@ fn index_writers_match_git() {
             ),
             ("", &["read-tree", "--reset", "-u", "HEAD"], b""),
             ("", &["read-tree", "-m", "-u", "HEAD", theirs], b""),
+            ("", &["read-tree", "--reset", "-u", "HEAD"], b""),
+            (
+                "",
+                &["read-tree", "-m", "HEAD~2", "HEAD~1", "HEAD", theirs],
+                b"",
+            ),
+            ("", &["read-tree", "--reset", "-u", "HEAD"], b""),
+            (
+                "",
+                &["read-tree", "-m", "--trivial", "HEAD~2", "HEAD", theirs],
+                b"",
+            ),
+            (
+                "",
+                &["read-tree", "-m", "--trivial", "HEAD", "HEAD", "HEAD"],
+                b"",
+            ),
+            (
+                "",
+                &[
+                    "read-tree",
+                    "--index-output=other.idx",
+                    "-m",
+                    "HEAD~2",
+                    "HEAD",
+                    theirs,
+                ],
+                b"",
+            ),
+            ("", &["read-tree", "--prefix=/v", "side"], b""),
         ],
     );
 }
@@ -1777,7 +2883,11 @@ fn show_branch_matches_git() {
         git(&dir, &["add", "."], &[]);
         commit(&dir, n, f, "T");
     }
-    git(&dir, &["checkout", "-q", "-b", "topic", "side"], &[]);
+    git(
+        &dir,
+        &["checkout", "-q", "-b", "topic", "side"],
+        &[("GIT_COMMITTER_DATE", "2024-01-08T09:00:00+0200")],
+    );
     write(&dir, "t.txt", b"t\n");
     git(&dir, &["add", "."], &[]);
     commit(&dir, 8, "topic work", "T");
@@ -1841,6 +2951,10 @@ fn show_branch_matches_git() {
             &["show-branch", "--reflog=2", "main"],
             &["show-branch", "-g"],
             &["show-branch", "--reflog=3,1", "topic"],
+            &["show-branch", "--reflog=2,1.day.ago", "topic"],
+            &["show-branch", "--reflog=3,2024-01-05", "main"],
+            &["show-branch", "--reflog=3,2000-01-01", "main"],
+            &["show-branch", "--reflog=30"],
         ],
     );
     git(
@@ -1960,4 +3074,360 @@ fn mailsplit_and_mailinfo_match_git() {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `bin args < input` in `dir`: stdout and success.
+fn piped_out(bin: &str, dir: &Path, args: &[&str], input: &[u8]) -> (Vec<u8>, bool) {
+    use std::io::Write;
+    let mut all: Vec<&str> = if bin == "git" {
+        vec![]
+    } else {
+        vec!["--human"]
+    };
+    all.extend(args);
+    let mut child = Command::new(bin)
+        .args(&all)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("RGIT_OPLOG", "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.stdout, out.status.success())
+}
+
+const RGIT: &str = env!("CARGO_BIN_EXE_rgit");
+
+/// The object ids a pack file holds, sorted, as git indexes it.
+fn pack_ids(dir: &Path, pack: &str) -> Vec<String> {
+    git(dir, &["index-pack", "-o", "ids.idx", pack], &[]);
+    let idx = std::fs::read(dir.join("ids.idx")).unwrap();
+    let (out, _) = piped_out("git", dir, &["show-index"], &idx);
+    let mut ids: Vec<String> = String::from_utf8_lossy(&out)
+        .lines()
+        .map(|l| l.split(' ').nth(1).unwrap().to_owned())
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn pack_plumbing_matches_git() {
+    let dir = repo("packs");
+    git(&dir, &["gc", "-q"], &[]);
+    let name = std::fs::read_dir(dir.join(".git/objects/pack"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|p| p.ends_with(".pack"))
+        .unwrap();
+    let hash = name[5..45].to_owned();
+    let pack = format!(".git/objects/pack/{name}");
+    let idx = pack.replace(".pack", ".idx");
+    same(
+        &dir,
+        &[
+            &["verify-pack", "-v", &pack],
+            &["verify-pack", "-s", &pack],
+            &["verify-pack", &idx],
+            &["verify-pack", "-v", &idx],
+        ],
+    );
+    let idx_bytes = std::fs::read(dir.join(&idx)).unwrap();
+    same_input(&dir, &["show-index"], &idx_bytes);
+
+    // index-pack writes the .idx and .rev git wrote, and prints the checksum.
+    std::fs::copy(dir.join(&pack), dir.join("copy.pack")).unwrap();
+    let out = rgit(&dir, &["index-pack", "copy.pack"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{hash}\n"));
+    assert_eq!(std::fs::read(dir.join("copy.idx")).unwrap(), idx_bytes);
+    assert_eq!(
+        std::fs::read(dir.join("copy.rev")).unwrap(),
+        std::fs::read(dir.join(pack.replace(".pack", ".rev"))).unwrap()
+    );
+    let data = std::fs::read(dir.join(&pack)).unwrap();
+    let (out, _) = piped_out(RGIT, &dir, &["index-pack", "--stdin", "--keep"], &data);
+    assert_eq!(String::from_utf8_lossy(&out), format!("keep\t{hash}\n"));
+    let (out, _) = piped_out(RGIT, &dir, &["index-pack", "--stdin"], &data);
+    assert_eq!(String::from_utf8_lossy(&out), format!("pack\t{hash}\n"));
+    std::fs::remove_file(dir.join(pack.replace(".pack", ".keep"))).unwrap();
+
+    // pack-objects packs the objects git packs.
+    for (args, input) in [
+        (
+            &["pack-objects", "--revs", "--stdout"][..],
+            &b"main\n^side\n"[..],
+        ),
+        (&["pack-objects", "--revs", "--stdout"], b"v1\n"),
+        (&["pack-objects", "--all", "--stdout"], b""),
+    ] {
+        let (ours, ok) = piped_out(RGIT, &dir, args, input);
+        assert!(ok, "{args:?}");
+        std::fs::write(dir.join("ours.pack"), ours).unwrap();
+        let (theirs, _) = piped_out("git", &dir, args, input);
+        std::fs::write(dir.join("theirs.pack"), theirs).unwrap();
+        assert_eq!(
+            pack_ids(&dir, "ours.pack"),
+            pack_ids(&dir, "theirs.pack"),
+            "{args:?}"
+        );
+    }
+    let (list, _) = piped_out("git", &dir, &["rev-list", "--objects", "side"], b"");
+    let (ours, _) = piped_out(RGIT, &dir, &["pack-objects", "--stdout"], &list);
+    std::fs::write(dir.join("ours.pack"), ours).unwrap();
+    assert_eq!(
+        pack_ids(&dir, "ours.pack").len(),
+        list.split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .count()
+    );
+    let (out, _) = piped_out(RGIT, &dir, &["pack-objects", "--revs", "out/p"], b"main\n");
+    let named = String::from_utf8_lossy(&out).trim().to_owned();
+    let written = format!("out/p-{named}.pack");
+    let check = git(&dir, &["verify-pack", "-v", &written], &[]);
+    assert!(check.ends_with(&format!("{written}: ok\n")), "{check}");
+
+    // unpack-objects writes each object loose in an empty repository.
+    git(&dir, &["init", "-q", "empty"], &[]);
+    let (_, ok) = piped_out(RGIT, &dir.join("empty"), &["unpack-objects"], &data);
+    assert!(ok);
+    let n = pack_ids(&dir, &pack).len();
+    let count = git(&dir.join("empty"), &["count-objects"], &[]);
+    assert!(count.starts_with(&format!("{n} objects")), "{count}");
+
+    // Loose copies of packed objects: prune-packed lists the same ones.
+    write(&dir, "p.txt", b"packed twice\n");
+    git(&dir, &["add", "p.txt"], &[]);
+    commit(&dir, 6, "loose", "T");
+    git(&dir, &["repack", "-q"], &[]);
+    same(&dir, &[&["prune-packed", "-n"]]);
+
+    // update-server-info writes git's info/refs and objects/info/packs.
+    let files = [".git/info/refs", ".git/objects/info/packs"];
+    git(&dir, &["update-server-info"], &[]);
+    let want: Vec<String> = files
+        .iter()
+        .map(|f| std::fs::read_to_string(dir.join(f)).unwrap())
+        .collect();
+    for f in files {
+        std::fs::remove_file(dir.join(f)).unwrap();
+    }
+    assert!(rgit(&dir, &["update-server-info"]).status.success());
+    let got: Vec<String> = files
+        .iter()
+        .map(|f| std::fs::read_to_string(dir.join(f)).unwrap())
+        .collect();
+    assert_eq!(got, want);
+
+    // A pack whose objects another pack holds is redundant.
+    piped_out(
+        "git",
+        &dir,
+        &["pack-objects", "--revs", ".git/objects/pack/pack"],
+        b"side\n",
+    );
+    same(
+        &dir,
+        &[
+            &["pack-redundant", "--all"],
+            &["pack-redundant", "--all", "--i-still-use-this"],
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_mailmap_and_unpack_file_match_git() {
+    let dir = repo("mailmap");
+    write(
+        &dir,
+        ".mailmap",
+        b"Proper <proper@x>  <A@X>\nOther Name <o@x> Old <old@x>\n<new@x> <cased@X>\n# c\nJane <jane@x>\n",
+    );
+    write(&dir, "extra.map", b"F <f@x> <nobody@x>\n");
+    same(
+        &dir,
+        &[
+            &[
+                "check-mailmap",
+                "A <a@x>",
+                "Z <old@x>",
+                "Old <OLD@x>",
+                "q <cased@x>",
+                "jane <jane@x>",
+                "<a@x>",
+                "<nobody@x>",
+                " Sp  <nobody@x> ",
+                "bare@x",
+            ],
+            &[
+                "check-mailmap",
+                "--mailmap-file",
+                "extra.map",
+                "N <nobody@x>",
+            ],
+            &[
+                "check-mailmap",
+                "--mailmap-blob",
+                "HEAD:nope",
+                "N <nobody@x>",
+            ],
+            &["check-mailmap"],
+        ],
+    );
+    same_input(
+        &dir,
+        &["check-mailmap", "--stdin", "Old <old@x>"],
+        b"A <a@x>\nX <nobody@x>\n",
+    );
+
+    same(&dir, &[&["unpack-file", "nope"], &["unpack-file", "HEAD"]]);
+    let out = rgit(&dir.join("dir"), &["unpack-file", "HEAD:c.txt"]);
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    assert!(
+        name.starts_with(".merge_file_") && name.len() == 18,
+        "{name}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join(&name)).unwrap(),
+        git(&dir, &["show", "HEAD:c.txt"], &[])
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn commit_graph_and_multi_pack_index_files_match_git() {
+    let dir = repo("graphs");
+    git(&dir, &["gc", "-q"], &[]);
+    for n in 6..8 {
+        write(&dir, &format!("n{n}.txt"), format!("{n}\n").as_bytes());
+        git(&dir, &["add", "."], &[]);
+        commit(&dir, n, "more", "T");
+        git(&dir, &["repack", "-q"], &[]);
+    }
+    // A pack duplicating objects of the others.
+    piped_out(
+        "git",
+        &dir,
+        &["pack-objects", "--revs", ".git/objects/pack/pack"],
+        b"side\n",
+    );
+    let packs = dir.join(".git/objects/pack");
+    let same_file = |args: &[&str], file: &str| {
+        git(&dir, args, &[]);
+        let want = std::fs::read(dir.join(file)).unwrap();
+        std::fs::remove_file(dir.join(file)).unwrap();
+        let out = rgit(&dir, args);
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        assert!(
+            std::fs::read(dir.join(file)).unwrap() == want,
+            "{args:?} differs"
+        );
+    };
+    let graph = ".git/objects/info/commit-graph";
+    same_file(&["commit-graph", "write", "--reachable"], graph);
+    same_file(&["commit-graph", "write"], graph);
+    same(&dir, &[&["commit-graph", "verify"]]);
+    let midx = ".git/objects/pack/multi-pack-index";
+    same_file(&["multi-pack-index", "write"], midx);
+    same(&dir, &[&["multi-pack-index", "verify"]]);
+
+    // repack folds every pack into one; expire drops the others, and git
+    // reads the index rgit wrote. Older packs keep the new one from tying on
+    // mtime, which would leave expire a pack still in use.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for e in std::fs::read_dir(&packs).unwrap().flatten() {
+        let f = std::fs::File::open(e.path()).unwrap();
+        f.set_modified(old).unwrap();
+    }
+    assert!(rgit(&dir, &["multi-pack-index", "repack"]).status.success());
+    assert!(rgit(&dir, &["multi-pack-index", "expire"]).status.success());
+    let left: Vec<_> = std::fs::read_dir(&packs)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+        .collect();
+    assert_eq!(left.len(), 1);
+    git(&dir, &["multi-pack-index", "verify"], &[]);
+    git(&dir, &["fsck", "--no-progress"], &[]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn merge_index_runs_merge_one_file_like_git() {
+    let setup = |tag: &str| {
+        let dir = std::env::temp_dir().join(format!("rgit-plumbing-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"], &[]);
+        git(&dir, &["config", "user.email", "t@example.com"], &[]);
+        git(&dir, &["config", "user.name", "T"], &[]);
+        write(&dir, "both.txt", b"1\n2\n3\n4\n5\n");
+        write(&dir, "del.txt", b"keep\n");
+        write(&dir, "delboth.txt", b"same\n");
+        write(&dir, "empty.txt", b"");
+        git(&dir, &["add", "."], &[]);
+        commit(&dir, 1, "base", "T");
+        git(&dir, &["branch", "base"], &[]);
+        git(&dir, &["checkout", "-q", "-b", "ours"], &[]);
+        write(&dir, "both.txt", b"1\nOURS\n3\n4\n5\n");
+        write(&dir, "onlyours.txt", b"added\n");
+        write(&dir, "addsame.txt", b"same\n");
+        write(&dir, "addboth.txt", b"a\nb\n");
+        git(&dir, &["rm", "-q", "delboth.txt"], &[]);
+        git(&dir, &["add", "."], &[]);
+        commit(&dir, 2, "ours", "T");
+        git(&dir, &["checkout", "-q", "-b", "theirs", "base"], &[]);
+        write(&dir, "both.txt", b"1\n2\n3\n4\nTHEIRS\n");
+        write(&dir, "onlytheirs.txt", b"theirs\n");
+        write(&dir, "addsame.txt", b"same\n");
+        write(&dir, "addboth.txt", b"a\nc\n");
+        git(&dir, &["rm", "-q", "del.txt", "delboth.txt"], &[]);
+        git(&dir, &["add", "."], &[]);
+        commit(&dir, 3, "theirs", "T");
+        git(&dir, &["checkout", "-q", "ours"], &[]);
+        git(&dir, &["read-tree", "-m", "base", "ours", "theirs"], &[]);
+        dir
+    };
+    let outcome = |dir: &Path, bin: &str| {
+        let out = if bin == "git" {
+            run(
+                "git",
+                dir,
+                &["merge-index", "-o", "git-merge-one-file", "-a"],
+                &[],
+            )
+        } else {
+            rgit(dir, &["merge-index", "-o", "git-merge-one-file", "-a"])
+        };
+        let markers = unlabeled(&std::fs::read_to_string(dir.join("addboth.txt")).unwrap());
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status.code(),
+            git(dir, &["ls-files", "-s"], &[]),
+            git(dir, &["status", "--porcelain"], &[]),
+            markers,
+            std::fs::read_to_string(dir.join("both.txt")).unwrap(),
+        )
+    };
+    let (a, b) = (setup("mi-git"), setup("mi-rgit"));
+    assert_eq!(outcome(&b, "rgit"), outcome(&a, "git"));
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}
+
+/// `text` with the random `.merge_file_XXXXXX` labels made fixed.
+fn unlabeled(text: &str) -> String {
+    text.lines()
+        .map(|l| match l.find(".merge_file_") {
+            Some(at) => format!("{}.merge_file_", &l[..at]),
+            None => l.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

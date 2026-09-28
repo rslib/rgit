@@ -1,6 +1,7 @@
 //! Submodule operations libgit2 has no call for: `summary`, `absorbgitdirs`
 //! and `add --name`, done as git does them.
 
+use crate::rev::RevParse;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -38,7 +39,7 @@ pub fn summary(
             n if n.starts_with("-n") => limit = number(Some(&n[2..].to_owned()))?,
             r if rev.is_none()
                 && paths.is_empty()
-                && repo.revparse_single(&format!("{r}^0")).is_ok() =>
+                && repo.rev_single(&format!("{r}^0")).is_ok() =>
             {
                 rev = Some(r.to_owned())
             }
@@ -54,7 +55,7 @@ pub fn summary(
     let src = if files {
         index.clone()
     } else {
-        let commit = repo.revparse_single(&format!("{}^0", rev.as_deref().unwrap_or("HEAD")));
+        let commit = repo.rev_single(&format!("{}^0", rev.as_deref().unwrap_or("HEAD")));
         match commit.and_then(|c| c.peel_to_tree()) {
             Ok(tree) => tree_gitlinks(&tree)?,
             Err(_) => BTreeMap::new(),

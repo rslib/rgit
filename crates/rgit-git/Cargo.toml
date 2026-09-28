@@ -15,7 +15,6 @@ ssh = ["dep:russh", "dep:tokio", "dep:tokio-util", "dep:home", "dep:nix"]
 
 [dependencies]
 git2 = { version = "0.21.0", features = ["https", "vendored-openssl"] }
-git2-hooks = "0.7.0"
 # Raw calls git2 does not wrap (config origins, filters, hashfile).
 libgit2-sys = "0.18"
 # zlib itself, to deflate binary patches byte for byte as git does.

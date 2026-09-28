@@ -138,6 +138,58 @@ fn apply_matches_git_apply() {
     assert_eq!(git(&dir, &["diff", "--cached"]), "");
 }
 
+#[test]
+fn apply_whitespace_modes_report_and_fix_like_git() {
+    let dir = repo("apply-ws");
+    std::fs::write(dir.join("f.txt"), "a  \n\tb\nc\nd \ne\nf\n").unwrap();
+    std::fs::write(dir.join("g.txt"), "x\ny\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-qm", "ws"]);
+    // Context without the file's whitespace errors, bad added lines; and
+    // more errors than git reports before squelching.
+    let fixed_context = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n\
+        @@ -1,6 +1,8 @@\n a\n \tb\n c\n+new  \n+  \tmixed\n d\n e\n f\n";
+    let mut many = String::from(
+        "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,6 +1,12 @@\n a  \n \tb\n c\n",
+    );
+    for i in 1..=6 {
+        many += &format!("+x{i} \n");
+    }
+    many += " d \n e\n f\ndiff --git a/g.txt b/g.txt\n--- a/g.txt\n+++ b/g.txt\n\
+        @@ -1,2 +1,3 @@\n x\n+g \n y\n";
+    for (n, patch) in [fixed_context, many.as_str()].into_iter().enumerate() {
+        std::fs::write(dir.join("p.diff"), patch).unwrap();
+        for mode in ["fix", "error", "error-all", "warn", "nowarn"] {
+            let arg = format!("--whitespace={mode}");
+            let outcome = |tool: &str| {
+                let copy = twin(&dir, tool);
+                let mut cmd = Command::new(if tool == "git" {
+                    "git"
+                } else {
+                    env!("CARGO_BIN_EXE_rgit")
+                });
+                if tool != "git" {
+                    cmd.arg("--human");
+                }
+                cmd.args(["apply", &arg, "p.diff"]).current_dir(&copy);
+                isolate(&mut cmd, &copy);
+                let out = cmd.output().unwrap();
+                (
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                    std::fs::read_to_string(copy.join("f.txt")).unwrap(),
+                    std::fs::read_to_string(copy.join("g.txt")).unwrap(),
+                )
+            };
+            let want = outcome("git");
+            // rgit words a failed hunk its own way; the rest must agree.
+            if !want.1.contains("patch failed") {
+                assert_eq!(outcome("rgit"), want, "patch {n} {arg}");
+            }
+        }
+    }
+}
+
 /// `git apply` and `rgit apply` with `args` on copies of `dir` changed by
 /// `prep` agree: success, progress on stderr, the file `f` and the index.
 fn same_apply(dir: &Path, prep: &str, args: &[&str]) {
@@ -693,6 +745,47 @@ fn notes_keep_or_clean_up_text_like_git() {
         git(&dir, args);
         assert_eq!(ours, git(&dir, &["notes", "show"]), "{args:?}");
     }
+}
+
+#[test]
+fn notes_commits_match_git_history() {
+    let ours = repo("notes-history");
+    commit(&ours, "a.txt", "two\n", "second");
+    let theirs = twin(&ours, "git");
+    let mut blobs = Vec::new();
+    for i in 0..100 {
+        let path = ours.join(format!("b{i}"));
+        std::fs::write(&path, format!("{i}\n")).unwrap();
+        blobs.push(git(&ours, &["hash-object", "-w", &format!("b{i}")]));
+        git(&theirs, &["hash-object", "-w", path.to_str().unwrap()]);
+    }
+    let mut steps: Vec<Vec<&str>> = vec![
+        vec!["notes", "add", "-m", "first"],
+        vec!["notes", "append", "-m", "second"],
+        vec!["notes", "copy", "HEAD", "HEAD~1"],
+        vec!["notes", "add", "-f", "-m", "", "HEAD~1"],
+        vec!["notes", "remove", "HEAD", "HEAD~1"],
+        vec!["notes", "remove", "--ignore-missing", "HEAD", "HEAD~1"],
+        vec!["notes", "append", "-m", "x", "HEAD~1"],
+        vec!["notes", "edit", "HEAD~1"],
+        vec!["notes", "--ref", "other", "add", "-m", "theirs", "HEAD"],
+        vec!["notes", "merge", "other"],
+    ];
+    // Enough notes that git fans the tree out into directories.
+    for b in &blobs {
+        steps.push(vec!["notes", "add", "-m", "n", b.trim()]);
+    }
+    steps.push(vec!["notes", "remove", blobs[0].trim()]);
+    for step in &steps {
+        let a = dated("git", &theirs, step, b"").1;
+        assert_eq!(dated("rgit", &ours, step, b"").1, a, "{step:?}");
+    }
+    let log = |dir: &Path| {
+        git(dir, &["log", "--format=raw", "--raw", "refs/notes/commits"])
+            + &git(dir, &["reflog", "--format=%gs", "refs/notes/commits"])
+    };
+    assert_eq!(log(&ours), log(&theirs));
+    assert!(git(&ours, &["ls-tree", "refs/notes/commits"]).starts_with("040000"));
 }
 
 #[test]
@@ -1535,7 +1628,7 @@ fn cherry_and_aliases_match_git() {
     );
     assert_eq!(
         ok(&dir, &["whatchanged", "-n", "2"]),
-        ok(&dir, &["log", "-n", "2"])
+        git(&dir, &["whatchanged", "-n", "2"])
     );
 }
 
@@ -2165,6 +2258,18 @@ fn same_signatures(dir: &Path) {
     }
     let args = ["log", "-3", "--show-signature"];
     assert_eq!(git_all(dir, &args).0, ok(dir, &args));
+    // fmt-merge-msg quotes signed tags with the verifier's report.
+    let mut input = String::new();
+    for t in ["signed", "plain"] {
+        let id = git(dir, &["rev-parse", t]);
+        input += &format!("{}\t\ttag '{t}' of .\n", id.trim());
+        let args = ["fmt-merge-msg"];
+        assert_eq!(
+            rgit_stdout(dir, &args, input.as_bytes()),
+            git_in(dir, &args, input.as_bytes()),
+            "{input}"
+        );
+    }
 }
 
 #[test]
@@ -2786,6 +2891,74 @@ fn archive_writes_gits_bytes() {
     same_bytes(
         &dir,
         &[&["archive", "-l"], &["archive", "--format=tar.cat", "HEAD"]],
+        &[],
+    );
+}
+
+#[test]
+fn archive_converts_like_a_checkout_and_streams_big_files() {
+    let dir = repo("archive-convert");
+    for (path, text) in [
+        ("crlf.txt", "a\nb\r\nc\n"),
+        ("auto.txt", "x\ny\n"),
+        ("mixed.txt", "x\r\ny\n"),
+        ("nul.txt", "x\0\ny\n"),
+        ("lf.txt", "l\nf\n"),
+        ("ident.txt", "$Id$ and $Id: old $ and $Id: x y $\n"),
+        ("up.txt", "shout\n"),
+        ("broken.txt", "kept\n"),
+    ] {
+        std::fs::write(dir.join(path), text).unwrap();
+    }
+    std::fs::write(dir.join("big.txt"), "big line\n".repeat(500)).unwrap();
+    std::fs::write(
+        dir.join(".gitattributes"),
+        "crlf.txt text eol=crlf\nauto.txt text=auto\nmixed.txt text=auto\nlf.txt eol=lf\n\
+         ident.txt ident\nup.txt filter=up\nbroken.txt filter=broken\nbig.txt text eol=crlf\n",
+    )
+    .unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-qm", "convert"]);
+    git(&dir, &["config", "filter.up.smudge", "tr a-z A-Z"]);
+    git(&dir, &["config", "filter.broken.smudge", "false"]);
+    git(&dir, &["config", "core.bigFileThreshold", "1k"]);
+    let cases: &[&[&str]] = &[
+        &["archive", "HEAD"],
+        &["archive", "--format=zip", "HEAD"],
+        &["archive", "--format=zip", "-0", "HEAD"],
+    ];
+    same_bytes(&dir, cases, &[]);
+    for (key, value) in [("core.autocrlf", "true"), ("core.eol", "crlf")] {
+        git(&dir, &["config", key, value]);
+        same_bytes(&dir, cases, &[]);
+        git(&dir, &["config", "--unset", key]);
+    }
+    git(&dir, &["config", "filter.broken.required", "true"]);
+    same_bytes(&dir, &[&["archive", "HEAD"]], &[]);
+
+    // Past 65535 entries git adds zip64 records.
+    let many = repo("archive-zip64");
+    let blob = git(&many, &["hash-object", "-w", "a.txt"]);
+    let listing: String = (0..65536)
+        .map(|i| format!("100644 blob {}\tf{i}\n", blob.trim()))
+        .collect();
+    let mut cmd = Command::new("git");
+    cmd.args(["mktree"])
+        .current_dir(&many)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    isolate(&mut cmd, &many);
+    let mut child = cmd.spawn().unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), listing.as_bytes()).unwrap();
+    let tree = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+    same_bytes(
+        &many,
+        &[&[
+            "archive",
+            "--format=zip",
+            "--mtime=2020-01-01 00:00:00 +0000",
+            tree.trim(),
+        ]],
         &[],
     );
 }

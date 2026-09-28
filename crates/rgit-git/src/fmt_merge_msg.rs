@@ -289,12 +289,18 @@ pub fn fmt_merge_msg(git_dir: &Path, input: &str, o: &FmtMergeMsgOpts) -> Result
         }
         let odb = repo.odb()?;
         let raw = odb.read(origin.oid)?;
-        let text = String::from_utf8_lossy(raw.data()).into_owned();
-        // ponytail: a signed tag's signature is dropped, not verified with gpg.
-        let payload = match text.find("-----BEGIN ") {
-            Some(i) => text[..i].to_owned(),
-            None => text,
-        };
+        // A signed tag's signature and its verifier's report follow the
+        // message as comments (fmt_tag_signature).
+        let (payload, sig) = crate::sign::split_tag(raw.data());
+        let payload = String::from_utf8_lossy(payload).into_owned();
+        let mut sig = String::from_utf8_lossy(sig).into_owned();
+        if !sig.is_empty() {
+            let c = crate::sign::check(&repo, payload.as_bytes(), &sig).unwrap_or_default();
+            if c.output.is_empty() && c.result != 'G' {
+                sig.push_str("gpg verification failed.\n");
+            }
+            sig.push_str(&c.output);
+        }
         count += 1;
         if count == 2
             && let Some(f) = first
@@ -314,6 +320,10 @@ pub fn fmt_merge_msg(git_dir: &Path, input: &str, o: &FmtMergeMsgOpts) -> Result
         }
         if !tags.is_empty() && !tags.ends_with('\n') {
             tags.push('\n');
+        }
+        if !sig.is_empty() {
+            tags.push('\n');
+            comment_lines(&mut tags, &sig, &comment);
         }
     }
     if !tags.is_empty() {

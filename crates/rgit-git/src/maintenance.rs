@@ -102,23 +102,7 @@ impl Pack {
 }
 
 pub(crate) fn idx_ids(path: &Path) -> Vec<Oid> {
-    let Ok(idx) = std::fs::read(path) else {
-        return Vec::new();
-    };
-    let (fanout, stride, first) = if idx.starts_with(b"\xfftOc") {
-        (8, 20, 8 + 1024)
-    } else {
-        (0, 24, 1024)
-    };
-    let n = idx.get(fanout + 1020..fanout + 1024).map_or(0, |b| {
-        u32::from_be_bytes(b.try_into().unwrap_or_default()) as usize
-    });
-    (0..n)
-        .filter_map(|i| {
-            let at = first + i * stride + if stride == 24 { 4 } else { 0 };
-            Oid::from_bytes(idx.get(at..at + 20)?).ok()
-        })
-        .collect()
+    idx_offsets(path).into_iter().map(|(id, _)| id).collect()
 }
 
 pub(crate) fn packs(repo: &Repository) -> Vec<Pack> {
@@ -145,6 +129,22 @@ pub(crate) fn packs(repo: &Repository) -> Vec<Pack> {
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// Each pack's position as the directory lists its `.idx` (unsorted), the
+/// order git meets packs in and breaks ties by.
+pub(crate) fn dir_order(repo: &Repository) -> HashMap<String, usize> {
+    std::fs::read_dir(objects_dir(repo).join("pack"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".idx").map(str::to_owned)
+        })
+        .enumerate()
+        .map(|(i, n)| (n, i))
+        .collect()
 }
 
 /// One index entry: path, mode and id.
@@ -672,33 +672,49 @@ fn new_pack_with(
     Ok(Some(name))
 }
 
-/// The objects of a v2 `.idx` with their pack offsets, in index order.
+/// The objects of an `.idx` with their pack offsets, in index order.
 pub(crate) fn idx_offsets(idx_path: &Path) -> Vec<(Oid, u64)> {
-    let Ok(idx) = std::fs::read(idx_path) else {
-        return Vec::new();
-    };
-    if !idx.starts_with(b"\xfftOc") || idx.len() < 8 + 1024 {
-        return Vec::new();
+    std::fs::read(idx_path)
+        .ok()
+        .and_then(|idx| idx_entries(&idx))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(id, off)| Some((Oid::from_bytes(&id).ok()?, off)))
+        .collect()
+}
+
+/// A v1 or v2 pack index's ids and offsets, in index order.
+pub(crate) fn idx_entries(idx: &[u8]) -> Option<Vec<([u8; 20], u64)>> {
+    let be32 = |at: usize| Some(u32::from_be_bytes(idx.get(at..at + 4)?.try_into().ok()?));
+    if !idx.starts_with(b"\xfftOc") {
+        let n = be32(1020)? as usize;
+        return (0..n)
+            .map(|i| {
+                let at = 1024 + i * 24;
+                Some((
+                    idx.get(at + 4..at + 24)?.try_into().ok()?,
+                    u64::from(be32(at)?),
+                ))
+            })
+            .collect();
     }
-    let be32 = |at: usize| {
-        idx.get(at..at + 4)
-            .map_or(0, |b| u32::from_be_bytes(b.try_into().unwrap_or_default()))
-    };
-    let n = be32(8 + 1020) as usize;
+    if be32(4)? != 2 {
+        return None;
+    }
+    let n = be32(8 + 1020)? as usize;
     let offsets_at = 8 + 1024 + n * 24;
     let large_at = offsets_at + n * 4;
     (0..n)
-        .filter_map(|i| {
+        .map(|i| {
             let at = 8 + 1024 + i * 20;
-            let oid = Oid::from_bytes(idx.get(at..at + 20)?).ok()?;
-            let v = be32(offsets_at + i * 4);
+            let v = be32(offsets_at + i * 4)?;
             let off = if v & 0x8000_0000 == 0 {
-                v as u64
+                u64::from(v)
             } else {
                 let at = large_at + (v & 0x7fff_ffff) as usize * 8;
                 u64::from_be_bytes(idx.get(at..at + 8)?.try_into().ok()?)
             };
-            Some((oid, off))
+            Some((idx.get(at..at + 20)?.try_into().ok()?, off))
         })
         .collect()
 }
@@ -912,7 +928,7 @@ pub fn repack(repo: &Repository, o: &RepackOptions) -> Result<String, GitError> 
         prune_packed(repo, false);
     }
     if !o.no_update_server_info && cfg_bool(repo, "repack.updateServerInfo", true) {
-        update_server_info(repo)?;
+        update_server_info(repo, false)?;
     }
     Ok(report)
 }
@@ -932,16 +948,73 @@ fn read_mtimes(p: &Pack) -> HashMap<Oid, i64> {
         .collect()
 }
 
-/// objects/info/packs, as `git update-server-info` writes it.
-fn update_server_info(repo: &Repository) -> Result<(), GitError> {
-    let info = objects_dir(repo).join("info");
+/// info/refs and objects/info/packs, as `git update-server-info` writes
+/// them: every ref (and what a tag peels to), and the packs, in the order
+/// the old file lists them unless `force`, new ones first.
+pub(crate) fn update_server_info(repo: &Repository, force: bool) -> Result<(), GitError> {
+    let mut refs = String::new();
+    let mut names: Vec<(String, Oid)> = repo
+        .references()?
+        .flatten()
+        .filter_map(|r| {
+            let name = r.name().ok()?.to_owned();
+            let id = r.resolve().ok()?.target()?;
+            name.starts_with("refs/").then_some((name, id))
+        })
+        .collect();
+    names.sort();
+    for (name, id) in names {
+        refs.push_str(&format!("{id}\t{name}\n"));
+        if let Ok(tag) = repo.find_tag(id)
+            && let Ok(target) = tag.into_object().peel(git2::ObjectType::Any)
+        {
+            refs.push_str(&format!("{}\t{name}^{{}}\n", target.id()));
+        }
+    }
+    let info = repo.commondir().join("info");
     std::fs::create_dir_all(&info)?;
+    write_if_changed(&info.join("refs"), &refs, force)?;
+    let objinfo = objects_dir(repo).join("info");
+    std::fs::create_dir_all(&objinfo)?;
+    let file = objinfo.join("packs");
+    let mut all = packs(repo);
+    let met = dir_order(repo);
+    all.sort_by_key(|p| met.get(&p.name).copied());
+    let old: Vec<String> = if force {
+        Vec::new()
+    } else {
+        std::fs::read_to_string(&file)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.strip_prefix("P ").map(str::to_owned))
+            .collect()
+    };
+    let stale = old
+        .iter()
+        .any(|o| !all.iter().any(|p| format!("{}.pack", p.name) == *o));
+    let rank = |p: &Pack| {
+        let name = format!("{}.pack", p.name);
+        match old.iter().position(|o| *o == name) {
+            Some(i) if !stale => i,
+            _ => usize::MAX,
+        }
+    };
+    all.sort_by_key(|p| rank(p));
     let mut text = String::new();
-    for p in packs(repo) {
+    for p in all {
         text.push_str(&format!("P {}.pack\n", p.name));
     }
     text.push('\n');
-    std::fs::write(info.join("packs"), text)?;
+    write_if_changed(&file, &text, force)?;
+    let _ = std::fs::remove_file(repo.commondir().join("info/rev-cache"));
+    Ok(())
+}
+
+/// Replace `path` with `text` unless it already holds exactly that.
+fn write_if_changed(path: &Path, text: &str, force: bool) -> Result<(), GitError> {
+    if force || std::fs::read_to_string(path).ok().as_deref() != Some(text) {
+        std::fs::write(path, text)?;
+    }
     Ok(())
 }
 
@@ -1308,24 +1381,7 @@ pub fn reflog_exists(repo: &Repository, name: &str) -> bool {
 /// `git rerere gc`: forget resolutions older than gc.rerereResolved (60
 /// days) and unresolved records older than gc.rerereUnresolved (15 days).
 pub fn rerere_gc(repo: &Repository) -> Result<(), GitError> {
-    let dir = repo.commondir().join("rr-cache");
-    let resolved =
-        cutoff(&cfg_str(repo, "gc.rerereResolved").unwrap_or_else(|| "60.days.ago".into()))?;
-    let unresolved =
-        cutoff(&cfg_str(repo, "gc.rerereUnresolved").unwrap_or_else(|| "15.days.ago".into()))?;
-    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-        let p = e.path();
-        let (file, limit) = if p.join("postimage").exists() {
-            ("postimage", resolved)
-        } else {
-            ("preimage", unresolved)
-        };
-        let t = std::fs::metadata(p.join(file)).map_or(0, |m| mtime(&m));
-        if t < limit {
-            let _ = std::fs::remove_dir_all(&p);
-        }
-    }
-    Ok(())
+    crate::rerere::gc(repo)
 }
 
 /// `git worktree prune --expire`: drop the records of worktrees whose folder
@@ -1396,7 +1452,9 @@ fn too_many_packs(repo: &Repository) -> bool {
 
 /// Whether `gc --auto` would do anything.
 pub(crate) fn gc_needed(repo: &Repository) -> bool {
-    cfg_int(repo, "gc.auto", 6700) > 0 && (too_many_loose(repo) || too_many_packs(repo))
+    cfg_int(repo, "gc.auto", 6700) > 0
+        && (too_many_loose(repo) || too_many_packs(repo))
+        && crate::hooks::hook_ok(repo, "pre-auto-gc")
 }
 
 /// gc.pid, as git's lock: `<pid> <host>`.
@@ -1577,7 +1635,7 @@ pub fn incremental_repack(repo: &Repository) -> Result<String, GitError> {
         );
     }
     crate::midx::incremental_repack(repo)?;
-    update_server_info(repo)?;
+    update_server_info(repo, false)?;
     Ok(String::new())
 }
 

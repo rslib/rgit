@@ -27,12 +27,63 @@ fn note_map(tree: Option<&Tree>) -> Result<BTreeMap<Oid, Oid>, GitError> {
     Ok(map)
 }
 
-// ponytail: writes a flat notes tree (no fanout) and drops non-note entries;
-// git reads it the same, and only rewrites it with fanout past ~256 notes.
+/// Write the notes as git's write_notes_tree lays them out: a note's fanout
+/// grows by one directory level while every one of the 16 nibbles at the
+/// next even 16-tree level holds two or more notes (notes.c determine_fanout).
+// ponytail: drops non-note entries, and does not keep a fanout that only
+// unread subtrees of the old tree would have held up.
 fn write_map(repo: &Repository, map: &BTreeMap<Oid, Oid>) -> Result<Oid, GitError> {
+    let hexes: Vec<(String, Oid)> = map.iter().map(|(o, b)| (o.to_string(), *b)).collect();
+    let full = |prefix: &str| {
+        let under: Vec<&str> = hexes
+            .iter()
+            .map(|(h, _)| h.as_str())
+            .filter(|h| h.starts_with(prefix))
+            .collect();
+        (0..16u32).all(|n| {
+            let c = char::from_digit(n, 16).unwrap_or('0');
+            under
+                .iter()
+                .filter(|h| h.as_bytes()[prefix.len()] == c as u8)
+                .nth(1)
+                .is_some()
+        })
+    };
+    let mut fanouts = std::collections::HashMap::new();
+    let mut paths = Vec::new();
+    for (hex, blob) in &hexes {
+        let mut fanout = 0;
+        while *fanouts
+            .entry(hex[..fanout * 2].to_owned())
+            .or_insert_with(|| full(&hex[..fanout * 2]))
+        {
+            fanout += 1;
+        }
+        let mut path = String::new();
+        for i in 0..fanout {
+            path.push_str(&hex[i * 2..i * 2 + 2]);
+            path.push('/');
+        }
+        path.push_str(&hex[fanout * 2..]);
+        paths.push((path, *blob));
+    }
+    write_paths(repo, &paths)
+}
+
+/// The tree of blobs at `/`-separated `paths`.
+fn write_paths(repo: &Repository, paths: &[(String, Oid)]) -> Result<Oid, GitError> {
     let mut b = repo.treebuilder(None)?;
-    for (obj, blob) in map {
-        b.insert(obj.to_string(), *blob, 0o100644)?;
+    let mut dirs: BTreeMap<&str, Vec<(String, Oid)>> = BTreeMap::new();
+    for (path, blob) in paths {
+        match path.split_once('/') {
+            Some((dir, rest)) => dirs.entry(dir).or_default().push((rest.to_owned(), *blob)),
+            None => {
+                b.insert(path, *blob, 0o100644)?;
+            }
+        }
+    }
+    for (dir, sub) in dirs {
+        b.insert(dir, write_paths(repo, &sub)?, 0o040000)?;
     }
     Ok(b.write()?)
 }
@@ -273,9 +324,10 @@ pub(crate) fn merge(
         ),
     );
     let tree = repo.find_tree(write_map(repo, &result)?)?;
-    let sig = repo.signature()?;
+    let sig = crate::git_repo::ident_signature(repo, true)?;
+    let author = crate::git_repo::ident_signature(repo, false)?;
     let parents = [&repo.find_commit(local)?, &repo.find_commit(remote)?];
-    let commit = repo.commit(None, &sig, &sig, &msg, &tree, &parents)?;
+    let commit = repo.commit(None, &author, &sig, &msg, &tree, &parents)?;
     if conflicts.is_empty() {
         repo.reference(local_ref, commit, true, &reflog)?;
         return Ok((out, None));
@@ -342,11 +394,12 @@ pub(crate) fn merge_finish(
         }
         let tree = repo.find_tree(write_map(repo, &notes)?)?;
         let parents: Vec<git2::Commit> = partial.parents().collect();
-        let sig = repo.signature()?;
+        let sig = crate::git_repo::ident_signature(repo, true)?;
+        let author = crate::git_repo::ident_signature(repo, false)?;
         let message = String::from_utf8_lossy(partial.message_bytes()).into_owned();
         let id = repo.commit(
             None,
-            &sig,
+            &author,
             &sig,
             &message,
             &tree,
@@ -425,34 +478,63 @@ pub(crate) fn copy_for_rewrite(
             }
         }
     }
-    let sig = repo.signature()?;
     let message = match cmd {
         "amend" => "Notes added by 'git commit --amend'",
         _ => "Notes added by 'git rebase'",
     };
     for r in refs {
-        let parent = repo.refname_to_id(&r)?;
-        let parent = repo.find_commit(parent)?;
-        let mut notes = note_map(Some(&parent.tree()?))?;
-        let before = notes.clone();
-        for (from, to) in pairs {
-            let Some(note) = before.get(from) else {
-                continue;
-            };
-            let new = blob(repo, Some(*note));
-            let merged = match notes.get(to) {
-                None => Some(new),
-                Some(cur) => combine(&mode, &blob(repo, Some(*cur)), &new),
-            };
-            if let Some(m) = merged {
-                notes.insert(*to, repo.blob(&m)?);
+        commit_notes(repo, &r, message, |notes| {
+            let before = notes.clone();
+            for (from, to) in pairs {
+                let Some(note) = before.get(from) else {
+                    continue;
+                };
+                let new = blob(repo, Some(*note));
+                let merged = match notes.get(to) {
+                    None => Some(new),
+                    Some(cur) => combine(&mode, &blob(repo, Some(*cur)), &new),
+                };
+                if let Some(m) = merged {
+                    notes.insert(*to, repo.blob(&m)?);
+                }
             }
-        }
-        if notes != before {
-            let tree = repo.find_tree(write_map(repo, &notes)?)?;
-            let id = repo.commit(None, &sig, &sig, message, &tree, &[&parent])?;
-            repo.reference(&r, id, true, &format!("notes: {message}"))?;
-        }
+            Ok(*notes != before)
+        })?;
     }
+    Ok(())
+}
+
+/// git's commit_notes: apply `edit` to the notes of `notes_ref` and, when it
+/// reports a change, commit the result with `msg` and log `notes: <msg>`.
+pub(crate) fn commit_notes(
+    repo: &Repository,
+    notes_ref: &str,
+    msg: &str,
+    edit: impl FnOnce(&mut BTreeMap<Oid, Oid>) -> Result<bool, GitError>,
+) -> Result<(), GitError> {
+    let parent = repo
+        .refname_to_id(notes_ref)
+        .ok()
+        .map(|id| repo.find_commit(id))
+        .transpose()?;
+    let mut notes = match &parent {
+        Some(p) => note_map(Some(&p.tree()?))?,
+        None => BTreeMap::new(),
+    };
+    if !edit(&mut notes)? {
+        return Ok(());
+    }
+    let tree = repo.find_tree(write_map(repo, &notes)?)?;
+    let sig = crate::git_repo::ident_signature(repo, true)?;
+    let author = crate::git_repo::ident_signature(repo, false)?;
+    let id = repo.commit(
+        None,
+        &author,
+        &sig,
+        &format!("{msg}\n"),
+        &tree,
+        &parent.iter().collect::<Vec<_>>(),
+    )?;
+    repo.reference(notes_ref, id, true, &format!("notes: {msg}"))?;
     Ok(())
 }

@@ -40,7 +40,7 @@ pub fn run(
     }
     opts.force_repos = force > 1;
     opts.prefix = prefix(backend);
-    if opts.paths.is_empty() && !opts.prefix.is_empty() {
+    if (opts.paths.is_empty() || rgit_git::only_excludes(&opts.paths)) && !opts.prefix.is_empty() {
         opts.paths.push(opts.prefix.clone());
     }
     let mut items = backend.clean_candidates(&opts)?;

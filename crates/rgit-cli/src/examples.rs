@@ -41,6 +41,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit diff --quiet && echo clean",
             "rgit diff main --name-only --diff-filter=A",
             "rgit diff --no-index a.txt b.txt --patch",
+            "rgit diff --patch --word-diff -W -- src/lib.rs",
         ],
     ),
     (
@@ -124,6 +125,10 @@ const EXAMPLES: &[Entry] = &[
             "rgit rev-list HEAD -- src/lib.rs",
             "rgit rev-list --count --left-right main...feature",
             "rgit rev-list --objects main..feature",
+            "rgit rev-list --format='%h %s' --no-commit-header -5 HEAD",
+            "rgit rev-list --objects --filter=blob:none --no-object-names HEAD",
+            "rgit rev-list --disk-usage=human --objects --all",
+            "rgit rev-list --bisect-vars good..bad",
         ],
     ),
     (
@@ -224,6 +229,8 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit diff-tree -r HEAD",
             "rgit diff-tree -p main feature -- src",
+            "rgit diff-tree -r -M --stat --summary HEAD",
+            "rgit diff-tree --cc HEAD",
         ],
     ),
     (
@@ -231,6 +238,7 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit diff-index HEAD",
             "rgit diff-index --cached --name-only HEAD",
+            "rgit diff-index --cached -C --name-status HEAD",
         ],
     ),
     (
@@ -242,6 +250,9 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit merge-tree --write-tree main feature",
             "rgit merge-tree --name-only main feature",
+            "rgit merge-tree -z --messages -Xno-renames main feature",
+            "printf 'main feature\\n' | rgit merge-tree --stdin",
+            "rgit merge-tree base-tree ours theirs",
         ],
     ),
     (
@@ -249,6 +260,29 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit merge-file ours.txt base.txt theirs.txt",
             "rgit merge-file -p --diff3 -L a -L b -L c a b c",
+        ],
+    ),
+    (
+        "fast-export",
+        &[
+            "rgit fast-export --all > repo.stream",
+            "rgit fast-export --no-data main~5..main",
+            "rgit fast-export --export-marks=marks main -- src",
+        ],
+    ),
+    (
+        "fast-import",
+        &[
+            "rgit fast-import < repo.stream",
+            "rgit fast-import --quiet --export-marks=marks < repo.stream",
+        ],
+    ),
+    (
+        "replay",
+        &[
+            "rgit replay --onto main main..topic",
+            "rgit replay --advance main main..topic",
+            "rgit replay --onto main main..topic | rgit update-ref --stdin",
         ],
     ),
     (
@@ -268,6 +302,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit read-tree HEAD",
             "rgit read-tree -m -u HEAD topic",
             "rgit read-tree -m base ours theirs",
+            "rgit read-tree -m --trivial --index-output=merged.idx base ours theirs",
             "rgit read-tree --prefix=vendor/lib/ lib-main",
         ],
     ),
@@ -282,10 +317,22 @@ const EXAMPLES: &[Entry] = &[
         ],
     ),
     (
+        "sparse-checkout",
+        &[
+            "rgit sparse-checkout set src docs",
+            "rgit sparse-checkout add tests",
+            "rgit sparse-checkout list",
+            "rgit sparse-checkout set --no-cone '/*' '!/build/'",
+            "rgit add --sparse vendor/lib.c",
+            "rgit sparse-checkout disable",
+        ],
+    ),
+    (
         "checkout-index",
         &[
             "rgit checkout-index -f src/lib.rs",
             "rgit checkout-index -a --prefix=/tmp/export/",
+            "rgit checkout-index --stage=all src/lib.rs",
         ],
     ),
     (
@@ -572,6 +619,16 @@ const EXAMPLES: &[Entry] = &[
             "rgit bisect bad",
             "rgit bisect run cargo test",
             "rgit bisect reset",
+        ],
+    ),
+    (
+        "rerere",
+        &[
+            "rgit config rerere.enabled true",
+            "rgit rerere status",
+            "rgit rerere diff",
+            "rgit rerere forget src/lib.rs",
+            "rgit rerere gc",
         ],
     ),
     (
@@ -875,6 +932,13 @@ const EXAMPLES: &[Entry] = &[
     ("bundle unbundle", &["rgit bundle unbundle update.bundle"]),
     ("pack-refs", &["rgit pack-refs --all"]),
     (
+        "hook",
+        &[
+            "rgit hook run pre-commit",
+            "rgit hook run --ignore-missing post-merge -- 0",
+        ],
+    ),
+    (
         "commit-graph",
         &[
             "rgit commit-graph write --reachable --changed-paths",
@@ -942,6 +1006,49 @@ const EXAMPLES: &[Entry] = &[
         &["rgit for-each-repo --config=maintenance.repo maintenance run --schedule=daily"],
     ),
     ("maintenance stop", &["rgit maintenance stop"]),
+    (
+        "credential",
+        &[
+            "printf 'protocol=https\\nhost=example.com\\n' | rgit credential fill",
+            "printf 'url=https://me:token@example.com\\n' | rgit credential approve",
+        ],
+    ),
+    (
+        "credential-store",
+        &[
+            "rgit config --global credential.helper store",
+            "printf 'protocol=https\\nhost=example.com\\n' | rgit credential-store get",
+        ],
+    ),
+    (
+        "credential-cache",
+        &[
+            "rgit config --global credential.helper 'cache --timeout=3600'",
+            "rgit credential-cache exit",
+        ],
+    ),
+    (
+        "credential-cache--daemon",
+        &["rgit credential-cache--daemon ~/.cache/git/credential/socket"],
+    ),
+    ("scalar", &["rgit scalar register", "rgit scalar list"]),
+    (
+        "scalar register",
+        &["rgit scalar register", "rgit scalar register ~/src/big"],
+    ),
+    ("scalar unregister", &["rgit scalar unregister"]),
+    ("scalar list", &["rgit scalar list"]),
+    (
+        "scalar run",
+        &["rgit scalar run all", "rgit scalar run commit-graph"],
+    ),
+    ("scalar reconfigure", &["rgit scalar reconfigure --all"]),
+    ("scalar delete", &["rgit scalar delete ~/src/big"]),
+    (
+        "scalar clone",
+        &["rgit scalar clone https://github.com/org/big.git"],
+    ),
+    ("scalar version", &["rgit scalar version"]),
     ("maintenance register", &["rgit maintenance register"]),
     (
         "maintenance unregister",
@@ -1367,6 +1474,13 @@ const EXAMPLES: &[Entry] = &[
     ),
     ("index status", &["rgit index status"]),
     ("index code", &["rgit index code \"<query>\""]),
+    (
+        "hook run",
+        &[
+            "rgit hook run pre-push -- origin https://example.com/repo.git",
+            "rgit hook run --to-stdin=refs.txt reference-transaction -- committed",
+        ],
+    ),
     ("hooks", &["rgit hooks install", "rgit hooks status"]),
     (
         "hooks install",
@@ -1377,6 +1491,84 @@ const EXAMPLES: &[Entry] = &[
         ],
     ),
     ("hooks status", &["rgit hooks status"]),
+    (
+        "diff-pairs",
+        &[
+            "rgit diff-tree -r -z main HEAD | rgit diff-pairs -z",
+            "rgit diff-tree -r -z -M main HEAD | rgit diff-pairs -z --stat",
+        ],
+    ),
+    (
+        "fetch-pack",
+        &[
+            "rgit fetch-pack ../other refs/heads/main",
+            "rgit fetch-pack --all file:///srv/repo.git",
+        ],
+    ),
+    (
+        "send-pack",
+        &[
+            "rgit send-pack ../backup.git main",
+            "rgit send-pack --all ../backup.git",
+            "rgit send-pack --force ../backup.git main:refs/heads/old",
+        ],
+    ),
+    (
+        "replace",
+        &[
+            "rgit replace <old> <new>",
+            "rgit replace --graft <commit> <parent>",
+            "rgit replace --format=long",
+            "rgit replace -d <old>",
+        ],
+    ),
+    (
+        "verify-pack",
+        &["rgit verify-pack -v .git/objects/pack/pack-*.idx"],
+    ),
+    (
+        "show-index",
+        &["rgit show-index < .git/objects/pack/pack-<hash>.idx"],
+    ),
+    (
+        "index-pack",
+        &[
+            "rgit index-pack received.pack",
+            "rgit index-pack --stdin < received.pack",
+        ],
+    ),
+    ("unpack-objects", &["rgit unpack-objects < received.pack"]),
+    (
+        "pack-objects",
+        &[
+            "rgit rev-list --objects main | rgit pack-objects out",
+            "echo main | rgit pack-objects --revs --stdout > main.pack",
+        ],
+    ),
+    ("prune-packed", &["rgit prune-packed -n"]),
+    (
+        "bugreport",
+        &["rgit bugreport", "rgit bugreport --diagnose -o /tmp/report"],
+    ),
+    (
+        "diagnose",
+        &["rgit diagnose", "rgit diagnose --mode=all -o /tmp"],
+    ),
+    ("backfill", &["rgit backfill"]),
+    ("merge-index", &["rgit merge-index git-merge-one-file -a"]),
+    (
+        "merge-one-file",
+        &["rgit merge-one-file <orig> <ours> <theirs> <path> 100644 100644 100644"],
+    ),
+    ("update-server-info", &["rgit update-server-info"]),
+    ("unpack-file", &["rgit unpack-file HEAD:README.md"]),
+    (
+        "check-mailmap",
+        &[
+            "rgit check-mailmap 'Jane <jane@old.example>'",
+            "rgit log --format='%an <%ae>' | rgit check-mailmap --stdin",
+        ],
+    ),
 ];
 
 fn render(lines: &[&str]) -> String {

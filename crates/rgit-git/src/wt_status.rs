@@ -1,6 +1,7 @@
 //! `git status` in git's own formats (long, short, porcelain v1 and v2),
 //! collected and printed the way wt-status.c does.
 
+use crate::rev::RevParse;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
@@ -211,7 +212,7 @@ struct Wt<'r> {
     workdir_dirty: bool,
     /// git's column option bits (text::column_mode).
     colopts: u32,
-    spec: Option<git2::Pathspec>,
+    spec: Option<crate::pathspec::Pathspec>,
     out: Vec<u8>,
 }
 
@@ -420,7 +421,7 @@ impl<'r> Wt<'r> {
             && repo.refname_to_id("CHERRY_PICK_HEAD").is_err();
         let reference = if opts.amend { "HEAD^1" } else { "HEAD" }.to_owned();
         let head_commit = repo
-            .revparse_single(&reference)
+            .rev_single(&reference)
             .and_then(|o| o.peel_to_commit())
             .ok();
         let branch = match repo.find_reference("HEAD") {
@@ -431,8 +432,8 @@ impl<'r> Wt<'r> {
             Err(_) => None,
         };
         let spec = (!opts.paths.is_empty())
-            .then(|| git2::Pathspec::new(opts.paths.iter()).ok())
-            .flatten();
+            .then(|| crate::pathspec::Pathspec::new(opts.paths.iter()))
+            .transpose()?;
         Ok(Self {
             repo,
             index,
@@ -483,7 +484,7 @@ impl<'r> Wt<'r> {
     fn in_spec(&self, path: &str) -> bool {
         self.spec
             .as_ref()
-            .is_none_or(|s| s.matches_path(Path::new(path), crate::pathspec_flags()))
+            .is_none_or(|s| s.matches_path(Path::new(path)))
     }
 
     fn entry(&mut self, path: &str) -> &mut Change {
@@ -553,9 +554,13 @@ impl<'r> Wt<'r> {
         let diff = self
             .repo
             .diff_index_to_workdir(Some(self.index), Some(&mut o))?;
+        let skips = crate::sparse::skipped_paths(self.index);
         for delta in diff.deltas() {
             let path = delta_path(&delta);
             if ita.contains(&path) || unmerged.contains_key(&path) || !self.in_spec(&path) {
+                continue;
+            }
+            if delta.status() == git2::Delta::Deleted && skips.contains(&path) {
                 continue;
             }
             if delta.old_file().mode() == git2::FileMode::Commit
@@ -802,7 +807,7 @@ impl<'r> Wt<'r> {
 
     fn reference_tree(&self) -> Option<git2::Tree<'r>> {
         self.repo
-            .revparse_single(&self.reference)
+            .rev_single(&self.reference)
             .ok()?
             .peel_to_tree()
             .ok()
@@ -1594,7 +1599,7 @@ impl<'r> Wt<'r> {
             return line.to_owned();
         };
         let rest = parts.next();
-        let Ok(obj) = self.repo.revparse_single(id.trim()) else {
+        let Ok(obj) = self.repo.rev_single(id.trim()) else {
             return line.to_owned();
         };
         let mut out = format!("{cmd} {}", self.abbrev(obj.id()));
@@ -2542,7 +2547,7 @@ fn submodule_dirty(sub: &Repository, untracked: bool) -> u8 {
 }
 
 /// git's parse_rename_score: `50`, `50%` or `0.5` as a percentage.
-fn parse_rename_score(arg: &str) -> u16 {
+pub(crate) fn parse_rename_score(arg: &str) -> u16 {
     if let Some(p) = arg.strip_suffix('%') {
         return p.parse::<f64>().map_or(50, |v| v.clamp(0.0, 100.0) as u16);
     }
@@ -2657,13 +2662,12 @@ pub(crate) fn patch_diff(
     paths: &[String],
 ) -> Result<Vec<u8>, GitError> {
     let context = context.unwrap_or(3);
+    crate::pathspec::Pathspec::new(paths)?;
     let options = |o: &mut DiffOptions| {
         o.reverse(reverse)
             .indent_heuristic(true)
             .context_lines(context);
-        for p in paths {
-            o.pathspec(p);
-        }
+        let _ = crate::pathspec::limit_diff(o, paths);
         // SAFETY: the options struct is owned by `o`.
         unsafe {
             (*o.raw().cast_mut()).ignore_submodules = libgit2_sys::GIT_SUBMODULE_IGNORE_DIRTY;
@@ -2683,21 +2687,18 @@ pub(crate) fn patch_diff(
         }
     }
     let spec = (!paths.is_empty())
-        .then(|| git2::Pathspec::new(paths.iter()).ok())
+        .then(|| crate::pathspec::Pathspec::new(paths.iter()).ok())
         .flatten();
     let unmerged: Vec<String> = unmerged
         .into_iter()
-        .filter(|p| {
-            spec.as_ref()
-                .is_none_or(|s| s.matches_path(Path::new(p), crate::pathspec_flags()))
-        })
+        .filter(|p| spec.as_ref().is_none_or(|s| s.matches_path(Path::new(p))))
         .collect();
     let index = if ita.is_empty() { index } else { &kept };
     let mut o = DiffOptions::new();
     options(&mut o);
     let tree = match rev {
         Some(r) => repo
-            .revparse_single(r)
+            .rev_single(r)
             .ok()
             .map(|o| o.peel_to_tree())
             .transpose()?,
@@ -2708,10 +2709,7 @@ pub(crate) fn patch_diff(
         (Some(_), true) => repo.diff_tree_to_index(tree.as_ref(), Some(index), Some(&mut o))?,
         (Some(_), false) => repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut o))?,
     }];
-    ita.retain(|p| {
-        spec.as_ref()
-            .is_none_or(|s| s.matches_path(Path::new(p), crate::pathspec_flags()))
-    });
+    ita.retain(|p| spec.as_ref().is_none_or(|s| s.matches_path(Path::new(p))));
     if !ita.is_empty() {
         // Intent-to-add files diff as new files.
         let mut o = DiffOptions::new();
@@ -2935,7 +2933,7 @@ struct Walk<'a> {
     dirs: &'a HashSet<String>,
     untracked: Untracked,
     ignored: Ignored,
-    spec: Option<&'a git2::Pathspec>,
+    spec: Option<&'a crate::pathspec::Pathspec>,
 }
 
 enum Kind {
@@ -2976,8 +2974,7 @@ impl Walk<'_> {
     }
 
     fn matches(&self, path: &str) -> bool {
-        self.spec
-            .is_none_or(|s| s.matches_path(Path::new(path), crate::pathspec_flags()))
+        self.spec.is_none_or(|s| s.matches_path(Path::new(path)))
     }
 
     /// Whether `dir` itself is matched, so it may be shown collapsed.

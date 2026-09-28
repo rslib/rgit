@@ -14,7 +14,7 @@ fn setenv(key: &str, value: impl AsRef<std::ffi::OsStr>) {
     unsafe { std::env::set_var(key, value) };
 }
 
-fn fatal(message: &str, code: i32) -> ! {
+pub(crate) fn fatal(message: &str, code: i32) -> ! {
     eprintln!("fatal: {message}");
     exit(code)
 }
@@ -165,7 +165,18 @@ pub fn apply(args: Vec<String>) -> (Vec<String>, Option<bool>) {
                     "--man-path" => "share/man",
                     _ => "share/info",
                 };
-                println!("{}", exe_prefix().join(sub).display());
+                let own = exe_prefix().join(sub);
+                // rgit ships no manuals of its own; point at git's, which
+                // document the commands rgit mirrors.
+                let git_doc = || {
+                    let out = Command::new("git").arg(&name).output().ok()?;
+                    let path = String::from_utf8(out.stdout).ok()?;
+                    out.status.success().then(|| path.trim().to_owned())
+                };
+                match git_doc().filter(|_| !own.is_dir()) {
+                    Some(path) => println!("{path}"),
+                    None => println!("{}", own.display()),
+                }
                 exit(0)
             }
             "-v" | "--version" => {
@@ -216,7 +227,7 @@ fn absolute_env() {
 }
 
 /// Where the subcommand sits in `args`, past rgit's own top-level flags.
-fn command_index(args: &[String]) -> Option<usize> {
+pub(crate) fn command_index(args: &[String]) -> Option<usize> {
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -342,7 +353,7 @@ fn top_and_prefix() -> Option<(PathBuf, String)> {
 /// `git-<name>` runs with the arguments, and `alias.<name>` expands (a `!`
 /// alias runs in the shell from the top of the work tree), as in git.
 /// Otherwise the arguments come back unchanged for clap to report.
-pub fn dispatch(mut args: Vec<String>) -> Vec<String> {
+pub fn dispatch(mut args: Vec<String>, paginate: &mut Option<bool>) -> Vec<String> {
     let Some(at) = command_index(&args) else {
         return args;
     };
@@ -357,7 +368,7 @@ pub fn dispatch(mut args: Vec<String>) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
     loop {
         let name = args[at].clone();
-        if builtin(&name).is_some() {
+        if builtin(&name).is_some() || matches!(name.as_str(), "help" | "version") {
             return args;
         }
         if let Some(pos) = seen.iter().position(|s| *s == name) {
@@ -391,6 +402,12 @@ pub fn dispatch(mut args: Vec<String>) -> Vec<String> {
             println!("'{name}' is aliased to '{alias}'");
             exit(0);
         }
+        if paginate.is_none()
+            && let Some((on, program)) = pager_config(&name)
+        {
+            *paginate = Some(on);
+            let _ = ALIAS_PAGER.set(program);
+        }
         if let Some(shell) = alias.strip_prefix('!') {
             let mut cmd = Command::new("sh");
             let rest = &args[at + 1..];
@@ -405,6 +422,7 @@ pub fn dispatch(mut args: Vec<String>) -> Vec<String> {
                 cmd.current_dir(top);
             }
             cmd.env("GIT_PREFIX", prefix);
+            start_pager(None, *paginate);
             run(cmd);
         }
         let Some(words) = split_cmdline(&alias) else {
@@ -413,9 +431,66 @@ pub fn dispatch(mut args: Vec<String>) -> Vec<String> {
         if words.is_empty() {
             fatal(&format!("empty alias for {name}"), 128);
         }
+        let opts = words.iter().take_while(|w| w.starts_with('-')).count();
+        if words[..opts].iter().any(|w| changes_env(w)) {
+            fatal(
+                &format!(
+                    "alias '{name}' changes environment variables.\n\
+                     You can use '!git' in the alias to do this"
+                ),
+                128,
+            );
+        }
+        let (words, alias_paginate) = if opts > 0 {
+            apply(words)
+        } else {
+            (words, None)
+        };
+        if words.is_empty() {
+            usage("no command given");
+        }
+        *paginate = alias_paginate.or(*paginate);
         args.splice(at..=at, words);
     }
 }
+
+/// Global options an alias may not start with, as they change the
+/// environment the command runs in (git's `envchanged`).
+fn changes_env(opt: &str) -> bool {
+    let name = opt.split_once('=').map_or(opt, |(n, _)| n);
+    matches!(
+        name,
+        "-C" | "--git-dir"
+            | "--work-tree"
+            | "--namespace"
+            | "--attr-source"
+            | "--bare"
+            | "-P"
+            | "--no-pager"
+            | "--no-replace-objects"
+            | "--literal-pathspecs"
+            | "--no-literal-pathspecs"
+            | "--glob-pathspecs"
+            | "--noglob-pathspecs"
+            | "--icase-pathspecs"
+            | "--no-optional-locks"
+            | "--no-advice"
+            | "--no-lazy-fetch"
+            | "--shallow-file"
+    ) || (name == "--exec-path" && opt.contains('='))
+}
+
+/// `pager.<cmd>`: paging on or off, or the pager program to page with.
+fn pager_config(cmd: &str) -> Option<(bool, Option<String>)> {
+    let v = rgit_git::config_get(&format!("pager.{cmd}"))?;
+    Some(match rgit_git::config_typed(Some(&v), "bool") {
+        Ok(b) => (b == "true", None),
+        Err(_) => (true, Some(v)),
+    })
+}
+
+/// The pager program an alias's `pager.<alias>` names.
+static ALIAS_PAGER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// Default paging, as git's builtins with USE_PAGER (and branch/tag lists).
 const PAGED: &[&str] = &[
@@ -441,17 +516,14 @@ pub fn start_pager(command: Option<&str>, paginate: Option<bool>) {
     if paginate == Some(false) || !std::io::stdout().is_terminal() {
         return;
     }
-    let mut program = None;
+    let mut program = ALIAS_PAGER.get().cloned().flatten();
     let wanted = match (paginate, command) {
         (Some(true), _) => true,
-        (_, Some(cmd)) => match rgit_git::config_get(&format!("pager.{cmd}")) {
-            Some(v) => match rgit_git::config_typed(Some(&v), "bool") {
-                Ok(b) => b == "true",
-                Err(_) => {
-                    program = Some(v);
-                    true
-                }
-            },
+        (_, Some(cmd)) => match pager_config(cmd) {
+            Some((on, p)) => {
+                program = p;
+                on
+            }
             None => PAGED.contains(&cmd),
         },
         _ => false,
@@ -520,6 +592,16 @@ extern "C" fn wait_for_pager() {
     {
         let _ = child.wait();
     }
+}
+
+/// Whether `auto` color is on: stdout is a terminal, or the pager is and
+/// `color.pager` allows it.
+pub fn color_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
+        || std::env::var_os("GIT_PAGER_IN_USE").is_some_and(|v| v == "true")
+            && rgit_git::config_get("color.pager")
+                .is_none_or(|v| rgit_git::config_typed(Some(&v), "bool").is_ok_and(|b| b == "true"))
 }
 
 /// Whether output goes to a terminal, directly or through the pager.

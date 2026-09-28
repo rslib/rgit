@@ -15,9 +15,13 @@ mod add_patch;
 mod axi;
 mod clean;
 mod cli;
+mod credential;
 mod creds;
 mod date;
+mod diffcolor;
+mod diffopts;
 mod examples;
+mod extra;
 mod forge;
 mod globals;
 mod graph;
@@ -31,6 +35,7 @@ mod plumbing;
 mod pretty;
 mod prompt;
 mod render;
+mod scalar;
 mod setup;
 mod stack;
 mod toon;
@@ -41,6 +46,7 @@ struct Emit {
     fields: Vec<String>,
     full: bool,
     rerun: String,
+    command: Option<String>,
 }
 
 fn main() -> ! {
@@ -51,22 +57,31 @@ fn main() -> ! {
         println!("{}", env!("CARGO_PKG_VERSION"));
         exit(0);
     }
-    let (args, paginate) = globals::apply(args);
-    let args = globals::dispatch(args);
+    let (args, mut paginate) = globals::apply(args);
+    let args = whatchanged(help_and_version(globals::dispatch(args, &mut paginate)));
     logging::init();
     let stdout_is_terminal = std::io::stdout().is_terminal();
-    let parsed =
-        examples::apply(Cli::command())
-            .try_get_matches_from(std::iter::once("rgit".to_owned()).chain(sticky_sign(
-                blame_scores(count_shorthand(&plumbing::grep_tokens(&args))),
-            )))
-            .and_then(|m| Cli::from_arg_matches(&m));
+    let parsed = examples::apply(Cli::command())
+        .try_get_matches_from(
+            std::iter::once("rgit".to_owned()).chain(sticky_sign(diff_scores(blame_scores(
+                diff_shorthand(count_shorthand(&plumbing::grep_tokens(&args))),
+            )))),
+        )
+        .and_then(|m| Cli::from_arg_matches(&m));
     let cli = match parsed {
         Ok(cli) => cli,
         Err(e) => usage_exit(e, &args, stdout_is_terminal),
     };
     let output_mode = cli.output_mode(stdout_is_terminal);
     let structured_output = output_mode != OutputMode::Text;
+    if !structured_output
+        && !matches!(
+            cli.command,
+            None | Some(Command::Mcp | Command::Serve { .. })
+        )
+    {
+        rgit_git::stream_hooks();
+    }
     let can_prompt = interactive::enabled(cli.no_input || structured_output);
     if can_prompt {
         // The in-process ssh transport falls back to a password prompt when key
@@ -81,6 +96,7 @@ fn main() -> ! {
         fields: cli.fields.clone(),
         full: cli.full,
         rerun: rerun(&args),
+        command: globals::command_name(&args),
     };
 
     match cli.command {
@@ -95,6 +111,13 @@ fn main() -> ! {
             maintenance::for_each_repo(&config, keep_going, &args, !structured_output),
             &emit,
         ),
+        Some(
+            cmd @ (Command::Credential { .. }
+            | Command::CredentialStore { .. }
+            | Command::CredentialCache { .. }
+            | Command::CredentialCacheDaemon { .. }),
+        ) => exit(credential::run(cmd)),
+        Some(Command::Scalar { cmd }) => finish(scalar::run(cmd), &emit),
         Some(Command::Hooks { cmd }) => finish(
             match cmd {
                 HooksCmd::Install { user, app } => setup::install(app, user),
@@ -316,7 +339,10 @@ fn main() -> ! {
                 unreachable!()
             };
             let mut opts = fmt.opts(untracked.as_deref(), ignored.as_deref(), &paths);
-            cli::status_env(&backend, &mut opts, cli.no_color, stdout_is_terminal);
+            if emit.mode == OutputMode::Text {
+                globals::start_pager(Some("status"), paginate);
+            }
+            cli::status_env(&backend, &mut opts, cli.no_color, globals::color_tty());
             match backend.status_text(&opts) {
                 Ok(report) => {
                     use std::io::Write;
@@ -400,6 +426,9 @@ fn main() -> ! {
             )
         }
         Some(command) => {
+            if output_mode == OutputMode::Text {
+                globals::start_pager(globals::command_name(&args).as_deref(), paginate);
+            }
             // Color and prompts only on a real terminal.
             render::init_color(
                 output_mode == OutputMode::Text,
@@ -409,9 +438,6 @@ fn main() -> ! {
                     cli.color.as_deref()
                 },
             );
-            if output_mode == OutputMode::Text {
-                globals::start_pager(globals::command_name(&args).as_deref(), paginate);
-            }
             let repoless = command.runs_without_repo();
             let backend = match discover_or_init(can_prompt && !repoless) {
                 Ok(backend) => backend,
@@ -422,12 +448,24 @@ fn main() -> ! {
             };
             let command = cli::from_cwd(command, &backend);
             let since = backend.index_second();
+            let watch = rgit_git::watch_hooks(&backend.git_dir());
+            let widened = command
+                .moves_worktree()
+                .then(|| rgit_git::sparse_widen(&backend.git_dir()).ok().flatten())
+                .flatten();
             let result = if structured_output {
                 axi::run(&backend, command, can_prompt)
             } else {
                 cli::run(&backend, command, can_prompt).map(Output::from)
             };
+            if let Some(w) = widened {
+                let _ = rgit_git::sparse_narrow(&backend.git_dir(), w);
+            }
             let _ = backend.smudge_racy(since);
+            let result = match watch.map(|w| w.finish(|| index_flags(&args))) {
+                Some(Err(e)) if result.is_ok() => Err(ref_hook_error(e)),
+                _ => result,
+            };
             finish(result, &emit)
         }
         None if structured_output => finish(Ok(home()), &emit),
@@ -490,6 +528,13 @@ fn finish(result: anyhow::Result<impl Into<Output>>, emit: &Emit) -> ! {
 }
 
 fn die(error: anyhow::Error, emit: &Emit) -> ! {
+    if emit.mode == OutputMode::Text {
+        let (text, code) = output::human(&error, emit.command.as_deref());
+        if !text.is_empty() {
+            eprintln!("{text}");
+        }
+        exit(code);
+    }
     let (message, help, code) = output::translate(&error);
     fail(message, help, code, emit.mode)
 }
@@ -497,21 +542,7 @@ fn die(error: anyhow::Error, emit: &Emit) -> ! {
 /// Report an error on stdout in the output format, or on stderr for humans.
 fn fail(message: String, help: Vec<String>, code: i32, mode: OutputMode) -> ! {
     match mode {
-        OutputMode::Text if message.is_empty() => {}
-        // A multi-line message is a report in git's own words (a refused push).
-        OutputMode::Text if message.contains('\n') => {
-            eprintln!("{message}");
-            for h in &help {
-                eprintln!("hint: {h}");
-            }
-        }
-        OutputMode::Text => {
-            eprintln!("rgit: {message}");
-            let advice = std::env::var("GIT_ADVICE").map_or(true, |v| v != "0" && v != "false");
-            for h in help.iter().filter(|_| advice) {
-                eprintln!("hint: {h}");
-            }
-        }
+        OutputMode::Text => eprintln!("error: {message}"),
         OutputMode::Json => {
             println!(
                 "{}",
@@ -527,6 +558,82 @@ fn fail(message: String, help: Vec<String>, code: i32, mode: OutputMode) -> ! {
         }
     }
     exit(code);
+}
+
+/// `whatchanged` is git's `log` with raw diffs and no merges (unless asked
+/// for another diff format, or for merges' diffs).
+fn whatchanged(mut args: Vec<String>) -> Vec<String> {
+    let Some(at) = args.iter().position(|a| a == "whatchanged") else {
+        return args;
+    };
+    let rest = &args[at + 1..];
+    let end = rest.iter().position(|a| a == "--").unwrap_or(rest.len());
+    let given = |flags: &[&str]| {
+        rest[..end].iter().any(|a| {
+            flags
+                .iter()
+                .any(|f| a == f || a.starts_with(&format!("{f}=")))
+        })
+    };
+    let mut extra = Vec::new();
+    if !given(&["-m", "-c", "--cc", "--diff-merges", "--dd"]) {
+        extra.push("--no-merges".to_owned());
+    }
+    let formats = [
+        "-p",
+        "-u",
+        "--patch",
+        "--stat",
+        "--numstat",
+        "--shortstat",
+        "--name-only",
+        "--name-status",
+        "--summary",
+        "-s",
+        "--no-patch",
+        "--raw",
+        "--patch-with-stat",
+        "--patch-with-raw",
+        "--dirstat",
+        "--compact-summary",
+    ];
+    if !given(&formats) {
+        extra.push("--raw".to_owned());
+    }
+    if !given(&["--oneline", "--format", "--pretty"]) {
+        extra.push("--pretty=medium".to_owned());
+    }
+    args[at] = "log".to_owned();
+    args.splice(at + 1..at + 1, extra);
+    args
+}
+
+/// A refused ref update, as git reports it.
+pub(crate) fn ref_hook_error(e: rgit_git::GitError) -> anyhow::Error {
+    CliError {
+        message: e.to_string(),
+        help: None,
+        code: 128,
+    }
+    .into()
+}
+
+/// post-index-change's flags for the command in `args`: whether it updated
+/// the working tree, and whether it may have changed skip-worktree bits, as
+/// git sets them.
+pub(crate) fn index_flags(args: &[String]) -> (bool, bool) {
+    let has = |flags: &[&str]| args.iter().any(|a| flags.contains(&a.as_str()));
+    match globals::command_name(args).as_deref() {
+        Some("checkout") => (!has(&["--"]), false),
+        Some("reset") if has(&["--hard", "--merge", "--keep"]) => (true, false),
+        Some("reset") => (false, !has(&["--soft"])),
+        Some(
+            "switch" | "merge" | "pull" | "rebase" | "cherry-pick" | "revert" | "stash" | "am"
+            | "sparse-checkout",
+        ) => (true, false),
+        Some("read-tree") => (has(&["-u"]), false),
+        _ => (false, false),
+    }
 }
 
 /// git's `-<n>` count for `log`, `rev-list` and `stash list`: `rgit log -3` is
@@ -558,6 +665,57 @@ fn count_shorthand(args: &[String]) -> Vec<String> {
         }
     }
     out.extend(rest.cloned());
+    out
+}
+
+/// git's sticky diff options: `-B[n][/m]`, `-X[param]`, `-l<n>` and
+/// `--stat=<width>[,<name-width>[,<count>]]` in `diff`, `log` and `show`.
+fn diff_shorthand(args: Vec<String>) -> Vec<String> {
+    let Some(at) = args
+        .iter()
+        .position(|a| matches!(a.as_str(), "diff" | "log" | "show" | "whatchanged"))
+    else {
+        return args;
+    };
+    let log = matches!(args[at].as_str(), "log" | "whatchanged");
+    let mut out = args[..=at].to_vec();
+    let mut rest = args[at + 1..].iter();
+    for a in rest.by_ref() {
+        if a == "--" {
+            out.push(a.clone());
+            break;
+        }
+        if let Some(v) = a.strip_prefix("-B") {
+            out.push(if v.is_empty() {
+                "--break-rewrites".to_owned()
+            } else {
+                format!("--break-rewrites={v}")
+            });
+        } else if let Some(v) = a.strip_prefix("-X") {
+            out.push(format!("--dirstat={v}"));
+        } else if let Some(n) = a
+            .strip_prefix("-l")
+            .filter(|n| !log && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            out.push(format!("--rename-limit={n}"));
+        } else if let Some(v) = a.strip_prefix("--stat=") {
+            out.push("--stat".to_owned());
+            let mut parts = v.split(',');
+            for flag in ["--stat-width", "--stat-name-width", "--stat-count"] {
+                if let Some(n) = parts.next().filter(|n| !n.is_empty()) {
+                    out.push(format!("{flag}={n}"));
+                }
+            }
+        } else {
+            out.push(a.clone());
+        }
+    }
+    out.extend(rest.cloned());
+    // --binary asks for a patch too.
+    let flags = &out[at + 1..out.iter().position(|a| a == "--").unwrap_or(out.len())];
+    if flags.iter().any(|a| a == "--binary") && !flags.iter().any(|a| a == "-p" || a == "--patch") {
+        out.insert(at + 1, "--patch".to_owned());
+    }
     out
 }
 
@@ -604,6 +762,30 @@ fn blame_scores(args: Vec<String>) -> Vec<String> {
     }
     out.extend(rest.cloned());
     out
+}
+
+/// git's sticky `-M[<n>]` and `-C[<n>]` for the diff plumbing: `-M50%` is
+/// `--find-renames=50%`, so a bare `-M` never takes the next word.
+fn diff_scores(mut args: Vec<String>) -> Vec<String> {
+    let diffs = ["diff-tree", "diff-index", "diff-files"];
+    let Some(at) = args.iter().position(|a| diffs.contains(&a.as_str())) else {
+        return args;
+    };
+    for a in &mut args[at + 1..] {
+        if a == "--" {
+            break;
+        }
+        let long = match a.get(..2) {
+            Some("-M") => "--find-renames",
+            Some("-C") => "--find-copies",
+            _ => continue,
+        };
+        *a = match &a[2..] {
+            "" => long.to_owned(),
+            n => format!("{long}={n}"),
+        };
+    }
+    args
 }
 
 /// The current invocation as a copy-pasteable command, for `--full` hints.
@@ -816,14 +998,24 @@ fn usage_exit(e: clap::Error, args: &[String], stdout_is_terminal: bool) -> ! {
     } else {
         OutputMode::Text
     };
-    if mode == OutputMode::Text
-        || matches!(
-            e.kind(),
-            ErrorKind::DisplayHelp
-                | ErrorKind::DisplayVersion
-                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-        )
+    let (cmd, path) = subcommand_at(args);
+    let before_dashes = args.iter().take_while(|a| *a != "--");
+    if e.kind() == ErrorKind::DisplayHelp && before_dashes.clone().any(|a| a == "-h")
+        || e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            && mode == OutputMode::Text
     {
+        print_raw(&short_usage(&cmd, &path));
+        exit(129);
+    }
+    if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+        e.exit();
+    }
+    if mode == OutputMode::Text {
+        let (text, code) = git_usage_error(&e, args, &cmd, &path);
+        eprint!("{text}");
+        exit(code);
+    }
+    if e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
         e.exit();
     }
 
@@ -848,18 +1040,6 @@ fn usage_exit(e: clap::Error, args: &[String], stdout_is_terminal: bool) -> ! {
         _ => None,
     });
 
-    let mut cmd = Cli::command();
-    let mut path = String::from("rgit");
-    for arg in args.iter().filter(|a| !a.starts_with('-')) {
-        match cmd.find_subcommand(arg) {
-            Some(sub) => {
-                path.push(' ');
-                path.push_str(sub.get_name());
-                cmd = sub.clone();
-            }
-            None => break,
-        }
-    }
     if let Some(arg) = &offending
         && let Some(hint) = renamed(&path, arg)
     {
@@ -892,6 +1072,291 @@ fn usage_exit(e: clap::Error, args: &[String], stdout_is_terminal: bool) -> ! {
         }
     }
     fail(message, help, 2, mode)
+}
+
+/// Write `text` to stdout, ignoring a closed pipe (`rgit help | head`).
+fn print_raw(text: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
+}
+
+/// The deepest subcommand `args` name, and its path (`rgit stash push`).
+fn subcommand_at(args: &[String]) -> (clap::Command, String) {
+    let mut cmd = Cli::command();
+    let mut path = String::from("rgit");
+    for arg in args.iter().filter(|a| !a.starts_with('-')) {
+        match cmd.find_subcommand(arg) {
+            Some(sub) => {
+                path.push(' ');
+                path.push_str(sub.get_name());
+                cmd = sub.clone();
+            }
+            None => break,
+        }
+    }
+    (cmd, path)
+}
+
+/// git's `-h` text: the usage lines, then one line per option with its help
+/// in a column at 26, and a blank line.
+fn short_usage(cmd: &clap::Command, path: &str) -> String {
+    let usage = cmd.clone().bin_name(path).render_usage().to_string();
+    // clap's `[PATHS]...` in git's spelling, `[<paths>...]`.
+    let optional = regex::Regex::new(r"\[([A-Z][A-Z0-9_]*)\](\.\.\.)?").expect("valid regex");
+    let usage = optional.replace_all(&usage, |c: &regex::Captures| {
+        format!(
+            "[<{}>{}]",
+            c[1].to_lowercase(),
+            c.get(2).map_or("", |m| m.as_str())
+        )
+    });
+    let required = regex::Regex::new(r"<([A-Z][A-Z0-9_]*)>").expect("valid regex");
+    let usage = required.replace_all(&usage, |c: &regex::Captures| {
+        format!("<{}>", c[1].to_lowercase())
+    });
+    let mut out = String::new();
+    for (i, line) in usage.lines().enumerate() {
+        let line = line.trim_start_matches("Usage: ").trim_start();
+        let lead = if i == 0 { "usage: " } else { "   or: " };
+        out.push_str(&format!("{lead}{line}\n"));
+    }
+    out.push('\n');
+    let mut any = false;
+    for a in cmd.get_arguments() {
+        if a.is_hide_set() || a.is_global_set() || a.is_positional() || a.get_id() == "help" {
+            continue;
+        }
+        let mut left = String::from("    ");
+        if let Some(s) = a.get_short() {
+            left.push_str(&format!("-{s}"));
+            if a.get_long().is_some() {
+                left.push_str(", ");
+            }
+        }
+        if let Some(l) = a.get_long() {
+            left.push_str(&format!("--{l}"));
+        }
+        if a.get_action().takes_values() {
+            let value = a
+                .get_value_names()
+                .and_then(|v| v.first())
+                .map_or("value".to_owned(), |v| v.to_lowercase());
+            if a.get_num_args().is_some_and(|n| n.min_values() == 0) {
+                left.push_str(&format!("[=<{value}>]"));
+            } else {
+                left.push_str(&format!(" <{value}>"));
+            }
+        }
+        let about = a.get_help().map(|h| h.to_string()).unwrap_or_default();
+        let about = about.lines().next().unwrap_or("");
+        let about = about.split(". ").next().unwrap_or("").trim_end_matches('.');
+        let mut chars = about.chars();
+        let about = match chars.next() {
+            Some(c) => c.to_lowercase().chain(chars).collect(),
+            None => String::new(),
+        };
+        if left.len() < 26 {
+            out.push_str(&format!("{left:<26}{about}\n"));
+        } else {
+            out.push_str(&format!("{left}\n{:26}{about}\n", ""));
+        }
+        any = true;
+    }
+    if any {
+        out.push('\n');
+    }
+    out
+}
+
+/// A clap parse error as git reports a bad command line: the stderr text and
+/// git's exit code (129 with the usage, 128 for a fatal, 1 for an unknown
+/// command).
+fn git_usage_error(
+    e: &clap::Error,
+    args: &[String],
+    cmd: &clap::Command,
+    path: &str,
+) -> (String, i32) {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let context = |want: ContextKind| {
+        e.context().find_map(|(k, v)| match v {
+            ContextValue::String(s) if k == want => Some(s.clone()),
+            _ => None,
+        })
+    };
+    let arg = context(ContextKind::InvalidArg)
+        .map(|s| s.split_whitespace().next().unwrap_or(&s).to_owned())
+        .unwrap_or_default();
+    let usage = || short_usage(cmd, path);
+    let first = e.render().to_string();
+    let first = first
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches("error: ")
+        .to_owned();
+    let top = path == "rgit";
+    let sub = path.rsplit(' ').next().unwrap_or_default();
+    match e.kind() {
+        ErrorKind::InvalidSubcommand if top => {
+            let name = context(ContextKind::InvalidSubcommand).unwrap_or_default();
+            let mut text = format!("rgit: '{name}' is not a git command. See 'rgit --help'.\n");
+            let similar: Vec<String> = e
+                .context()
+                .filter(|(k, _)| *k == ContextKind::SuggestedSubcommand)
+                .flat_map(|(_, v)| match v {
+                    ContextValue::String(s) => vec![s.clone()],
+                    ContextValue::Strings(s) => s.clone(),
+                    _ => Vec::new(),
+                })
+                .collect();
+            if !similar.is_empty() {
+                text.push_str(if similar.len() == 1 {
+                    "\nThe most similar command is\n"
+                } else {
+                    "\nThe most similar commands are\n"
+                });
+                for s in similar {
+                    text.push_str(&format!("\t{s}\n"));
+                }
+            }
+            (text, 1)
+        }
+        ErrorKind::InvalidSubcommand => {
+            let name = context(ContextKind::InvalidSubcommand).unwrap_or_default();
+            (
+                format!("error: unknown subcommand: `{name}'\n{}", usage()),
+                129,
+            )
+        }
+        ErrorKind::UnknownArgument if top && arg.starts_with('-') => {
+            (format!("unknown option: {arg}\n{}", usage()), 129)
+        }
+        ErrorKind::UnknownArgument if arg.starts_with('-') => match sub {
+            "log" | "show" | "whatchanged" => {
+                (format!("fatal: unrecognized argument: {arg}\n"), 128)
+            }
+            "diff" => (format!("error: invalid option: {arg}\n{}", usage()), 129),
+            "rev-list" => (usage(), 129),
+            _ => {
+                let (kind, name) = match arg.strip_prefix("--") {
+                    Some(long) => ("option", long.split('=').next().unwrap_or(long)),
+                    None => ("switch", arg.get(1..2).unwrap_or_default()),
+                };
+                (format!("error: unknown {kind} `{name}'\n{}", usage()), 129)
+            }
+        },
+        ErrorKind::InvalidValue
+            if context(ContextKind::InvalidValue).is_some_and(|v| v.is_empty()) =>
+        {
+            let typed = args
+                .iter()
+                .take_while(|a| *a != "--")
+                .filter(|a| a.starts_with('-'))
+                .last()
+                .map_or(arg.as_str(), String::as_str);
+            let text = match typed.strip_prefix("--") {
+                Some(long) => format!("error: option `{long}' requires a value\n"),
+                None => format!(
+                    "error: switch `{}' requires a value\n",
+                    typed.chars().last().unwrap_or('?')
+                ),
+            };
+            (text, 129)
+        }
+        ErrorKind::ArgumentConflict => {
+            let other = context(ContextKind::PriorArg)
+                .map(|s| s.split_whitespace().next().unwrap_or(&s).to_owned())
+                .unwrap_or_default();
+            (
+                format!("fatal: options '{arg}' and '{other}' cannot be used together\n"),
+                128,
+            )
+        }
+        _ => (format!("error: {first}\n{}", usage()), 129),
+    }
+}
+
+/// `rgit help [-a | -g | <command>]` and `rgit version`, which git runs as
+/// builtins: a command's help becomes `<command> --help` for clap to print.
+fn help_and_version(mut args: Vec<String>) -> Vec<String> {
+    let Some(at) = globals::command_index(&args) else {
+        return args;
+    };
+    let owned = args[at + 1..].to_vec();
+    let rest: Vec<&str> = owned.iter().map(String::as_str).collect();
+    match args[at].as_str() {
+        "version" => match rest.as_slice() {
+            [] | ["--build-options"] => {
+                println!("rgit version {}", env!("CARGO_PKG_VERSION"));
+                if !rest.is_empty() {
+                    println!("cpu: {}", std::env::consts::ARCH);
+                    println!("no commit associated with this build");
+                    println!("sizeof-long: {}", std::mem::size_of::<std::ffi::c_long>());
+                    println!("sizeof-size_t: {}", std::mem::size_of::<usize>());
+                    println!("shell-path: /bin/sh");
+                }
+                exit(0)
+            }
+            _ => {
+                print!(
+                    "usage: rgit version [--[no-]build-options]\n\n    --[no-]build-options  also print build options\n\n"
+                );
+                exit(129)
+            }
+        },
+        "help" => {
+            let names: Vec<&str> = rest
+                .iter()
+                .copied()
+                .filter(|a| !matches!(*a, "-m" | "--man" | "-w" | "--web" | "-i" | "--info"))
+                .collect();
+            match names.as_slice() {
+                [] | ["-a" | "--all", ..] => {
+                    let cli = Cli::command();
+                    let subs: Vec<&clap::Command> =
+                        cli.get_subcommands().filter(|c| !c.is_hide_set()).collect();
+                    let width = subs.iter().map(|c| c.get_name().len()).max().unwrap_or(0);
+                    let mut out = "See 'rgit help <command>' to read about a specific \
+                                   subcommand\n\nAvailable rgit commands\n"
+                        .to_owned();
+                    for c in subs {
+                        let about = c.get_about().map(|a| a.to_string()).unwrap_or_default();
+                        let about = about.split(". ").next().unwrap_or("").trim_end_matches('.');
+                        out.push_str(&format!("   {:width$}   {about}\n", c.get_name()));
+                    }
+                    print_raw(&out);
+                    exit(0)
+                }
+                ["-g" | "--guides"] => {
+                    println!(
+                        "rgit ships no concept guides; `git help -g` lists git's, which describe \
+                         rgit too."
+                    );
+                    exit(0)
+                }
+                [name] if !name.starts_with('-') => {
+                    if Cli::command().find_subcommand(name).is_none() {
+                        eprintln!("rgit: '{name}' is not a git command. See 'rgit --help'.");
+                        exit(1)
+                    }
+                    args.truncate(at);
+                    args.push((*name).to_owned());
+                    args.push("--help".to_owned());
+                    args
+                }
+                _ => {
+                    print!(
+                        "usage: rgit help [-a|--all]\n   or: rgit help [[-i|--info] [-m|--man] \
+                         [-w|--web]] [<command>]\n   or: rgit help [-g|--guides]\n\n"
+                    );
+                    exit(129)
+                }
+            }
+        }
+        _ => args,
+    }
 }
 
 /// A targeted hint for git spellings that rgit names differently.
@@ -975,25 +1440,23 @@ use output::sanitize;
 
 fn discover_or_exit() -> Arc<dyn GitBackend> {
     let discovered = std::env::current_dir()
-        .map_err(|e| e.to_string())
-        .and_then(|cwd| Git2Backend::open_env(&cwd).map_err(|e| e.to_string()));
+        .map_err(anyhow::Error::from)
+        .and_then(|cwd| Ok(Git2Backend::open_env(&cwd)?));
     match discovered {
         Ok(backend) => Arc::new(backend),
-        Err(e) => {
-            eprintln!("rgit: {e}");
-            exit(1);
-        }
+        Err(e) => exit_human(&e),
     }
 }
 
 fn discover_or_init_or_exit(can_prompt: bool) -> Arc<dyn GitBackend> {
-    match discover_or_init(can_prompt) {
-        Ok(backend) => backend,
-        Err(e) => {
-            eprintln!("rgit: {e}");
-            exit(1);
-        }
-    }
+    discover_or_init(can_prompt).unwrap_or_else(|e| exit_human(&e))
+}
+
+/// Report `error` on stderr as git words it, and exit with git's code.
+fn exit_human(error: &anyhow::Error) -> ! {
+    let (text, code) = output::human(error, None);
+    eprintln!("{text}");
+    exit(code)
 }
 
 fn discover_or_init(can_prompt: bool) -> anyhow::Result<Arc<dyn GitBackend>> {

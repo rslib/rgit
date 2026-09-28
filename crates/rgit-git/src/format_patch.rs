@@ -1,5 +1,6 @@
 //! `git format-patch`: commits as mbox emails, written as git writes them.
 
+use crate::rev::RevParse;
 use std::fmt::Write as _;
 
 use git2::{Commit, Diff, DiffFindOptions, DiffOptions, Oid, Repository};
@@ -122,11 +123,11 @@ fn select<'r>(repo: &'r Repository, o: &FormatPatchOpts) -> Result<Vec<Commit<'r
     match o.range.as_deref() {
         Some(r) if r.contains("..") => walk.push_range(r)?,
         Some(r) if o.count.is_some() || o.root => {
-            walk.push(repo.revparse_single(r)?.peel_to_commit()?.id())?
+            walk.push(repo.rev_single(r)?.peel_to_commit()?.id())?
         }
         Some(r) => {
             walk.push_head()?;
-            walk.hide(repo.revparse_single(r)?.peel_to_commit()?.id())?;
+            walk.hide(repo.rev_single(r)?.peel_to_commit()?.id())?;
         }
         None => walk.push_head()?,
     }
@@ -519,8 +520,8 @@ fn upstream_side<'r>(
         _ => return Ok(None),
     };
     let mut walk = repo.revwalk()?;
-    walk.push(repo.revparse_single(theirs)?.peel_to_commit()?.id())?;
-    walk.hide(repo.revparse_single(ours)?.peel_to_commit()?.id())?;
+    walk.push(repo.rev_single(theirs)?.peel_to_commit()?.id())?;
+    walk.hide(repo.rev_single(ours)?.peel_to_commit()?.id())?;
     let mut out = Vec::new();
     for id in walk {
         let c = repo.find_commit(id?)?;
@@ -638,7 +639,7 @@ fn versions(
         String::new()
     };
     if let Some(prev) = &o.interdiff {
-        let old = repo.revparse_single(prev)?.peel_to_tree()?;
+        let old = repo.rev_single(prev)?.peel_to_tree()?;
         let diff = tree_diff_opts(repo, Some(&old), &tip.tree()?, false)?;
         let _ = write!(out, "Interdiff{against}:\n{}", patch_text(&diff)?);
     }
@@ -646,7 +647,7 @@ fn versions(
         let old = if prev.contains("..") {
             prev.clone()
         } else {
-            let p = repo.revparse_single(prev)?.peel_to_commit()?.id();
+            let p = repo.rev_single(prev)?.peel_to_commit()?.id();
             let b = repo.merge_base(p, Oid::from_str(&base).unwrap_or(p))?;
             format!("{b}..{p}")
         };
@@ -727,7 +728,7 @@ fn base_info(repo: &Repository, base: &str, first: &Commit) -> Result<String, Gi
         let target = upstream.get().peel_to_commit()?.id();
         repo.merge_base(target, first.id())?
     } else {
-        repo.revparse_single(base)?.peel_to_commit()?.id()
+        repo.rev_single(base)?.peel_to_commit()?.id()
     };
     let mut out = format!("\nbase-commit: {base}\n");
     if first.parent_count() > 0 {
@@ -749,6 +750,15 @@ fn base_info(repo: &Repository, base: &str, first: &Commit) -> Result<String, Gi
 /// file's header and lines, whitespace removed, hashed on its own and summed,
 /// so file order does not matter.
 pub(crate) fn patch_id(repo: &Repository, c: &Commit) -> Result<Oid, GitError> {
+    patch_id_in(repo, c, &[])
+}
+
+/// [`patch_id`] of the commit's diff limited to `paths`.
+pub(crate) fn patch_id_in(
+    repo: &Repository,
+    c: &Commit,
+    paths: &[String],
+) -> Result<Oid, GitError> {
     use sha1::{Digest, Sha1};
     let parent = match c.parent_count() {
         0 => None,
@@ -767,6 +777,12 @@ pub(crate) fn patch_id(repo: &Repository, c: &Commit) -> Result<Oid, GitError> {
             continue;
         };
         let delta = patch.delta();
+        let name = delta.new_file().path().or(delta.old_file().path());
+        if !paths.is_empty()
+            && !name.is_some_and(|p| crate::pathspec_matches(paths, &p.to_string_lossy()))
+        {
+            continue;
+        }
         let path = |f: git2::DiffFile| {
             f.path()
                 .map_or(Vec::new(), |p| squeeze(p.to_string_lossy().as_bytes()))
@@ -866,10 +882,10 @@ pub(crate) fn request_pull(
     };
     let head = head_ref.clone().unwrap_or_else(|| local.to_owned());
     let local_obj = repo
-        .revparse_single(&head)
+        .rev_single(&head)
         .map_err(|_| GitError::Other(format!("Not a valid revision: {local}")))?;
     let headrev = local_obj.peel_to_commit()?.id();
-    let baserev = repo.revparse_single(start)?.peel_to_commit()?.id();
+    let baserev = repo.rev_single(start)?.peel_to_commit()?.id();
     let merge_base = repo
         .merge_base(baserev, headrev)
         .map_err(|_| GitError::Other(format!("No commits in common between {start} and {head}")))?;
@@ -1023,7 +1039,7 @@ pub(crate) fn cherry(
     limit: Option<&str>,
 ) -> Result<Vec<CherryCommit>, GitError> {
     let resolve =
-        |r: &str| -> Result<Oid, GitError> { Ok(repo.revparse_single(r)?.peel_to_commit()?.id()) };
+        |r: &str| -> Result<Oid, GitError> { Ok(repo.rev_single(r)?.peel_to_commit()?.id()) };
     let up = resolve(upstream).map_err(|_| {
         GitError::Other(format!(
             "could not find {upstream}; name the upstream branch (rgit cherry <upstream>)"
@@ -1474,7 +1490,7 @@ const BASE85: &[u8; 85] =
 
 /// Binary hunks deflated at git's level (Z_BEST_SPEED) rather than libgit2's,
 /// so the base85 text matches git's.
-fn rezip_binary(patch: &str) -> String {
+pub(crate) fn rezip_binary(patch: &str) -> String {
     let mut out = String::with_capacity(patch.len());
     let mut lines = patch.split_inclusive('\n').peekable();
     let mut in_binary = false;

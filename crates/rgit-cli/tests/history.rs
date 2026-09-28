@@ -1135,3 +1135,392 @@ fn colors_match_gits_palette() {
     same(&dir, &["log", "--graph", "--oneline", "--color"]);
     same(&dir, &["diff", "-p", "--color=always"]);
 }
+
+#[test]
+fn revisions_take_gits_forms() {
+    let dir = repo("revs");
+    git(
+        &dir,
+        &["remote", "add", "origin", "https://example.invalid/r"],
+    );
+    git(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD~1"]);
+    git(&dir, &["config", "branch.main.remote", "origin"]);
+    git(&dir, &["config", "branch.main.merge", "refs/heads/main"]);
+    all_same(
+        &dir,
+        &[
+            &["rev-parse", "HEAD^!", "HEAD~2^@", "HEAD^-", "HEAD~2^-2"],
+            &["rev-parse", "--symbolic", "HEAD~3^!"],
+            &[
+                "rev-parse",
+                "@{-1}",
+                "@{-2}",
+                "@{u}",
+                "@{push}",
+                "main@{upstream}",
+            ],
+            &["rev-parse", "--abbrev-ref", "@{u}", "@{push}"],
+            &[
+                "rev-parse",
+                "HEAD^{/bug one}",
+                ":/side work",
+                ":/!-e",
+                "HEAD^{/!-Fix}",
+            ],
+            &[
+                "rev-parse",
+                "HEAD^{/}",
+                "v1^{tag}",
+                "v1^{commit}",
+                "HEAD^{tree}",
+            ],
+            &[
+                "rev-parse",
+                "HEAD@{2024-01-05}",
+                "main@{2024-01-03 13:00}",
+                ":0:b.txt",
+            ],
+            &["rev-parse", "side@{u}"],
+            &["rev-parse", "--show-object-format"],
+            &["log", "--oneline", "HEAD~3^!"],
+            &["log", "--oneline", "HEAD~3^-"],
+            &["log", "--oneline", "@{u}.."],
+            &["diff", "--stat", "HEAD^!"],
+            &["show", "-s", "--format=%s", ":/side"],
+            &["cat-file", "-p", "HEAD:./b.txt"],
+        ],
+    );
+    let sub = dir.join("dir");
+    for spec in ["HEAD:./x", "HEAD:../b.txt", ":./x", "HEAD~1:./"] {
+        same(&sub, &["rev-parse", spec]);
+    }
+}
+
+#[test]
+fn reflog_walks_and_limits_like_git() {
+    let dir = repo("reflog");
+    git_at(&dir, &["checkout", "-q", "side"], 9);
+    git_at(&dir, &["checkout", "-q", "main"], 10);
+    all_same(
+        &dir,
+        &[
+            &["log", "-g", "--oneline", "main", "side"],
+            &[
+                "log",
+                "-g",
+                "--format=%gd %gD %gs",
+                "main",
+                "refs/heads/side",
+                "HEAD",
+            ],
+            &["log", "-g", "-1", "main"],
+            &["log", "-g", "--oneline", "main@{2}"],
+            &["log", "-g", "--oneline", "HEAD@{2024-01-06}"],
+            &["log", "-g", "--oneline", "--date=iso", "HEAD"],
+            &["log", "-g", "--format=%gd|%gD", "--date=short"],
+            &["reflog", "--date=iso", "main"],
+            &["reflog", "-2", "--format=%h %gd"],
+            &["reflog", "--date=unix"],
+            &["log", "--oneline", "--since=2024-01-05"],
+            &["log", "--oneline", "--since=2024-01-05", "--topo-order"],
+            &[
+                "log",
+                "--oneline",
+                "--cherry-pick",
+                "--left-right",
+                "side...topic",
+                "--",
+                "dir",
+            ],
+        ],
+    );
+    std::fs::write(dir.join("b.txt"), "stash\n").unwrap();
+    git_at(&dir, &["stash", "-q"], 11);
+    all_same(
+        &dir,
+        &[
+            &["stash", "list"],
+            &["stash", "list", "--date=iso"],
+            &["stash", "list", "--date=raw", "--format=%gd %gs"],
+        ],
+    );
+}
+
+#[test]
+fn blame_reads_contents_and_prints_incremental() {
+    let dir = repo("blame-inc");
+    std::fs::write(dir.join("alt"), "1\ntwo\nnew\n4\n").unwrap();
+    all_same(
+        &dir,
+        &[
+            &["blame", "--incremental", "b.txt"],
+            &["blame", "--incremental", "-L", "2,5", "b.txt"],
+            &["blame", "--incremental", "HEAD~2", "--", "a.txt"],
+            &["blame", "--root", "--incremental", "b.txt"],
+            &[
+                "blame",
+                "--progress",
+                "--date=short",
+                "--contents",
+                "alt",
+                "b.txt",
+            ],
+            &[
+                "blame",
+                "-e",
+                "--date=short",
+                "--contents",
+                "alt",
+                "HEAD~1",
+                "--",
+                "b.txt",
+            ],
+            &[
+                "blame",
+                "--encoding=UTF-8",
+                "--date=short",
+                "--contents",
+                "alt",
+                "b.txt",
+            ],
+        ],
+    );
+}
+
+const RUST: &str = "use std::io;\n\npub fn alpha(x: u32) -> u32 {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 4;\n    let e = 5;\n    a + b + c + d + e + x\n}\n\nimpl Foo {\n    fn beta(&self) {\n        println!(\"hello world\");\n        let q = 7;\n        let r = 8;\n        let s = 9;\n    }\n}\n\nstruct Bar;\n";
+const PY: &str = "import os\n\nclass K:\n    def m(self):\n        x = 1\n        y = 2\n        z = 3\n        w = 4\n        return x\n\n    async def n(self):\n        return 5\n";
+const C: &str = "#include <stdio.h>\n\nint main(int argc, char **argv)\n{\n\tint i = 0;\n\tint j = 1;\n\tint k = 2;\nlabel:\n\tint l = 3;\n\tint m = 4;\n\tint n = 5;\n\treturn i;\n}\n";
+
+#[test]
+fn diff_names_functions_and_diffs_words_like_git() {
+    let dir = std::env::temp_dir().join(format!("rgit-history-{}-userdiff", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(
+        &dir,
+        &["config", "diff.cfg.xfuncname", "!^START\n^[A-Za-z].*$"],
+    );
+    git(&dir, &["config", "diff.basic.funcname", "^BEGIN\\(.*\\)$"]);
+    let body = |heads: &[&str]| -> String {
+        heads
+            .iter()
+            .map(|h| {
+                format!(
+                    "{h}\n{}",
+                    "    body 1\n    body 2\n    body 3\n    body 4\n    body 5\n    body 6\n"
+                )
+            })
+            .collect()
+    };
+    let long = format!("int {}(void)", "x".repeat(90));
+    let files = [
+        (".gitattributes", "*.rs diff=rust\n*.py diff=python\n*.c diff=cpp\n*.xx diff=cfg\n*.yy diff=basic\n*.tex diff=tex\n*.sh diff=bash\n".to_owned()),
+        ("a.rs", RUST.to_owned()),
+        ("a.py", PY.to_owned()),
+        ("a.c", C.to_owned()),
+        ("plain.txt", "x\ny\n".to_owned()),
+        ("cfg.xx", body(&["START here", "middle", "start lower"])),
+        ("b.yy", body(&["BEGIN(x)", "other"])),
+        ("a.tex", body(&["\\section{Intro}", "\\subsection*{More}"])),
+        ("a.sh", body(&["foo() {", "function bar {"])),
+        ("long.c", body(&[&long])),
+    ];
+    let refs: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+    commit(&dir, 1, &refs, "one");
+    let edit = |p: &str, f: &dyn Fn(String) -> String| {
+        let t = std::fs::read_to_string(dir.join(p)).unwrap();
+        std::fs::write(dir.join(p), f(t)).unwrap();
+    };
+    edit("a.rs", &|t| {
+        t.replace("let e = 5;", "let e = 55;")
+            .replace("hello world", "hello there world")
+            .replace("let s = 9;", "let s = 0x1F + s;")
+    });
+    edit("a.py", &|t| {
+        t.replace("w = 4", "w = 44").replace("return 5", "return 6")
+    });
+    edit("a.c", &|t| t.replace("int m = 4;", "int m = 44;"));
+    edit("plain.txt", &|_| "x\nz".to_owned());
+    for p in ["cfg.xx", "b.yy", "a.tex", "a.sh", "long.c"] {
+        edit(p, &|t| {
+            t.replace("body 5", "body five")
+                .replace("body 2", "body two")
+        });
+    }
+    all_same(
+        &dir,
+        &[
+            &["diff", "-p"],
+            &["diff", "-p", "-U1"],
+            &["diff", "-p", "-U0"],
+            &["diff", "-p", "-W"],
+            &["diff", "-p", "--function-context", "-U1"],
+            &["diff", "-p", "--word-diff"],
+            &["diff", "-p", "--word-diff=porcelain"],
+            &["diff", "-p", "--word-diff=color"],
+            &["diff", "-p", "--color-words"],
+            &["diff", "-p", "--color-words=."],
+            &["diff", "-p", "--word-diff-regex=[a-z]+"],
+            &["diff", "-p", "--word-diff", "-W"],
+        ],
+    );
+    git(&dir, &["config", "diff.wordRegex", "[^ ]"]);
+    git(&dir, &["config", "diff.rust.wordRegex", "[a-z]+"]);
+    all_same(&dir, &[&["diff", "-p", "--word-diff"]]);
+    git_at(&dir, &["commit", "-qam", "two"], 2);
+    all_same(
+        &dir,
+        &[
+            &["log", "--format=medium", "-p", "-W"],
+            &["log", "--format=medium", "-p", "--word-diff"],
+            &["show", "--format=medium", "--color-words"],
+            &["show", "--format=medium", "-W"],
+            &["log", "-L:beta:a.rs", "--oneline"],
+            &["log", "-L:m:a.py", "--format=%s"],
+            &["blame", "-n", "-L:main", "a.c"],
+            &["blame", "-n", "-L:beta", "a.rs"],
+        ],
+    );
+}
+
+#[test]
+fn diff_options_match_git() {
+    let dir = repo("diff-opts");
+    std::fs::create_dir_all(dir.join("dir/deep")).unwrap();
+    let moved: String = (1..=30)
+        .map(|i| format!("line {i} of the moved block here\n"))
+        .collect();
+    let big: String = (1..=60)
+        .map(|i| format!("original content line number {i}\n"))
+        .collect();
+    commit(
+        &dir,
+        9,
+        &[
+            ("m.txt", &moved),
+            ("big.txt", &big),
+            ("dir/deep/w.txt", "x\ny\n"),
+            (
+                "alg.c",
+                "int a(void)\n{\n\treturn 1;\n}\n\nint b(void)\n{\n\treturn 2;\n}\n",
+            ),
+            ("gone.txt", "bye\n"),
+        ],
+        "base",
+    );
+    let lines: Vec<&str> = moved.lines().collect();
+    let mut shuffled: Vec<&str> = lines[..4].to_vec();
+    shuffled.extend(&lines[15..]);
+    shuffled.extend(&lines[4..15]);
+    std::fs::write(dir.join("m.txt"), shuffled.join("\n") + "\n").unwrap();
+    let rewrite: String = (1..=60)
+        .map(|i| format!("completely different {i}\n"))
+        .collect();
+    std::fs::write(dir.join("big.txt"), rewrite).unwrap();
+    std::fs::write(
+        dir.join("dir/deep/w.txt"),
+        "x\n \ty\nz  \n    eight\n\ttabbed\n\n\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("alg.c"),
+        "int b(void)\n{\n\treturn 2;\n}\n\nint a(void)\n{\n\treturn 1;\n}\n",
+    )
+    .unwrap();
+    std::fs::remove_file(dir.join("gone.txt")).unwrap();
+    for args in [
+        &["diff", "-p", "--minimal"][..],
+        &["diff", "-p", "--patience"],
+        &["diff", "-p", "--histogram"],
+        &["diff", "-p", "--diff-algorithm=histogram"],
+        &["diff", "-p", "--anchored=int"],
+        &["diff", "-p", "--inter-hunk-context=5"],
+        &["diff", "-p", "--src-prefix=X/", "--dst-prefix=Y/"],
+        &["diff", "-p", "--no-prefix"],
+        &["diff", "-p", "--full-index"],
+        &["diff", "-p", "-D"],
+        &["diff", "-p", "-B"],
+        &["diff", "-B", "--name-status"],
+        &["diff", "-p", "--relative=dir"],
+        &["diff", "-p", "--line-prefix=> "],
+        &["diff", "--check"],
+        &["diff", "--dirstat=0"],
+        &["diff", "--dirstat=files,lines,cumulative"],
+        &["diff", "--compact-summary"],
+        &["diff", "--stat=50,10,2"],
+        &["diff", "--stat", "--stat-graph-width=3"],
+        &["diff", "--color", "-p"],
+        &["diff", "--color", "-p", "--ws-error-highlight=all"],
+        &["diff", "--color", "-p", "--color-moved"],
+        &["diff", "--color", "-p", "--color-moved=dimmed-zebra"],
+        &["diff", "--color", "-p", "--color-moved=blocks"],
+        &[
+            "diff",
+            "--color",
+            "-p",
+            "--color-moved",
+            "--color-moved-ws=allow-indentation-change",
+        ],
+    ] {
+        same(&dir, args);
+    }
+    git(&dir, &["add", "-A"]);
+    git_at(&dir, &["commit", "-qm", "change"], 10);
+    for args in [
+        &["log", "-1", "--format=%s", "-p", "--histogram"][..],
+        &["show", "--format=%s", "--dirstat=0"],
+        &["show", "--format=%s", "--compact-summary"],
+        &["show", "--format=%s", "--check"],
+        &["show", "--format=%s", "--binary", "--", "dir"],
+    ] {
+        same(&dir, args);
+    }
+    // textconv and external diff tools.
+    std::fs::write(dir.join(".gitattributes"), "*.c diff=upper\n").unwrap();
+    git(&dir, &["config", "diff.upper.textconv", "tr a-z A-Z <"]);
+    same(&dir, &["show", "--format=%s", "--", "alg.c"]);
+    same(
+        &dir,
+        &["show", "--format=%s", "--no-textconv", "--", "alg.c"],
+    );
+    let ext = dir.join("ext.sh");
+    std::fs::write(
+        &ext,
+        "#!/bin/sh\necho \"EXT $# [$1] [$3] [$4] [$6] [$7] $GIT_DIFF_PATH_COUNTER/$GIT_DIFF_PATH_TOTAL\"\ncat \"$5\"\n",
+    )
+    .unwrap();
+    git(
+        &dir,
+        &[
+            "config",
+            "diff.upper.command",
+            &format!("sh {}", ext.display()),
+        ],
+    );
+    same(&dir, &["show", "--format=%s", "--ext-diff"]);
+    same(&dir, &["diff", "-p", "HEAD~1"]);
+    same(&dir, &["diff", "-p", "HEAD~1", "--no-ext-diff"]);
+    // --output writes the patch to a file.
+    let (a, b) = (dir.join("out-git"), dir.join("out-rgit"));
+    git(
+        &dir,
+        &[
+            "diff",
+            "HEAD~1",
+            "--no-ext-diff",
+            &format!("--output={}", a.display()),
+        ],
+    );
+    ok(
+        &dir,
+        &[
+            "diff",
+            "-p",
+            "HEAD~1",
+            "--no-ext-diff",
+            &format!("--output={}", b.display()),
+        ],
+    );
+    assert_eq!(std::fs::read(a).unwrap(), std::fs::read(b).unwrap());
+}
