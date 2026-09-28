@@ -107,9 +107,9 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 
 ## Remotes and forge (GitHub/GitLab)
 
-- `fetch`: Fetch the current branch's remote. e.g. `rgit fetch`, `rgit fetch --all`, `rgit fetch --remote origin --prune`
-- `pull`: Fetch and integrate the current branch's upstream. e.g. `rgit pull`, `rgit pull --rebase`
-- `push`: Push the current branch to its upstream. e.g. `rgit push`, `rgit push --set-upstream`, `rgit push --force-with-lease`
+- `fetch`: Fetch the current branch's remote, or `<repository> [<refspec>...]`. e.g. `rgit fetch`, `rgit fetch --all`, `rgit fetch --remote origin --prune`, `rgit fetch origin main --depth 1`, `rgit fetch --dry-run`
+- `pull`: Fetch and integrate the current branch's upstream (merges when it has diverged, unless `pull.rebase` says otherwise). e.g. `rgit pull`, `rgit pull --rebase`, `rgit pull --ff-only`, `rgit pull origin main`
+- `push`: Push the current branch to its upstream, or `<repository> [<refspec>...]`. e.g. `rgit push`, `rgit push --set-upstream`, `rgit push --force-with-lease`, `rgit push origin feature`, `rgit push origin local:remote`, `rgit push origin --delete feature`, `rgit push --all --dry-run`
 - `remote`: Remote management (no subcommand lists remotes). e.g. `rgit remote`, `rgit remote add origin https://github.com/example/repo.git`
   - `remote add`: Add a remote. e.g. `rgit remote add origin https://github.com/example/repo.git`
   - `remote remove`: Remove a remote. e.g. `rgit remote remove origin`
@@ -145,7 +145,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 ## Repositories and escape hatch
 
 - `init`: Create a new repository in the current directory (or PATH). e.g. `rgit init`, `rgit init <path> -b main`
-- `clone`: Clone a repository into a new directory. e.g. `rgit clone https://github.com/example/repo.git`, `rgit clone https://github.com/example/repo.git repo-dir --depth 1`
+- `clone`: Clone a repository into a new directory. e.g. `rgit clone https://github.com/example/repo.git`, `rgit clone https://github.com/example/repo.git repo-dir --depth 1`, `rgit clone --bare https://github.com/example/repo.git`, `rgit clone --recurse-submodules -o upstream https://github.com/example/repo.git`
 - `submodule`: Submodule management: forwards to `git submodule <args>`. e.g. `rgit submodule update --init`
 - `git`: Escape hatch: run any `git` subcommand and print its output. e.g. `rgit git status`, `rgit git log --oneline -5`
 

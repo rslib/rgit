@@ -1741,82 +1741,7 @@ impl GitBackend for Git2Backend {
         self.logged("merge", || {
             let repo = self.repo.lock().expect("repo mutex");
             let source = repo.revparse_single(rev)?.peel_to_commit()?;
-            let annotated = repo.find_annotated_commit(source.id())?;
-            let (analysis, _) = repo.merge_analysis(&[&annotated])?;
-
-            if analysis.is_up_to_date() {
-                report(OpProgress::Line("Already up to date.".to_owned()));
-                return Ok(());
-            }
-            if ff_only && !analysis.is_fast_forward() {
-                return Err(GitError::Other(
-                    "not possible to fast-forward; use a merge commit instead".to_owned(),
-                ));
-            }
-            if analysis.is_fast_forward() && !no_ff {
-                if let Some(old) = repo.head().ok().and_then(|h| h.target()) {
-                    report(OpProgress::Line(format!(
-                        "Updating {}..{}",
-                        short7(old),
-                        short7(source.id())
-                    )));
-                }
-                // Safe checkout first: refuse (rather than clobber) if the update
-                // would overwrite local uncommitted changes, like real git. Only
-                // move the branch ref once the working tree updated cleanly.
-                repo.checkout_tree(source.as_object(), Some(CheckoutBuilder::new().safe()))
-                    .map_err(|_| {
-                        GitError::Conflict(
-                            "your local changes would be overwritten by the fast-forward; \
-                             commit or stash them first"
-                                .into(),
-                        )
-                    })?;
-                let name = repo.head()?.name().unwrap_or("HEAD").to_owned();
-                repo.reference(&name, source.id(), true, "merge: fast-forward")?;
-                repo.set_head(&name)?;
-                report(OpProgress::Line("Fast-forward".to_owned()));
-                return Ok(());
-            }
-
-            repo.merge(&[&annotated], None, None)?;
-            let index = repo.index()?;
-            if index.has_conflicts() {
-                for entry in index.conflicts()?.flatten() {
-                    if let Some(path) = entry
-                        .our
-                        .as_ref()
-                        .or(entry.their.as_ref())
-                        .and_then(|e| std::str::from_utf8(&e.path).ok())
-                    {
-                        report(OpProgress::Line(format!(
-                            "CONFLICT (content): Merge conflict in {path}"
-                        )));
-                    }
-                }
-                report(OpProgress::Line(
-                    "Automatic merge failed; fix conflicts and then commit the result.".to_owned(),
-                ));
-                return Err(GitError::Conflict(
-                    "merge conflicts; resolve and commit, or reset --hard to abort".into(),
-                ));
-            }
-            let sig = repo.signature()?;
-            let tree = repo.find_tree(repo.index()?.write_tree()?)?;
-            let head = repo.head()?.peel_to_commit()?;
-            repo.commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                &format!("Merge {rev}"),
-                &tree,
-                &[&head, &source],
-            )?;
-            repo.cleanup_state()?;
-            report(OpProgress::Line(
-                "Merge made by the 'ort' strategy.".to_owned(),
-            ));
-            Ok(())
+            merge_commit(&repo, &source, rev, no_ff, ff_only, report)
         })
     }
 
@@ -2409,7 +2334,7 @@ impl GitBackend for Git2Backend {
 
     fn sync(&self, report: &dyn Fn(OpProgress)) -> Result<crate::RestackOutcome, GitError> {
         self.logged("sync", || {
-            self.fetch(None, false, false, report)?;
+            self.fetch(None, &[], &crate::FetchArgs::default(), report)?;
             {
                 let repo = self.repo.lock().expect("repo mutex");
                 let current_ref: Option<String> = repo
@@ -2722,53 +2647,124 @@ impl GitBackend for Git2Backend {
     fn fetch(
         &self,
         remote: Option<&str>,
-        all: bool,
-        prune: bool,
+        refspecs: &[String],
+        args: &crate::FetchArgs,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let cred_guard = self.cred_prompt.lock().expect("cred mutex");
         let cred = cred_guard.as_deref();
-        if all {
-            let names: Vec<String> = repo
-                .remotes()?
+        let names: Vec<String> = if args.all {
+            repo.remotes()?
                 .iter()
                 .filter_map(|t| t.ok().flatten())
                 .map(|s| s.to_owned())
-                .collect();
-            for name in names {
-                do_fetch(&repo, &name, prune, report, cred)?;
-            }
-            Ok(())
+                .collect()
         } else {
-            let name = match remote {
+            vec![match remote {
                 Some(r) => r.to_owned(),
                 None => upstream_remote(&repo)?.0,
-            };
-            do_fetch(&repo, &name, prune, report, cred)
+            }]
+        };
+        for name in &names {
+            let local = repo.find_remote(name)?.url().is_ok_and(is_local_url);
+            if args.dry_run {
+                fetch_dry_run(&repo, name, refspecs, args.tags, report, cred)?;
+            } else if args.depth > 0 && local {
+                // libgit2's local transport cannot fetch shallow; git can.
+                let depth = args.depth.to_string();
+                let mut cmd = vec!["fetch", "--depth", depth.as_str()];
+                if args.prune {
+                    cmd.push("--prune");
+                }
+                if args.tags {
+                    cmd.push("--tags");
+                }
+                cmd.push(name);
+                cmd.extend(refspecs.iter().map(String::as_str));
+                self.run_git(&cmd, &[])?;
+            } else {
+                do_fetch(&repo, name, refspecs, args, report, cred)?;
+            }
         }
+        Ok(())
     }
 
-    fn pull(&self, rebase: bool, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
-        let run = || {
+    fn pull(
+        &self,
+        remote: Option<&str>,
+        branch: Option<&str>,
+        rebase: Option<bool>,
+        ff_only: bool,
+        report: &dyn Fn(OpProgress),
+    ) -> Result<(), GitError> {
+        let (remote, branch, rebase, ff_only, chosen) = {
+            let repo = self.repo.lock().expect("repo mutex");
+            let (upstream, current) = upstream_remote(&repo)?;
+            let config = repo.config()?;
+            // git refuses a diverged pull until a flag or config picks merge or rebase.
+            let chosen = rebase.is_some()
+                || ff_only
+                || config_rebase(&config, &format!("branch.{current}.rebase")).is_some()
+                || config_rebase(&config, "pull.rebase").is_some()
+                || config.get_string("pull.ff").is_ok();
+            let merge_branch = repo
+                .branch_upstream_merge(&format!("refs/heads/{current}"))
+                .ok()
+                .and_then(|b| b.as_str().ok().map(|s| short_ref(s).to_owned()));
+            let rebase = !ff_only
+                && rebase.unwrap_or_else(|| {
+                    config_rebase(&config, &format!("branch.{current}.rebase"))
+                        .or_else(|| config_rebase(&config, "pull.rebase"))
+                        .unwrap_or(false)
+                });
+            let ff_only = ff_only || config.get_string("pull.ff").is_ok_and(|v| v == "only");
+            (
+                remote.map_or(upstream, str::to_owned),
+                branch
+                    .map(str::to_owned)
+                    .or(merge_branch)
+                    .unwrap_or(current),
+                rebase,
+                ff_only,
+                chosen,
+            )
+        };
+        self.logged(if rebase { "pull --rebase" } else { "pull" }, || {
             let repo = self.repo.lock().expect("repo mutex");
             let cred_guard = self.cred_prompt.lock().expect("cred mutex");
             let cred = cred_guard.as_deref();
-            let (remote, branch) = upstream_remote(&repo)?;
-            do_fetch(&repo, &remote, false, report, cred)?;
+            do_fetch(
+                &repo,
+                &remote,
+                &[],
+                &crate::FetchArgs::default(),
+                report,
+                cred,
+            )?;
+            let target = repo.refname_to_id(&format!("refs/remotes/{remote}/{branch}"))?;
             if rebase {
-                let target = repo.refname_to_id(&format!("refs/remotes/{remote}/{branch}"))?;
                 let upstream = repo.find_annotated_commit(target)?;
                 run_rebase(&repo, &upstream, None, report)
             } else {
-                fast_forward(&repo, &remote, &branch, report)
+                let url = repo
+                    .find_remote(&remote)?
+                    .url()
+                    .unwrap_or(&remote)
+                    .to_owned();
+                let source = repo.find_commit(target)?;
+                let (analysis, _) = repo.merge_analysis(&[&repo.find_annotated_commit(target)?])?;
+                if !chosen && !analysis.is_up_to_date() && !analysis.is_fast_forward() {
+                    return Err(GitError::Other(
+                        "you have divergent branches and need to specify how to reconcile \
+                         them: pass --rebase, --no-rebase or --ff-only, or set pull.rebase"
+                            .to_owned(),
+                    ));
+                }
+                let name = format!("branch '{branch}' of {url}");
+                merge_commit(&repo, &source, &name, false, ff_only, report)
             }
-        };
-        if rebase {
-            self.logged("pull --rebase", run)
-        } else {
-            run()
-        }
+        })
     }
 
     fn push(
@@ -2779,65 +2775,153 @@ impl GitBackend for Git2Backend {
         set_upstream: bool,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
+        let args = crate::PushArgs {
+            force,
+            force_with_lease,
+            set_upstream,
+            ..Default::default()
+        };
+        self.push_to(remote, &[], &args, report)
+    }
+
+    fn push_to(
+        &self,
+        remote: Option<&str>,
+        refspecs: &[String],
+        args: &crate::PushArgs,
+        report: &dyn Fn(OpProgress),
+    ) -> Result<(), GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let cred_guard = self.cred_prompt.lock().expect("cred mutex");
-        // A named remote pushes the current branch to <remote>/<branch>; without
-        // one, fall back to the branch's configured upstream.
-        let (remote_name, branch) = match remote {
-            Some(r) => {
-                let head = repo.head()?;
-                let branch = head.shorthand().ok().map(str::to_owned).ok_or_else(|| {
-                    GitError::Other("HEAD is detached; not on a branch".to_owned())
-                })?;
-                (r.to_owned(), branch)
-            }
-            None => upstream_remote(&repo)?,
+        let remote_name = match remote {
+            Some(r) => r.to_owned(),
+            None if refspecs.is_empty() && !args.all && !args.tags => upstream_remote(&repo)?.0,
+            None => upstream_remote(&repo)
+                .map(|(r, _)| r)
+                .or_else(|_| default_remote(&repo))?,
         };
-        let branch_ref = format!("refs/heads/{branch}");
-        let lease = repo
-            .refname_to_id(&format!("refs/remotes/{remote_name}/{branch}"))
-            .ok();
+        // (force, source ref, destination ref); an empty source deletes.
+        let mut specs = refspecs
+            .iter()
+            .map(|s| expand_push_refspec(&repo, s))
+            .collect::<Result<Vec<_>, _>>()?;
+        if args.all {
+            for b in repo.branches(Some(BranchType::Local))? {
+                if let Ok(name) = b?.0.get().name() {
+                    specs.push((false, name.to_owned(), name.to_owned()));
+                }
+            }
+        }
+        if args.tags {
+            for t in repo.tag_names(None)?.iter().flatten().flatten() {
+                let name = format!("refs/tags/{t}");
+                specs.push((false, name.clone(), name));
+            }
+        }
+        if specs.is_empty() {
+            if args.tags {
+                report(OpProgress::Line("no tags to push".to_owned()));
+                return Ok(());
+            }
+            let head = format!("refs/heads/{}", current_branch(&repo)?);
+            specs.push((false, head.clone(), head));
+        }
+        let force = args.force || args.force_with_lease;
+        let refspecs: Vec<String> = specs
+            .iter()
+            .map(|(f, src, dst)| {
+                let lead = if force || *f { "+" } else { "" };
+                format!("{lead}{src}:{dst}")
+            })
+            .collect();
+        // Force-with-lease: each remote branch must still match the ref we
+        // last fetched for it.
+        let leases: std::collections::HashMap<String, Oid> = specs
+            .iter()
+            .filter(|_| args.force_with_lease)
+            .filter_map(|(_, _, dst)| {
+                let name = dst.strip_prefix("refs/heads/")?;
+                let id = repo
+                    .refname_to_id(&format!("refs/remotes/{remote_name}/{name}"))
+                    .ok()?;
+                Some((dst.clone(), id))
+            })
+            .collect();
 
         let mut remote = repo.find_remote(&remote_name)?;
         if let Ok(url) = remote.url() {
             report(OpProgress::Line(format!("To {url}")));
         }
-        let lead = if force || force_with_lease { "+" } else { "" };
-        let refspec = format!("{lead}{branch_ref}:{branch_ref}");
-
+        let forced: Vec<String> = specs
+            .iter()
+            .filter(|(f, _, _)| force || *f)
+            .map(|(_, _, dst)| dst.clone())
+            .collect();
         let rejected = std::sync::atomic::AtomicBool::new(false);
+        let dry_run_hit = std::sync::atomic::AtomicBool::new(false);
         let mut callbacks = remote_callbacks(report, &rejected, cred_guard.as_deref());
-        if force_with_lease {
-            // Abort if the remote no longer matches the ref we last fetched -
-            // this is force-with-lease, done through the negotiation callback.
-            let target = branch_ref.clone();
-            callbacks.push_negotiation(move |updates| {
-                for update in updates {
-                    if update.dst_refname().ok() == Some(target.as_str())
-                        && let Some(lease) = lease
-                        && update.src() != lease
-                    {
-                        return Err(git2::Error::from_str(
-                            "stale info: the remote branch moved; force-with-lease aborted",
-                        ));
-                    }
+        let (dry_run, repo_ref) = (args.dry_run, &*repo);
+        let (dry_run_flag, rejected_flag) = (&dry_run_hit, &rejected);
+        // The negotiation callback sees every update before anything is sent:
+        // it enforces the leases, and a dry run reports the updates and stops.
+        callbacks.push_negotiation(move |updates| {
+            for update in updates {
+                if let Ok(dst) = update.dst_refname()
+                    && let Some(lease) = leases.get(dst)
+                    && update.src() != *lease
+                {
+                    return Err(git2::Error::from_str(
+                        "stale info: the remote branch moved; force-with-lease aborted",
+                    ));
                 }
-                Ok(())
-            });
-        }
+            }
+            if dry_run {
+                for update in updates {
+                    let forced = update
+                        .dst_refname()
+                        .is_ok_and(|d| forced.iter().any(|f| f == d));
+                    let line = push_update_line(repo_ref, update, forced);
+                    if line.starts_with(" ! ") {
+                        rejected_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    report(OpProgress::Line(line));
+                }
+                dry_run_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(git2::Error::from_str("dry run"));
+            }
+            Ok(())
+        });
 
         let mut opts = PushOptions::new();
         opts.remote_callbacks(callbacks);
-        remote.push(&[refspec.as_str()], Some(&mut opts))?;
+        let pushed = remote.push(&refspecs, Some(&mut opts));
+        if dry_run_hit.load(std::sync::atomic::Ordering::Relaxed) {
+            if rejected.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(GitError::PushRejected);
+            }
+            return Ok(());
+        }
+        pushed?;
+        if args.dry_run {
+            report(OpProgress::Line("Everything up-to-date".to_owned()));
+            return Ok(());
+        }
         // libgit2 reports a refused ref through the callback but still returns
         // success, so surface the rejection as an error.
         if rejected.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(GitError::PushRejected);
         }
 
-        if set_upstream {
-            repo.find_branch(&branch, BranchType::Local)?
-                .set_upstream(Some(&format!("{remote_name}/{branch}")))?;
+        if args.set_upstream {
+            for (_, src, dst) in &specs {
+                if let (Some(local), Some(theirs)) = (
+                    src.strip_prefix("refs/heads/"),
+                    dst.strip_prefix("refs/heads/"),
+                ) {
+                    repo.find_branch(local, BranchType::Local)?
+                        .set_upstream(Some(&format!("{remote_name}/{theirs}")))?;
+                }
+            }
         }
         Ok(())
     }
@@ -2900,7 +2984,8 @@ fn upstream_remote(repo: &Repository) -> Result<(String, String), GitError> {
 fn do_fetch(
     repo: &Repository,
     remote: &str,
-    prune: bool,
+    refspecs: &[String],
+    args: &crate::FetchArgs,
     report: &dyn Fn(OpProgress),
     cred: Option<&dyn crate::CredentialPrompt>,
 ) -> Result<(), GitError> {
@@ -2911,45 +2996,259 @@ fn do_fetch(
     let ignored = std::sync::atomic::AtomicBool::new(false);
     let mut opts = FetchOptions::new();
     opts.remote_callbacks(remote_callbacks(report, &ignored, cred));
-    if prune {
+    if args.prune {
         opts.prune(git2::FetchPrune::On);
     }
-    remote.fetch::<&str>(&[], Some(&mut opts), None)?;
+    if args.tags {
+        opts.download_tags(git2::AutotagOption::All);
+    } else if !refspecs.is_empty() {
+        // git follows no tags when the refs to fetch are named.
+        opts.download_tags(git2::AutotagOption::None);
+    }
+    if args.depth > 0 {
+        opts.depth(args.depth);
+    }
+    remote.fetch(refspecs, Some(&mut opts), None)?;
     Ok(())
 }
 
-fn fast_forward(
+/// `git fetch --dry-run`: list the remote's refs and report the tracking-ref
+/// updates a fetch would make, without downloading or writing anything.
+fn fetch_dry_run(
     repo: &Repository,
-    remote: &str,
-    branch: &str,
+    name: &str,
+    refspecs: &[String],
+    tags: bool,
+    report: &dyn Fn(OpProgress),
+    cred: Option<&dyn crate::CredentialPrompt>,
+) -> Result<(), GitError> {
+    let mut remote = repo.find_remote(name)?;
+    if let Ok(url) = remote.url() {
+        report(OpProgress::Line(format!("From {url}")));
+    }
+    let ignored = std::sync::atomic::AtomicBool::new(false);
+    let heads: Vec<(String, Oid)> = {
+        let callbacks = remote_callbacks(report, &ignored, cred);
+        let conn = remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None)?;
+        conn.list()?
+            .iter()
+            .map(|h| (h.name().to_owned(), h.oid()))
+            .collect()
+    };
+    let wanted = |head: &str| {
+        refspecs.is_empty()
+            || refspecs.iter().any(|s| {
+                let src = s.trim_start_matches('+').split(':').next().unwrap_or("");
+                head == src || short_ref(head) == src
+            })
+    };
+    for (head, new) in heads {
+        if !wanted(&head) || head.ends_with("^{}") {
+            continue;
+        }
+        let tag = head.starts_with("refs/tags/");
+        let dst = if tag && tags {
+            head.clone()
+        } else {
+            let spec = remote
+                .refspecs()
+                .find(|s| s.direction() == git2::Direction::Fetch && s.src_matches(&head));
+            match spec.and_then(|s| s.transform(&head).ok()) {
+                Some(buf) => buf.as_str().unwrap_or_default().to_owned(),
+                None => continue,
+            }
+        };
+        let (src, dst_short) = (short_ref(&head), short_ref(&dst));
+        let line = match repo.refname_to_id(&dst).ok() {
+            Some(old) if old == new => continue,
+            None if tag => format!(" * [new tag]         {src} -> {dst_short}"),
+            None => format!(" * [new branch]      {src} -> {dst_short}"),
+            Some(old) if repo.graph_descendant_of(new, old).unwrap_or(true) => {
+                format!("   {}..{}  {src} -> {dst_short}", short7(old), short7(new))
+            }
+            Some(old) => format!(
+                " + {}...{} {src} -> {dst_short}  (forced update)",
+                short7(old),
+                short7(new)
+            ),
+        };
+        report(OpProgress::Line(line));
+    }
+    Ok(())
+}
+
+/// A git-style `push --dry-run` line for one negotiated ref update.
+fn push_update_line(repo: &Repository, update: &git2::PushUpdate<'_>, force: bool) -> String {
+    let src = short_ref(update.src_refname().unwrap_or_default());
+    let dst = short_ref(update.dst_refname().unwrap_or_default());
+    let (old, new) = (update.src(), update.dst());
+    if new.is_zero() {
+        return format!(" - [deleted]         {dst}");
+    }
+    if old.is_zero() {
+        let kind = if update
+            .dst_refname()
+            .is_ok_and(|d| d.starts_with("refs/tags/"))
+        {
+            "tag"
+        } else {
+            "branch"
+        };
+        return format!(" * [new {kind}]      {src} -> {dst}");
+    }
+    if repo.graph_descendant_of(new, old).unwrap_or(false) {
+        format!("   {}..{}  {src} -> {dst}", short7(old), short7(new))
+    } else if force {
+        format!(
+            " + {}...{} {src} -> {dst} (forced update)",
+            short7(old),
+            short7(new)
+        )
+    } else {
+        format!(" ! [rejected]        {src} -> {dst} (non-fast-forward)")
+    }
+}
+
+/// Expand a git push refspec (`branch`, `src:dst`, `:dst`, `+src:dst`) to
+/// (force, full source ref, full destination ref); an empty source deletes.
+fn expand_push_refspec(repo: &Repository, spec: &str) -> Result<(bool, String, String), GitError> {
+    let (force, spec) = match spec.strip_prefix('+') {
+        Some(s) => (true, s),
+        None => (false, spec),
+    };
+    let (src, dst) = match spec.split_once(':') {
+        Some((s, d)) => (s, Some(d)),
+        None => (spec, None),
+    };
+    let src = if src.is_empty() {
+        String::new()
+    } else if src == "HEAD" {
+        format!("refs/heads/{}", current_branch(repo)?)
+    } else {
+        repo.resolve_reference_from_short_name(src)
+            .ok()
+            .and_then(|r| r.name().ok().map(str::to_owned))
+            .ok_or_else(|| GitError::Other(format!("src refspec {src} does not match any")))?
+    };
+    let dst = match dst {
+        None | Some("") if src.is_empty() => {
+            return Err(GitError::Other(format!("invalid refspec '{spec}'")));
+        }
+        None | Some("") => src.clone(),
+        Some(d) if d.starts_with("refs/") => d.to_owned(),
+        Some(d) if src.starts_with("refs/tags/") => format!("refs/tags/{d}"),
+        Some(d) => format!("refs/heads/{d}"),
+    };
+    Ok((force, src, dst))
+}
+
+/// A ref name without its `refs/heads/`, `refs/tags/` or `refs/remotes/` prefix.
+fn short_ref(name: &str) -> &str {
+    ["refs/heads/", "refs/tags/", "refs/remotes/"]
+        .iter()
+        .find_map(|p| name.strip_prefix(p))
+        .unwrap_or(name)
+}
+
+/// A `pull.rebase`-style setting: `false` merges, anything else (`true`,
+/// `merges`, `interactive`) rebases. `None` when unset.
+fn config_rebase(config: &git2::Config, key: &str) -> Option<bool> {
+    let v = config.get_string(key).ok()?.to_ascii_lowercase();
+    Some(!matches!(v.as_str(), "false" | "no" | "off" | "0"))
+}
+
+/// Whether `url` goes through libgit2's local transport (a path or `file://`),
+/// which cannot fetch shallow history.
+fn is_local_url(url: &str) -> bool {
+    url.starts_with("file://")
+        || (!url.contains("://") && !url.split('/').next().unwrap_or("").contains(':'))
+}
+
+/// Merge `source` into HEAD: fast-forward when possible (unless `no_ff`), else
+/// a merge commit titled `Merge <name>`. `ff_only` refuses a real merge.
+fn merge_commit(
+    repo: &Repository,
+    source: &git2::Commit<'_>,
+    name: &str,
+    no_ff: bool,
+    ff_only: bool,
     report: &dyn Fn(OpProgress),
 ) -> Result<(), GitError> {
-    let tracking = format!("refs/remotes/{remote}/{branch}");
-    let target = repo.refname_to_id(&tracking)?;
-    let annotated = repo.find_annotated_commit(target)?;
+    let annotated = repo.find_annotated_commit(source.id())?;
     let (analysis, _) = repo.merge_analysis(&[&annotated])?;
 
     if analysis.is_up_to_date() {
         report(OpProgress::Line("Already up to date.".to_owned()));
         return Ok(());
     }
-    if !analysis.is_fast_forward() {
-        return Err(GitError::NotFastForward);
+    if ff_only && !analysis.is_fast_forward() {
+        return Err(GitError::Other(
+            "not possible to fast-forward; use a merge commit instead".to_owned(),
+        ));
+    }
+    if analysis.is_fast_forward() && !no_ff {
+        if let Some(old) = repo.head().ok().and_then(|h| h.target()) {
+            report(OpProgress::Line(format!(
+                "Updating {}..{}",
+                short7(old),
+                short7(source.id())
+            )));
+        }
+        // Safe checkout first: refuse (rather than clobber) if the update
+        // would overwrite local uncommitted changes, like real git. Only
+        // move the branch ref once the working tree updated cleanly.
+        repo.checkout_tree(source.as_object(), Some(CheckoutBuilder::new().safe()))
+            .map_err(|_| {
+                GitError::Conflict(
+                    "your local changes would be overwritten by the fast-forward; \
+                     commit or stash them first"
+                        .into(),
+                )
+            })?;
+        let head_ref = repo.head()?.name().unwrap_or("HEAD").to_owned();
+        repo.reference(&head_ref, source.id(), true, "merge: fast-forward")?;
+        repo.set_head(&head_ref)?;
+        report(OpProgress::Line("Fast-forward".to_owned()));
+        return Ok(());
     }
 
-    let local = format!("refs/heads/{branch}");
-    if let Ok(old) = repo.refname_to_id(&local) {
-        report(OpProgress::Line(format!(
-            "Updating {}..{}",
-            short7(old),
-            short7(target)
-        )));
+    repo.merge(&[&annotated], None, None)?;
+    let index = repo.index()?;
+    if index.has_conflicts() {
+        for entry in index.conflicts()?.flatten() {
+            if let Some(path) = entry
+                .our
+                .as_ref()
+                .or(entry.their.as_ref())
+                .and_then(|e| std::str::from_utf8(&e.path).ok())
+            {
+                report(OpProgress::Line(format!(
+                    "CONFLICT (content): Merge conflict in {path}"
+                )));
+            }
+        }
+        report(OpProgress::Line(
+            "Automatic merge failed; fix conflicts and then commit the result.".to_owned(),
+        ));
+        return Err(GitError::Conflict(
+            "merge conflicts; resolve and commit, or reset --hard to abort".into(),
+        ));
     }
-    repo.find_reference(&local)?
-        .set_target(target, "pull: fast-forward")?;
-    repo.set_head(&local)?;
-    repo.checkout_head(Some(CheckoutBuilder::new().force()))?;
-    report(OpProgress::Line("Fast-forward".to_owned()));
+    let sig = repo.signature()?;
+    let tree = repo.find_tree(repo.index()?.write_tree()?)?;
+    let head = repo.head()?.peel_to_commit()?;
+    repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        &format!("Merge {name}"),
+        &tree,
+        &[&head, source],
+    )?;
+    repo.cleanup_state()?;
+    report(OpProgress::Line(
+        "Merge made by the 'ort' strategy.".to_owned(),
+    ));
     Ok(())
 }
 
@@ -2979,15 +3278,23 @@ fn default_initial_branch() -> Option<String> {
 
 /// Clone `url` into `path` (`git clone`), via libgit2, using the same
 /// credentials as fetch/push and reporting git-style progress.
-/// Clone `url` into `path`. `branch` checks out that branch instead of the
-/// remote's default HEAD; `depth > 0` makes a shallow clone of that many commits.
+/// `args.depth` is ignored for a plain local path, as git does.
 pub fn clone(
     url: &str,
     path: &Path,
-    branch: Option<&str>,
-    depth: i32,
+    args: &crate::CloneArgs,
     report: &dyn Fn(OpProgress),
 ) -> Result<(), GitError> {
+    let mut depth = args.depth;
+    if depth > 0 && is_local_url(url) {
+        if url.starts_with("file://") {
+            return clone_with_git(url, path, args);
+        }
+        report(OpProgress::Line(
+            "warning: --depth is ignored in local clones; use file:// instead.".to_owned(),
+        ));
+        depth = 0;
+    }
     let ignored = std::sync::atomic::AtomicBool::new(false);
     let mut opts = FetchOptions::new();
     opts.remote_callbacks(remote_callbacks(report, &ignored, None));
@@ -2995,11 +3302,61 @@ pub fn clone(
         opts.depth(depth);
     }
     let mut builder = git2::build::RepoBuilder::new();
-    builder.fetch_options(opts);
-    if let Some(b) = branch {
+    builder.fetch_options(opts).bare(args.bare);
+    if let Some(b) = &args.branch {
         builder.branch(b);
     }
-    builder.clone(url, path)?;
+    if let Some(origin) = args.origin.clone() {
+        builder.remote_create(move |repo, _, url| repo.remote(&origin, url));
+    }
+    let repo = builder.clone(url, path)?;
+    if args.recurse_submodules && !args.bare {
+        update_submodules(&repo, report)?;
+    }
+    Ok(())
+}
+
+/// A shallow clone over `file://`, which libgit2's local transport cannot do.
+fn clone_with_git(url: &str, path: &Path, args: &crate::CloneArgs) -> Result<(), GitError> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["clone", "--quiet", "--depth", &args.depth.to_string()]);
+    if let Some(b) = &args.branch {
+        cmd.args(["--branch", b]);
+    }
+    if let Some(o) = &args.origin {
+        cmd.args(["--origin", o]);
+    }
+    if args.bare {
+        cmd.arg("--bare");
+    }
+    if args.recurse_submodules {
+        cmd.arg("--recurse-submodules");
+    }
+    let out = cmd
+        .arg(url)
+        .arg(path)
+        .output()
+        .map_err(|e| GitError::Cli(format!("could not run git: {e}")))?;
+    if !out.status.success() {
+        return Err(GitError::Cli(
+            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Clone and check out every submodule of `repo`, recursively.
+fn update_submodules(repo: &Repository, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
+    for mut sm in repo.submodules()? {
+        report(OpProgress::Line(format!(
+            "Submodule '{}' ({}) registered for path '{}'",
+            sm.name().unwrap_or_default(),
+            sm.url().ok().flatten().unwrap_or_default(),
+            sm.path().display()
+        )));
+        sm.update(true, None)?;
+        update_submodules(&sm.open()?, report)?;
+    }
     Ok(())
 }
 

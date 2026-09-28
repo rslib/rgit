@@ -319,8 +319,12 @@ pub enum Command {
     Next,
     /// Check out this branch's stack parent (move down the stack).
     Prev,
-    /// Fetch the current branch's remote.
+    /// Fetch the current branch's remote, or `<repository> [<refspec>...]`.
     Fetch {
+        /// The remote to fetch (defaults to the branch's upstream remote).
+        repository: Option<String>,
+        /// Refs to fetch, as in git (`main`, `src:dst`); defaults to the remote's.
+        refspecs: Vec<String>,
         /// Fetch from every remote (git's --all).
         #[arg(long)]
         all: bool,
@@ -330,21 +334,46 @@ pub enum Command {
         /// Fetch this named remote instead of the branch's upstream.
         #[arg(long)]
         remote: Option<String>,
+        /// Fetch every tag too (git's --tags).
+        #[arg(short = 't', long)]
+        tags: bool,
+        /// Limit history to this many commits (git's --depth).
+        #[arg(long, default_value_t = 0)]
+        depth: i32,
+        /// Show what would be fetched without changing any ref.
+        #[arg(long)]
+        dry_run: bool,
     },
-    /// Fetch and integrate the current branch's upstream.
+    /// Fetch and integrate the current branch's upstream (merges when it has
+    /// diverged, unless `pull.rebase` says otherwise).
     Pull {
-        /// Rebase local commits onto the upstream instead of fast-forwarding.
+        /// The remote to pull from (defaults to the upstream's remote).
+        repository: Option<String>,
+        /// The remote branch to integrate (defaults to the upstream branch).
+        branch: Option<String>,
+        /// Rebase local commits onto the upstream instead of merging.
         #[arg(short = 'r', long)]
         rebase: bool,
+        /// Merge even if `pull.rebase` is set (git's --no-rebase).
+        #[arg(long, conflicts_with = "rebase")]
+        no_rebase: bool,
+        /// Refuse unless the upstream fast-forwards the branch (git's --ff-only).
+        #[arg(long)]
+        ff_only: bool,
     },
     /// Fetch, fast-forward branches to their upstreams, and restack the stack.
     Sync,
     /// Push every branch in the stack and open a pull request per branch.
     Submit,
-    /// Push the current branch to its upstream.
+    /// Push the current branch to its upstream, or `<repository> [<refspec>...]`.
     Push {
+        /// The remote to push to (defaults to the branch's upstream remote).
+        repository: Option<String>,
+        /// Refs to push, as in git: `branch`, `src:dst`, `:branch` (delete),
+        /// `+src:dst` (force).
+        refspecs: Vec<String>,
         /// Overwrite the remote branch unconditionally (dangerous).
-        #[arg(long, conflicts_with = "force_with_lease")]
+        #[arg(short = 'f', long, conflicts_with = "force_with_lease")]
         force: bool,
         /// Overwrite the remote branch only if it still matches our tracking ref.
         #[arg(long)]
@@ -358,9 +387,15 @@ pub enum Command {
         /// Push all local tags (git's --tags).
         #[arg(long)]
         tags: bool,
-        /// Delete this branch on the remote (git's --delete).
-        #[arg(long, value_name = "BRANCH")]
-        delete: Option<String>,
+        /// Push every local branch (git's --all).
+        #[arg(long)]
+        all: bool,
+        /// Delete the named branches on the remote (git's --delete).
+        #[arg(short = 'd', long)]
+        delete: bool,
+        /// Show what would be pushed without sending anything.
+        #[arg(short = 'n', long)]
+        dry_run: bool,
     },
     /// Check out a branch or, for any other revision, a detached HEAD.
     Checkout {
@@ -625,6 +660,15 @@ pub enum Command {
         /// Shallow-clone this many commits of history (git's --depth).
         #[arg(long, default_value_t = 0)]
         depth: i32,
+        /// Make a bare repository (git's --bare).
+        #[arg(long)]
+        bare: bool,
+        /// Name the remote this instead of `origin` (git's -o).
+        #[arg(short = 'o', long)]
+        origin: Option<String>,
+        /// Clone the submodules too (git's --recurse-submodules).
+        #[arg(long)]
+        recurse_submodules: bool,
     },
     /// Submodule management: forwards to `git submodule <args>`.
     Submodule {
@@ -2122,10 +2166,40 @@ pub fn run(
             }
             _ => anyhow::bail!("pass exactly one of --before or --after"),
         },
-        Command::Fetch { all, prune, remote } => net(interactive, "fetch", |r| {
-            backend.fetch(remote.as_deref(), all, prune, r)
-        })?,
-        Command::Pull { rebase } => net(interactive, "pull", |r| backend.pull(rebase, r))?,
+        Command::Fetch {
+            repository,
+            refspecs,
+            all,
+            prune,
+            remote,
+            tags,
+            depth,
+            dry_run,
+        } => {
+            let (remote, refspecs) = remote_and_refspecs(remote, repository, refspecs);
+            let args = rgit_git::FetchArgs {
+                all,
+                prune,
+                tags,
+                depth,
+                dry_run,
+            };
+            net(interactive, "fetch", |r| {
+                backend.fetch(remote.as_deref(), &refspecs, &args, r)
+            })?
+        }
+        Command::Pull {
+            repository,
+            branch,
+            rebase,
+            no_rebase,
+            ff_only,
+        } => {
+            let rebase = (rebase || no_rebase).then_some(rebase);
+            net(interactive, "pull", |r| {
+                backend.pull(repository.as_deref(), branch.as_deref(), rebase, ff_only, r)
+            })?
+        }
         Command::Submit => backend.submit_stack(&|_| {})?.join("\n"),
         Command::Sync => {
             let outcome = backend.sync(&|_| {})?;
@@ -2139,21 +2213,47 @@ pub fn run(
             msg
         }
         Command::Push {
+            repository,
+            refspecs,
             force,
             force_with_lease,
             set_upstream,
             remote,
             tags,
+            all,
             delete,
-        } => net(interactive, "push", |r| {
-            if let Some(branch) = &delete {
-                backend.push_delete(remote.as_deref(), branch, r)
-            } else if tags {
-                backend.push_tags(remote.as_deref(), r)
-            } else {
-                backend.push(remote.as_deref(), force, force_with_lease, set_upstream, r)
+            dry_run,
+        } => {
+            // `push --delete <branch>` (no remote named) deletes on the upstream.
+            let (remote, mut refspecs) = match repository {
+                Some(b)
+                    if delete
+                        && remote.is_none()
+                        && refspecs.is_empty()
+                        && !backend.remotes()?.iter().any(|r| r.name == b) =>
+                {
+                    (None, vec![b])
+                }
+                repository => remote_and_refspecs(remote, repository, refspecs),
+            };
+            if delete {
+                if refspecs.is_empty() {
+                    anyhow::bail!("--delete needs a branch to delete");
+                }
+                refspecs = refspecs.iter().map(|b| format!(":{b}")).collect();
             }
-        })?,
+            let args = rgit_git::PushArgs {
+                force,
+                force_with_lease,
+                set_upstream,
+                all,
+                tags,
+                dry_run,
+            };
+            net(interactive, "push", |r| {
+                backend.push_to(remote.as_deref(), &refspecs, &args, r)
+            })?
+        }
         Command::Checkout { rev, branch } => {
             // `-b <new>`: create the branch (from rev/HEAD) and switch to it.
             if let Some(new) = branch {
@@ -2523,6 +2623,19 @@ pub fn run(
         | Command::Serve { .. }
         | Command::Forge { .. } => unreachable!("handled before dispatch"),
     })
+}
+
+/// git's `<repository> [<refspec>...]`: the first positional names the remote,
+/// unless `--remote` already did, in which case it is a refspec too.
+fn remote_and_refspecs(
+    remote: Option<String>,
+    repository: Option<String>,
+    refspecs: Vec<String>,
+) -> (Option<String>, Vec<String>) {
+    match remote {
+        Some(r) => (Some(r), repository.into_iter().chain(refspecs).collect()),
+        None => (repository, refspecs),
+    }
 }
 
 /// Resolve a stash index: the given one, a prompt, or 0 (most recent).

@@ -1300,8 +1300,8 @@ async fn op_console(
         }
     };
     let result = tokio::task::spawn_blocking(move || match op {
-        ConsoleOp::Fetch => backend.fetch(None, false, false, &report),
-        ConsoleOp::Pull => backend.pull(false, &report),
+        ConsoleOp::Fetch => backend.fetch(None, &[], &Default::default(), &report),
+        ConsoleOp::Pull => backend.pull(None, None, None, false, &report),
         ConsoleOp::Push {
             force,
             force_with_lease,

@@ -656,3 +656,50 @@ pub enum OpProgress {
     Line(String),
     Transfer { received: usize, total: usize },
 }
+
+/// `git fetch` flags beyond the remote and refspecs.
+#[derive(Debug, Clone, Default)]
+pub struct FetchArgs {
+    /// Fetch every remote (`--all`).
+    pub all: bool,
+    /// Drop remote-tracking refs that no longer exist upstream (`--prune`).
+    pub prune: bool,
+    /// Fetch every tag as well (`--tags`).
+    pub tags: bool,
+    /// Limit history to this many commits (`--depth`); 0 fetches all of it.
+    pub depth: i32,
+    /// Report what would change without updating any ref (`--dry-run`).
+    pub dry_run: bool,
+}
+
+/// `git push` flags beyond the remote and refspecs.
+#[derive(Debug, Clone, Default)]
+pub struct PushArgs {
+    /// Overwrite remote refs unconditionally (`--force`).
+    pub force: bool,
+    /// Overwrite only if the remote still matches our remote-tracking ref.
+    pub force_with_lease: bool,
+    /// Record each pushed branch's upstream (`-u`).
+    pub set_upstream: bool,
+    /// Push every local branch (`--all`).
+    pub all: bool,
+    /// Push every local tag too (`--tags`).
+    pub tags: bool,
+    /// Report what would be pushed without sending it (`--dry-run`).
+    pub dry_run: bool,
+}
+
+/// `git clone` options beyond the URL and target directory.
+#[derive(Debug, Clone, Default)]
+pub struct CloneArgs {
+    /// Check out this branch instead of the remote's HEAD (`-b`).
+    pub branch: Option<String>,
+    /// Shallow-clone this many commits (`--depth`); 0 clones all history.
+    pub depth: i32,
+    /// Make a bare repository (`--bare`).
+    pub bare: bool,
+    /// Name the remote this instead of `origin` (`-o`).
+    pub origin: Option<String>,
+    /// Clone submodules too (`--recurse-submodules`).
+    pub recurse_submodules: bool,
+}

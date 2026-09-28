@@ -111,9 +111,19 @@ const EXAMPLES: &[Entry] = &[
             "rgit fetch",
             "rgit fetch --all",
             "rgit fetch --remote origin --prune",
+            "rgit fetch origin main --depth 1",
+            "rgit fetch --dry-run",
         ],
     ),
-    ("pull", &["rgit pull", "rgit pull --rebase"]),
+    (
+        "pull",
+        &[
+            "rgit pull",
+            "rgit pull --rebase",
+            "rgit pull --ff-only",
+            "rgit pull origin main",
+        ],
+    ),
     ("sync", &["rgit sync"]),
     ("submit", &["rgit submit"]),
     (
@@ -122,6 +132,10 @@ const EXAMPLES: &[Entry] = &[
             "rgit push",
             "rgit push --set-upstream",
             "rgit push --force-with-lease",
+            "rgit push origin feature",
+            "rgit push origin local:remote",
+            "rgit push origin --delete feature",
+            "rgit push --all --dry-run",
         ],
     ),
     (
@@ -194,6 +208,8 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit clone https://github.com/example/repo.git",
             "rgit clone https://github.com/example/repo.git repo-dir --depth 1",
+            "rgit clone --bare https://github.com/example/repo.git",
+            "rgit clone --recurse-submodules -o upstream https://github.com/example/repo.git",
         ],
     ),
     ("submodule", &["rgit submodule update --init"]),

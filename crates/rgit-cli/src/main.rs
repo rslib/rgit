@@ -100,6 +100,9 @@ fn main() -> ! {
             dir,
             branch,
             depth,
+            bare,
+            origin,
+            recurse_submodules,
         }) => {
             // Default the target directory to the repo name, as git does.
             let dir = dir.unwrap_or_else(|| {
@@ -109,14 +112,22 @@ fn main() -> ! {
                     .unwrap_or("repo")
                     .trim_end_matches(".git")
                     .to_owned()
+                    + if bare { ".git" } else { "" }
             });
-            let result = rgit_git::clone(
-                &url,
-                std::path::Path::new(&dir),
-                branch.as_deref(),
+            let args = rgit_git::CloneArgs {
+                branch,
                 depth,
-                &|_| {},
-            );
+                bare,
+                origin,
+                recurse_submodules,
+            };
+            let result = rgit_git::clone(&url, std::path::Path::new(&dir), &args, &|p| {
+                if let rgit_git::OpProgress::Line(l) = p
+                    && l.starts_with("warning:")
+                {
+                    eprintln!("{l}");
+                }
+            });
             finish(
                 result
                     .map(|()| format!("cloned into {dir}"))

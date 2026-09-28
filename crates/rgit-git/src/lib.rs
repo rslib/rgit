@@ -35,9 +35,9 @@ pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 pub use error::GitError;
 pub use git_repo::{Git2Backend, clone, init, pathspec_matches};
 pub use model::{
-    BlameLine, Blob, Commit, CommitDetails, CommitFile, CommitOverview, CommitRef, Deco,
-    FileActivity, GrepMatch, GrepQuery, Head, HunkRef, Lane, LanesState, LastCommit, LogEntry,
-    LogOptions, OpLogEntry, OpProgress, RefEntry, RefKind, Remote, RepoState, RepoStatus,
-    ResetMode, RestackOutcome, SmartlogEntry, Stash, StatusCode, StatusEntry, TagInfo, TreeEntry,
-    Worktree, activity_weights, group_decorations,
+    BlameLine, Blob, CloneArgs, Commit, CommitDetails, CommitFile, CommitOverview, CommitRef, Deco,
+    FetchArgs, FileActivity, GrepMatch, GrepQuery, Head, HunkRef, Lane, LanesState, LastCommit,
+    LogEntry, LogOptions, OpLogEntry, OpProgress, PushArgs, RefEntry, RefKind, Remote, RepoState,
+    RepoStatus, ResetMode, RestackOutcome, SmartlogEntry, Stash, StatusCode, StatusEntry, TagInfo,
+    TreeEntry, Worktree, activity_weights, group_decorations,
 };

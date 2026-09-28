@@ -1046,7 +1046,7 @@ fn next_steps(c: &Command) -> Vec<String> {
             "Run `rgit pull` to integrate the current branch's upstream".into(),
             "Run `rgit sync` to update and restack the whole stack".into(),
         ],
-        Command::Push { delete: None, tags: false, .. } => vec![
+        Command::Push { delete: false, tags: false, dry_run: false, .. } => vec![
             "Run `rgit forge pr create --title \"<title>\" --head <branch> --base <branch>` to open a pull request".into(),
         ],
         Command::Branch {

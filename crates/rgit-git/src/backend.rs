@@ -128,24 +128,30 @@ pub trait GitBackend: Send + Sync {
     /// editor) - magit's "extend".
     fn commit_extend(&self) -> Result<(), GitError>;
 
-    /// Fetch the current branch's remote, updating remote-tracking refs.
-    /// `report` receives git-style progress lines and transfer counts.
-    /// Fetch from a remote. `remote` names one (else the branch's upstream
-    /// remote); `all` fetches every remote; `prune` removes remote-tracking refs
-    /// that no longer exist upstream (git's `--all` / `--prune`).
+    /// Fetch from a remote, updating remote-tracking refs. `remote` names one
+    /// (else the branch's upstream remote); `refspecs` fetch just those refs
+    /// (else the remote's configured ones). `report` receives git-style
+    /// progress lines and transfer counts.
     fn fetch(
         &self,
         remote: Option<&str>,
-        all: bool,
-        prune: bool,
+        refspecs: &[String],
+        args: &crate::FetchArgs,
         report: &dyn Fn(crate::OpProgress),
     ) -> Result<(), GitError>;
 
-    /// Fetch and fast-forward the current branch; errors if not fast-forwardable.
-    /// Fetch and integrate the upstream into the current branch. `rebase`
-    /// replays local commits onto the upstream (git's `pull --rebase`); otherwise
-    /// it fast-forwards.
-    fn pull(&self, rebase: bool, report: &dyn Fn(crate::OpProgress)) -> Result<(), GitError>;
+    /// Fetch and integrate a branch into the current one, like `git pull`.
+    /// `remote`/`branch` default to the upstream. `rebase` forces a rebase
+    /// (`Some(true)`) or a merge (`Some(false)`); `None` follows `pull.rebase`.
+    /// `ff_only` (or `pull.ff=only`) refuses anything but a fast-forward.
+    fn pull(
+        &self,
+        remote: Option<&str>,
+        branch: Option<&str>,
+        rebase: Option<bool>,
+        ff_only: bool,
+        report: &dyn Fn(crate::OpProgress),
+    ) -> Result<(), GitError>;
 
     /// Push the current branch to its upstream remote. `force` overwrites
     /// unconditionally; `force_with_lease` overwrites only if the remote still
@@ -158,6 +164,17 @@ pub trait GitBackend: Send + Sync {
         force: bool,
         force_with_lease: bool,
         set_upstream: bool,
+        report: &dyn Fn(crate::OpProgress),
+    ) -> Result<(), GitError>;
+
+    /// Push `refspecs` (git syntax: `branch`, `src:dst`, `:dst`, `+src:dst`) to
+    /// `remote` (else the upstream's remote). With no refspecs it pushes the
+    /// current branch, or every branch with `args.all`.
+    fn push_to(
+        &self,
+        remote: Option<&str>,
+        refspecs: &[String],
+        args: &crate::PushArgs,
         report: &dyn Fn(crate::OpProgress),
     ) -> Result<(), GitError>;
 

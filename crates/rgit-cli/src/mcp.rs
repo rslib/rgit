@@ -811,30 +811,48 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_fetch",
             "Fetch a remote. `all` fetches every remote, `prune` drops stale remote-tracking refs, \
-             `remote` picks one.",
+             `remote` picks one, `refspecs` fetch just those refs (git syntax: `main`, \
+             `src:dst`). `tags` fetches every tag, `depth` limits history, `dry_run` only \
+             reports what would change.",
             &[
                 ("all", "boolean", false),
                 ("prune", "boolean", false),
                 ("remote", "string", false),
+                ("refspecs", "string[]", false),
+                ("tags", "boolean", false),
+                ("depth", "integer", false),
+                ("dry_run", "boolean", false),
             ],
         ),
         tool(
             "git_pull",
-            "Fetch and integrate the current branch's upstream; `rebase` rebases instead of \
-             fast-forwarding.",
-            &[("rebase", "boolean", false)],
+            "Fetch and integrate the current branch's upstream, or `branch` of `remote`. \
+             Merges when diverged unless `pull.rebase` is set; `rebase` rebases, `no_rebase` \
+             merges, `ff_only` refuses anything but a fast-forward.",
+            &[
+                ("remote", "string", false),
+                ("branch", "string", false),
+                ("rebase", "boolean", false),
+                ("no_rebase", "boolean", false),
+                ("ff_only", "boolean", false),
+            ],
         ),
         tool(
             "git_push",
-            "Push the current branch to its upstream, or to `remote`. `tags` pushes all tags; \
-             `delete` deletes that branch on the remote.",
+            "Push the current branch to its upstream, or to `remote`. `refspecs` push those refs \
+             instead (git syntax: `branch`, `src:dst`, `:branch` deletes, `+src:dst` forces); \
+             `all` pushes every branch, `tags` all tags; `delete` deletes that branch on the \
+             remote; `dry_run` only reports what would be pushed.",
             &[
                 ("force", "boolean", false),
                 ("force_with_lease", "boolean", false),
                 ("set_upstream", "boolean", false),
                 ("remote", "string", false),
+                ("refspecs", "string[]", false),
+                ("all", "boolean", false),
                 ("tags", "boolean", false),
                 ("delete", "string", false),
+                ("dry_run", "boolean", false),
             ],
         ),
         tool(
@@ -1287,7 +1305,7 @@ const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
     ("resolve", "git_resolve", &["path"]),
     ("commit", "git_commit", &[]),
     ("push", "git_push", &[]),
-    ("pull", "git_pull", &[]),
+    ("pull", "git_pull", &["remote", "branch"]),
     ("fetch", "git_fetch", &[]),
     ("sync", "git_sync", &[]),
     ("submit", "git_submit", &[]),
@@ -1640,20 +1658,38 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         },
         "git_extend" => Command::Extend,
         "git_fetch" => Command::Fetch {
+            repository: None,
+            refspecs: a.strs("refspecs").unwrap_or_default(),
             all: a.flag("all"),
             prune: a.flag("prune"),
             remote: a.str("remote"),
+            tags: a.flag("tags"),
+            depth: a.num("depth")?.map_or(0, |n| n as i32),
+            dry_run: a.flag("dry_run"),
         },
         "git_pull" => Command::Pull {
+            repository: a.str("remote"),
+            branch: a.str("branch"),
             rebase: a.flag("rebase"),
+            no_rebase: a.flag("no_rebase"),
+            ff_only: a.flag("ff_only"),
         },
         "git_push" => Command::Push {
+            repository: None,
+            refspecs: a
+                .strs("refspecs")
+                .unwrap_or_default()
+                .into_iter()
+                .chain(a.str("delete"))
+                .collect(),
             force: a.flag("force"),
             force_with_lease: a.flag("force_with_lease"),
             set_upstream: a.flag("set_upstream"),
             remote: a.str("remote"),
             tags: a.flag("tags"),
-            delete: a.str("delete"),
+            all: a.flag("all"),
+            delete: a.str("delete").is_some(),
+            dry_run: a.flag("dry_run"),
         },
         "git_checkout" => Command::Checkout {
             rev: Some(a.req("rev")?),
