@@ -225,6 +225,75 @@ const EXAMPLES: &[Entry] = &[
         ],
     ),
     ("absorb", &["rgit absorb"]),
+    (
+        "config",
+        &[
+            "rgit config user.email",
+            "rgit config user.email me@example.com",
+            "rgit config --global pull.rebase true",
+            "rgit config --unset core.pager",
+            "rgit config --list",
+        ],
+    ),
+    (
+        "apply",
+        &[
+            "rgit apply fix.patch",
+            "rgit apply --check fix.patch",
+            "rgit apply --cached fix.patch",
+            "rgit apply -R fix.patch",
+        ],
+    ),
+    ("notes", &["rgit notes", "rgit notes show HEAD"]),
+    ("notes list", &["rgit notes list"]),
+    ("notes show", &["rgit notes show", "rgit notes show <rev>"]),
+    (
+        "notes add",
+        &[
+            "rgit notes add -m \"<note>\"",
+            "rgit notes add <rev> -m \"<note>\" --force",
+        ],
+    ),
+    ("notes append", &["rgit notes append -m \"<more>\""]),
+    ("notes remove", &["rgit notes remove <rev>"]),
+    (
+        "update-ref",
+        &[
+            "rgit update-ref refs/heads/topic <rev>",
+            "rgit update-ref refs/heads/topic <new> <old>",
+            "rgit update-ref -d refs/heads/topic",
+        ],
+    ),
+    (
+        "hash-object",
+        &["rgit hash-object src/lib.rs", "rgit hash-object -w --stdin"],
+    ),
+    (
+        "format-patch",
+        &[
+            "rgit format-patch -1",
+            "rgit format-patch main -o patches",
+            "rgit format-patch main..topic --stdout",
+        ],
+    ),
+    (
+        "am",
+        &[
+            "rgit am patches/*.patch",
+            "rgit am --continue",
+            "rgit am --abort",
+        ],
+    ),
+    (
+        "archive",
+        &[
+            "rgit archive -o release.tar.gz",
+            "rgit archive v1.0 --prefix project/ -o project.zip",
+            "rgit archive HEAD src > src.tar",
+        ],
+    ),
+    ("gc", &["rgit gc", "rgit gc --prune=now"]),
+    ("fsck", &["rgit fsck", "rgit fsck --unreachable"]),
     ("clean", &["rgit clean", "rgit clean --dry-run"]),
     ("rm", &["rgit rm src/lib.rs", "rgit rm src/lib.rs --cached"]),
     ("mv", &["rgit mv src/old.rs src/new.rs"]),

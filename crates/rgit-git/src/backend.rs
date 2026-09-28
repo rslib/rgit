@@ -393,6 +393,118 @@ pub trait GitBackend: Send + Sync {
     /// `reset`, ...). Shells out to `git` (libgit2 has no bisect).
     fn bisect(&self, args: &[String]) -> Result<String, GitError>;
 
+    /// Config entries as `(name, value)`: every entry when `name` is `None`,
+    /// else each value of `name` (a multivar has several), oldest first.
+    fn config_entries(
+        &self,
+        scope: crate::ConfigScope,
+        name: Option<&str>,
+    ) -> Result<Vec<(String, String)>, GitError>;
+
+    /// Set `name` to `value` (in the repository's config unless `scope` is
+    /// global). With `add`, append a value to a multivar instead of replacing.
+    fn config_write(
+        &self,
+        scope: crate::ConfigScope,
+        name: &str,
+        value: &str,
+        add: bool,
+    ) -> Result<(), GitError>;
+
+    /// Remove `name`; `all` removes every value of a multivar.
+    fn config_unset(
+        &self,
+        scope: crate::ConfigScope,
+        name: &str,
+        all: bool,
+    ) -> Result<(), GitError>;
+
+    /// Apply a unified diff (`git apply`) to the working tree, the index
+    /// (`cached`), or both (`index`). `reverse` undoes the patch; `check` only
+    /// tests that it applies.
+    fn apply_patch(
+        &self,
+        patch: &[u8],
+        cached: bool,
+        index: bool,
+        reverse: bool,
+        check: bool,
+    ) -> Result<(), GitError>;
+
+    /// A patch's diffstat (`git apply --stat`), without applying it.
+    fn patch_stat(&self, patch: &[u8]) -> Result<String, GitError>;
+
+    /// Notes under `notes_ref` (default `refs/notes/commits`) as
+    /// `(note blob id, annotated object id)`.
+    fn notes(&self, notes_ref: Option<&str>) -> Result<Vec<(String, String)>, GitError>;
+
+    /// The note attached to `rev`.
+    fn note_show(&self, notes_ref: Option<&str>, rev: &str) -> Result<String, GitError>;
+
+    /// Attach `message` as the note of `rev`. `append` adds it as a new
+    /// paragraph to an existing note; otherwise an existing note needs `force`.
+    fn note_add(
+        &self,
+        notes_ref: Option<&str>,
+        rev: &str,
+        message: &str,
+        force: bool,
+        append: bool,
+    ) -> Result<(), GitError>;
+
+    /// Remove the note of `rev`.
+    fn note_remove(&self, notes_ref: Option<&str>, rev: &str) -> Result<(), GitError>;
+
+    /// Point ref `name` at revision `new`, or delete it when `new` is `None`
+    /// (`git update-ref`). With `old`, only if the ref now holds `old` (all
+    /// zeros: only if it does not exist). A symbolic ref is followed unless
+    /// `no_deref`.
+    fn update_ref(
+        &self,
+        name: &str,
+        new: Option<&str>,
+        old: Option<&str>,
+        no_deref: bool,
+        message: Option<&str>,
+    ) -> Result<(), GitError>;
+
+    /// The object id of `data` as a `kind` object (blob, tree, commit, tag);
+    /// `write` stores it in the object database (`git hash-object`).
+    fn hash_object(&self, kind: &str, data: &[u8], write: bool) -> Result<String, GitError>;
+
+    /// Commits as mbox patches (`git format-patch`), oldest first, as
+    /// `(file name, email)`. `range` is `<a>..<b>`, or `<rev>` for
+    /// `<rev>..HEAD`; `count` keeps the newest `count` commits ending at
+    /// `range` (or HEAD). Merge commits are skipped.
+    fn format_patch(
+        &self,
+        range: Option<&str>,
+        count: Option<usize>,
+    ) -> Result<Vec<(String, String)>, GitError>;
+
+    /// Apply mbox patches as commits (`git am`). `args` are `git am` arguments
+    /// (mbox paths, `--abort`, `--continue`, `--skip`, ...); `mbox` is patch
+    /// text to apply instead of files. Shells out to `git` (libgit2 has no am).
+    fn am(&self, args: &[String], mbox: Option<&[u8]>) -> Result<String, GitError>;
+
+    /// The tree of `rev` as an archive; `format` is tar, tar.gz/tgz or zip.
+    /// Entries are named under `prefix`; `paths` limits them.
+    fn archive(
+        &self,
+        rev: &str,
+        format: &str,
+        prefix: &str,
+        paths: &[String],
+    ) -> Result<Vec<u8>, GitError>;
+
+    /// Pack and prune the object database (`git gc` with `args`). Shells out
+    /// to `git` (libgit2 has no gc).
+    fn gc(&self, args: &[String]) -> Result<String, GitError>;
+
+    /// Verify the object database (`git fsck` with `args`) and return its
+    /// report. Shells out to `git` (libgit2 has no fsck).
+    fn fsck(&self, args: &[String]) -> Result<String, GitError>;
+
     /// Remove untracked files and directories (`git clean -fd`). With `dry_run`
     /// (git's `-n`), report what would be removed without deleting. `args` are
     /// extra `git clean` arguments (`-x`, `-X`, `-e <pattern>`, `--`, paths).

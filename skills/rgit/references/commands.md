@@ -134,6 +134,24 @@ Every command with what it does and example invocations. Run `rgit <command> --h
     - `forge pr create`: Create a pull request or merge request. e.g. `rgit forge pr create --title "<title>" --head <branch> --base main`
     - `forge pr close`: Close a pull request or merge request. e.g. `rgit forge pr close 42 --yes`, `rgit forge pr close 42 owner/repo --yes`
 
+## Patches, notes, config and maintenance
+
+- `format-patch`: Write commits as mbox patch files (`-<n>`, `<since>` or `<a>..<b>`). e.g. `rgit format-patch -1`, `rgit format-patch main -o patches`, `rgit format-patch main..topic --stdout`
+- `am`: Apply mbox patches (from format-patch) as commits. e.g. `rgit am patches/*.patch`, `rgit am --continue`, `rgit am --abort`
+- `apply`: Apply a patch to the working tree, the index, or both. e.g. `rgit apply fix.patch`, `rgit apply --check fix.patch`, `rgit apply --cached fix.patch`, `rgit apply -R fix.patch`
+- `archive`: Write a tar or zip of a revision's files. e.g. `rgit archive -o release.tar.gz`, `rgit archive v1.0 --prefix project/ -o project.zip`, `rgit archive HEAD src > src.tar`
+- `notes`: Notes attached to commits (no subcommand lists them). e.g. `rgit notes`, `rgit notes show HEAD`
+  - `notes list`: List notes as `<note id> <object id>`, or the note id of one object. e.g. `rgit notes list`
+  - `notes show`: Print an object's note (default HEAD). e.g. `rgit notes show`, `rgit notes show <rev>`
+  - `notes add`: Attach a note to an object (default HEAD). e.g. `rgit notes add -m "<note>"`, `rgit notes add <rev> -m "<note>" --force`
+  - `notes append`: Add a paragraph to an object's note, creating it if needed. e.g. `rgit notes append -m "<more>"`
+  - `notes remove`: Remove an object's note (default HEAD). e.g. `rgit notes remove <rev>`
+- `config`: Get, set, unset or list config values: `config <key>` reads, `config <key> <value>` writes. e.g. `rgit config user.email`, `rgit config user.email me@example.com`, `rgit config --global pull.rebase true`, `rgit config --unset core.pager`, `rgit config --list`
+- `update-ref`: Point a ref at a commit, or delete it, optionally only if it holds an expected value. e.g. `rgit update-ref refs/heads/topic <rev>`, `rgit update-ref refs/heads/topic <new> <old>`, `rgit update-ref -d refs/heads/topic`
+- `hash-object`: Print the object id of files or stdin; -w stores them. e.g. `rgit hash-object src/lib.rs`, `rgit hash-object -w --stdin`
+- `gc`: Pack the object database and prune unreachable objects. e.g. `rgit gc`, `rgit gc --prune=now`
+- `fsck`: Check the object database for corruption and dangling objects. e.g. `rgit fsck`, `rgit fsck --unreachable`
+
 ## Code search
 
 - `index`: Semantic code search: build the on-disk vector index or query it. e.g. `rgit index status`

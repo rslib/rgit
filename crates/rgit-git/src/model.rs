@@ -100,6 +100,15 @@ pub struct RebaseOptions {
     pub strategy_option: Option<String>,
 }
 
+/// Which config file a `config` command reads or writes. `Any` reads the
+/// merged config and writes the repository's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScope {
+    Any,
+    Local,
+    Global,
+}
+
 impl RepoStatus {
     pub fn unstaged_diff(&self, path: &str) -> Option<&FileDiff> {
         self.unstaged.iter().find(|d| d.path == path)

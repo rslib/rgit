@@ -710,6 +710,185 @@ pub enum Command {
     /// Fold each pending change into the stacked commit that last touched those
     /// lines (blame-routed fixups + autosquash).
     Absorb,
+    /// Get, set, unset or list config values: `config <key>` reads,
+    /// `config <key> <value>` writes.
+    Config {
+        /// The key (`section.name`).
+        key: Option<String>,
+        /// The value to set.
+        value: Option<String>,
+        /// Use the user's global config (~/.gitconfig or $GIT_CONFIG_GLOBAL).
+        #[arg(long)]
+        global: bool,
+        /// Use only the repository's config.
+        #[arg(long, conflicts_with = "global")]
+        local: bool,
+        /// Print the key's value (the default with just a key).
+        #[arg(long)]
+        get: bool,
+        /// Print every value of a multi-valued key.
+        #[arg(long)]
+        get_all: bool,
+        /// Remove the key.
+        #[arg(long)]
+        unset: bool,
+        /// Remove every value of a multi-valued key.
+        #[arg(long)]
+        unset_all: bool,
+        /// List every `key=value`.
+        #[arg(short = 'l', long)]
+        list: bool,
+        /// Add a value to a multi-valued key instead of replacing it.
+        #[arg(long)]
+        add: bool,
+        /// Read and write the value as a boolean (true/false).
+        #[arg(long = "bool")]
+        as_bool: bool,
+        /// Read and write the value as an integer (k/m/g suffixes allowed).
+        #[arg(long = "int", conflicts_with = "as_bool")]
+        as_int: bool,
+    },
+    /// Apply a patch to the working tree, the index, or both.
+    Apply {
+        /// Patch files (reads stdin when none or `-`).
+        patches: Vec<String>,
+        /// Apply to the index only, leaving the working tree as it is.
+        #[arg(long)]
+        cached: bool,
+        /// Apply to both the index and the working tree.
+        #[arg(long, conflicts_with = "cached")]
+        index: bool,
+        /// Only check that the patch applies.
+        #[arg(long)]
+        check: bool,
+        /// Undo the patch (apply it in reverse).
+        #[arg(short = 'R', long)]
+        reverse: bool,
+        /// Print the patch's diffstat instead of applying it.
+        #[arg(long)]
+        stat: bool,
+    },
+    /// Notes attached to commits (no subcommand lists them).
+    Notes {
+        /// The notes ref (default refs/notes/commits).
+        #[arg(long = "ref", value_name = "REF")]
+        notes_ref: Option<String>,
+        #[command(subcommand)]
+        cmd: Option<NotesCmd>,
+    },
+    /// Point a ref at a commit, or delete it, optionally only if it holds an
+    /// expected value.
+    UpdateRef {
+        /// The ref (e.g. refs/heads/main).
+        name: String,
+        /// The new value (with -d: the expected old value).
+        new: Option<String>,
+        /// Only update if the ref holds this value (all zeros: does not exist).
+        old: Option<String>,
+        /// Delete the ref.
+        #[arg(short = 'd')]
+        delete: bool,
+        /// Update a symbolic ref itself instead of the ref it points to.
+        #[arg(long)]
+        no_deref: bool,
+        /// The reflog message.
+        #[arg(short = 'm', value_name = "REASON")]
+        message: Option<String>,
+    },
+    /// Print the object id of files or stdin; -w stores them.
+    HashObject {
+        /// Files to hash.
+        paths: Vec<String>,
+        /// Store the objects in the repository.
+        #[arg(short = 'w')]
+        write: bool,
+        /// Hash stdin (before any files).
+        #[arg(long)]
+        stdin: bool,
+        /// The object type.
+        #[arg(short = 't', default_value = "blob", value_name = "TYPE")]
+        kind: String,
+    },
+    /// Write commits as mbox patch files (`-<n>`, `<since>` or `<a>..<b>`).
+    FormatPatch {
+        /// `-<n>` for the newest n commits, `<rev>` for the commits after it
+        /// up to HEAD, or a range `<a>..<b>`.
+        #[arg(allow_negative_numbers = true)]
+        revs: Vec<String>,
+        /// Write the files to this folder.
+        #[arg(short = 'o', long = "output-directory", value_name = "DIR")]
+        output_dir: Option<String>,
+        /// Print the patches instead of writing files.
+        #[arg(long)]
+        stdout: bool,
+    },
+    /// Apply mbox patches (from format-patch) as commits.
+    Am {
+        /// mbox files (reads stdin when none).
+        mbox: Vec<String>,
+        /// Give up and restore the branch as it was.
+        #[arg(long, conflicts_with_all = ["cont", "skip"])]
+        abort: bool,
+        /// Commit the resolved patch and go on.
+        #[arg(long = "continue", conflicts_with = "skip")]
+        cont: bool,
+        /// Skip the current patch.
+        #[arg(long)]
+        skip: bool,
+        /// Fall back to a three-way merge.
+        #[arg(short = '3', long)]
+        three_way: bool,
+        /// Add a Signed-off-by trailer.
+        #[arg(short = 's', long)]
+        signoff: bool,
+    },
+    /// Write a tar or zip of a revision's files.
+    Archive {
+        /// The revision (default HEAD).
+        rev: Option<String>,
+        /// Limit to these paths.
+        paths: Vec<String>,
+        /// tar, tgz (tar.gz) or zip (default: from -o's extension, else tar).
+        #[arg(long, value_parser = ["tar", "tgz", "tar.gz", "zip"])]
+        format: Option<String>,
+        /// Write to this file instead of stdout.
+        #[arg(short = 'o', long)]
+        output: Option<String>,
+        /// Put every entry under this folder (e.g. `project/`).
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+    /// Pack the object database and prune unreachable objects.
+    Gc {
+        /// Prune loose objects older than this date (default 2 weeks ago).
+        #[arg(long, value_name = "DATE", num_args = 0..=1, require_equals = true,
+              default_missing_value = "")]
+        prune: Option<String>,
+        /// Repack more thoroughly (slow).
+        #[arg(long)]
+        aggressive: bool,
+        /// Only run when enough loose objects have piled up.
+        #[arg(long)]
+        auto: bool,
+    },
+    /// Check the object database for corruption and dangling objects.
+    Fsck {
+        /// Also check packed objects.
+        #[arg(long)]
+        full: bool,
+        /// Strict checking.
+        #[arg(long)]
+        strict: bool,
+        /// List unreachable objects.
+        #[arg(long)]
+        unreachable: bool,
+        /// Do not report dangling objects.
+        #[arg(long)]
+        no_dangling: bool,
+        /// Check only that objects are connected.
+        #[arg(long)]
+        connectivity_only: bool,
+    },
     /// Remove untracked files and directories.
     Clean {
         /// List what would be removed without deleting (git's -n).
@@ -1024,6 +1203,44 @@ pub enum StashCmd {
     },
     /// List the stashes.
     List,
+}
+
+#[derive(Subcommand)]
+pub enum NotesCmd {
+    /// List notes as `<note id> <object id>`, or the note id of one object.
+    List {
+        /// The annotated object.
+        rev: Option<String>,
+    },
+    /// Print an object's note (default HEAD).
+    Show {
+        /// The annotated object.
+        rev: Option<String>,
+    },
+    /// Attach a note to an object (default HEAD).
+    Add {
+        /// The annotated object.
+        rev: Option<String>,
+        /// The note text; several -m become paragraphs.
+        #[arg(short, long, required = true)]
+        message: Vec<String>,
+        /// Replace an existing note.
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Add a paragraph to an object's note, creating it if needed.
+    Append {
+        /// The annotated object.
+        rev: Option<String>,
+        /// The text to add; several -m become paragraphs.
+        #[arg(short, long, required = true)]
+        message: Vec<String>,
+    },
+    /// Remove an object's note (default HEAD).
+    Remove {
+        /// The annotated object.
+        rev: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1850,6 +2067,21 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
     (
         "Remotes and forge (GitHub/GitLab)",
         &["fetch", "pull", "push", "remote", "forge"],
+    ),
+    (
+        "Patches, notes, config and maintenance",
+        &[
+            "format-patch",
+            "am",
+            "apply",
+            "archive",
+            "notes",
+            "config",
+            "update-ref",
+            "hash-object",
+            "gc",
+            "fsck",
+        ],
     ),
     ("Code search", &["index"]),
     (
@@ -2742,6 +2974,290 @@ pub fn run(
                 }
             }
         },
+        Command::Config {
+            key,
+            value,
+            global,
+            local,
+            get,
+            get_all,
+            unset,
+            unset_all,
+            list,
+            add,
+            as_bool,
+            as_int,
+        } => {
+            use rgit_git::ConfigScope;
+            let scope = match (global, local) {
+                (true, _) => ConfigScope::Global,
+                (_, true) => ConfigScope::Local,
+                _ => ConfigScope::Any,
+            };
+            let typed = |v: &str| rgit_git::config_value(v, as_bool, as_int);
+            if list {
+                return Ok(backend
+                    .config_entries(scope, None)?
+                    .into_iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"));
+            }
+            let key = key.ok_or_else(|| CliError::usage("a config key required"))?;
+            if unset || unset_all {
+                backend.config_unset(scope, &key, unset_all)?;
+                "ok".to_owned()
+            } else if let Some(value) = value.filter(|_| !get && !get_all) {
+                backend.config_write(scope, &key, &typed(&value)?, add)?;
+                "ok".to_owned()
+            } else {
+                let mut values = backend.config_entries(scope, Some(&key))?;
+                if values.is_empty() {
+                    return Err(GitError::Other(format!("{key} is not set")).into());
+                }
+                if !get_all {
+                    values.drain(..values.len() - 1);
+                }
+                values
+                    .iter()
+                    .map(|(_, v)| typed(v))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join("\n")
+            }
+        }
+        Command::Apply {
+            patches,
+            cached,
+            index,
+            check,
+            reverse,
+            stat,
+        } => {
+            let patches = if patches.is_empty() {
+                vec!["-".to_owned()]
+            } else {
+                patches
+            };
+            let mut stats = Vec::new();
+            for p in &patches {
+                let patch = read_input(p)?;
+                if stat {
+                    stats.push(backend.patch_stat(&patch)?);
+                } else {
+                    backend.apply_patch(&patch, cached, index, reverse, check)?;
+                }
+            }
+            if stat {
+                stats.join("\n")
+            } else {
+                "ok".to_owned()
+            }
+        }
+        Command::Notes { notes_ref, cmd } => {
+            let r = notes_ref.as_deref();
+            let head = |rev: Option<String>| rev.unwrap_or_else(|| "HEAD".to_owned());
+            match cmd.unwrap_or(NotesCmd::List { rev: None }) {
+                NotesCmd::List { rev } => {
+                    let notes = backend.notes(r)?;
+                    match rev {
+                        Some(rev) => {
+                            let oid = backend.rev_parse(&rev)?;
+                            notes
+                                .into_iter()
+                                .find(|(_, obj)| *obj == oid)
+                                .map(|(note, _)| note)
+                                .ok_or_else(|| {
+                                    GitError::Other(format!("no note found for object {oid}"))
+                                })?
+                        }
+                        None if notes.is_empty() => "no notes".to_owned(),
+                        None => notes
+                            .into_iter()
+                            .map(|(note, obj)| format!("{note} {obj}"))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    }
+                }
+                NotesCmd::Show { rev } => backend.note_show(r, &head(rev))?,
+                NotesCmd::Add {
+                    rev,
+                    message,
+                    force,
+                } => ok(backend.note_add(r, &head(rev), &message.join("\n\n"), force, false))?,
+                NotesCmd::Append { rev, message } => {
+                    ok(backend.note_add(r, &head(rev), &message.join("\n\n"), false, true))?
+                }
+                NotesCmd::Remove { rev } => ok(backend.note_remove(r, &head(rev)))?,
+            }
+        }
+        Command::UpdateRef {
+            name,
+            new,
+            old,
+            delete,
+            no_deref,
+            message,
+        } => {
+            let (new, old) = if delete {
+                if old.is_some() {
+                    return Err(CliError::usage("-d takes a ref and an optional old value"));
+                }
+                (None, new)
+            } else {
+                let new = new.ok_or_else(|| CliError::usage("a new value required"))?;
+                (Some(new), old)
+            };
+            ok(backend.update_ref(
+                &name,
+                new.as_deref(),
+                old.as_deref(),
+                no_deref,
+                message.as_deref(),
+            ))?
+        }
+        Command::HashObject {
+            paths,
+            write,
+            stdin,
+            kind,
+        } => {
+            let mut inputs = Vec::new();
+            if stdin {
+                inputs.push(read_input("-")?);
+            }
+            for p in &paths {
+                inputs.push(read_input(p)?);
+            }
+            if inputs.is_empty() {
+                return Err(CliError::usage("a file or --stdin required"));
+            }
+            inputs
+                .iter()
+                .map(|data| backend.hash_object(&kind, data, write))
+                .collect::<Result<Vec<_>, _>>()?
+                .join("\n")
+        }
+        Command::FormatPatch {
+            revs,
+            output_dir,
+            stdout,
+        } => {
+            let (counts, ranges): (Vec<&String>, Vec<&String>) = revs.iter().partition(|r| {
+                r.strip_prefix('-')
+                    .is_some_and(|n| n.parse::<usize>().is_ok())
+            });
+            let count = counts.last().and_then(|n| n[1..].parse().ok());
+            if ranges.len() > 1 || (ranges.is_empty() && count.is_none()) {
+                return Err(CliError::usage(
+                    "give `-<n>`, a `<since>` revision, or one `<a>..<b>` range",
+                ));
+            }
+            let patches = backend.format_patch(ranges.first().map(|r| r.as_str()), count)?;
+            if patches.is_empty() {
+                return Ok("no commits to format".to_owned());
+            }
+            if stdout {
+                return Ok(patches
+                    .into_iter()
+                    .map(|(_, email)| email)
+                    .collect::<Vec<_>>()
+                    .join("\n"));
+            }
+            let dir = PathBuf::from(output_dir.unwrap_or_default());
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(&dir)?;
+            }
+            let mut written = Vec::new();
+            for (name, email) in patches {
+                let path = dir.join(name);
+                std::fs::write(&path, email)?;
+                written.push(path.display().to_string());
+            }
+            written.join("\n")
+        }
+        Command::Am {
+            mbox,
+            abort,
+            cont,
+            skip,
+            three_way,
+            signoff,
+        } => {
+            let mut args: Vec<String> = Vec::new();
+            args.extend(abort.then(|| "--abort".to_owned()));
+            args.extend(cont.then(|| "--continue".to_owned()));
+            args.extend(skip.then(|| "--skip".to_owned()));
+            args.extend(three_way.then(|| "--3way".to_owned()));
+            args.extend(signoff.then(|| "--signoff".to_owned()));
+            let resume = abort || cont || skip;
+            let input = if !resume && mbox.is_empty() {
+                Some(read_input("-")?)
+            } else {
+                None
+            };
+            for m in &mbox {
+                args.push(std::path::absolute(m)?.display().to_string());
+            }
+            let out = backend.am(&args, input.as_deref())?;
+            if out.is_empty() { "ok".to_owned() } else { out }
+        }
+        Command::Archive {
+            rev,
+            paths,
+            format,
+            output,
+            prefix,
+        } => {
+            let Some(output) = output.filter(|o| o != "-") else {
+                return Err(CliError::usage("-o <file> required"));
+            };
+            let bytes = archive(backend, rev, &paths, format, Some(&output), prefix)?;
+            std::fs::write(&output, bytes)?;
+            format!("wrote {output}")
+        }
+        Command::Gc {
+            prune,
+            aggressive,
+            auto,
+        } => {
+            let mut args: Vec<String> = Vec::new();
+            args.extend(prune.map(|p| {
+                if p.is_empty() {
+                    "--prune".to_owned()
+                } else {
+                    format!("--prune={p}")
+                }
+            }));
+            args.extend(aggressive.then(|| "--aggressive".to_owned()));
+            args.extend(auto.then(|| "--auto".to_owned()));
+            args.push("--quiet".to_owned());
+            backend.gc(&args)?;
+            "ok".to_owned()
+        }
+        Command::Fsck {
+            full,
+            strict,
+            unreachable,
+            no_dangling,
+            connectivity_only,
+        } => {
+            let mut args: Vec<String> = Vec::new();
+            for (on, flag) in [
+                (full, "--full"),
+                (strict, "--strict"),
+                (unreachable, "--unreachable"),
+                (no_dangling, "--no-dangling"),
+                (connectivity_only, "--connectivity-only"),
+            ] {
+                args.extend(on.then(|| flag.to_owned()));
+            }
+            let out = backend.fsck(&args)?;
+            if out.is_empty() {
+                "no problems found".to_owned()
+            } else {
+                out
+            }
+        }
         Command::Clean {
             dry_run,
             ignored_too,
@@ -2887,6 +3403,45 @@ fn pick(
     ok(backend.pick(&revs, opts))
 }
 
+/// The bytes of a file, or of stdin for `-`.
+fn read_input(path: &str) -> anyhow::Result<Vec<u8>> {
+    if path == "-" {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
+        Ok(buf)
+    } else {
+        std::fs::read(path).map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))
+    }
+}
+
+/// `rgit archive` output; the format defaults from `output`'s extension.
+pub fn archive(
+    backend: &Arc<dyn GitBackend>,
+    rev: Option<String>,
+    paths: &[String],
+    format: Option<String>,
+    output: Option<&str>,
+    prefix: Option<String>,
+) -> anyhow::Result<Vec<u8>> {
+    let format = format.unwrap_or_else(|| {
+        let out = output.unwrap_or_default();
+        if out.ends_with(".zip") {
+            "zip"
+        } else if out.ends_with(".tgz") || out.ends_with(".tar.gz") {
+            "tgz"
+        } else {
+            "tar"
+        }
+        .to_owned()
+    });
+    Ok(backend.archive(
+        rev.as_deref().unwrap_or("HEAD"),
+        &format,
+        prefix.as_deref().unwrap_or_default(),
+        paths,
+    )?)
+}
+
 /// Resolve a stash index: the given one, a prompt, or 0 (most recent).
 fn stash_index(
     backend: &Arc<dyn GitBackend>,
@@ -2954,6 +3509,7 @@ pub fn from_cwd(mut command: Command, workdir: &Path) -> Command {
         | Command::Discard { paths, .. }
         | Command::Split { paths, .. }
         | Command::Reset { paths, .. }
+        | Command::Archive { paths, .. }
         | Command::Clean { paths, .. }
         | Command::Rm { paths, .. }
         | Command::Mv { paths, .. } => paths.iter_mut().for_each(fix),

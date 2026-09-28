@@ -10,8 +10,8 @@ use rgit_git::{
 };
 
 use crate::cli::{
-    BranchCmd, Command, FlowCmd, IndexCmd, LanesCmd, RemoteCmd, StackCmd, StashCmd, WorkspaceCmd,
-    WorktreeCmd,
+    BranchCmd, Command, FlowCmd, IndexCmd, LanesCmd, NotesCmd, RemoteCmd, StackCmd, StashCmd,
+    WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::render;
@@ -1057,6 +1057,35 @@ fn done_message(c: &Command) -> Option<String> {
         Command::Fetch { .. } => "fetched".to_owned(),
         Command::Pull { .. } => "pulled".to_owned(),
         Command::Push { .. } => "pushed".to_owned(),
+        Command::Config {
+            key: Some(key),
+            unset,
+            unset_all,
+            ..
+        } if *unset || *unset_all => format!("unset {key}"),
+        Command::Config {
+            key: Some(key),
+            value: Some(value),
+            get: false,
+            get_all: false,
+            ..
+        } => format!("set {key} = {value}"),
+        Command::Apply { check: true, .. } => "the patch applies cleanly".to_owned(),
+        Command::Apply { stat: false, .. } => "applied the patch".to_owned(),
+        Command::Notes { cmd: Some(cmd), .. } => match cmd {
+            NotesCmd::Add { rev, .. } | NotesCmd::Append { rev, .. } => {
+                format!("noted {}", rev.as_deref().unwrap_or("HEAD"))
+            }
+            NotesCmd::Remove { rev } => {
+                format!("removed the note of {}", rev.as_deref().unwrap_or("HEAD"))
+            }
+            _ => return None,
+        },
+        Command::UpdateRef {
+            name, delete: true, ..
+        } => format!("deleted {name}"),
+        Command::UpdateRef { name, .. } => format!("updated {name}"),
+        Command::Gc { .. } => "packed the object database".to_owned(),
         Command::Clean { dry_run: false, .. } => "removed untracked files".to_owned(),
         Command::Rm { paths, .. } if !paths.is_empty() => {
             format!("removed {}", paths.join(" "))

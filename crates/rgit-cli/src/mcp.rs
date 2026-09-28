@@ -15,8 +15,8 @@ use rgit_git::{Git2Backend, GitBackend, GrepQuery};
 use serde_json::{Map, Value, json};
 
 use crate::cli::{
-    BranchCmd, CliError, Command, DiffFormat, FlowCmd, IndexCmd, LanesCmd, RemoteCmd, StackCmd,
-    StashCmd, WorkspaceCmd, WorktreeCmd,
+    BranchCmd, CliError, Command, DiffFormat, FlowCmd, IndexCmd, LanesCmd, NotesCmd, RemoteCmd,
+    StackCmd, StashCmd, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::toon::{Node, Obj};
@@ -69,6 +69,9 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "git_stack_list",
     "git_workspace_list",
     "git_flow_status",
+    "git_config",
+    "git_notes",
+    "git_fsck",
 ];
 
 /// Whether a tool only reads (may be served over the read-only HTTP endpoint).
@@ -1285,6 +1288,151 @@ fn tools() -> Vec<Tool> {
             none,
         ),
         tool(
+            "git_config",
+            "Read config: the value of `key` (`all` returns every value of a multi-valued key), or \
+             every key=value when no key is given. `global` or `local` reads only that file.",
+            &[
+                ("key", "string", false),
+                ("all", "boolean", false),
+                ("global", "boolean", false),
+                ("local", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_config_set",
+            "Set config `key` to `value` in the repository's config (`global`: the user's). `add` \
+             appends to a multi-valued key; `unset` removes the key instead (no value needed).",
+            &[
+                ("key", "string", true),
+                ("value", "string", false),
+                ("global", "boolean", false),
+                ("add", "boolean", false),
+                ("unset", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_apply",
+            "Apply patch files (unified diffs) to the working tree; `cached` applies to the index \
+             only, `index` to both. `reverse` undoes a patch, `check` only tests that it applies, \
+             `stat` returns its diffstat without applying. Undo with git_undo.",
+            &[
+                ("patch", "paths", true),
+                ("cached", "boolean", false),
+                ("index", "boolean", false),
+                ("reverse", "boolean", false),
+                ("check", "boolean", false),
+                ("stat", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_notes",
+            "Notes attached to commits: the note of `rev`, or every note as `<note id> <object \
+             id>` lines when no rev is given. `ref` picks a notes ref (default refs/notes/commits).",
+            &[("rev", "string", false), ("ref", "string", false)],
+        ),
+        tool(
+            "git_note_add",
+            "Attach `message` as the note of `rev` (default HEAD). An existing note needs `force` \
+             to be replaced; `append` adds the message as a new paragraph instead.",
+            &[
+                ("message", "string", true),
+                ("rev", "string", false),
+                ("force", "boolean", false),
+                ("append", "boolean", false),
+                ("ref", "string", false),
+            ],
+        ),
+        tool(
+            "git_note_remove",
+            "Remove the note of `rev` (default HEAD).",
+            &[("rev", "string", false), ("ref", "string", false)],
+        ),
+        tool(
+            "git_update_ref",
+            "Point ref `name` (e.g. refs/heads/topic) at revision `new`, or delete it with \
+             `delete`. Destructive: it can move or delete a branch; undo with git_undo. `old` makes \
+             it conditional on the ref's current value (all zeros: the ref must not exist). A \
+             symbolic ref like HEAD is followed unless `no_deref`.",
+            &[
+                ("name", "string", true),
+                ("new", "string", false),
+                ("old", "string", false),
+                ("delete", "boolean", false),
+                ("no_deref", "boolean", false),
+                ("message", "string", false),
+            ],
+        ),
+        tool(
+            "git_hash_object",
+            "Object ids of files, one per line; `write` stores them in the repository. `type` is \
+             blob (default), tree, commit or tag.",
+            &[
+                ("path", "paths", true),
+                ("write", "boolean", false),
+                ("type", "string", false),
+            ],
+        ),
+        tool(
+            "git_format_patch",
+            "Write commits as mbox patch files, oldest first, and return their paths. `range` is \
+             `<a>..<b>`, or a base revision for the commits after it up to HEAD; `count` takes the \
+             newest n (ending at `range` when given). `output_dir` is the folder (default the \
+             current one); `stdout` returns the patches instead of writing files.",
+            &[
+                ("range", "string", false),
+                ("count", "integer", false),
+                ("output_dir", "string", false),
+                ("stdout", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_am",
+            "Apply mbox patch files (from git_format_patch) as commits. When a patch does not \
+             apply, resolve it and call with `continue`, or `skip` it, or `abort` to restore the \
+             branch. `three_way` falls back to a three-way merge; `signoff` adds Signed-off-by. \
+             Undo with git_undo.",
+            &[
+                ("mbox", "paths", false),
+                ("continue", "boolean", false),
+                ("skip", "boolean", false),
+                ("abort", "boolean", false),
+                ("three_way", "boolean", false),
+                ("signoff", "boolean", false),
+            ],
+        ),
+        tool(
+            "git_archive",
+            "Write the files of `rev` (default HEAD) to the archive file `output`: tar, tgz or zip \
+             (`format`, else from output's extension). `paths` limits it; `prefix` puts every \
+             entry under a folder (e.g. project/).",
+            &[
+                ("output", "string", true),
+                ("rev", "string", false),
+                ("paths", "paths", false),
+                ("format", "string", false),
+                ("prefix", "string", false),
+            ],
+        ),
+        tool(
+            "git_gc",
+            "Pack the object database and prune unreachable loose objects (git gc). Destructive: \
+             pruned objects are gone for good (rgit's undo history is kept). `prune` is the age \
+             cutoff (e.g. now; default 2 weeks ago); `aggressive` repacks thoroughly (slow).",
+            &[("prune", "string", false), ("aggressive", "boolean", false)],
+        ),
+        tool(
+            "git_fsck",
+            "Check the object database for corruption; returns problems and dangling objects. \
+             `full` checks packed objects too, `unreachable` lists unreachable objects, \
+             `no_dangling` hides dangling ones.",
+            &[
+                ("full", "boolean", false),
+                ("strict", "boolean", false),
+                ("unreachable", "boolean", false),
+                ("no_dangling", "boolean", false),
+            ],
+        ),
+        tool(
             "git_clean",
             "Remove untracked files and directories. Destructive. `dry_run` lists what would be \
              removed without deleting. `paths` limits it; `ignored` also removes ignored files \
@@ -1377,6 +1525,9 @@ const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
     ("flow init", "git_flow_init", &["preset"]),
     ("flow start", "git_flow_start", &["name"]),
     ("flow finish", "git_flow_finish", &[]),
+    ("notes add", "git_note_add", &["rev"]),
+    ("notes remove", "git_note_remove", &["rev"]),
+    ("notes show", "git_notes", &["rev"]),
     ("git ls-files", "git_files", &[]),
     ("status", "git_status", &[]),
     ("log", "git_log", &["rev"]),
@@ -1408,6 +1559,14 @@ const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
     ("worktree", "git_worktrees", &[]),
     ("workspace", "git_workspace_list", &[]),
     ("stack", "git_stack_list", &[]),
+    ("notes", "git_notes", &[]),
+    ("config", "git_config", &["key"]),
+    ("apply", "git_apply", &["patch"]),
+    ("format-patch", "git_format_patch", &["range"]),
+    ("am", "git_am", &["mbox"]),
+    ("update-ref", "git_update_ref", &["name", "new", "old"]),
+    ("gc", "git_gc", &[]),
+    ("fsck", "git_fsck", &[]),
 ];
 
 /// CLI flags that take a value, and the tool parameter they set.
@@ -2028,6 +2187,125 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         }),
         "git_worktree_prune" => worktree(WorktreeCmd::Prune),
 
+        "git_config" | "git_config_set" => {
+            let set = a.tool == "git_config_set";
+            let unset = set && a.flag("unset");
+            Command::Config {
+                key: if set {
+                    Some(a.req("key")?)
+                } else {
+                    a.str("key")
+                },
+                value: if set && !unset {
+                    Some(a.req("value")?)
+                } else {
+                    None
+                },
+                global: a.flag("global"),
+                local: a.flag("local"),
+                get: false,
+                get_all: a.flag("all"),
+                unset,
+                unset_all: false,
+                list: !set && a.str("key").is_none(),
+                add: a.flag("add"),
+                as_bool: false,
+                as_int: false,
+            }
+        }
+        "git_apply" => Command::Apply {
+            patches: a.strs("patch")?,
+            cached: a.flag("cached"),
+            index: a.flag("index"),
+            check: a.flag("check"),
+            reverse: a.flag("reverse"),
+            stat: a.flag("stat"),
+        },
+        "git_notes" | "git_note_add" | "git_note_remove" => Command::Notes {
+            notes_ref: a.str("ref"),
+            cmd: Some(match a.tool {
+                "git_notes" => match a.str("rev") {
+                    Some(rev) => NotesCmd::Show { rev: Some(rev) },
+                    None => NotesCmd::List { rev: None },
+                },
+                "git_note_remove" => NotesCmd::Remove { rev: a.str("rev") },
+                _ if a.flag("append") => NotesCmd::Append {
+                    rev: a.str("rev"),
+                    message: vec![a.req("message")?],
+                },
+                _ => NotesCmd::Add {
+                    rev: a.str("rev"),
+                    message: vec![a.req("message")?],
+                    force: a.flag("force"),
+                },
+            }),
+        },
+        "git_update_ref" => {
+            let delete = a.flag("delete");
+            Command::UpdateRef {
+                name: a.req("name")?,
+                new: if delete {
+                    a.str("old")
+                } else {
+                    Some(a.req("new")?)
+                },
+                old: if delete { None } else { a.str("old") },
+                delete,
+                no_deref: a.flag("no_deref"),
+                message: a.str("message"),
+            }
+        }
+        "git_hash_object" => Command::HashObject {
+            paths: a.strs("path")?,
+            write: a.flag("write"),
+            stdin: false,
+            kind: a.or("type", "blob"),
+        },
+        "git_format_patch" => Command::FormatPatch {
+            revs: a
+                .num("count")?
+                .map(|n| format!("-{n}"))
+                .into_iter()
+                .chain(a.str("range"))
+                .collect(),
+            output_dir: a.str("output_dir"),
+            stdout: a.flag("stdout"),
+        },
+        "git_am" => {
+            let (abort, cont, skip) = (a.flag("abort"), a.flag("continue"), a.flag("skip"));
+            Command::Am {
+                // Never read stdin: it carries the MCP protocol.
+                mbox: if abort || cont || skip {
+                    Vec::new()
+                } else {
+                    a.strs("mbox")?
+                },
+                abort,
+                cont,
+                skip,
+                three_way: a.flag("three_way"),
+                signoff: a.flag("signoff"),
+            }
+        }
+        "git_archive" => Command::Archive {
+            rev: a.str("rev"),
+            paths: a.strs("paths").unwrap_or_default(),
+            format: a.str("format"),
+            output: Some(a.req("output")?),
+            prefix: a.str("prefix"),
+        },
+        "git_gc" => Command::Gc {
+            prune: a.str("prune"),
+            aggressive: a.flag("aggressive"),
+            auto: false,
+        },
+        "git_fsck" => Command::Fsck {
+            full: a.flag("full"),
+            strict: a.flag("strict"),
+            unreachable: a.flag("unreachable"),
+            no_dangling: a.flag("no_dangling"),
+            connectivity_only: false,
+        },
         "git_clean" => Command::Clean {
             dry_run: a.flag("dry_run"),
             ignored_too: a.flag("ignored"),

@@ -1,0 +1,4 @@
+[env]
+# Building the clap command tree in a debug build needs more than the 2 MiB a
+# test thread gets; match the main thread's 8 MiB.
+RUST_MIN_STACK = "8388608"

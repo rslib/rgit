@@ -236,6 +236,33 @@ fn main() -> ! {
                 Err(e) => die(anyhow::anyhow!("could not run git: {e}"), &emit),
             }
         }
+        // An archive with no output file is raw bytes on stdout, as in git.
+        Some(command @ Command::Archive { output: None, .. }) => {
+            let backend = match discover_or_init(false) {
+                Ok(backend) => backend,
+                Err(error) => die(error, &emit),
+            };
+            let Command::Archive {
+                rev,
+                paths,
+                format,
+                prefix,
+                ..
+            } = cli::from_cwd(command, backend.workdir())
+            else {
+                unreachable!()
+            };
+            match cli::archive(&backend, rev, &paths, format, None, prefix) {
+                Ok(bytes) => {
+                    use std::io::Write;
+                    let mut out = std::io::stdout().lock();
+                    exit(i32::from(
+                        out.write_all(&bytes).and_then(|()| out.flush()).is_err(),
+                    ));
+                }
+                Err(error) => die(error, &emit),
+            }
+        }
         // Every other subcommand runs one operation and prints compact output.
         Some(Command::Forge {
             profile,
