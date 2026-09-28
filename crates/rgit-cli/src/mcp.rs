@@ -15,8 +15,8 @@ use rgit_git::{Git2Backend, GitBackend, GrepQuery};
 use serde_json::{Map, Value, json};
 
 use crate::cli::{
-    BranchCmd, CliError, Command, FlowCmd, IndexCmd, LanesCmd, RemoteCmd, StackCmd, StashCmd,
-    WorkspaceCmd, WorktreeCmd,
+    BranchCmd, CliError, Command, DiffFormat, FlowCmd, IndexCmd, LanesCmd, RemoteCmd, StackCmd,
+    StashCmd, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::toon::{Node, Obj};
@@ -595,52 +595,90 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_log",
-            "Commits newest first (limit, default 20): a table of id, summary, author, when, with a \
-             count when more exist. Filter with author, since, until, path; rev or all picks the \
-             start. Extra fields: oid, parents, refs, unpushed.",
+            "Commits newest first (limit, default 20; skip pages): a table of id, summary, \
+             author, when, with a count when more exist. Filter with author, since, until, path \
+             (one or many), grep \
+             (message regex; ignore_case), merges/no_merges; rev (one or many: `main`, `^main`, \
+             `A..B`, `A...B`) or all picks the start; first_parent, reverse, follow (one path \
+             across renames). patch, stat, name_only, name_status or numstat add each commit's \
+             changes as text. Extra fields: oid, parents, refs, unpushed.",
             &[
                 ("limit", "integer", false),
+                ("skip", "integer", false),
                 ("all", "boolean", false),
                 ("author", "string", false),
                 ("since", "string", false),
                 ("until", "string", false),
-                ("rev", "string", false),
-                ("path", "string", false),
+                ("rev", "paths", false),
+                ("path", "paths", false),
+                ("grep", "paths", false),
+                ("ignore_case", "boolean", false),
+                ("first_parent", "boolean", false),
+                ("merges", "boolean", false),
+                ("no_merges", "boolean", false),
+                ("reverse", "boolean", false),
+                ("follow", "boolean", false),
+                ("patch", "boolean", false),
+                ("stat", "boolean", false),
+                ("name_only", "boolean", false),
+                ("name_status", "boolean", false),
+                ("numstat", "boolean", false),
                 FIELDS,
             ],
         ),
         tool(
             "git_diff",
             "Changes as a diffstat table (path, added, removed) with totals. Default is unstaged \
-             changes; cached=true for staged; from/to for a ref range. patch=true returns the \
-             unified patch (truncated unless full); name_only=true returns only paths.",
+             changes; cached=true for staged; from alone diffs that revision against the working \
+             tree (the index with cached), or takes a range `A..B` / `A...B` (from the merge \
+             base); from+to diffs two revisions. paths limits to files, folders or globs. \
+             patch=true returns the unified patch (truncated unless full), with `unified` context \
+             lines and ignore_all_space; name_only, name_status and numstat list files.",
             &[
                 ("from", "string", false),
                 ("to", "string", false),
+                ("paths", "paths", false),
                 ("cached", "boolean", false),
                 ("patch", "boolean", false),
                 ("name_only", "boolean", false),
+                ("name_status", "boolean", false),
+                ("numstat", "boolean", false),
+                ("unified", "integer", false),
+                ("ignore_all_space", "boolean", false),
                 FIELDS,
                 FULL,
             ],
         ),
         tool(
             "git_show",
-            "One commit: id, author, when, subject, body, totals, and a changed-files table. \
-             patch=true returns its patch instead (truncated unless full).",
+            "One commit (default HEAD): id, author, when, subject, body, totals, and a \
+             changed-files table (paths limits it; no_patch drops it). patch=true returns its \
+             patch instead (truncated unless full); name_only/name_status/numstat list files. \
+             rev `<rev>:<path>` prints a file (or folder) at a revision, `:<path>` the staged \
+             file; several revs print each.",
             &[
-                ("rev", "string", true),
+                ("rev", "paths", false),
+                ("paths", "paths", false),
                 ("patch", "boolean", false),
                 ("name_only", "boolean", false),
+                ("name_status", "boolean", false),
+                ("numstat", "boolean", false),
+                ("no_patch", "boolean", false),
                 FIELDS,
                 FULL,
             ],
         ),
         tool(
             "git_blame",
-            "Blame a working-tree file: a table of line, id, author, text. Shows the first 200 \
-             lines; `lines` takes START,END, and help names the next range.",
-            &[("path", "string", true), ("lines", "string", false), FIELDS],
+            "Blame a file (working tree, or as of `rev`): a table of line, id, author, text. Shows \
+             the first 200 lines; `lines` takes START,END or START,+COUNT, and help names the \
+             next range.",
+            &[
+                ("path", "string", true),
+                ("rev", "string", false),
+                ("lines", "string", false),
+                FIELDS,
+            ],
         ),
         tool(
             "git_refs",
@@ -744,13 +782,16 @@ fn tools() -> Vec<Tool> {
             "git_describe",
             "Describe a revision relative to the nearest tag (default HEAD). `tags` uses \
              lightweight tags too, `dirty` appends -dirty, `long` forces long format, `abbrev` \
-             sets the oid length.",
+             sets the oid length (0: the tag only), `match` limits tags to a glob, `exact_match` \
+             fails unless a tag points at the revision.",
             &[
                 ("rev", "string", false),
                 ("tags", "boolean", false),
                 ("dirty", "boolean", false),
                 ("long", "boolean", false),
                 ("abbrev", "integer", false),
+                ("match", "string", false),
+                ("exact_match", "boolean", false),
             ],
         ),
         tool(
@@ -862,19 +903,39 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_merge",
-            "Merge a revision into the current branch. `no_ff` forces a merge commit, `ff_only` \
-             refuses a non-fast-forward, `abort` cancels a conflicted merge.",
+            "Merge a revision (or several, an octopus merge) into the current branch. `no_ff` \
+             forces a merge commit, `ff_only` refuses a non-fast-forward, `squash` stages the \
+             result without a merge commit, `no_commit` stops before committing, `message` sets \
+             the commit message, `strategy_option` (ours|theirs) settles conflicting hunks. \
+             `continue` commits a resolved merge, `abort` cancels a conflicted one.",
             &[
-                ("rev", "string", false),
+                ("rev", "paths", false),
                 ("no_ff", "boolean", false),
                 ("ff_only", "boolean", false),
+                ("squash", "boolean", false),
+                ("no_commit", "boolean", false),
+                ("message", "string", false),
+                ("strategy_option", "string", false),
+                ("continue", "boolean", false),
                 ("abort", "boolean", false),
             ],
         ),
         tool(
             "git_rebase",
-            "Rebase the current branch onto a revision.",
-            &[("onto", "string", true)],
+            "Rebase the current branch onto a revision (`onto`; the upstream when omitted). \
+             `newbase` replays the commits after `onto` onto it (git's --onto). `root` rebases \
+             down to the root commit, `autosquash` folds fixup!/squash! commits, `exec` runs \
+             shell commands after each commit, `update_refs` moves branches inside the range, \
+             `strategy_option` (ours|theirs) settles conflicting hunks.",
+            &[
+                ("onto", "string", false),
+                ("newbase", "string", false),
+                ("root", "boolean", false),
+                ("autosquash", "boolean", false),
+                ("exec", "string[]", false),
+                ("update_refs", "boolean", false),
+                ("strategy_option", "string", false),
+            ],
         ),
         tool(
             "git_rebase_continue",
@@ -889,13 +950,36 @@ fn tools() -> Vec<Tool> {
         tool("git_rebase_abort", "Abort an in-progress rebase.", none),
         tool(
             "git_cherry_pick",
-            "Cherry-pick a commit onto HEAD.",
-            &[("rev", "string", true), ("no_commit", "boolean", false)],
+            "Cherry-pick commits onto HEAD in order; `rev` is a commit, a range `A..B`, or a list. \
+             `record_origin` appends \"(cherry picked from commit ...)\", `mainline` picks the \
+             parent (from 1) of a merge commit, `strategy_option` (ours|theirs) settles \
+             conflicting hunks. After a conflict: `continue`, `skip` or `abort`.",
+            &[
+                ("rev", "paths", false),
+                ("no_commit", "boolean", false),
+                ("record_origin", "boolean", false),
+                ("mainline", "integer", false),
+                ("strategy_option", "string", false),
+                ("continue", "boolean", false),
+                ("skip", "boolean", false),
+                ("abort", "boolean", false),
+            ],
         ),
         tool(
             "git_revert",
-            "Revert a commit on HEAD.",
-            &[("rev", "string", true), ("no_commit", "boolean", false)],
+            "Revert commits on HEAD; `rev` is a commit, a range `A..B` (newest first), or a list. \
+             `mainline` picks the parent (from 1) of a merge commit, `strategy_option` \
+             (ours|theirs) settles conflicting hunks. After a conflict: `continue`, `skip` or \
+             `abort`.",
+            &[
+                ("rev", "paths", false),
+                ("no_commit", "boolean", false),
+                ("mainline", "integer", false),
+                ("strategy_option", "string", false),
+                ("continue", "boolean", false),
+                ("skip", "boolean", false),
+                ("abort", "boolean", false),
+            ],
         ),
         tool(
             "git_reset",
@@ -1315,6 +1399,8 @@ const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
     ("checkout", "git_checkout", &["rev"]),
     ("merge", "git_merge", &["rev"]),
     ("rebase", "git_rebase", &["onto"]),
+    ("cherry-pick", "git_cherry_pick", &["rev"]),
+    ("revert", "git_revert", &["rev"]),
     ("stash", "git_stash_push", &[]),
     ("branch", "git_branches", &[]),
     ("tag", "git_tag_create", &["name"]),
@@ -1539,6 +1625,11 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         onto,
         onto_new: None,
         edit: false,
+        root: false,
+        autosquash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        strategy_option: None,
         cont,
         skip,
         abort,
@@ -1560,6 +1651,13 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         list: false,
     };
     let stash_index = || a.num("index").map(|n| n.map(|n| n as usize));
+    let format = || DiffFormat {
+        patch: a.flag("patch"),
+        stat: a.flag("stat"),
+        name_only: a.flag("name_only"),
+        name_status: a.flag("name_status"),
+        numstat: a.flag("numstat"),
+    };
     Ok(Some(match a.tool {
         "git_status" => Command::Status {
             porcelain: None,
@@ -1572,29 +1670,40 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         },
         "git_log" => Command::Log {
             limit: a.num("limit")?.map_or(20, |n| n as usize),
+            skip: a.num("skip")?.map_or(0, |n| n as usize),
             all: a.flag("all"),
             author: a.str("author"),
             since: a.str("since"),
             until: a.str("until"),
             oneline: false,
-            rev: a.str("rev"),
-            path: a.str("path"),
+            grep: a.strs("grep").unwrap_or_default(),
+            ignore_case: a.flag("ignore_case"),
+            first_parent: a.flag("first_parent"),
+            merges: a.flag("merges"),
+            no_merges: a.flag("no_merges"),
+            reverse: a.flag("reverse"),
+            follow: a.flag("follow"),
+            format: format(),
+            revs: a.strs("rev").unwrap_or_default(),
+            paths: a.strs("path").unwrap_or_default(),
         },
         "git_diff" => Command::Diff {
-            from: a.str("from"),
-            to: a.str("to"),
-            patch: a.flag("patch"),
+            revs: a.str("from").into_iter().chain(a.str("to")).collect(),
+            paths: a.strs("paths").unwrap_or_default(),
             cached: a.flag("cached"),
-            name_only: a.flag("name_only"),
-            stat: false,
+            format: format(),
+            unified: a.num("unified")?.map(|n| n as u32),
+            ignore_all_space: a.flag("ignore_all_space"),
+            ignore_space_change: false,
         },
         "git_show" => Command::Show {
-            rev: a.req("rev")?,
-            patch: a.flag("patch"),
-            name_only: a.flag("name_only"),
+            revs: a.strs("rev").unwrap_or_default(),
+            paths: a.strs("paths").unwrap_or_default(),
+            format: format(),
+            no_patch: a.flag("no_patch"),
         },
         "git_blame" => Command::Blame {
-            path: a.req("path")?,
+            args: a.str("rev").into_iter().chain([a.req("path")?]).collect(),
             lines: a.str("lines"),
         },
         "git_refs" => Command::Refs,
@@ -1613,6 +1722,9 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             dirty: a.flag("dirty"),
             long: a.flag("long"),
             abbrev: a.num("abbrev")?.map(|n| n as u32),
+            always: false,
+            pattern: a.str("match"),
+            exact_match: a.flag("exact_match"),
         },
         "index_build" => index(IndexCmd::Build {
             root: a.str("root"),
@@ -1696,22 +1808,53 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             branch: None,
         },
         "git_merge" => Command::Merge {
-            rev: a.str("rev"),
+            revs: a.strs("rev").unwrap_or_default(),
             no_ff: a.flag("no_ff"),
             ff_only: a.flag("ff_only"),
+            squash: a.flag("squash"),
+            no_commit: a.flag("no_commit"),
+            message: a.str("message"),
+            strategy_option: a.str("strategy_option"),
+            no_edit: false,
+            cont: a.flag("continue"),
             abort: a.flag("abort"),
         },
-        "git_rebase" => rebase(Some(a.req("onto")?), false, false, false),
+        "git_rebase" => Command::Rebase {
+            onto: a.str("onto"),
+            onto_new: a.str("newbase"),
+            edit: false,
+            root: a.flag("root"),
+            autosquash: a.flag("autosquash"),
+            exec: a.strings("exec")?,
+            update_refs: a.flag("update_refs"),
+            strategy_option: a.str("strategy_option"),
+            cont: false,
+            skip: false,
+            abort: false,
+        },
         "git_rebase_continue" => rebase(None, true, false, false),
         "git_rebase_skip" => rebase(None, false, true, false),
         "git_rebase_abort" => rebase(None, false, false, true),
         "git_cherry_pick" => Command::CherryPick {
-            rev: Some(a.req("rev")?),
+            revs: a.strs("rev").unwrap_or_default(),
             no_commit: a.flag("no_commit"),
+            record_origin: a.flag("record_origin"),
+            mainline: a.num("mainline")?.map(|m| m as u32),
+            strategy_option: a.str("strategy_option"),
+            no_edit: false,
+            cont: a.flag("continue"),
+            skip: a.flag("skip"),
+            abort: a.flag("abort"),
         },
         "git_revert" => Command::Revert {
-            rev: Some(a.req("rev")?),
+            revs: a.strs("rev").unwrap_or_default(),
             no_commit: a.flag("no_commit"),
+            mainline: a.num("mainline")?.map(|m| m as u32),
+            strategy_option: a.str("strategy_option"),
+            no_edit: false,
+            cont: a.flag("continue"),
+            skip: a.flag("skip"),
+            abort: a.flag("abort"),
         },
         "git_reset" => {
             let (soft, hard) = match a.str("mode").as_deref() {
@@ -2273,14 +2416,51 @@ mod tests {
     }
 
     #[test]
+    fn history_tools_take_ranges_paths_and_revisions() {
+        let dir = init_repo("history");
+        let backend = open(&dir);
+        std::fs::write(dir.join("g.txt"), "gee\n").unwrap();
+        std::fs::write(dir.join("f.txt"), "y\n").unwrap();
+        git(&dir, &["commit", "-qam", "c1"]);
+        git(&dir, &["add", "g.txt"]);
+        git(&dir, &["commit", "-qm", "c2"]);
+
+        let log = call(&backend, "git_log", json!({ "rev": "HEAD~1..HEAD" })).unwrap();
+        assert!(log.contains("c2") && !log.contains("c1"), "{log}");
+        let log = call(
+            &backend,
+            "git_log",
+            json!({ "path": ["f.txt"], "grep": "1$" }),
+        )
+        .unwrap();
+        assert!(log.contains("c1") && !log.contains("c0"), "{log}");
+        let diff = call(
+            &backend,
+            "git_diff",
+            json!({ "from": "HEAD~2..HEAD", "paths": "g.txt", "name_only": true }),
+        )
+        .unwrap();
+        assert!(diff.contains("g.txt") && !diff.contains("f.txt"), "{diff}");
+        let show = call(&backend, "git_show", json!({ "rev": "HEAD:g.txt" })).unwrap();
+        assert!(show.contains("gee"), "{show}");
+        let blame = call(
+            &backend,
+            "git_blame",
+            json!({ "path": "f.txt", "rev": "HEAD~2" }),
+        )
+        .unwrap();
+        assert!(blame.contains(",x"), "{blame}");
+    }
+
+    #[test]
     fn errors_carry_help() {
         let dir = init_repo("errors");
         let backend = open(&dir);
 
-        let missing = call(&backend, "git_show", json!({})).unwrap_err();
+        let missing = call(&backend, "git_blame", json!({})).unwrap_err();
         assert_eq!(
             missing,
-            "error: rev required\nhelp[1]: Call git_show with `rev` set"
+            "error: path required\nhelp[1]: Call git_blame with `path` set"
         );
 
         let nothing = call(&backend, "git_commit", json!({ "message": "m" })).unwrap_err();

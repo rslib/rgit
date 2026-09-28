@@ -7,15 +7,19 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit log --limit 50",
             "rgit log main -- src/lib.rs",
+            "rgit log main..feature",
             "rgit log --author alice --since 2024-01-01",
+            "rgit log --grep fix --no-merges -p",
+            "rgit log --follow --stat -- src/lib.rs",
         ],
     ),
     (
         "diff",
         &[
             "rgit diff",
-            "rgit diff --cached",
-            "rgit diff main HEAD --patch",
+            "rgit diff --cached -- src",
+            "rgit diff main...HEAD --name-status",
+            "rgit diff v1 HEAD --patch -U1 -w -- src",
         ],
     ),
     (
@@ -24,11 +28,16 @@ const EXAMPLES: &[Entry] = &[
             "rgit show HEAD",
             "rgit show <rev> --patch",
             "rgit show <rev> --name-only",
+            "rgit show HEAD~1:src/lib.rs",
         ],
     ),
     (
         "blame",
-        &["rgit blame src/lib.rs", "rgit blame src/lib.rs -L 10,20"],
+        &[
+            "rgit blame src/lib.rs",
+            "rgit blame src/lib.rs -L 10,20",
+            "rgit blame v1 -- src/lib.rs",
+        ],
     ),
     ("refs", &["rgit refs"]),
     (
@@ -147,6 +156,10 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit merge <branch>",
             "rgit merge <branch> --no-ff",
+            "rgit merge <branch> --squash",
+            "rgit merge <branch> -m \"<message>\"",
+            "rgit merge <a> <b>",
+            "rgit merge --continue",
             "rgit merge --abort",
         ],
     ),
@@ -155,6 +168,9 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit rebase main",
             "rgit rebase --onto <newbase> <upstream>",
+            "rgit rebase --autosquash main",
+            "rgit rebase --exec \"cargo test\" main",
+            "rgit rebase --root",
             "rgit rebase --continue",
         ],
     ),
@@ -183,11 +199,22 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit cherry-pick <rev>",
             "rgit cherry-pick <rev> --no-commit",
+            "rgit cherry-pick <a> <b>",
+            "rgit cherry-pick main~3..main -x",
+            "rgit cherry-pick <merge> -m 1",
+            "rgit cherry-pick --continue",
+            "rgit cherry-pick --abort",
         ],
     ),
     (
         "revert",
-        &["rgit revert <rev>", "rgit revert <rev> --no-commit"],
+        &[
+            "rgit revert <rev>",
+            "rgit revert <rev> --no-commit",
+            "rgit revert HEAD~2..HEAD",
+            "rgit revert <merge> -m 1",
+            "rgit revert --continue",
+        ],
     ),
     (
         "tag",
@@ -201,7 +228,14 @@ const EXAMPLES: &[Entry] = &[
     ("clean", &["rgit clean", "rgit clean --dry-run"]),
     ("rm", &["rgit rm src/lib.rs", "rgit rm src/lib.rs --cached"]),
     ("mv", &["rgit mv src/old.rs src/new.rs"]),
-    ("describe", &["rgit describe", "rgit describe HEAD --tags"]),
+    (
+        "describe",
+        &[
+            "rgit describe",
+            "rgit describe HEAD --tags",
+            "rgit describe --tags --abbrev=0",
+        ],
+    ),
     ("init", &["rgit init", "rgit init <path> -b main"]),
     (
         "clone",

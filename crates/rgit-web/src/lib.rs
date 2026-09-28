@@ -415,7 +415,10 @@ fn log_page(
         limit: LOG_PAGE,
         offset,
         author: author.clone(),
-        rev: (rev != "HEAD").then(|| rev.to_owned()),
+        revs: (rev != "HEAD")
+            .then(|| rev.to_owned())
+            .into_iter()
+            .collect(),
         ..LogOptions::default()
     })?;
     if q.contains_key("partial") {

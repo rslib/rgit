@@ -45,84 +45,85 @@ pub fn run(
             untracked.as_deref(),
             ignored,
         )?),
-        Command::Log {
-            limit,
-            all,
-            author,
-            since,
-            until,
-            oneline: _,
-            rev,
-            path,
-        } => {
-            let filtered = author.is_some() || since.is_some() || until.is_some() || path.is_some();
-            let opts = LogOptions {
-                limit,
-                all,
-                author,
-                rev: rev.clone(),
-                since: since.as_deref().map(crate::cli::parse_date).transpose()?,
-                until: until.as_deref().map(crate::cli::parse_date).transpose()?,
-                path,
-                ..LogOptions::default()
-            };
+        Command::Log { format, .. } if !format.any() => {
+            let opts: LogOptions = crate::cli::log_options(backend, &command)?;
+            let filtered = opts.author.is_some()
+                || opts.since.is_some()
+                || opts.until.is_some()
+                || !opts.paths.is_empty()
+                || !opts.grep.is_empty()
+                || opts.merges.is_some();
             let entries = backend.log(&opts)?;
-            let total = if entries.len() < limit {
+            let total = if entries.len() < opts.limit {
                 Some(entries.len())
             } else if filtered {
                 None
             } else {
-                let from = if all {
-                    "--all".to_owned()
-                } else {
-                    rev.clone().unwrap_or_else(|| "HEAD".to_owned())
-                };
-                backend
-                    .git(&["rev-list".to_owned(), "--count".to_owned(), from])
-                    .ok()
-                    .and_then(|n| n.trim().parse().ok())
+                let mut args = vec!["rev-list".to_owned(), "--count".to_owned()];
+                if opts.first_parent {
+                    args.push("--first-parent".to_owned());
+                }
+                if opts.all {
+                    args.push("--all".to_owned());
+                } else if opts.revs.is_empty() {
+                    args.push("HEAD".to_owned());
+                }
+                args.extend(opts.revs.iter().cloned());
+                backend.git(&args).ok().and_then(|n| n.trim().parse().ok())
             };
             let mut base = String::from("rgit log");
-            if all {
+            if opts.all {
                 base.push_str(" --all");
             }
-            if let Some(rev) = &opts.rev {
+            for rev in &opts.revs {
                 base.push(' ');
                 base.push_str(rev);
             }
             log(&entries, total, filtered, &base)
         }
         Command::Diff {
-            from,
-            to,
-            patch,
+            format,
+            ref revs,
             cached,
-            name_only,
-            stat: _,
+            ..
         } => {
-            let (files, scope) = match (&from, &to) {
-                (Some(from), Some(to)) => (backend.diff_refs(from, to)?, format!("{from}..{to}")),
-                (Some(rev), None) => (backend.diff_refs(rev, "HEAD")?, format!("{rev}..HEAD")),
-                (None, _) if cached => (backend.status()?.staged, "staged".to_owned()),
-                (None, _) => (backend.status()?.unstaged, "unstaged".to_owned()),
-            };
+            let (files, scope) = crate::cli::diff_files(backend, &command)?;
             let mut base = String::from("rgit diff");
-            for rev in [&from, &to].into_iter().flatten() {
+            for rev in revs {
                 base.push(' ');
                 base.push_str(rev);
             }
             if cached {
                 base.push_str(" --cached");
             }
-            diff(&files, &scope, &base, patch, name_only)
+            if format.name_status || format.numstat || (format.patch && format.stat) {
+                Output::new(crate::cli::diff_out(&files, format))
+            } else {
+                diff(&files, &scope, &base, format.patch, format.name_only)
+            }
         }
         Command::Show {
-            rev,
-            patch,
-            name_only,
-        } => show(&backend.commit_details(&rev)?, patch, name_only),
-        Command::Blame { path, lines } => {
-            let all = backend.blame(&path).map_err(|e| match e {
+            ref revs,
+            ref paths,
+            format,
+            no_patch,
+        } if revs.len() <= 1
+            && !revs.iter().any(|r| r.contains(':'))
+            && !(format.name_status || format.numstat) =>
+        {
+            let mut c = backend.commit_details(revs.first().map_or("HEAD", String::as_str))?;
+            if !paths.is_empty() {
+                c.files
+                    .retain(|f| rgit_git::pathspec_matches(paths, &f.path));
+            }
+            if no_patch {
+                c.files.clear();
+            }
+            show(&c, format.patch && !no_patch, format.name_only && !no_patch)
+        }
+        Command::Blame { args, lines } => {
+            let path = args.join(" ");
+            let all = crate::cli::blame(backend, &args).map_err(|e| match e {
                 rgit_git::GitError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
                     anyhow::Error::new(crate::cli::CliError {
                         message: format!("no file {path} in this repository"),
@@ -568,7 +569,7 @@ fn tag_exists(backend: &Arc<dyn GitBackend>, name: &str) -> anyhow::Result<bool>
     Ok(backend.all_tags()?.iter().any(|t| t.name == name))
 }
 
-fn line_counts(f: &FileDiff) -> (usize, usize) {
+pub(crate) fn line_counts(f: &FileDiff) -> (usize, usize) {
     let (mut add, mut del) = (0, 0);
     for l in f.hunks.iter().flat_map(|h| &h.lines) {
         match l.origin {
@@ -659,7 +660,23 @@ pub fn run_status(s: &RepoStatus) -> Output {
                 .help("Run `rgit rebase --continue` after resolving conflicts")
                 .help("Run `rgit rebase --abort` to give up the rebase");
         }
-        Some("merging") => out = out.help("Run `rgit merge --abort` to give up the merge"),
+        Some("merging") => {
+            out = out
+                .help("Run `rgit merge --continue` after resolving conflicts")
+                .help("Run `rgit merge --abort` to give up the merge");
+        }
+        Some(state @ ("cherry-picking" | "reverting")) => {
+            let verb = if state == "reverting" {
+                "revert"
+            } else {
+                "cherry-pick"
+            };
+            out = out
+                .help(format!(
+                    "Run `rgit {verb} --continue` after resolving conflicts"
+                ))
+                .help(format!("Run `rgit {verb} --abort` to give up the {verb}"));
+        }
         _ => {}
     }
     if conflicted {
@@ -959,13 +976,28 @@ fn done_message(c: &Command) -> Option<String> {
         } => format!("created and checked out {new}"),
         Command::Checkout { rev: Some(rev), .. } => format!("checked out {rev}"),
         Command::Merge { abort: true, .. } => "merge aborted".to_owned(),
-        Command::Merge { rev: Some(rev), .. } => format!("merged {rev}"),
+        Command::Merge { cont: true, .. } => "merge committed".to_owned(),
+        Command::Merge {
+            squash: true, revs, ..
+        } => {
+            format!(
+                "squashed {} into the index; commit to finish",
+                revs.join(" ")
+            )
+        }
+        Command::Merge {
+            no_commit: true,
+            revs,
+            ..
+        } => format!("merged {} without committing", revs.join(" ")),
+        Command::Merge { revs, .. } if !revs.is_empty() => format!("merged {}", revs.join(" ")),
         Command::Rebase { abort: true, .. } => "rebase aborted".to_owned(),
         Command::Rebase { cont: true, .. } => "rebase continued".to_owned(),
         Command::Rebase { skip: true, .. } => "skipped the current commit".to_owned(),
         Command::Rebase {
             onto: Some(onto), ..
         } => format!("rebased onto {onto}"),
+        Command::Rebase { .. } => "rebased".to_owned(),
         Command::Reset {
             rev: Some(rev),
             soft,
@@ -979,8 +1011,17 @@ fn done_message(c: &Command) -> Option<String> {
             };
             format!("reset to {rev} ({mode})")
         }
-        Command::CherryPick { rev: Some(rev), .. } => format!("cherry-picked {rev}"),
-        Command::Revert { rev: Some(rev), .. } => format!("reverted {rev}"),
+        Command::CherryPick { abort: true, .. } => "cherry-pick aborted".to_owned(),
+        Command::CherryPick { cont: true, .. } => "cherry-pick continued".to_owned(),
+        Command::CherryPick { skip: true, .. } | Command::Revert { skip: true, .. } => {
+            "skipped the current commit".to_owned()
+        }
+        Command::CherryPick { revs, .. } if !revs.is_empty() => {
+            format!("cherry-picked {}", revs.join(" "))
+        }
+        Command::Revert { abort: true, .. } => "revert aborted".to_owned(),
+        Command::Revert { cont: true, .. } => "revert continued".to_owned(),
+        Command::Revert { revs, .. } if !revs.is_empty() => format!("reverted {}", revs.join(" ")),
         Command::Branch { cmd: Some(cmd), .. } => match cmd {
             BranchCmd::Create { name } => format!("created and checked out branch {name}"),
             BranchCmd::Checkout { name } => format!("checked out {name}"),

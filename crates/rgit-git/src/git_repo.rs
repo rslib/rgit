@@ -251,21 +251,41 @@ impl GitBackend for Git2Backend {
             .unwrap_or(0);
 
         let mut walk = repo.revwalk()?;
-        let seeded = if opts.all {
-            walk.push_glob("refs/*").is_ok()
-        } else if let Some(rev) = &opts.rev {
-            repo.revparse_single(rev)
-                .ok()
-                .and_then(|o| o.peel_to_commit().ok())
-                .map(|c| walk.push(c.id()).is_ok())
-                .unwrap_or(false)
-        } else {
-            walk.push_head().is_ok()
-        };
+        let mut seeded = opts.all && walk.push_glob("refs/*").is_ok();
+        for rev in &opts.revs {
+            seeded |= push_rev(&repo, &mut walk, rev)?;
+        }
+        if !opts.all && opts.revs.is_empty() {
+            seeded = walk.push_head().is_ok();
+        }
         if !seeded {
             return Ok(Vec::new());
         }
         walk.set_sorting(git2::Sort::TIME)?;
+        if opts.first_parent {
+            walk.simplify_first_parent()?;
+        }
+        let grep = if opts.grep.is_empty() {
+            None
+        } else {
+            let alt: Vec<String> = opts.grep.iter().map(|g| format!("(?:{g})")).collect();
+            Some(
+                regex::RegexBuilder::new(&alt.join("|"))
+                    .case_insensitive(opts.grep_ignore_case)
+                    .multi_line(true)
+                    .build()
+                    .map_err(|e| GitError::Other(format!("bad --grep pattern: {e}")))?,
+            )
+        };
+        let mut follow = match (opts.follow, &opts.paths[..]) {
+            (true, [path]) => Some(path.clone()),
+            (true, _) => {
+                return Err(GitError::Other(
+                    "--follow requires exactly one pathspec".into(),
+                ));
+            }
+            _ => None,
+        };
 
         let unpushed = unpushed_oids(&repo);
         let decorations = log_decorations(&repo);
@@ -283,8 +303,23 @@ impl GitBackend for Git2Backend {
             {
                 continue;
             }
-            if let Some(path) = &opts.path
-                && !commit_touched_path(&repo, &commit, path)
+            if opts
+                .merges
+                .is_some_and(|m| m != (commit.parent_count() > 1))
+            {
+                continue;
+            }
+            if let Some(re) = &grep
+                && !re.is_match(&String::from_utf8_lossy(commit.message_bytes()))
+            {
+                continue;
+            }
+            if let Some(path) = &mut follow {
+                if !follow_path(&repo, &commit, path) {
+                    continue;
+                }
+            } else if !opts.paths.is_empty()
+                && !commit_touched_path(&repo, &commit, &opts.paths, opts.first_parent)
             {
                 continue;
             }
@@ -323,6 +358,9 @@ impl GitBackend for Git2Backend {
                 refs: decorations.get(&commit.id()).cloned().unwrap_or_default(),
                 unpushed: unpushed.contains(&commit.id()),
             });
+        }
+        if opts.reverse {
+            entries.reverse();
         }
         Ok(entries)
     }
@@ -592,6 +630,44 @@ impl GitBackend for Git2Backend {
         extract_with_renames(diff)
     }
 
+    fn diff(&self, spec: &crate::DiffSpec) -> Result<Vec<crate::FileDiff>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        sync_index(&repo)?;
+        let mut opts = DiffOptions::new();
+        // libgit2 has no `.` pathspec; it means the whole tree, the same as none.
+        for p in spec.paths.iter().filter(|p| *p != ".") {
+            opts.pathspec(p);
+        }
+        if let Some(n) = spec.context {
+            opts.context_lines(n);
+        }
+        opts.ignore_whitespace(spec.ignore_all_space)
+            .ignore_whitespace_change(spec.ignore_space_change);
+        let tree = |rev: &str| repo.revparse_single(rev).and_then(|o| o.peel_to_tree());
+        let diff = match (&spec.from, &spec.to) {
+            (Some(range), None) if range.contains("..") => {
+                let (old, new) = range_trees(&repo, range)?;
+                repo.diff_tree_to_tree(Some(&old), Some(&new), Some(&mut opts))?
+            }
+            (from, Some(to)) => {
+                let old = from.as_deref().map(tree).transpose()?;
+                repo.diff_tree_to_tree(old.as_ref(), Some(&tree(to)?), Some(&mut opts))?
+            }
+            (Some(from), None) if spec.cached => {
+                repo.diff_tree_to_index(Some(&tree(from)?), None, Some(&mut opts))?
+            }
+            (Some(from), None) => {
+                repo.diff_tree_to_workdir_with_index(Some(&tree(from)?), Some(&mut opts))?
+            }
+            (None, None) if spec.cached => {
+                let head = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+                repo.diff_tree_to_index(head.as_ref(), None, Some(&mut opts))?
+            }
+            (None, None) => repo.diff_index_to_workdir(None, Some(&mut opts))?,
+        };
+        extract_with_renames(diff)
+    }
+
     fn file_diff(&self, path: &str, staged: bool) -> Result<Option<crate::FileDiff>, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         sync_index(&repo)?;
@@ -621,29 +697,24 @@ impl GitBackend for Git2Backend {
         // blame and errors with "path does not exist". Match `git blame` and mark
         // every line not-yet-committed rather than failing.
         let blame = repo.blame_file(Path::new(path), None).ok();
+        Ok(blame_lines(blame.as_ref(), &content))
+    }
 
-        let lines = content
-            .lines()
-            .enumerate()
-            .map(
-                |(i, text)| match blame.as_ref().and_then(|b| b.get_line(i + 1)) {
-                    Some(hunk) => crate::BlameLine {
-                        short_id: hunk.final_commit_id().to_string().chars().take(7).collect(),
-                        author: hunk
-                            .final_signature()
-                            .and_then(|s| s.name().ok().map(str::to_owned))
-                            .unwrap_or_else(|| "?".to_owned()),
-                        line: text.to_owned(),
-                    },
-                    None => crate::BlameLine {
-                        short_id: String::new(),
-                        author: String::new(),
-                        line: text.to_owned(),
-                    },
-                },
-            )
-            .collect();
-        Ok(lines)
+    fn blame_at(&self, rev: &str, path: &str) -> Result<Vec<crate::BlameLine>, GitError> {
+        let repo = self.repo.lock().expect("repo mutex");
+        let commit = repo.revparse_single(rev)?.peel_to_commit()?;
+        let blob = commit
+            .tree()?
+            .get_path(Path::new(path))?
+            .to_object(&repo)?
+            .peel_to_blob()?;
+        let mut opts = git2::BlameOptions::new();
+        opts.newest_commit(commit.id());
+        let blame = repo.blame_file(Path::new(path), Some(&mut opts))?;
+        Ok(blame_lines(
+            Some(&blame),
+            &String::from_utf8_lossy(blob.content()),
+        ))
     }
 
     fn ignored(&self) -> Result<Vec<StatusEntry>, GitError> {
@@ -855,12 +926,18 @@ impl GitBackend for Git2Backend {
 
     fn read_blob(&self, rev: &str, path: &str) -> Result<crate::Blob, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
-        let commit = repo.revparse_single(rev)?.peel_to_commit()?;
-        let blob = commit
-            .tree()?
-            .get_path(std::path::Path::new(path))?
-            .to_object(&repo)?
-            .peel_to_blob()?;
+        // An empty rev reads the index, as git's `:path` does.
+        let blob = if rev.is_empty() {
+            sync_index(&repo)?;
+            let entry = repo
+                .index()?
+                .get_path(Path::new(path), 0)
+                .ok_or_else(|| GitError::Other(format!("path '{path}' is not in the index")))?;
+            repo.find_blob(entry.id)?
+        } else {
+            repo.revparse_single(&format!("{rev}:{path}"))?
+                .peel_to_blob()?
+        };
         let content = blob.content();
         let is_binary = blob.is_binary();
         Ok(crate::Blob {
@@ -1356,23 +1433,71 @@ impl GitBackend for Git2Backend {
         self.run_git(&["rebase", "--skip"], &[]).map(drop)
     }
 
-    fn rebase_interactive(&self, onto: Option<&str>) -> Result<(), GitError> {
-        // Inherit stdio so git can open the todo editor on the terminal.
-        let mut cmd = std::process::Command::new("git");
-        cmd.arg("rebase").arg("-i").current_dir(&self.workdir);
-        if let Some(onto) = onto {
-            cmd.arg(onto);
+    fn rebase_with(
+        &self,
+        upstream: Option<&str>,
+        opts: &crate::RebaseOptions,
+    ) -> Result<(), GitError> {
+        // libgit2's rebase has no todo list, so these run on git's sequencer.
+        let mut args = vec!["rebase"];
+        if opts.interactive || opts.autosquash {
+            args.push("-i");
         }
-        let status = cmd
-            .status()
-            .map_err(|e| GitError::Cli(format!("could not run git: {e}")))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(GitError::Cli(
-                "interactive rebase failed or was aborted".into(),
-            ))
+        if opts.autosquash {
+            args.push("--autosquash");
         }
+        for cmd in &opts.exec {
+            args.extend(["--exec", cmd]);
+        }
+        if opts.root {
+            args.push("--root");
+        }
+        if opts.update_refs {
+            args.push("--update-refs");
+        }
+        if let Some(side) = &opts.strategy_option {
+            args.extend(["-X", side]);
+        }
+        if let Some(onto) = &opts.onto {
+            args.extend(["--onto", onto]);
+        }
+        args.extend(upstream);
+        self.logged("rebase", || {
+            let result = if opts.interactive {
+                // Inherit stdio so git can open the todo editor on the terminal.
+                let status = std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(&self.workdir)
+                    .status()
+                    .map_err(|e| GitError::Cli(format!("could not run git: {e}")))?;
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err(GitError::Cli(
+                        "interactive rebase failed or was aborted".into(),
+                    ))
+                }
+            } else {
+                // The todo list is taken as generated; commit messages as they are.
+                self.run_git(
+                    &args,
+                    &[("GIT_SEQUENCE_EDITOR", "true"), ("GIT_EDITOR", "true")],
+                )
+                .map(drop)
+            };
+            let stopped =
+                self.repo.lock().expect("repo mutex").state() != git2::RepositoryState::Clean;
+            match result {
+                Err(GitError::Cli(msg)) if stopped => {
+                    let why: Vec<&str> = msg.lines().filter(|l| !l.starts_with("hint:")).collect();
+                    Err(GitError::Conflict(format!(
+                        "{}; resolve, then run `rgit rebase --continue` (or --skip / --abort)",
+                        why.join("; ")
+                    )))
+                }
+                other => other,
+            }
+        })
     }
 
     fn undo(&self) -> Result<String, GitError> {
@@ -1647,11 +1772,15 @@ impl GitBackend for Git2Backend {
         dirty: bool,
         long: bool,
         abbrev: Option<u32>,
+        pattern: Option<&str>,
     ) -> Result<String, GitError> {
         let repo = self.repo.lock().expect("repo mutex");
         let mut opts = git2::DescribeOptions::new();
         if tags {
             opts.describe_tags();
+        }
+        if let Some(p) = pattern {
+            opts.pattern(p);
         }
         opts.show_commit_oid_as_fallback(true);
         // git2's Object::describe never sets the dirty flag; only the workdir
@@ -1701,47 +1830,99 @@ impl GitBackend for Git2Backend {
         })
     }
 
-    fn cherry_pick(&self, rev: &str, no_commit: bool) -> Result<(), GitError> {
+    fn pick(&self, revs: &[String], opts: &crate::PickOptions) -> Result<(), GitError> {
+        self.logged(if opts.revert { "revert" } else { "cherry-pick" }, || {
+            let repo = self.repo.lock().expect("repo mutex");
+            sync_index(&repo)?;
+            use git2::RepositoryState as S;
+            if !matches!(repo.state(), S::Clean | S::Bisect) {
+                return Err(GitError::Conflict(
+                    "an operation is already in progress; finish or abort it first".into(),
+                ));
+            }
+            let todo = pick_list(&repo, revs, opts.revert)?;
+            if todo.is_empty() {
+                return Err(GitError::Other("no commits to apply".into()));
+            }
+            let orig_head = repo.head()?.peel_to_commit()?.id();
+            run_picks(&repo, &todo, opts, orig_head)
+        })
+    }
+
+    fn pick_continue(&self) -> Result<(), GitError> {
         self.logged("cherry-pick", || {
             let repo = self.repo.lock().expect("repo mutex");
-            let source = repo.revparse_single(rev)?.peel_to_commit()?;
-            repo.cherrypick(&source, None)?;
-            if no_commit {
-                // Leave the change staged; the caller commits when ready.
-                return Ok(());
+            sync_index(&repo)?;
+            let state = read_pick_state(&repo)?;
+            let mut index = repo.index()?;
+            if index.has_conflicts() {
+                return Err(GitError::Conflict(
+                    "resolve the conflicts and stage the files first".into(),
+                ));
             }
-            finalize_sequenced(&repo, &source.author(), source.message().unwrap_or(""))
+            if let Some(source) = pick_head(&repo) {
+                let source = repo.find_commit(source)?;
+                let head = repo.head()?.peel_to_commit()?;
+                let tree = repo.find_tree(index.write_tree()?)?;
+                if tree.id() == head.tree_id() {
+                    return Err(GitError::Conflict(format!(
+                        "the {} is now empty; run `rgit {} --skip`",
+                        state.verb(),
+                        state.verb()
+                    )));
+                }
+                let message = std::fs::read_to_string(repo.path().join("MERGE_MSG"))
+                    .map(|m| strip_comments(&m))
+                    .unwrap_or_else(|_| pick_message(&source, &state.opts));
+                let committer = repo.signature()?;
+                let author = if state.opts.revert {
+                    committer.clone()
+                } else {
+                    source.author().to_owned()
+                };
+                repo.commit(Some("HEAD"), &author, &committer, &message, &tree, &[&head])?;
+            }
+            repo.cleanup_state()?;
+            run_picks(&repo, &state.todo[1..], &state.opts, state.orig_head)
         })
     }
 
-    fn revert(&self, rev: &str, no_commit: bool) -> Result<(), GitError> {
-        self.logged("revert", || {
+    fn pick_skip(&self) -> Result<(), GitError> {
+        self.logged("cherry-pick", || {
             let repo = self.repo.lock().expect("repo mutex");
-            let source = repo.revparse_single(rev)?.peel_to_commit()?;
-            repo.revert(&source, None)?;
-            if no_commit {
-                return Ok(());
-            }
-            let summary = source.summary().ok().flatten().unwrap_or("commit");
-            let message = format!(
-                "Revert \"{summary}\"\n\nThis reverts commit {}.",
-                source.id()
-            );
-            finalize_sequenced(&repo, &repo.signature()?, &message)
+            let state = read_pick_state(&repo)?;
+            let head = repo.head()?.peel_to_commit()?;
+            repo.reset(head.as_object(), ResetType::Hard, None)?;
+            repo.cleanup_state()?;
+            run_picks(&repo, &state.todo[1..], &state.opts, state.orig_head)
         })
     }
 
-    fn merge(
+    fn pick_abort(&self) -> Result<(), GitError> {
+        self.logged("cherry-pick abort", || {
+            let repo = self.repo.lock().expect("repo mutex");
+            let state = read_pick_state(&repo)?;
+            let orig = repo.find_commit(state.orig_head)?;
+            repo.reset(orig.as_object(), ResetType::Hard, None)?;
+            repo.cleanup_state()?;
+            Ok(())
+        })
+    }
+
+    fn merge_with(
         &self,
-        rev: &str,
-        no_ff: bool,
-        ff_only: bool,
+        revs: &[String],
+        opts: &crate::MergeOptions,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
+        if revs.len() > 1 {
+            return self.logged("merge", || octopus(self, revs, opts, report));
+        }
+        let rev = revs.first().map(String::as_str).unwrap_or("HEAD");
         self.logged("merge", || {
             let repo = self.repo.lock().expect("repo mutex");
             let source = repo.revparse_single(rev)?.peel_to_commit()?;
-            merge_commit(&repo, &source, rev, no_ff, ff_only, report)
+            merge_commit(&repo, &source, rev, opts, report)
         })
     }
 
@@ -1755,6 +1936,20 @@ impl GitBackend for Git2Backend {
             repo.cleanup_state()?;
             Ok(())
         })
+    }
+
+    fn merge_continue(&self) -> Result<(), GitError> {
+        let message = {
+            let repo = self.repo.lock().expect("repo mutex");
+            if repo.state() != git2::RepositoryState::Merge {
+                return Err(GitError::Other("there is no merge to continue".into()));
+            }
+            std::fs::read_to_string(repo.path().join("MERGE_MSG"))
+                .map(|m| strip_comments(&m))
+                .unwrap_or_else(|_| "Merge".to_owned())
+        };
+        // `commit` adds every MERGE_HEAD as a parent and clears the merge state.
+        self.commit(&message)
     }
 
     fn resolve_conflict(&self, path: &str, ours: bool) -> Result<(), GitError> {
@@ -2762,7 +2957,16 @@ impl GitBackend for Git2Backend {
                     ));
                 }
                 let name = format!("branch '{branch}' of {url}");
-                merge_commit(&repo, &source, &name, false, ff_only, report)
+                merge_commit(
+                    &repo,
+                    &source,
+                    &name,
+                    &crate::MergeOptions {
+                        ff_only,
+                        ..Default::default()
+                    },
+                    report,
+                )
             }
         })
     }
@@ -3170,8 +3374,7 @@ fn merge_commit(
     repo: &Repository,
     source: &git2::Commit<'_>,
     name: &str,
-    no_ff: bool,
-    ff_only: bool,
+    opts: &crate::MergeOptions,
     report: &dyn Fn(OpProgress),
 ) -> Result<(), GitError> {
     let annotated = repo.find_annotated_commit(source.id())?;
@@ -3181,12 +3384,12 @@ fn merge_commit(
         report(OpProgress::Line("Already up to date.".to_owned()));
         return Ok(());
     }
-    if ff_only && !analysis.is_fast_forward() {
+    if opts.ff_only && !analysis.is_fast_forward() {
         return Err(GitError::Other(
             "not possible to fast-forward; use a merge commit instead".to_owned(),
         ));
     }
-    if analysis.is_fast_forward() && !no_ff {
+    if analysis.is_fast_forward() && !opts.no_ff && !opts.squash {
         if let Some(old) = repo.head().ok().and_then(|h| h.target()) {
             report(OpProgress::Line(format!(
                 "Updating {}..{}",
@@ -3205,14 +3408,28 @@ fn merge_commit(
                         .into(),
                 )
             })?;
-        let head_ref = repo.head()?.name().unwrap_or("HEAD").to_owned();
-        repo.reference(&head_ref, source.id(), true, "merge: fast-forward")?;
-        repo.set_head(&head_ref)?;
+        let name = repo.head()?.name().unwrap_or("HEAD").to_owned();
+        repo.reference(&name, source.id(), true, "merge: fast-forward")?;
+        repo.set_head(&name)?;
         report(OpProgress::Line("Fast-forward".to_owned()));
         return Ok(());
     }
 
-    repo.merge(&[&annotated], None, None)?;
+    let mut merge_opts = git2::MergeOptions::new();
+    if let Some(side) = &opts.strategy_option {
+        merge_opts.file_favor(file_favor(side)?);
+    }
+    repo.merge(&[&annotated], Some(&mut merge_opts), None)?;
+    let message = opts
+        .message
+        .clone()
+        .unwrap_or_else(|| format!("Merge {name}"));
+    if opts.squash {
+        // A squash stages the result as an ordinary change: no MERGE_HEAD.
+        repo.cleanup_state()?;
+    } else {
+        std::fs::write(repo.path().join("MERGE_MSG"), format!("{message}\n"))?;
+    }
     let index = repo.index()?;
     if index.has_conflicts() {
         for entry in index.conflicts()?.flatten() {
@@ -3230,21 +3447,28 @@ fn merge_commit(
         report(OpProgress::Line(
             "Automatic merge failed; fix conflicts and then commit the result.".to_owned(),
         ));
-        return Err(GitError::Conflict(
-            "merge conflicts; resolve and commit, or reset --hard to abort".into(),
+        return Err(GitError::Conflict(if opts.squash {
+            "merge conflicts; resolve and commit, or reset --hard to abort".into()
+        } else {
+            "merge conflicts; resolve, then run `rgit merge --continue` (or --abort)".into()
+        }));
+    }
+    if opts.squash {
+        report(OpProgress::Line(
+            "Squash commit -- not updating HEAD".to_owned(),
         ));
+        return Ok(());
+    }
+    if opts.no_commit {
+        report(OpProgress::Line(
+            "Automatic merge went well; stopped before committing as requested".to_owned(),
+        ));
+        return Ok(());
     }
     let sig = repo.signature()?;
     let tree = repo.find_tree(repo.index()?.write_tree()?)?;
     let head = repo.head()?.peel_to_commit()?;
-    repo.commit(
-        Some("HEAD"),
-        &sig,
-        &sig,
-        &format!("Merge {name}"),
-        &tree,
-        &[&head, source],
-    )?;
+    repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&head, source])?;
     repo.cleanup_state()?;
     report(OpProgress::Line(
         "Merge made by the 'ort' strategy.".to_owned(),
@@ -3588,13 +3812,32 @@ fn make_commit(
     let mut index = repo.index()?;
     let tree_oid = index.write_tree()?;
     let tree = repo.find_tree(tree_oid)?;
-    if check_empty && parents.first().is_some_and(|p| p.tree_id() == tree_oid) {
+    // Committing a stopped merge records every merged head as a parent, as git does.
+    let merging = repo.state() == git2::RepositoryState::Merge;
+    let mut merge_heads = Vec::new();
+    if merging {
+        for line in std::fs::read_to_string(repo.path().join("MERGE_HEAD"))?.lines() {
+            merge_heads.push(repo.find_commit(Oid::from_str(line.trim())?)?);
+        }
+    }
+    if check_empty && !merging && parents.first().is_some_and(|p| p.tree_id() == tree_oid) {
         return Err(GitError::NothingToCommit);
     }
 
-    let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+    let parent_refs: Vec<&git2::Commit> = parents.iter().chain(&merge_heads).collect();
     let sig = repo.signature()?;
     repo.commit(Some("HEAD"), &sig, &sig, &msg, &tree, &parent_refs)?;
+    // Like `git commit`: the in-progress merge, cherry-pick or revert is done, but
+    // a cherry-pick sequence keeps its todo for `--continue`.
+    for file in [
+        "MERGE_HEAD",
+        "MERGE_MODE",
+        "MERGE_MSG",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+    ] {
+        let _ = std::fs::remove_file(repo.path().join(file));
+    }
 
     if verify {
         let _ = git2_hooks::hooks_post_commit(repo, None);
@@ -4310,47 +4553,509 @@ fn repo_state(repo: &Repository) -> RepoState {
     }
 }
 
-/// Commit the result of a cherry-pick or revert with the given author and
-/// message, then clear the sequencer state. Errors if there are conflicts.
-fn finalize_sequenced(
-    repo: &Repository,
-    author: &git2::Signature<'_>,
-    message: &str,
-) -> Result<(), GitError> {
-    if repo.index()?.has_conflicts() {
-        return Err(GitError::Conflict(
-            "conflicts; resolve and commit, or reset --hard to abort".into(),
+/// The commits `revs` name, in the order a cherry-pick (oldest first) or a
+/// revert (newest first) applies them. A rev is a commit or a range `A..B`.
+fn pick_list(repo: &Repository, revs: &[String], revert: bool) -> Result<Vec<Oid>, GitError> {
+    let commit = |rev: &str| -> Result<Oid, GitError> {
+        let rev = if rev.is_empty() { "HEAD" } else { rev };
+        Ok(repo.revparse_single(rev)?.peel_to_commit()?.id())
+    };
+    let mut todo = Vec::new();
+    for rev in revs {
+        let Some((from, to)) = rev.split_once("..") else {
+            todo.push(commit(rev)?);
+            continue;
+        };
+        let mut walk = repo.revwalk()?;
+        let mut sort = git2::Sort::TOPOLOGICAL;
+        if !revert {
+            sort |= git2::Sort::REVERSE;
+        }
+        walk.set_sorting(sort)?;
+        walk.push(commit(to)?)?;
+        walk.hide(commit(from)?)?;
+        for oid in walk {
+            todo.push(oid?);
+        }
+    }
+    Ok(todo)
+}
+
+/// A stopped cherry-pick or revert, as git's sequencer records it.
+struct PickState {
+    todo: Vec<Oid>,
+    opts: crate::PickOptions,
+    orig_head: Oid,
+}
+
+impl PickState {
+    fn verb(&self) -> &'static str {
+        if self.opts.revert {
+            "revert"
+        } else {
+            "cherry-pick"
+        }
+    }
+}
+
+/// The commit a stopped cherry-pick or revert was applying.
+fn pick_head(repo: &Repository) -> Option<Oid> {
+    ["CHERRY_PICK_HEAD", "REVERT_HEAD"]
+        .iter()
+        .find_map(|f| std::fs::read_to_string(repo.path().join(f)).ok())
+        .and_then(|s| Oid::from_str(s.trim()).ok())
+}
+
+/// Read git's sequencer state (`.git/sequencer`), which rgit and git both write.
+fn read_pick_state(repo: &Repository) -> Result<PickState, GitError> {
+    let seq = repo.path().join("sequencer");
+    let Ok(todo) = std::fs::read_to_string(seq.join("todo")) else {
+        // A single pick started by git itself keeps no todo.
+        let Some(oid) = pick_head(repo) else {
+            return Err(GitError::Other(
+                "no cherry-pick or revert in progress".into(),
+            ));
+        };
+        let opts = crate::PickOptions {
+            revert: repo.path().join("REVERT_HEAD").exists(),
+            ..Default::default()
+        };
+        let orig_head = repo.head()?.peel_to_commit()?.id();
+        return Ok(PickState {
+            todo: vec![oid],
+            opts,
+            orig_head,
+        });
+    };
+    let mut opts = crate::PickOptions::default();
+    let mut list = Vec::new();
+    for line in todo.lines() {
+        let mut words = line.split_whitespace();
+        let (Some(verb), Some(rev)) = (words.next(), words.next()) else {
+            continue;
+        };
+        if verb.starts_with('#') {
+            continue;
+        }
+        opts.revert = verb == "revert";
+        list.push(repo.revparse_single(rev)?.peel_to_commit()?.id());
+    }
+    if list.is_empty() {
+        return Err(GitError::Other(
+            "no cherry-pick or revert in progress".into(),
         ));
     }
-    let committer = repo.signature()?;
-    let tree = repo.find_tree(repo.index()?.write_tree()?)?;
-    let head = repo.head()?.peel_to_commit()?;
-    repo.commit(Some("HEAD"), author, &committer, message, &tree, &[&head])?;
-    repo.cleanup_state()?;
+    if let Ok(cfg) = git2::Config::open(&seq.join("opts")) {
+        opts.no_commit = cfg.get_bool("options.no-commit").unwrap_or(false);
+        opts.record_origin = cfg.get_bool("options.record-origin").unwrap_or(false);
+        opts.mainline = cfg.get_i32("options.mainline").ok().map(|m| m as u32);
+        opts.strategy_option = cfg.get_string("options.strategy-option").ok();
+    }
+    let head = std::fs::read_to_string(seq.join("head"))?;
+    Ok(PickState {
+        todo: list,
+        opts,
+        orig_head: Oid::from_str(head.trim())?,
+    })
+}
+
+/// Record a stopped pick in git's sequencer format, so `rgit` or `git`
+/// `cherry-pick`/`revert` `--continue`, `--skip` and `--abort` all work.
+fn write_pick_state(
+    repo: &Repository,
+    todo: &[Oid],
+    opts: &crate::PickOptions,
+    orig_head: Oid,
+    message: &str,
+) -> Result<(), GitError> {
+    let dir = repo.path();
+    let verb = if opts.revert { "revert" } else { "pick" };
+    if !opts.no_commit {
+        let head = if opts.revert {
+            "REVERT_HEAD"
+        } else {
+            "CHERRY_PICK_HEAD"
+        };
+        std::fs::write(dir.join(head), format!("{}\n", todo[0]))?;
+    }
+    std::fs::write(dir.join("MERGE_MSG"), message)?;
+    let seq = dir.join("sequencer");
+    std::fs::create_dir_all(&seq)?;
+    std::fs::write(seq.join("head"), format!("{orig_head}\n"))?;
+    let head = repo.head()?.peel_to_commit()?.id();
+    std::fs::write(seq.join("abort-safety"), format!("{head}\n"))?;
+    let mut list = String::new();
+    for oid in todo {
+        let commit = repo.find_commit(*oid)?;
+        let subject = commit.summary().ok().flatten().unwrap_or("");
+        list.push_str(&format!("{verb} {oid} {subject}\n"));
+    }
+    std::fs::write(seq.join("todo"), list)?;
+    let _ = std::fs::remove_file(seq.join("opts"));
+    let mut cfg = git2::Config::open(&seq.join("opts"))?;
+    if opts.no_commit {
+        cfg.set_bool("options.no-commit", true)?;
+    }
+    if opts.record_origin {
+        cfg.set_bool("options.record-origin", true)?;
+    }
+    if let Some(m) = opts.mainline {
+        cfg.set_i32("options.mainline", m as i32)?;
+    }
+    if let Some(side) = &opts.strategy_option {
+        cfg.set_str("options.strategy-option", side)?;
+    }
+    Ok(())
+}
+
+/// Apply `todo` onto HEAD in order, committing each unless `no_commit`. A
+/// conflict or an empty result stops the sequence with git's sequencer state.
+fn run_picks(
+    repo: &Repository,
+    todo: &[Oid],
+    opts: &crate::PickOptions,
+    orig_head: Oid,
+) -> Result<(), GitError> {
+    let verb = if opts.revert { "revert" } else { "cherry-pick" };
+    let mut ours = repo.find_tree(repo.index()?.write_tree()?)?;
+    if !todo.is_empty() && !opts.no_commit && ours.id() != repo.head()?.peel_to_tree()?.id() {
+        return Err(GitError::Conflict(
+            "you have staged changes; commit or stash them first".into(),
+        ));
+    }
+    let mut staged = None;
+    for (i, &oid) in todo.iter().enumerate() {
+        let commit = repo.find_commit(oid)?;
+        let mut merged = pick_index(repo, &commit, &ours, opts)?;
+        let message = pick_message(&commit, opts);
+        let subject = commit.summary().ok().flatten().unwrap_or("").to_owned();
+        let stop = if merged.has_conflicts() {
+            repo.checkout_index(
+                Some(&mut merged),
+                Some(
+                    CheckoutBuilder::new()
+                        .safe()
+                        .allow_conflicts(true)
+                        .conflict_style_merge(true),
+                ),
+            )?;
+            Some(format!(
+                "could not apply {} ({subject}); resolve the conflicts, then run `rgit {verb} \
+                 --continue` (or --skip / --abort)",
+                short7(oid)
+            ))
+        } else {
+            None
+        };
+        let tree = match stop {
+            Some(_) => None,
+            None => Some(repo.find_tree(merged.write_tree_to(repo)?)?),
+        };
+        let stop = match &tree {
+            Some(tree) if !opts.no_commit && tree.id() == ours.id() => Some(format!(
+                "the {verb} of {} ({subject}) is now empty; run `rgit {verb} --skip`",
+                short7(oid)
+            )),
+            _ => stop,
+        };
+        if let Some(why) = stop {
+            write_pick_state(repo, &todo[i..], opts, orig_head, &message)?;
+            return Err(GitError::Conflict(why));
+        }
+        let tree = tree.expect("no stop means a clean tree");
+        if opts.no_commit {
+            ours = tree;
+            staged = Some(merged);
+            continue;
+        }
+        repo.checkout_tree(tree.as_object(), Some(CheckoutBuilder::new().safe()))?;
+        let head = repo.head()?.peel_to_commit()?;
+        let committer = repo.signature()?;
+        let author = if opts.revert {
+            committer.clone()
+        } else {
+            commit.author().to_owned()
+        };
+        repo.commit(Some("HEAD"), &author, &committer, &message, &tree, &[&head])?;
+        ours = tree;
+    }
+    if let Some(mut index) = staged {
+        repo.checkout_index(Some(&mut index), Some(CheckoutBuilder::new().safe()))?;
+    }
+    Ok(())
+}
+
+/// The index after applying `commit` (or, for a revert, its inverse) to `ours`.
+fn pick_index(
+    repo: &Repository,
+    commit: &git2::Commit<'_>,
+    ours: &git2::Tree<'_>,
+    opts: &crate::PickOptions,
+) -> Result<git2::Index, GitError> {
+    let parents = commit.parent_count();
+    let parent = match opts.mainline {
+        None if parents > 1 => {
+            return Err(GitError::Other(format!(
+                "commit {} is a merge but no --mainline was given",
+                commit.id()
+            )));
+        }
+        None => commit.parent(0).ok(),
+        Some(m) if m == 0 || m as usize > parents => {
+            return Err(GitError::Other(format!(
+                "commit {} does not have parent {m}",
+                commit.id()
+            )));
+        }
+        Some(m) => Some(commit.parent(m as usize - 1)?),
+    };
+    let parent_tree = match parent {
+        Some(p) => p.tree()?,
+        None => repo.find_tree(repo.treebuilder(None)?.write()?)?,
+    };
+    let tree = commit.tree()?;
+    let (base, theirs) = if opts.revert {
+        (&tree, &parent_tree)
+    } else {
+        (&parent_tree, &tree)
+    };
+    let mut merge_opts = git2::MergeOptions::new();
+    if let Some(side) = &opts.strategy_option {
+        merge_opts.file_favor(file_favor(side)?);
+    }
+    Ok(repo.merge_trees(base, ours, theirs, Some(&merge_opts))?)
+}
+
+/// The libgit2 file favor for git's `-X ours` / `-X theirs`.
+fn file_favor(side: &str) -> Result<git2::FileFavor, GitError> {
+    match side {
+        "ours" => Ok(git2::FileFavor::Ours),
+        "theirs" => Ok(git2::FileFavor::Theirs),
+        _ => Err(GitError::Other(format!(
+            "unknown strategy option '{side}'; use ours or theirs"
+        ))),
+    }
+}
+
+/// The message git gives a cherry-picked or reverted commit.
+fn pick_message(commit: &git2::Commit<'_>, opts: &crate::PickOptions) -> String {
+    if opts.revert {
+        let summary = commit.summary().ok().flatten().unwrap_or("commit");
+        let mut msg = format!(
+            "Revert \"{summary}\"\n\nThis reverts commit {}",
+            commit.id()
+        );
+        if commit.parent_count() > 1
+            && let Ok(parent) = commit.parent_id(opts.mainline.unwrap_or(1) as usize - 1)
+        {
+            msg.push_str(&format!(", reversing\nchanges made to {parent}"));
+        }
+        msg.push_str(".\n");
+        return msg;
+    }
+    let mut msg = commit.message().unwrap_or("").trim_end().to_owned();
+    msg.push('\n');
+    if opts.record_origin {
+        if !ends_in_trailers(&msg) {
+            msg.push('\n');
+        }
+        msg.push_str(&format!("(cherry picked from commit {})\n", commit.id()));
+    }
+    msg
+}
+
+/// Whether a message ends in a trailer block (`Key: value` lines), which git's
+/// `-x` line joins without a blank line.
+fn ends_in_trailers(msg: &str) -> bool {
+    let Some((_, last)) = msg.trim_end().rsplit_once("\n\n") else {
+        return false;
+    };
+    last.lines().all(|l| {
+        l.starts_with("(cherry picked from commit ")
+            || l.split_once(": ").is_some_and(|(key, _)| {
+                !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            })
+    })
+}
+
+/// A git message file (MERGE_MSG) without its `#` comment lines.
+fn strip_comments(msg: &str) -> String {
+    let kept: Vec<&str> = msg.lines().filter(|l| !l.starts_with('#')).collect();
+    format!("{}\n", kept.join("\n").trim_end())
+}
+
+/// Merge several heads at once. libgit2 merges only a single head, so this
+/// runs git's octopus strategy.
+fn octopus(
+    backend: &Git2Backend,
+    revs: &[String],
+    opts: &crate::MergeOptions,
+    report: &dyn Fn(OpProgress),
+) -> Result<(), GitError> {
+    let mut args = vec!["merge", "--no-edit"];
+    for (on, flag) in [
+        (opts.no_ff, "--no-ff"),
+        (opts.ff_only, "--ff-only"),
+        (opts.squash, "--squash"),
+        (opts.no_commit, "--no-commit"),
+    ] {
+        if on {
+            args.push(flag);
+        }
+    }
+    if let Some(message) = &opts.message {
+        args.extend(["-m", message]);
+    }
+    if let Some(side) = &opts.strategy_option {
+        args.extend(["-X", side]);
+    }
+    args.extend(revs.iter().map(String::as_str));
+    for line in backend.run_git(&args, &[])?.lines() {
+        report(OpProgress::Line(line.to_owned()));
+    }
     Ok(())
 }
 
 /// A short relative age (`5s`, `12m`, `3h`, `9d`) from a commit time to now.
 /// Whether `commit`'s diff against its first parent touched `path`, matched as an
 /// exact path or a directory prefix. A root commit is compared to the empty tree.
-fn commit_touched_path(repo: &Repository, commit: &git2::Commit<'_>, path: &str) -> bool {
+/// Each line of `content` with the commit that last touched it; lines the
+/// blame does not cover (not yet committed) get an empty id.
+fn blame_lines(blame: Option<&git2::Blame>, content: &str) -> Vec<crate::BlameLine> {
+    content
+        .lines()
+        .enumerate()
+        .map(|(i, text)| match blame.and_then(|b| b.get_line(i + 1)) {
+            Some(hunk) => crate::BlameLine {
+                short_id: hunk.final_commit_id().to_string().chars().take(7).collect(),
+                author: hunk
+                    .final_signature()
+                    .and_then(|s| s.name().ok().map(str::to_owned))
+                    .unwrap_or_else(|| "?".to_owned()),
+                line: text.to_owned(),
+            },
+            None => crate::BlameLine {
+                short_id: String::new(),
+                author: String::new(),
+                line: text.to_owned(),
+            },
+        })
+        .collect()
+}
+
+/// Whether `commit` changed `paths`. Like git's default history simplification,
+/// a merge counts only when it differs from every parent it follows.
+fn commit_touched_path(
+    repo: &Repository,
+    commit: &git2::Commit<'_>,
+    paths: &[String],
+    first_parent: bool,
+) -> bool {
+    let Ok(tree) = commit.tree() else {
+        return false;
+    };
+    let mut opts = DiffOptions::new();
+    for p in paths.iter().filter(|p| *p != ".") {
+        opts.pathspec(p);
+    }
+    let mut differs = |old: Option<&git2::Tree>| {
+        repo.diff_tree_to_tree(old, Some(&tree), Some(&mut opts))
+            .is_ok_and(|d| d.deltas().len() > 0)
+    };
+    let parents = if first_parent {
+        commit.parent_count().min(1)
+    } else {
+        commit.parent_count()
+    };
+    if parents == 0 {
+        return differs(None);
+    }
+    (0..parents).all(|i| {
+        let old = commit.parent(i).ok().and_then(|p| p.tree().ok());
+        differs(old.as_ref())
+    })
+}
+
+/// Whether `commit` touched `path`; when it renamed the file, `path` moves to
+/// the old name for older commits, as `git log --follow` does.
+fn follow_path(repo: &Repository, commit: &git2::Commit<'_>, path: &mut String) -> bool {
     let Ok(tree) = commit.tree() else {
         return false;
     };
     let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-    let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) else {
+    let Ok(mut diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) else {
         return false;
     };
-    let prefix = format!("{path}/");
-    (0..diff.deltas().len()).any(|i| {
-        diff.get_delta(i)
-            .and_then(|d| d.new_file().path().or_else(|| d.old_file().path()))
-            .map(|p| {
-                let s = p.to_string_lossy();
-                s == path || s.starts_with(&prefix)
-            })
-            .unwrap_or(false)
-    })
+    if diff
+        .find_similar(Some(DiffFindOptions::new().renames(true)))
+        .is_err()
+    {
+        return false;
+    }
+    let Some(delta) = diff
+        .deltas()
+        .find(|d| d.new_file().path() == Some(Path::new(path.as_str())))
+    else {
+        return false;
+    };
+    if delta.status() == Delta::Renamed
+        && let Some(old) = delta.old_file().path()
+    {
+        *path = old.to_string_lossy().into_owned();
+    }
+    true
+}
+
+/// Add one `git log` revision to a walk: `rev`, `^rev`, `A..B` or `A...B`.
+/// Returns whether it added a starting point (not only an exclusion).
+fn push_rev(repo: &Repository, walk: &mut git2::Revwalk, rev: &str) -> Result<bool, GitError> {
+    if let Some(neg) = rev.strip_prefix('^') {
+        walk.hide(repo.revparse_single(neg)?.peel_to_commit()?.id())?;
+        return Ok(false);
+    }
+    let spec = repo.revparse(rev)?;
+    let oid = |o: Option<&git2::Object>| -> Result<Oid, GitError> {
+        Ok(
+            o.ok_or_else(|| GitError::Other(format!("bad revision '{rev}'")))?
+                .peel_to_commit()?
+                .id(),
+        )
+    };
+    let from = oid(spec.from())?;
+    if spec.mode().contains(git2::RevparseMode::SINGLE) {
+        walk.push(from)?;
+        return Ok(true);
+    }
+    let to = oid(spec.to())?;
+    walk.push(to)?;
+    if spec.mode().contains(git2::RevparseMode::MERGE_BASE) {
+        walk.push(from)?;
+        if let Ok(base) = repo.merge_base(from, to) {
+            walk.hide(base)?;
+        }
+    } else {
+        walk.hide(from)?;
+    }
+    Ok(true)
+}
+
+/// The two trees a `A..B` or `A...B` diff compares (merge base for `...`).
+fn range_trees<'r>(
+    repo: &'r Repository,
+    range: &str,
+) -> Result<(git2::Tree<'r>, git2::Tree<'r>), GitError> {
+    let spec = repo.revparse(range)?;
+    let (Some(from), Some(to)) = (spec.from(), spec.to()) else {
+        return Err(GitError::Other(format!("bad revision '{range}'")));
+    };
+    let to_tree = to.peel_to_tree()?;
+    let from_tree = if spec.mode().contains(git2::RevparseMode::MERGE_BASE) {
+        let base = repo.merge_base(from.peel_to_commit()?.id(), to.peel_to_commit()?.id())?;
+        repo.find_commit(base)?.tree()?
+    } else {
+        from.peel_to_tree()?
+    };
+    Ok((from_tree, to_tree))
 }
 
 /// Stash flags: always keep the index consistent; add untracked files only when

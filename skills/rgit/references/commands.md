@@ -5,13 +5,13 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 ## Inspect
 
 - `status`: Compact working-tree status. Agents: add `--toon` for a structured table. `--porcelain`, `--short`, `--branch`, and `-z` print git's raw formats, exactly as `git status` does, for scripts. e.g. `rgit status`, `rgit status --toon`
-- `log`: Recent commits as `sha subject` lines. e.g. `rgit log --limit 50`, `rgit log main -- src/lib.rs`, `rgit log --author alice --since 2024-01-01`
-- `diff`: Diffstat of unstaged changes (`--cached` for staged), or between two revisions. e.g. `rgit diff`, `rgit diff --cached`, `rgit diff main HEAD --patch`
-- `show`: A commit's header and diffstat. e.g. `rgit show HEAD`, `rgit show <rev> --patch`, `rgit show <rev> --name-only`
-- `blame`: Blame a file: `sha author line` per line. e.g. `rgit blame src/lib.rs`, `rgit blame src/lib.rs -L 10,20`
+- `log`: Recent commits as `sha subject` lines. e.g. `rgit log --limit 50`, `rgit log main -- src/lib.rs`, `rgit log main..feature`, `rgit log --author alice --since 2024-01-01`, `rgit log --grep fix --no-merges -p`, `rgit log --follow --stat -- src/lib.rs`
+- `diff`: Diffstat of unstaged changes (`--cached` for staged), against a revision, or between two revisions (`A B`, `A..B`, `A...B`). e.g. `rgit diff`, `rgit diff --cached -- src`, `rgit diff main...HEAD --name-status`, `rgit diff v1 HEAD --patch -U1 -w -- src`
+- `show`: A commit's header and diffstat, or a file (`rev:path`) or folder at a revision. e.g. `rgit show HEAD`, `rgit show <rev> --patch`, `rgit show <rev> --name-only`, `rgit show HEAD~1:src/lib.rs`
+- `blame`: Blame a file: `sha author line` per line. e.g. `rgit blame src/lib.rs`, `rgit blame src/lib.rs -L 10,20`, `rgit blame v1 -- src/lib.rs`
 - `refs`: All refs (local branches, remotes, tags). e.g. `rgit refs`
 - `smartlog`: Smartlog: your local/draft commits and the trunk they branch from. e.g. `rgit smartlog`, `rgit sl`
-- `describe`: Describe a revision relative to the nearest tag (default HEAD). e.g. `rgit describe`, `rgit describe HEAD --tags`
+- `describe`: Describe a revision relative to the nearest tag (default HEAD). e.g. `rgit describe`, `rgit describe HEAD --tags`, `rgit describe --tags --abbrev=0`
 
 ## Stage and discard
 
@@ -35,8 +35,8 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `move`: Move a commit before or after another in the current branch's history. e.g. `rgit move <rev> --before <rev>`, `rgit move <rev> --after <rev>`
 - `split`: Split a commit into two by path (given paths first, the rest second). e.g. `rgit split src/lib.rs src/main.rs`, `rgit split --rev <rev> src/lib.rs`
 - `absorb`: Fold each pending change into the stacked commit that last touched those lines (blame-routed fixups + autosquash). e.g. `rgit absorb`
-- `cherry-pick`: Cherry-pick a commit onto HEAD. e.g. `rgit cherry-pick <rev>`, `rgit cherry-pick <rev> --no-commit`
-- `revert`: Revert a commit on HEAD. e.g. `rgit revert <rev>`, `rgit revert <rev> --no-commit`
+- `cherry-pick`: Cherry-pick commits onto HEAD, or continue/skip/abort a stopped one. e.g. `rgit cherry-pick <rev>`, `rgit cherry-pick <rev> --no-commit`, `rgit cherry-pick <a> <b>`, `rgit cherry-pick main~3..main -x`, `rgit cherry-pick <merge> -m 1`, `rgit cherry-pick --continue`, `rgit cherry-pick --abort`
+- `revert`: Revert commits on HEAD, or continue/skip/abort a stopped revert. e.g. `rgit revert <rev>`, `rgit revert <rev> --no-commit`, `rgit revert HEAD~2..HEAD`, `rgit revert <merge> -m 1`, `rgit revert --continue`
 - `reset`: Reset HEAD to a revision (default mixed). e.g. `rgit reset HEAD~1`, `rgit reset --hard <rev>`, `rgit reset -- src/lib.rs`
 
 ## Undo
@@ -54,8 +54,8 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `branch rename`: Rename a branch. e.g. `rgit branch rename <old> <new>`
   - `branch prune`: Delete every local branch already merged into a base (default HEAD). e.g. `rgit branch prune`, `rgit branch prune main`
 - `checkout`: Check out a branch or, for any other revision, a detached HEAD. e.g. `rgit checkout main`, `rgit checkout -b <new_branch>`
-- `merge`: Merge a revision into the current branch. e.g. `rgit merge <branch>`, `rgit merge <branch> --no-ff`, `rgit merge --abort`
-- `rebase`: Rebase onto a revision, or continue/skip/abort an in-progress rebase. e.g. `rgit rebase main`, `rgit rebase --onto <newbase> <upstream>`, `rgit rebase --continue`
+- `merge`: Merge revisions into the current branch (several make an octopus merge). e.g. `rgit merge <branch>`, `rgit merge <branch> --no-ff`, `rgit merge <branch> --squash`, `rgit merge <branch> -m "<message>"`, `rgit merge <a> <b>`, `rgit merge --continue`, `rgit merge --abort`
+- `rebase`: Rebase onto a revision, or continue/skip/abort an in-progress rebase. e.g. `rgit rebase main`, `rgit rebase --onto <newbase> <upstream>`, `rgit rebase --autosquash main`, `rgit rebase --exec "cargo test" main`, `rgit rebase --root`, `rgit rebase --continue`
 - `tag`: Tag management: `tag` lists, `tag <name>` creates, `tag -d <name>` deletes. e.g. `rgit tag`, `rgit tag v1.0.0 -m "<message>"`, `rgit tag -d v1.0.0`
 - `stash`: Stash management (no subcommand stashes the working tree). e.g. `rgit stash`, `rgit stash push "<message>"`
   - `stash push`: Stash the working tree, with an optional message. e.g. `rgit stash push "<message>" --include-untracked`

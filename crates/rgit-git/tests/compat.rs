@@ -424,15 +424,21 @@ fn describe_reports_the_nearest_tag() {
     let backend = Git2Backend::discover(&dir).unwrap();
     backend.create_tag("v1", "release 1").unwrap();
 
-    let clean = backend.describe("HEAD", false, false, false, None).unwrap();
+    let clean = backend
+        .describe("HEAD", false, false, false, None, None)
+        .unwrap();
     assert_eq!(clean, "v1");
 
     // `--dirty` describes the workdir: with an uncommitted change it appends
     // "-dirty"; without the flag it does not.
     std::fs::write(dir.join("f.txt"), "v1\nmodified\n").unwrap();
-    let no_flag = backend.describe("HEAD", false, false, false, None).unwrap();
+    let no_flag = backend
+        .describe("HEAD", false, false, false, None, None)
+        .unwrap();
     assert_eq!(no_flag, "v1", "no --dirty means no suffix");
-    let dirty = backend.describe("HEAD", false, true, false, None).unwrap();
+    let dirty = backend
+        .describe("HEAD", false, true, false, None, None)
+        .unwrap();
     assert_eq!(dirty, "v1-dirty", "--dirty reports the dirty worktree");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -499,7 +505,7 @@ fn log_filters_by_path() {
     let backend = Git2Backend::discover(&dir).unwrap();
     let a_log = backend
         .log(&LogOptions {
-            path: Some("A".into()),
+            paths: vec!["A".into()],
             ..Default::default()
         })
         .unwrap();

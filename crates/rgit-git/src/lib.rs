@@ -36,8 +36,9 @@ pub use error::GitError;
 pub use git_repo::{Git2Backend, clone, init, pathspec_matches};
 pub use model::{
     BlameLine, Blob, CloneArgs, Commit, CommitDetails, CommitFile, CommitOverview, CommitRef, Deco,
-    FetchArgs, FileActivity, GrepMatch, GrepQuery, Head, HunkRef, Lane, LanesState, LastCommit,
-    LogEntry, LogOptions, OpLogEntry, OpProgress, PushArgs, RefEntry, RefKind, Remote, RepoState,
-    RepoStatus, ResetMode, RestackOutcome, SmartlogEntry, Stash, StatusCode, StatusEntry, TagInfo,
-    TreeEntry, Worktree, activity_weights, group_decorations,
+    DiffSpec, FetchArgs, FileActivity, GrepMatch, GrepQuery, Head, HunkRef, Lane, LanesState,
+    LastCommit, LogEntry, LogOptions, MergeOptions, OpLogEntry, OpProgress, PickOptions, PushArgs,
+    RebaseOptions, RefEntry, RefKind, Remote, RepoState, RepoStatus, ResetMode, RestackOutcome,
+    SmartlogEntry, Stash, StatusCode, StatusEntry, TagInfo, TreeEntry, Worktree, activity_weights,
+    group_decorations,
 };

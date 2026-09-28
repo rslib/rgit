@@ -254,12 +254,19 @@ pub trait GitBackend: Send + Sync {
     /// The diff between two revisions' trees (`from` as the old side).
     fn diff_refs(&self, from: &str, to: &str) -> Result<Vec<crate::FileDiff>, GitError>;
 
+    /// A `git diff`: any two of a revision, the index and the working tree,
+    /// limited to pathspecs, with git's context and whitespace options.
+    fn diff(&self, spec: &crate::DiffSpec) -> Result<Vec<crate::FileDiff>, GitError>;
+
     /// The working-tree diff for one file: unstaged (index vs workdir) when
     /// `staged` is false, staged (HEAD vs index) when true. None if unchanged.
     fn file_diff(&self, path: &str, staged: bool) -> Result<Option<crate::FileDiff>, GitError>;
 
     /// Blame a working-tree file: each line with the commit that last touched it.
     fn blame(&self, path: &str) -> Result<Vec<crate::BlameLine>, GitError>;
+
+    /// Blame a file as it is at revision `rev`.
+    fn blame_at(&self, rev: &str, path: &str) -> Result<Vec<crate::BlameLine>, GitError>;
 
     /// All references: local branches, remote branches, and tags.
     fn refs(&self) -> Result<Vec<crate::RefEntry>, GitError>;
@@ -356,9 +363,15 @@ pub trait GitBackend: Send + Sync {
     /// Skip the current commit of an in-progress rebase. Shells out to `git`.
     fn rebase_skip(&self) -> Result<(), GitError>;
 
-    /// Start an interactive rebase (`git rebase -i [onto]`), inheriting the
-    /// terminal so git can open the todo editor. Needs a TTY.
-    fn rebase_interactive(&self, onto: Option<&str>) -> Result<(), GitError>;
+    /// Rebase onto `upstream` (the branch's upstream when `None`) with options
+    /// libgit2's rebase lacks (`-i`, `--root`, `--autosquash`, `--exec`,
+    /// `--update-refs`, `-X`), run through git's sequencer. `-i` inherits the
+    /// terminal for the todo editor. A conflict leaves the rebase in progress.
+    fn rebase_with(
+        &self,
+        upstream: Option<&str>,
+        opts: &crate::RebaseOptions,
+    ) -> Result<(), GitError>;
 
     /// Undo the last destructive operation, restoring HEAD, its branch, and the
     /// working tree from the operation log (recovers uncommitted work too).
@@ -400,7 +413,9 @@ pub trait GitBackend: Send + Sync {
     /// Describe `rev` relative to the nearest tag. `tags` also considers
     /// lightweight tags (git's `--tags`); `dirty` appends `-dirty` when the
     /// worktree is modified; `long` always shows the long format; `abbrev` sets
-    /// the abbreviated-oid length.
+    /// the abbreviated-oid length; `pattern` only considers tags matching the
+    /// glob (git's `--match`).
+    #[allow(clippy::too_many_arguments)]
     fn describe(
         &self,
         rev: &str,
@@ -408,6 +423,7 @@ pub trait GitBackend: Send + Sync {
         dirty: bool,
         long: bool,
         abbrev: Option<u32>,
+        pattern: Option<&str>,
     ) -> Result<String, GitError>;
 
     /// Run any `git` subcommand and return its stdout - the escape hatch for
@@ -417,15 +433,43 @@ pub trait GitBackend: Send + Sync {
     /// Reset HEAD (and, per mode, the index and worktree) to `rev`.
     fn reset(&self, rev: &str, mode: crate::ResetMode) -> Result<(), GitError>;
 
-    /// Cherry-pick `rev` onto HEAD, committing when there are no conflicts.
     /// Cherry-pick `rev` onto HEAD. With `no_commit` (git's `-n`), apply it to
     /// the index and working tree without committing.
-    fn cherry_pick(&self, rev: &str, no_commit: bool) -> Result<(), GitError>;
+    fn cherry_pick(&self, rev: &str, no_commit: bool) -> Result<(), GitError> {
+        let opts = crate::PickOptions {
+            no_commit,
+            ..Default::default()
+        };
+        self.pick(&[rev.to_owned()], &opts)
+    }
 
-    /// Revert `rev` on HEAD, committing when there are no conflicts.
     /// Revert `rev` on HEAD. With `no_commit` (git's `-n`), apply the inverse to
     /// the index and working tree without committing.
-    fn revert(&self, rev: &str, no_commit: bool) -> Result<(), GitError>;
+    fn revert(&self, rev: &str, no_commit: bool) -> Result<(), GitError> {
+        let opts = crate::PickOptions {
+            revert: true,
+            no_commit,
+            ..Default::default()
+        };
+        self.pick(&[rev.to_owned()], &opts)
+    }
+
+    /// Cherry-pick (or, with `opts.revert`, revert) commits in order. Each rev is
+    /// a commit or a range `A..B`. On a conflict the sequence stops with git's
+    /// sequencer state, for [`pick_continue`](Self::pick_continue),
+    /// [`pick_skip`](Self::pick_skip) or [`pick_abort`](Self::pick_abort).
+    fn pick(&self, revs: &[String], opts: &crate::PickOptions) -> Result<(), GitError>;
+
+    /// Commit the resolved commit of a stopped cherry-pick or revert and apply
+    /// the rest of the sequence.
+    fn pick_continue(&self) -> Result<(), GitError>;
+
+    /// Drop the current commit of a stopped cherry-pick or revert and apply the
+    /// rest of the sequence.
+    fn pick_skip(&self) -> Result<(), GitError>;
+
+    /// Cancel a stopped cherry-pick or revert, restoring the HEAD it started from.
+    fn pick_abort(&self) -> Result<(), GitError>;
 
     /// Merge `rev` into the current branch. Fast-forwards when possible unless
     /// `no_ff` forces a merge commit. `report` receives git-style progress lines
@@ -436,7 +480,27 @@ pub trait GitBackend: Send + Sync {
         no_ff: bool,
         ff_only: bool,
         report: &dyn Fn(crate::OpProgress),
+    ) -> Result<(), GitError> {
+        let opts = crate::MergeOptions {
+            no_ff,
+            ff_only,
+            ..Default::default()
+        };
+        self.merge_with(&[rev.to_owned()], &opts, report)
+    }
+
+    /// Merge one or more revisions (several make an octopus merge) into the
+    /// current branch.
+    fn merge_with(
+        &self,
+        revs: &[String],
+        opts: &crate::MergeOptions,
+        report: &dyn Fn(crate::OpProgress),
     ) -> Result<(), GitError>;
+
+    /// Commit a merge whose conflicts are resolved, with every MERGE_HEAD as a
+    /// parent (git's `merge --continue`).
+    fn merge_continue(&self) -> Result<(), GitError>;
 
     /// Abort an in-progress merge, restoring the working tree and index to HEAD
     /// (git's `merge --abort`).

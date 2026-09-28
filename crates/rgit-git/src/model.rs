@@ -49,6 +49,57 @@ pub enum ResetMode {
     Hard,
 }
 
+/// Options for a cherry-pick or revert of one or more commits.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PickOptions {
+    /// Revert the commits instead of cherry-picking them.
+    pub revert: bool,
+    /// Apply to the index and working tree without committing (git's `-n`).
+    pub no_commit: bool,
+    /// Append `(cherry picked from commit ...)` to the message (git's `-x`).
+    pub record_origin: bool,
+    /// For a merge commit, the 1-based parent to diff against (git's `-m`).
+    pub mainline: Option<u32>,
+    /// `ours` or `theirs`: the side taken on conflicting hunks (git's `-X`).
+    pub strategy_option: Option<String>,
+}
+
+/// Options for a merge.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MergeOptions {
+    /// Always create a merge commit (git's `--no-ff`).
+    pub no_ff: bool,
+    /// Refuse unless the merge can fast-forward (git's `--ff-only`).
+    pub ff_only: bool,
+    /// Stage the merged changes without a merge commit or MERGE_HEAD (git's `--squash`).
+    pub squash: bool,
+    /// Merge but stop before committing (git's `--no-commit`).
+    pub no_commit: bool,
+    /// The merge commit message (git's `-m`).
+    pub message: Option<String>,
+    /// `ours` or `theirs`: the side taken on conflicting hunks (git's `-X`).
+    pub strategy_option: Option<String>,
+}
+
+/// Rebase options that go past libgit2's rebase, run through git's sequencer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RebaseOptions {
+    /// Replay onto this base instead of the upstream (git's `--onto`).
+    pub onto: Option<String>,
+    /// Open the todo editor on the terminal (git's `-i`).
+    pub interactive: bool,
+    /// Rebase every commit down to the root (git's `--root`).
+    pub root: bool,
+    /// Move `fixup!`/`squash!` commits next to their targets (git's `--autosquash`).
+    pub autosquash: bool,
+    /// Shell commands to run after each commit (git's `--exec`).
+    pub exec: Vec<String>,
+    /// Move branches that point into the rebased commits too (git's `--update-refs`).
+    pub update_refs: bool,
+    /// `ours` or `theirs`: the side taken on conflicting hunks (git's `-X`).
+    pub strategy_option: Option<String>,
+}
+
 impl RepoStatus {
     pub fn unstaged_diff(&self, path: &str) -> Option<&FileDiff> {
         self.unstaged.iter().find(|d| d.path == path)
@@ -243,14 +294,47 @@ pub struct LogOptions {
     pub all: bool,
     /// Keep only commits whose author name/email contains this (case-insensitive).
     pub author: Option<String>,
-    /// Start the walk from this revision instead of HEAD (a branch/tag/sha).
-    pub rev: Option<String>,
+    /// Start the walk from these revisions instead of HEAD: a branch/tag/sha,
+    /// `^rev` to exclude, or a range `A..B` / `A...B`.
+    pub revs: Vec<String>,
     /// Keep only commits at or after this author time (unix seconds).
     pub since: Option<i64>,
     /// Keep only commits at or before this author time (unix seconds).
     pub until: Option<i64>,
-    /// Keep only commits that touched this path (a pathspec prefix).
-    pub path: Option<String>,
+    /// Keep only commits that touched one of these pathspecs.
+    pub paths: Vec<String>,
+    /// Keep only commits whose message matches one of these regexes.
+    pub grep: Vec<String>,
+    /// Match `grep` case-insensitively.
+    pub grep_ignore_case: bool,
+    /// Follow only the first parent of merges.
+    pub first_parent: bool,
+    /// `Some(true)` keeps only merges, `Some(false)` drops them.
+    pub merges: Option<bool>,
+    /// Oldest first (applied after `limit`, as in git).
+    pub reverse: bool,
+    /// Follow the single path in `paths` across renames.
+    pub follow: bool,
+}
+
+/// Which two sides [`crate::GitBackend::diff`] compares, and how.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiffSpec {
+    /// Old side: a revision, or a range `A..B` / `A...B` when `to` is None.
+    /// None with `to` set diffs `to` against the empty tree.
+    pub from: Option<String>,
+    /// New side revision; None means the working tree (the index when `cached`).
+    pub to: Option<String>,
+    /// Compare against the index instead of the working tree.
+    pub cached: bool,
+    /// Limit to these pathspecs.
+    pub paths: Vec<String>,
+    /// Lines of context (git's -U); None keeps git's 3.
+    pub context: Option<u32>,
+    /// Ignore all whitespace (git's -w).
+    pub ignore_all_space: bool,
+    /// Ignore changes in amount of whitespace (git's -b).
+    pub ignore_space_change: bool,
 }
 
 impl Default for LogOptions {
@@ -260,10 +344,16 @@ impl Default for LogOptions {
             offset: 0,
             all: false,
             author: None,
-            rev: None,
+            revs: Vec::new(),
             since: None,
             until: None,
-            path: None,
+            paths: Vec::new(),
+            grep: Vec::new(),
+            grep_ignore_case: false,
+            first_parent: false,
+            merges: None,
+            reverse: false,
+            follow: false,
         }
     }
 }

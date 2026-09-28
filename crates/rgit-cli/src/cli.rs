@@ -79,6 +79,32 @@ impl Cli {
     }
 }
 
+/// How `log`, `diff` and `show` print the changes.
+#[derive(clap::Args, Clone, Copy, Default)]
+pub struct DiffFormat {
+    /// Print the full unified patch (git's -p).
+    #[arg(short, long)]
+    pub patch: bool,
+    /// Print a diffstat.
+    #[arg(long)]
+    pub stat: bool,
+    /// List only the names of changed files.
+    #[arg(long)]
+    pub name_only: bool,
+    /// List changed files with a status letter (A, M, D, R...).
+    #[arg(long)]
+    pub name_status: bool,
+    /// Added and removed line counts per file, tab-separated.
+    #[arg(long)]
+    pub numstat: bool,
+}
+
+impl DiffFormat {
+    pub(crate) fn any(self) -> bool {
+        self.patch || self.stat || self.name_only || self.name_status || self.numstat
+    }
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// Compact working-tree status. Agents: add `--toon` for a structured table.
@@ -131,6 +157,9 @@ pub enum Command {
             default_value_t = 20
         )]
         limit: usize,
+        /// Skip this many commits before showing any.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        skip: usize,
         /// Walk every ref, not just HEAD.
         #[arg(long)]
         all: bool,
@@ -138,57 +167,93 @@ pub enum Command {
         #[arg(long)]
         author: Option<String>,
         /// Only commits at or after this date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS).
-        #[arg(long)]
+        #[arg(long, visible_alias = "after")]
         since: Option<String>,
         /// Only commits at or before this date (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS).
-        #[arg(long)]
+        #[arg(long, visible_alias = "before")]
         until: Option<String>,
         /// Accepted for git compatibility (rgit's log is already one line each).
         #[arg(long)]
         oneline: bool,
-        /// Start from this revision instead of HEAD, and/or limit to a path:
-        /// `rgit log <rev>` or `rgit log -- <path>` or `rgit log <rev> -- <path>`.
+        /// Keep only commits whose message matches this regex (repeat for any of several).
+        #[arg(long, value_name = "REGEX")]
+        grep: Vec<String>,
+        /// Match --grep case-insensitively.
+        #[arg(short = 'i', long = "regexp-ignore-case")]
+        ignore_case: bool,
+        /// Follow only the first parent of merge commits.
+        #[arg(long)]
+        first_parent: bool,
+        /// Show only merge commits.
+        #[arg(long, conflicts_with = "no_merges")]
+        merges: bool,
+        /// Leave out merge commits.
+        #[arg(long)]
+        no_merges: bool,
+        /// Oldest first.
+        #[arg(long)]
+        reverse: bool,
+        /// Follow one file's history across renames.
+        #[arg(long)]
+        follow: bool,
+        #[command(flatten)]
+        format: DiffFormat,
+        /// Revisions to walk (`main`, `^main`, `A..B`, `A...B`; default HEAD),
+        /// then paths: `rgit log <rev>...` or `rgit log <rev> -- <path>...`.
         #[arg(value_name = "REV_OR_PATH")]
-        rev: Option<String>,
-        /// Limit to commits touching this path (after `--`).
+        revs: Vec<String>,
+        /// Limit to commits touching these paths (after `--`).
         #[arg(last = true, value_name = "PATH")]
-        path: Option<String>,
+        paths: Vec<String>,
     },
-    /// Diffstat of unstaged changes (`--cached` for staged), or between two revisions.
+    /// Diffstat of unstaged changes (`--cached` for staged), against a revision,
+    /// or between two revisions (`A B`, `A..B`, `A...B`).
     Diff {
-        /// Diff FROM..TO; omit both to diff the working tree.
-        from: Option<String>,
-        /// The second revision (defaults to HEAD when only FROM is given).
-        to: Option<String>,
-        /// Print the full unified patch instead of a diffstat.
-        #[arg(short, long)]
-        patch: bool,
+        /// Revisions (none: the working tree against the index; one: it against
+        /// the working tree; `A B`, `A..B`, or `A...B` from their merge base),
+        /// then paths.
+        #[arg(value_name = "REV_OR_PATH")]
+        revs: Vec<String>,
+        /// Limit to these paths (after `--`).
+        #[arg(last = true, value_name = "PATH")]
+        paths: Vec<String>,
         /// Diff the staged changes (index vs HEAD), like git's --cached.
         #[arg(long, visible_alias = "staged")]
         cached: bool,
-        /// List only the names of changed files.
-        #[arg(long = "name-only")]
-        name_only: bool,
-        /// Show a diffstat (the default when neither --patch nor --name-only).
-        #[arg(long)]
-        stat: bool,
+        #[command(flatten)]
+        format: DiffFormat,
+        /// Lines of context around each change (git's -U, default 3).
+        #[arg(short = 'U', long = "unified", value_name = "N")]
+        unified: Option<u32>,
+        /// Ignore whitespace when comparing lines.
+        #[arg(short = 'w', long = "ignore-all-space")]
+        ignore_all_space: bool,
+        /// Ignore changes in the amount of whitespace.
+        #[arg(short = 'b', long = "ignore-space-change")]
+        ignore_space_change: bool,
     },
-    /// A commit's header and diffstat.
+    /// A commit's header and diffstat, or a file (`rev:path`) or folder at a revision.
     Show {
-        /// The commit to show (branch, tag, or sha).
-        rev: String,
-        /// Show the full unified patch (git's -p), not just the diffstat.
-        #[arg(short, long)]
-        patch: bool,
-        /// List only the names of the files the commit changed.
-        #[arg(long = "name-only")]
-        name_only: bool,
+        /// The commits to show (branch, tag, or sha; default HEAD), or `rev:path`
+        /// to print a file as it is at `rev` (`:path` for the staged version).
+        #[arg(value_name = "REV")]
+        revs: Vec<String>,
+        /// Limit the listed changes to these paths (after `--`).
+        #[arg(last = true, value_name = "PATH")]
+        paths: Vec<String>,
+        #[command(flatten)]
+        format: DiffFormat,
+        /// Only the header, no changed files (git's -s).
+        #[arg(short = 's', long = "no-patch")]
+        no_patch: bool,
     },
     /// Blame a file: `sha author line` per line.
     Blame {
-        /// The file to annotate.
-        path: String,
-        /// Limit to a 1-based line range `START,END` (git's -L).
+        /// `[REV] PATH`: the file to annotate, as it is in the working tree or
+        /// at REV (`rgit blame <rev> -- <path>` also works).
+        #[arg(value_name = "REV_OR_PATH", required = true, num_args = 1..=2)]
+        args: Vec<String>,
+        /// Limit to a 1-based line range `START,END` or `START,+COUNT` (git's -L).
         #[arg(short = 'L', value_name = "START,END")]
         lines: Option<String>,
     },
@@ -405,16 +470,34 @@ pub enum Command {
         #[arg(short = 'b', value_name = "NEW_BRANCH")]
         branch: Option<String>,
     },
-    /// Merge a revision into the current branch.
+    /// Merge revisions into the current branch (several make an octopus merge).
     Merge {
-        /// The branch or revision to merge (prompted for if omitted).
-        rev: Option<String>,
+        /// The branches or revisions to merge (prompted for if omitted).
+        revs: Vec<String>,
         /// Always create a merge commit, even if a fast-forward is possible.
         #[arg(long = "no-ff", conflicts_with = "ff_only")]
         no_ff: bool,
         /// Refuse to merge unless it can fast-forward (git's --ff-only).
         #[arg(long = "ff-only")]
         ff_only: bool,
+        /// Stage the merged changes as one ordinary change, without a merge commit.
+        #[arg(long)]
+        squash: bool,
+        /// Merge but stop before committing; finish with `merge --continue`.
+        #[arg(long = "no-commit")]
+        no_commit: bool,
+        /// The merge commit message.
+        #[arg(short = 'm', long = "message")]
+        message: Option<String>,
+        /// Take this side on conflicting hunks (git's -X).
+        #[arg(short = 'X', long = "strategy-option", value_parser = ["ours", "theirs"])]
+        strategy_option: Option<String>,
+        /// Accepted for git compatibility; rgit never opens an editor.
+        #[arg(long = "no-edit", hide = true)]
+        no_edit: bool,
+        /// Commit a merge whose conflicts are resolved.
+        #[arg(long = "continue")]
+        cont: bool,
         /// Abort an in-progress (conflicted) merge, restoring HEAD.
         #[arg(long)]
         abort: bool,
@@ -430,6 +513,21 @@ pub enum Command {
         /// Interactive rebase: opens the todo editor (needs a terminal).
         #[arg(short = 'i', long = "interactive")]
         edit: bool,
+        /// Rebase every commit down to the root commit.
+        #[arg(long)]
+        root: bool,
+        /// Move `fixup!`/`squash!` commits after their targets and fold them in.
+        #[arg(long)]
+        autosquash: bool,
+        /// Run this shell command after each rebased commit (repeatable).
+        #[arg(short = 'x', long = "exec", value_name = "CMD")]
+        exec: Vec<String>,
+        /// Also move branches that point into the rebased commits.
+        #[arg(long = "update-refs")]
+        update_refs: bool,
+        /// Take this side on conflicting hunks (git's -X).
+        #[arg(short = 'X', long = "strategy-option", value_parser = ["ours", "theirs"])]
+        strategy_option: Option<String>,
         /// Continue after resolving conflicts.
         #[arg(long = "continue")]
         cont: bool,
@@ -470,21 +568,60 @@ pub enum Command {
         #[arg(last = true, value_name = "PATH")]
         paths: Vec<String>,
     },
-    /// Cherry-pick a commit onto HEAD.
+    /// Cherry-pick commits onto HEAD, or continue/skip/abort a stopped one.
     CherryPick {
-        /// The commit to cherry-pick (prompted for if omitted on a terminal).
-        rev: Option<String>,
+        /// Commits or ranges `A..B` to apply in order (prompted for if omitted on a terminal).
+        revs: Vec<String>,
         /// Apply the change without committing (git's -n/--no-commit).
         #[arg(short = 'n', long = "no-commit")]
         no_commit: bool,
+        /// Append "(cherry picked from commit ...)" to each message (git's -x).
+        #[arg(short = 'x')]
+        record_origin: bool,
+        /// For a merge commit, the parent number (from 1) to diff against.
+        #[arg(short = 'm', long = "mainline", value_name = "PARENT")]
+        mainline: Option<u32>,
+        /// Take this side on conflicting hunks (git's -X).
+        #[arg(short = 'X', long = "strategy-option", value_parser = ["ours", "theirs"])]
+        strategy_option: Option<String>,
+        /// Accepted for git compatibility; rgit keeps the original message.
+        #[arg(long = "no-edit", hide = true)]
+        no_edit: bool,
+        /// Commit the resolved commit and apply the rest.
+        #[arg(long = "continue")]
+        cont: bool,
+        /// Drop the current commit and apply the rest.
+        #[arg(long)]
+        skip: bool,
+        /// Cancel and return to where the cherry-pick started.
+        #[arg(long)]
+        abort: bool,
     },
-    /// Revert a commit on HEAD.
+    /// Revert commits on HEAD, or continue/skip/abort a stopped revert.
     Revert {
-        /// The commit to revert (prompted for if omitted on a terminal).
-        rev: Option<String>,
+        /// Commits or ranges `A..B` to revert, newest first (prompted for if omitted on a terminal).
+        revs: Vec<String>,
         /// Apply the inverse without committing (git's -n/--no-commit).
         #[arg(short = 'n', long = "no-commit")]
         no_commit: bool,
+        /// For a merge commit, the parent number (from 1) to revert to.
+        #[arg(short = 'm', long = "mainline", value_name = "PARENT")]
+        mainline: Option<u32>,
+        /// Take this side on conflicting hunks (git's -X).
+        #[arg(short = 'X', long = "strategy-option", value_parser = ["ours", "theirs"])]
+        strategy_option: Option<String>,
+        /// Accepted for git compatibility; rgit writes git's revert message.
+        #[arg(long = "no-edit", hide = true)]
+        no_edit: bool,
+        /// Commit the resolved revert and apply the rest.
+        #[arg(long = "continue")]
+        cont: bool,
+        /// Drop the current commit and apply the rest.
+        #[arg(long)]
+        skip: bool,
+        /// Cancel and return to where the revert started.
+        #[arg(long)]
+        abort: bool,
     },
     /// Branch management (no subcommand lists local branches).
     Branch {
@@ -633,9 +770,18 @@ pub enum Command {
         /// Always use the long format (tag-count-oid), even on a tag.
         #[arg(long)]
         long: bool,
-        /// Number of hex digits for the abbreviated commit oid.
+        /// Number of hex digits for the abbreviated commit oid (0: the tag only).
         #[arg(long, value_name = "N")]
         abbrev: Option<u32>,
+        /// Show the abbreviated commit oid when no tag is found (rgit always does).
+        #[arg(long)]
+        always: bool,
+        /// Only consider tags matching this glob.
+        #[arg(long = "match", value_name = "GLOB")]
+        pattern: Option<String>,
+        /// Print the tag only when it points at the revision itself; else fail.
+        #[arg(long)]
+        exact_match: bool,
     },
     /// Create a new repository in the current directory (or PATH).
     Init {
@@ -1636,11 +1782,6 @@ pub const GIT_SPELLINGS: &[(&str, &[&str], &str)] = &[
         "use `rgit smartlog` for the branch graph",
     ),
     (
-        "rgit log",
-        &["-p", "--patch"],
-        "use `rgit show <id> --patch` for one commit's patch",
-    ),
-    (
         "rgit push",
         &["-f"],
         "use `--force-with-lease` (or `--force`)",
@@ -1894,7 +2035,10 @@ pub(crate) fn parse_line_range(spec: &str) -> anyhow::Result<(usize, usize)> {
     let bad = || CliError::usage(format!("-L wants START,END line numbers, got {spec:?}"));
     let (a, b) = spec.split_once(',').ok_or_else(bad)?;
     let start: usize = a.trim().parse().map_err(|_| bad())?;
-    let end: usize = b.trim().parse().map_err(|_| bad())?;
+    let end: usize = match b.trim().strip_prefix('+') {
+        Some(count) => start + count.parse::<usize>().map_err(|_| bad())?.saturating_sub(1),
+        None => b.trim().parse().map_err(|_| bad())?,
+    };
     Ok((start, end))
 }
 
@@ -1936,68 +2080,58 @@ pub fn run(
             untracked.as_deref(),
             ignored,
         )?),
-        Command::Log {
-            limit,
-            all,
-            author,
-            since,
-            until,
-            oneline: _,
-            rev,
-            path,
-        } => {
-            let since = since.as_deref().map(parse_date).transpose()?;
-            let until = until.as_deref().map(parse_date).transpose()?;
-            render::log(&backend.log(&LogOptions {
-                limit,
-                all,
-                author,
-                rev,
-                since,
-                until,
-                path,
-                ..LogOptions::default()
-            })?)
-        }
-        Command::Diff {
-            from,
-            to,
-            patch,
-            cached,
-            name_only,
-            stat: _,
-        } => {
-            // Bare `diff` shows the unstaged (worktree vs index) changes, like
-            // git; `--cached` shows the staged (index vs HEAD) changes.
-            let files = match (from, to) {
-                (Some(from), Some(to)) => backend.diff_refs(&from, &to)?,
-                (Some(rev), None) => backend.diff_refs(&rev, "HEAD")?,
-                (None, _) if cached => backend.status()?.staged,
-                (None, _) => backend.status()?.unstaged,
-            };
-            diff_out(&files, patch, name_only)
-        }
-        Command::Show {
-            rev,
-            patch,
-            name_only,
-        } => {
-            let details = backend.commit_details(&rev)?;
-            if name_only {
-                details
-                    .files
-                    .iter()
-                    .map(|f| f.path.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else if patch {
-                render::patch(&details.files)
+        Command::Log { format, .. } if format.any() => {
+            let opts = log_options(backend, &command)?;
+            let paths = if opts.follow {
+                Vec::new()
             } else {
-                render::commit_details(&details)
+                opts.paths.clone()
+            };
+            let mut out = Vec::new();
+            for e in backend.log(&opts)? {
+                let mut text = render::log(std::slice::from_ref(&e));
+                // git shows no diff for a merge unless asked for a combined one.
+                if e.parents.len() <= 1 {
+                    let files = backend.diff(&rgit_git::DiffSpec {
+                        from: e.parents.first().cloned(),
+                        to: Some(e.oid.clone()),
+                        paths: paths.clone(),
+                        ..Default::default()
+                    })?;
+                    if !files.is_empty() {
+                        text.push('\n');
+                        text.push_str(diff_out(&files, format).trim_end());
+                    }
+                }
+                out.push(text);
+            }
+            if out.is_empty() {
+                "no commits".to_owned()
+            } else {
+                out.join("\n\n")
             }
         }
-        Command::Blame { path, lines } => {
-            let all = backend.blame(&path)?;
+        Command::Log { .. } => render::log(&backend.log(&log_options(backend, &command)?)?),
+        Command::Diff { format, .. } => diff_out(&diff_files(backend, &command)?.0, format),
+        Command::Show {
+            revs,
+            paths,
+            format,
+            no_patch,
+        } => {
+            let revs = if revs.is_empty() {
+                vec!["HEAD".to_owned()]
+            } else {
+                revs
+            };
+            let mut out = Vec::new();
+            for rev in &revs {
+                out.push(show_one(backend, rev, &paths, format, no_patch)?);
+            }
+            out.join("\n\n")
+        }
+        Command::Blame { args, lines } => {
+            let all = blame(backend, &args)?;
             let selected = match lines {
                 Some(spec) => {
                     let (start, end) = parse_line_range(&spec)?;
@@ -2278,19 +2412,37 @@ pub fn run(
             }
         }
         Command::Merge {
-            rev,
+            mut revs,
             no_ff,
             ff_only,
+            squash,
+            no_commit,
+            message,
+            strategy_option,
+            no_edit: _,
+            cont,
             abort,
         } => {
             if abort {
                 ok(backend.merge_abort())?
+            } else if cont {
+                ok(backend.merge_continue())?
             } else {
-                let rev = resolve(rev, "a revision to merge", &|| {
-                    crate::interactive::pick_branch(backend, "Merge which branch?")
-                })?;
+                if revs.is_empty() {
+                    revs.push(resolve(None, "a revision to merge", &|| {
+                        crate::interactive::pick_branch(backend, "Merge which branch?")
+                    })?);
+                }
+                let opts = rgit_git::MergeOptions {
+                    no_ff,
+                    ff_only,
+                    squash,
+                    no_commit,
+                    message,
+                    strategy_option,
+                };
                 net(interactive, "merge", |r| {
-                    backend.merge(&rev, no_ff, ff_only, r)
+                    backend.merge_with(&revs, &opts, r)
                 })?
             }
         }
@@ -2298,6 +2450,11 @@ pub fn run(
             onto,
             onto_new,
             edit,
+            root,
+            autosquash,
+            exec,
+            update_refs,
+            strategy_option,
             cont,
             skip,
             abort,
@@ -2308,6 +2465,34 @@ pub fn run(
                 ok(backend.rebase_continue())?
             } else if skip {
                 ok(backend.rebase_skip())?
+            } else if edit
+                || root
+                || autosquash
+                || update_refs
+                || !exec.is_empty()
+                || strategy_option.is_some()
+            {
+                if edit && !interactive {
+                    anyhow::bail!("interactive rebase needs a terminal");
+                }
+                // Pick the base (how far back to edit) when it is not given.
+                let onto = match onto {
+                    None if edit && !root => Some(crate::interactive::pick_commit(
+                        backend,
+                        "Rebase onto which commit? (edits the commits after it)",
+                    )?),
+                    onto => onto,
+                };
+                let opts = rgit_git::RebaseOptions {
+                    onto: onto_new,
+                    interactive: edit,
+                    root,
+                    autosquash,
+                    exec,
+                    update_refs,
+                    strategy_option,
+                };
+                ok(backend.rebase_with(onto.as_deref(), &opts))?
             } else if let Some(newbase) = onto_new {
                 // `rebase --onto NEWBASE UPSTREAM`: replay UPSTREAM..HEAD onto NEWBASE.
                 let upstream = resolve(onto, "the upstream (after --onto NEWBASE)", &|| {
@@ -2316,19 +2501,6 @@ pub fn run(
                 net(interactive, "rebase", |r| {
                     backend.rebase_range(&upstream, &newbase, r)
                 })?
-            } else if edit {
-                if !interactive {
-                    anyhow::bail!("interactive rebase needs a terminal");
-                }
-                // Pick the base (how far back to edit) when it is not given.
-                let onto = match onto {
-                    Some(o) => o,
-                    None => crate::interactive::pick_commit(
-                        backend,
-                        "Rebase onto which commit? (edits the commits after it)",
-                    )?,
-                };
-                ok(backend.rebase_interactive(Some(&onto)))?
             } else {
                 let onto = resolve(
                     onto,
@@ -2378,17 +2550,44 @@ pub fn run(
                 ok(backend.reset(&rev, mode))?
             }
         }
-        Command::CherryPick { rev, no_commit } => {
-            let rev = resolve(rev, "a commit to cherry-pick", &|| {
-                crate::interactive::pick_commit(backend, "Cherry-pick which commit?")
-            })?;
-            ok(backend.cherry_pick(&rev, no_commit))?
+        Command::CherryPick {
+            revs,
+            no_commit,
+            record_origin,
+            mainline,
+            strategy_option,
+            no_edit: _,
+            cont,
+            skip,
+            abort,
+        } => {
+            let opts = rgit_git::PickOptions {
+                revert: false,
+                no_commit,
+                record_origin,
+                mainline,
+                strategy_option,
+            };
+            pick(backend, revs, &opts, (cont, skip, abort), interactive)?
         }
-        Command::Revert { rev, no_commit } => {
-            let rev = resolve(rev, "a commit to revert", &|| {
-                crate::interactive::pick_commit(backend, "Revert which commit?")
-            })?;
-            ok(backend.revert(&rev, no_commit))?
+        Command::Revert {
+            revs,
+            no_commit,
+            mainline,
+            strategy_option,
+            no_edit: _,
+            cont,
+            skip,
+            abort,
+        } => {
+            let opts = rgit_git::PickOptions {
+                revert: true,
+                no_commit,
+                record_origin: false,
+                mainline,
+                strategy_option,
+            };
+            pick(backend, revs, &opts, (cont, skip, abort), interactive)?
         }
         Command::Branch { cmd, all, remotes } => match cmd {
             None if remotes => backend.remote_branches()?.join("\n"),
@@ -2611,7 +2810,27 @@ pub fn run(
             dirty,
             long,
             abbrev,
-        } => backend.describe(rev.as_deref().unwrap_or("HEAD"), tags, dirty, long, abbrev)?,
+            always: _,
+            pattern,
+            exact_match,
+        } => {
+            let rev = rev.as_deref().unwrap_or("HEAD");
+            if exact_match {
+                let tag = backend.describe(rev, tags, false, false, Some(0), pattern.as_deref())?;
+                let oid = backend.rev_parse(rev)?;
+                if oid.starts_with(&tag) || backend.rev_parse(&tag).ok() != Some(oid) {
+                    return Err(CliError {
+                        message: format!("no tag exactly matches '{rev}'"),
+                        help: Some("Run `rgit describe` for the nearest tag".to_owned()),
+                        code: 128,
+                    }
+                    .into());
+                }
+                tag
+            } else {
+                backend.describe(rev, tags, dirty, long, abbrev, pattern.as_deref())?
+            }
+        }
         Command::Submodule { mut args } => {
             args.insert(0, "submodule".to_owned());
             backend.git(&args)?
@@ -2636,6 +2855,36 @@ fn remote_and_refspecs(
         Some(r) => (Some(r), repository.into_iter().chain(refspecs).collect()),
         None => (repository, refspecs),
     }
+}
+
+/// Cherry-pick or revert `revs`, or continue/skip/abort a stopped sequence.
+fn pick(
+    backend: &Arc<dyn GitBackend>,
+    mut revs: Vec<String>,
+    opts: &rgit_git::PickOptions,
+    (cont, skip, abort): (bool, bool, bool),
+    interactive: bool,
+) -> anyhow::Result<String> {
+    if abort {
+        return ok(backend.pick_abort());
+    }
+    if cont {
+        return ok(backend.pick_continue());
+    }
+    if skip {
+        return ok(backend.pick_skip());
+    }
+    if revs.is_empty() {
+        if !interactive {
+            return Err(CliError::usage("a commit required"));
+        }
+        let verb = if opts.revert { "Revert" } else { "Cherry-pick" };
+        revs.push(crate::interactive::pick_commit(
+            backend,
+            &format!("{verb} which commit?"),
+        )?);
+    }
+    ok(backend.pick(&revs, opts))
 }
 
 /// Resolve a stash index: the given one, a prompt, or 0 (most recent).
@@ -2708,8 +2957,16 @@ pub fn from_cwd(mut command: Command, workdir: &Path) -> Command {
         | Command::Clean { paths, .. }
         | Command::Rm { paths, .. }
         | Command::Mv { paths, .. } => paths.iter_mut().for_each(fix),
-        Command::Blame { path, .. } | Command::Resolve { path, .. } => fix(path),
-        Command::Log { path: Some(p), .. } => fix(p),
+        Command::Resolve { path, .. } => fix(path),
+        Command::Blame { args, .. } => args.last_mut().into_iter().for_each(fix),
+        Command::Show { paths, .. } => paths.iter_mut().for_each(fix),
+        Command::Log { revs, paths, .. } | Command::Diff { revs, paths, .. } => {
+            // A positional that names a file here is a path, not a revision.
+            revs.iter_mut()
+                .filter(|r| Path::new(r.as_str()).exists())
+                .for_each(fix);
+            paths.iter_mut().for_each(fix);
+        }
         _ => {}
     }
     command
@@ -2791,17 +3048,221 @@ fn ok_msg(r: Result<String, GitError>) -> anyhow::Result<String> {
     r.map_err(Into::into)
 }
 
-fn diff_out(files: &[rgit_git::FileDiff], patch: bool, name_only: bool) -> String {
-    if name_only {
-        files
-            .iter()
-            .map(|f| f.path.clone())
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else if patch {
+pub(crate) fn diff_out(files: &[rgit_git::FileDiff], format: DiffFormat) -> String {
+    let rows = |row: &dyn Fn(&rgit_git::FileDiff) -> String| {
+        files.iter().map(row).collect::<Vec<_>>().join("\n")
+    };
+    let path = |f: &rgit_git::FileDiff| match &f.old_path {
+        Some(old) => format!("{old}\t{}", f.path),
+        None => f.path.clone(),
+    };
+    if format.name_only {
+        rows(&|f| f.path.clone())
+    } else if format.name_status {
+        rows(&|f| {
+            let mut code = f.status.letter().to_owned();
+            // git prints a similarity score; an unchanged move is 100%.
+            if f.old_path.is_some() && f.hunks.is_empty() {
+                code.push_str("100");
+            }
+            format!("{code}\t{}", path(f))
+        })
+    } else if format.numstat {
+        rows(&|f| {
+            let (add, del) = crate::axi::line_counts(f);
+            let path = match &f.old_path {
+                Some(old) => format!("{old} => {}", f.path),
+                None => f.path.clone(),
+            };
+            if f.binary {
+                format!("-\t-\t{path}")
+            } else {
+                format!("{add}\t{del}\t{path}")
+            }
+        })
+    } else if format.patch && format.stat {
+        format!("{}\n\n{}", render::diffstat(files), render::patch(files))
+    } else if format.patch {
         render::patch(files)
     } else {
         render::diffstat(files)
+    }
+}
+
+/// The log walk a `rgit log` command asks for.
+pub(crate) fn log_options(
+    backend: &Arc<dyn GitBackend>,
+    command: &Command,
+) -> anyhow::Result<LogOptions> {
+    let Command::Log {
+        limit,
+        skip,
+        all,
+        author,
+        since,
+        until,
+        grep,
+        ignore_case,
+        first_parent,
+        merges,
+        no_merges,
+        reverse,
+        follow,
+        revs,
+        paths,
+        ..
+    } = command
+    else {
+        anyhow::bail!("not a log command");
+    };
+    let (revs, paths) = split_revs(backend, revs, paths)?;
+    Ok(LogOptions {
+        limit: *limit,
+        offset: *skip,
+        all: *all,
+        author: author.clone(),
+        revs,
+        since: since.as_deref().map(parse_date).transpose()?,
+        until: until.as_deref().map(parse_date).transpose()?,
+        paths,
+        grep: grep.clone(),
+        grep_ignore_case: *ignore_case,
+        first_parent: *first_parent,
+        merges: (*merges || *no_merges).then_some(*merges),
+        reverse: *reverse,
+        follow: *follow,
+    })
+}
+
+/// The files a `rgit diff` command compares, and a name for that scope.
+pub(crate) fn diff_files(
+    backend: &Arc<dyn GitBackend>,
+    command: &Command,
+) -> anyhow::Result<(Vec<rgit_git::FileDiff>, String)> {
+    let Command::Diff {
+        revs,
+        paths,
+        cached,
+        unified,
+        ignore_all_space,
+        ignore_space_change,
+        ..
+    } = command
+    else {
+        anyhow::bail!("not a diff command");
+    };
+    let (revs, paths) = split_revs(backend, revs, paths)?;
+    let side = if *cached { "index" } else { "working tree" };
+    let (from, to, scope) = match &revs[..] {
+        [] if *cached => (None, None, "staged".to_owned()),
+        [] => (None, None, "unstaged".to_owned()),
+        [range] if range.contains("..") => (Some(range.clone()), None, range.clone()),
+        [rev] => (Some(rev.clone()), None, format!("{rev}..{side}")),
+        [from, to] => (
+            Some(from.clone()),
+            Some(to.clone()),
+            format!("{from}..{to}"),
+        ),
+        _ => return Err(CliError::usage("diff takes at most two revisions")),
+    };
+    let files = backend.diff(&rgit_git::DiffSpec {
+        from,
+        to,
+        cached: *cached,
+        paths,
+        context: *unified,
+        ignore_all_space: *ignore_all_space,
+        ignore_space_change: *ignore_space_change,
+    })?;
+    Ok((files, scope))
+}
+
+/// Split `log`/`diff` arguments into revisions and paths as git does: the
+/// leading ones that name revisions, then paths (and everything after `--`).
+fn split_revs(
+    backend: &Arc<dyn GitBackend>,
+    args: &[String],
+    after: &[String],
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+    let is_rev = |arg: &str| {
+        let arg = arg.strip_prefix('^').unwrap_or(arg);
+        let (a, b) = arg
+            .split_once("...")
+            .or_else(|| arg.split_once(".."))
+            .unwrap_or((arg, ""));
+        [a, b]
+            .iter()
+            .all(|s| s.is_empty() || backend.rev_parse(s).is_ok())
+    };
+    let n = args.iter().take_while(|a| is_rev(a)).count();
+    let mut paths = args[n..].to_vec();
+    if let Some(p) = paths
+        .iter()
+        .find(|p| !p.contains(['*', '?', '[']) && !backend.workdir().join(p.as_str()).exists())
+    {
+        return Err(CliError {
+            message: format!(
+                "ambiguous argument '{p}': unknown revision or path not in the working tree"
+            ),
+            help: Some("Put paths after `--`, e.g. `rgit log -- <path>`".to_owned()),
+            code: 128,
+        }
+        .into());
+    }
+    paths.extend_from_slice(after);
+    Ok((args[..n].to_vec(), paths))
+}
+
+/// One `rgit show` argument: a commit, or `rev:path` for a file or folder.
+fn show_one(
+    backend: &Arc<dyn GitBackend>,
+    rev: &str,
+    paths: &[String],
+    format: DiffFormat,
+    no_patch: bool,
+) -> anyhow::Result<String> {
+    if let Some((commit, path)) = rev.split_once(':') {
+        return match backend.read_blob(commit, path) {
+            Ok(blob) => Ok(render::blob(&blob)),
+            Err(e) => {
+                let Ok(mut entries) = backend.list_tree(commit, path) else {
+                    return Err(e.into());
+                };
+                let key = |e: &rgit_git::TreeEntry| {
+                    format!("{}{}", e.name, if e.is_dir { "/" } else { "" })
+                };
+                entries.sort_by_key(key);
+                let names: Vec<String> = entries.iter().map(key).collect();
+                Ok(format!("tree {rev}\n\n{}", names.join("\n")))
+            }
+        };
+    }
+    let mut details = backend.commit_details(rev)?;
+    if !paths.is_empty() {
+        details
+            .files
+            .retain(|f| rgit_git::pathspec_matches(paths, &f.path));
+    }
+    if no_patch {
+        details.files.clear();
+    }
+    let stat_only = !(format.patch || format.name_only || format.name_status || format.numstat);
+    Ok(if stat_only || no_patch {
+        render::commit_details(&details)
+    } else {
+        diff_out(&details.files, format)
+    })
+}
+
+/// Blame `[rev] path`.
+pub(crate) fn blame(
+    backend: &Arc<dyn GitBackend>,
+    args: &[String],
+) -> Result<Vec<rgit_git::BlameLine>, GitError> {
+    match args {
+        [rev, path] => backend.blame_at(rev, path),
+        [path, ..] => backend.blame(path),
+        [] => Ok(Vec::new()),
     }
 }
 

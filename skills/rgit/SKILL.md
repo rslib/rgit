@@ -45,7 +45,6 @@ If `rgit` is not on PATH, install it with `cargo install --locked --git https://
 - `git stash save`: use `rgit stash push [<message>]`
 - `git stash show`: use `rgit stash list`, then `rgit git stash show -p <stash>`
 - `git log --graph`: use `rgit smartlog` for the branch graph
-- `git log -p`, `git log --patch`: use `rgit show <id> --patch` for one commit's patch
 - `git push -f`: use `--force-with-lease` (or `--force`)
 
 ## More commands
