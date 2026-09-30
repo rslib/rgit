@@ -13,7 +13,13 @@ fn base(cmd: &mut Command, dir: &Path) {
         .env("RGIT_OPLOG", "0")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_PAGER");
+        .env_remove("GIT_PAGER")
+        // Identity comes from repo/config files in these tests; an ambient
+        // GIT_AUTHOR_*/GIT_COMMITTER_* (e.g. CI-wide env) would override it.
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL");
 }
 
 fn git(dir: &Path, args: &[&str]) -> Output {
