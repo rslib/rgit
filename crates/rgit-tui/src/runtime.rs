@@ -302,6 +302,7 @@ async fn event_loop(
     loop {
         // The select borrows `events` only until it resolves, freeing it (and
         // the terminal) for effect handling below.
+        let was_signing = app.signing;
         let incoming = tokio::select! {
             Some(event) = events.next() => Incoming::Event(event),
             Some(msg) = msg_rx.recv() => Incoming::Msg(msg),
@@ -399,7 +400,20 @@ async fn event_loop(
             }
         };
 
-        if redraw {
+        // While a signed commit runs, a tty passphrase prompt may be drawing on
+        // the terminal: yield input and the screen to it, then clear and
+        // repaint everything it scribbled once the commit finishes.
+        if app.signing && !was_signing {
+            events.pause();
+        }
+        if !app.signing && was_signing {
+            events.resume();
+            // Wipe whatever the passphrase prompt scribbled and force a full
+            // repaint. Best-effort: it asks the terminal for the cursor
+            // position, which a dumb pipe cannot answer.
+            let _ = terminal.clear();
+        }
+        if redraw && (!app.signing || !was_signing) {
             terminal.draw(|frame| ui::render(frame, &mut app))?;
         }
         if app.should_quit {
@@ -540,18 +554,24 @@ async fn run_msg(
                     let _ = msg_tx.send(out);
                 });
             }
-            Effect::CommitConsole { amend, message } => {
+            Effect::CommitConsole {
+                amend,
+                message,
+                sign,
+            } => {
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
-                tokio::spawn(commit_console(backend, amend, message, msg_tx));
+                if sign {
+                    // A tty pinentry/ssh-keygen prompt draws on the terminal
+                    // behind the TUI; freeze our frames until it finishes.
+                    app.signing = true;
+                }
+                tokio::spawn(commit_console(backend, amend, message, sign, msg_tx));
             }
             Effect::OpConsole(op) => {
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
                 tokio::spawn(op_console(backend, op, msg_tx));
-            }
-            Effect::RunGit { args, label } => {
-                git_console(app, events, terminal, msg_tx, args, label).await?
             }
             Effect::LoadRebaseTodo { base } => {
                 let backend = app.backend();
@@ -1174,6 +1194,7 @@ async fn commit_console(
     backend: Arc<dyn GitBackend>,
     amend: bool,
     message: String,
+    sign: bool,
     msg_tx: UnboundedSender<Msg>,
 ) {
     let workdir = backend.workdir().to_path_buf();
@@ -1237,16 +1258,27 @@ async fn commit_console(
         }
     }
 
-    // Commit through libgit2 (hooks already ran).
+    // Commit through libgit2 (hooks already ran), signing natively when asked.
+    if sign {
+        // The TUI freezes while this runs; a tty pinentry/ssh-keygen prompt
+        // then owns the screen, so say where the passphrase goes up front.
+        let _ = msg_tx.send(Msg::HookOutput(
+            "signing: if your key has a passphrase, answer the prompt on screen".into(),
+        ));
+    }
     let commit = {
         let backend = backend.clone();
         let message = message.clone();
         tokio::task::spawn_blocking(move || {
-            if amend {
-                backend.amend_no_verify(&message)
-            } else {
-                backend.commit_no_verify(&message)
-            }
+            backend.commit_with(
+                &message,
+                &rgit_git::CommitOptions {
+                    amend,
+                    no_verify: true,
+                    sign: sign.then(String::new),
+                    ..Default::default()
+                },
+            )
         })
         .await
     };
@@ -1705,20 +1737,8 @@ fn stack_move(backend: &dyn GitBackend, up: bool) -> Result<(), GitError> {
     backend.checkout_branch(&target)
 }
 
-/// Suspend the TUI and run `git <args>` in the user's terminal so it can drive
-/// its own editor (interactive rebase, `--continue`), then refresh. Used for the
-/// few operations libgit2 cannot express in-process.
-async fn git_console(
-    app: &mut App,
-    events: &mut Events,
-    terminal: &mut DefaultTerminal,
-    msg_tx: &UnboundedSender<Msg>,
-    args: Vec<String>,
-    label: String,
-) -> std::io::Result<()> {
-    git_console_env(app, events, terminal, msg_tx, args, label, Vec::new()).await
-}
-
+/// Suspend the TUI and run `rgit --human <args>` in the user's terminal so it
+/// can drive its own editor (interactive rebase, `--continue`), then refresh.
 async fn git_console_env(
     app: &mut App,
     events: &mut Events,

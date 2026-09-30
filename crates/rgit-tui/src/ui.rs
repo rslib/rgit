@@ -335,6 +335,124 @@ fn render_commit_editor(frame: &mut Frame, editor: &crate::app::CommitEditor, ar
     frame.render_widget(Paragraph::new(footer_line), footer);
 }
 
+/// Parse one line of streamed op output (hook script or network progress)
+/// into styled spans. SGR sequences (`ESC [ ... m`) become ratatui styles,
+/// so a hook that forces color renders as intended; every other escape
+/// sequence is dropped — cursor movement has no meaning inside the pane.
+/// Lines without any escape take a zero-allocation fast path beyond the one
+/// String the pane already had to own.
+pub fn ansi_line(line: &str) -> Line<'static> {
+    if !line.contains('\x1b') {
+        return Line::from(RSpan::styled(line.to_owned(), RStyle::default()));
+    }
+    let mut spans: Vec<RSpan<'static>> = Vec::new();
+    let mut text = String::new();
+    let mut style = RStyle::default();
+    let mut rest = line;
+    while let Some(esc) = rest.find('\x1b') {
+        text.push_str(&rest[..esc]);
+        let after = &rest[esc + 1..];
+        let Some(after) = after.strip_prefix('[') else {
+            rest = after; // a lone ESC: drop it
+            continue;
+        };
+        // CSI: parameter/intermediate bytes, then a final byte 0x40..=0x7e.
+        match after.find(|c: char| (0x40..=0x7e).contains(&(c as u32))) {
+            Some(i) => {
+                if after.as_bytes()[i] == b'm' {
+                    if !text.is_empty() {
+                        spans.push(RSpan::styled(std::mem::take(&mut text), style));
+                    }
+                    apply_sgr(&after[..i], &mut style);
+                }
+                rest = &after[i + 1..];
+            }
+            None => break,
+        }
+    }
+    text.push_str(rest);
+    if !text.is_empty() {
+        spans.push(RSpan::styled(text, style));
+    }
+    Line::from(spans)
+}
+
+/// Apply one SGR parameter string (`"1;31"`) to a style.
+fn apply_sgr(params: &str, style: &mut RStyle) {
+    let mut parts = params.split(';').peekable();
+    while let Some(p) = parts.next() {
+        let n: u16 = if p.is_empty() { 0 } else { p.parse().unwrap_or(0) };
+        match n {
+            0 => *style = RStyle::default(),
+            1 => *style = style.add_modifier(Modifier::BOLD),
+            2 => *style = style.add_modifier(Modifier::DIM),
+            3 => *style = style.add_modifier(Modifier::ITALIC),
+            4 => *style = style.add_modifier(Modifier::UNDERLINED),
+            7 => *style = style.add_modifier(Modifier::REVERSED),
+            9 => *style = style.add_modifier(Modifier::CROSSED_OUT),
+            22 => *style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => *style = style.remove_modifier(Modifier::ITALIC),
+            24 => *style = style.remove_modifier(Modifier::UNDERLINED),
+            27 => *style = style.remove_modifier(Modifier::REVERSED),
+            29 => *style = style.remove_modifier(Modifier::CROSSED_OUT),
+            30..=37 => *style = style.fg(ansi16(n - 30)),
+            38 => match parts.next() {
+                Some("5") => {
+                    let c = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    *style = style.fg(Color::Indexed(c));
+                }
+                Some("2") => {
+                    let next = |v: Option<&str>| v.and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let (r, g, b) = (next(parts.next()), next(parts.next()), next(parts.next()));
+                    *style = style.fg(Color::Rgb(r, g, b));
+                }
+                _ => {}
+            },
+            39 => style.fg = None,
+            40..=47 => *style = style.bg(ansi16(n - 40)),
+            48 => match parts.next() {
+                Some("5") => {
+                    let c = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                    *style = style.bg(Color::Indexed(c));
+                }
+                Some("2") => {
+                    let next = |v: Option<&str>| v.and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let (r, g, b) = (next(parts.next()), next(parts.next()), next(parts.next()));
+                    *style = style.bg(Color::Rgb(r, g, b));
+                }
+                _ => {}
+            },
+            49 => style.bg = None,
+            90..=97 => *style = style.fg(ansi16(n - 90 + 8)),
+            100..=107 => *style = style.bg(ansi16(n - 100 + 8)),
+            _ => {}
+        }
+    }
+}
+
+/// The 16 standard colors as named variants, so a terminal palette theme
+/// applies; 256-color and RGB stays indexed.
+fn ansi16(n: u16) -> Color {
+    match n {
+        0 => Color::Black,
+        1 => Color::Red,
+        2 => Color::Green,
+        3 => Color::Yellow,
+        4 => Color::Blue,
+        5 => Color::Magenta,
+        6 => Color::Cyan,
+        7 => Color::White,
+        8 => Color::DarkGray,
+        9 => Color::LightRed,
+        10 => Color::LightGreen,
+        11 => Color::LightYellow,
+        12 => Color::LightBlue,
+        13 => Color::LightMagenta,
+        14 => Color::LightCyan,
+        _ => Color::Gray,
+    }
+}
+
 /// The live hook console: a large panel streaming `git commit` output, with a
 /// status title and a footer that offers retry/dismiss once the run finishes.
 fn render_hook_console(
@@ -410,11 +528,8 @@ fn render_hook_console(
             theme::resolve(Style::Dim),
         ))]
     } else {
-        console.lines[top..]
-            .iter()
-            .take(rows)
-            .map(|l| Line::from(RSpan::styled(l.clone(), theme::resolve(Style::Plain))))
-            .collect()
+        // Spans were parsed at ingest; the visible window clones them as-is.
+        console.lines[top..].iter().take(rows).cloned().collect()
     };
     frame.render_widget(Paragraph::new(lines), body);
 
@@ -1643,4 +1758,91 @@ fn render_help(frame: &mut Frame, area: Rect) {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
     frame.render_widget(Paragraph::new(help_lines(&HELP_GROUPS[..mid])), left);
     frame.render_widget(Paragraph::new(help_lines(&HELP_GROUPS[mid..])), right);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::{Color, Modifier};
+
+    /// The spans of a parsed line as (text, style) pairs for easy assertions.
+    fn spans(line: &str) -> Vec<(String, RStyle)> {
+        ansi_line(line)
+            .spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style))
+            .collect()
+    }
+
+    #[test]
+    fn plain_line_is_a_single_default_span() {
+        assert_eq!(
+            spans("just text"),
+            vec![("just text".to_owned(), RStyle::default())]
+        );
+    }
+
+    #[test]
+    fn sgr_color_runs_and_reset() {
+        assert_eq!(
+            spans("\x1b[31mred\x1b[0m plain"),
+            vec![
+                ("red".to_owned(), RStyle::default().fg(Color::Red)),
+                (" plain".to_owned(), RStyle::default()),
+            ]
+        );
+    }
+
+    #[test]
+    fn sgr_bold_combines_with_color() {
+        assert_eq!(
+            spans("\x1b[1;34mbold blue\x1b[m"),
+            vec![(
+                "bold blue".to_owned(),
+                RStyle::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD)
+            )]
+        );
+    }
+
+    #[test]
+    fn sgr_extended_colors() {
+        assert_eq!(
+            spans("\x1b[38;5;196mx"),
+            vec![("x".to_owned(), RStyle::default().fg(Color::Indexed(196)))]
+        );
+        assert_eq!(
+            spans("\x1b[48;2;1;2;3m y"),
+            vec![(
+                " y".to_owned(),
+                RStyle::default().bg(Color::Rgb(1, 2, 3))
+            )]
+        );
+    }
+
+    #[test]
+    fn sgr_bright_and_reset_to_default() {
+        assert_eq!(
+            spans("\x1b[92mbright\x1b[39m done"),
+            vec![
+                ("bright".to_owned(), RStyle::default().fg(Color::LightGreen)),
+                (" done".to_owned(), RStyle::default()),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_sgr_escapes_are_dropped() {
+        // Cursor erase and a stray ESC vanish; the text stays.
+        assert_eq!(
+            spans("a\x1b[2Kb\x1b c"),
+            vec![("ab c".to_owned(), RStyle::default())]
+        );
+    }
+
+    #[test]
+    fn trailing_escape_without_text_adds_nothing() {
+        assert_eq!(spans("x\x1b[31m"), vec![("x".to_owned(), RStyle::default())]);
+    }
 }

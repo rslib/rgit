@@ -68,7 +68,8 @@ impl ConsoleOp {
 pub struct HookConsole {
     /// Short operation name shown in the title ("commit", "fetch", ...).
     pub title: String,
-    pub lines: Vec<String>,
+    /// Streamed output, pre-parsed into styled spans (see `ui::ansi_line`).
+    pub lines: Vec<ratatui::text::Line<'static>>,
     pub status: HookStatus,
     /// Top visible line; follows the tail while running unless the user scrolls.
     pub scroll: usize,
@@ -1658,12 +1659,6 @@ pub enum Effect {
     Commit {
         amend: bool,
     },
-    /// Suspend the TUI and run `git <args>` in the foreground (for operations
-    /// that drive their own editor, like interactive rebase), then refresh.
-    RunGit {
-        args: Vec<String>,
-        label: String,
-    },
     /// Load the branch list, then open the checkout prompt.
     LoadBranches,
     /// Load the commit log with the given filters, then push the log view.
@@ -1764,6 +1759,8 @@ pub enum Effect {
     CommitConsole {
         amend: bool,
         message: String,
+        /// Sign the commit (git's `-S`), on top of commit.gpgSign.
+        sign: bool,
     },
     /// Run a network op via libgit2, streaming its git-style progress into the
     /// operation console.
@@ -1904,6 +1901,10 @@ pub struct App {
     oplog_len: usize,
     /// Sign commits via git's -S when set.
     gpg_sign: bool,
+    /// A signed commit is running: a tty passphrase prompt may be drawing on
+    /// the terminal behind us, so the loop paints one static frame and then
+    /// yields the screen until the commit finishes (cleared by HookFinished).
+    pub signing: bool,
     /// Restack stacked children after an amend/reword/extend when set.
     auto_restack: bool,
     /// The lane targeted by a pending lane-commit prompt.
@@ -2042,6 +2043,7 @@ impl App {
             log_filter: LogFilter::All,
             oplog_len: 0,
             gpg_sign,
+            signing: false,
             auto_restack: config.commit.auto_restack,
             pending_reword_rev: None,
             pending_push: None,
@@ -3515,27 +3517,16 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 } else {
                     let amend = editor.amend;
                     app.commit_editor = None;
-                    if app.gpg_sign {
-                        // Signing may prompt for a passphrase, which needs the
-                        // real terminal; run it in the suspended-terminal console
-                        // (hooks still run and show there).
-                        app.busy = Some(if amend { "amending" } else { "committing" }.into());
-                        let mut args = vec!["commit".to_owned(), "-S".to_owned()];
-                        if amend {
-                            args.push("--amend".to_owned());
-                        }
-                        args.push("-m".to_owned());
-                        args.push(message);
-                        return vec![Effect::RunGit {
-                            args,
-                            label: "committing".into(),
-                        }];
-                    }
-                    // Run the commit through `git commit` and stream its hook
-                    // output into the console, so hooks are visible and a hook
+                    // Stream the commit's hook output into the console, so a
                     // rejection holds the commit with its errors on screen.
+                    // Signing is honored natively: per commit.gpgSign, or forced
+                    // as git's -S by the gpg_sign config.
                     app.hook_console = Some(HookConsole::commit(amend, message.clone()));
-                    return vec![Effect::CommitConsole { amend, message }];
+                    return vec![Effect::CommitConsole {
+                        amend,
+                        message,
+                        sign: app.gpg_sign,
+                    }];
                 }
             }
         }
@@ -3559,7 +3550,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::HookOutput(line) => {
             if let Some(console) = &mut app.hook_console {
-                console.lines.push(line);
+                // Parse SGR color once, at ingest: rendering then just clones
+                // the visible rows, so a redraw never re-parses.
+                console.lines.push(crate::ui::ansi_line(&line));
             }
         }
         Msg::HookProgress { received, total } => {
@@ -3568,6 +3561,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::HookFinished { ok, summary } => {
+            app.signing = false;
             if let Some(console) = &mut app.hook_console {
                 console.status = if ok {
                     HookStatus::Passed
