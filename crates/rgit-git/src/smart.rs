@@ -282,7 +282,10 @@ impl Session {
 
     fn open_http(url: &str, config: Option<&git2::Config>) -> Result<Self, GitError> {
         let base = url.trim_end_matches('/').to_owned();
-        let agent: ureq::Agent = ureq::Agent::config_builder().user_agent(AGENT).build().into();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .user_agent(AGENT)
+            .build()
+            .into();
         let info = format!("{base}/info/refs?service=git-upload-pack");
         let mut auth: Option<String> = None;
         let resp = loop {
@@ -423,7 +426,10 @@ impl Session {
                     req = req.header("Authorization", a.as_str());
                 }
                 Ok(Box::new(
-                    req.send(&body).map_err(http_error)?.into_body().into_reader(),
+                    req.send(&body)
+                        .map_err(http_error)?
+                        .into_body()
+                        .into_reader(),
                 ))
             }
         }

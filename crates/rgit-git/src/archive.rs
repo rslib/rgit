@@ -820,7 +820,8 @@ pub(crate) fn archive(repo: &Repository, o: &ArchiveOpts) -> Result<Vec<u8>, Git
             unsafe {
                 let m = libc::umask(0);
                 libc::umask(m);
-                u32::from(m)
+                // mode_t is u32 on linux and u16 on apple; `as` keeps both lint-clean.
+                m as u32
             }
         }
         Some(v) => parse_c_int(v).unwrap_or(0o002),

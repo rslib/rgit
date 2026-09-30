@@ -381,7 +381,11 @@ pub fn ansi_line(line: &str) -> Line<'static> {
 fn apply_sgr(params: &str, style: &mut RStyle) {
     let mut parts = params.split(';').peekable();
     while let Some(p) = parts.next() {
-        let n: u16 = if p.is_empty() { 0 } else { p.parse().unwrap_or(0) };
+        let n: u16 = if p.is_empty() {
+            0
+        } else {
+            p.parse().unwrap_or(0)
+        };
         match n {
             0 => *style = RStyle::default(),
             1 => *style = style.add_modifier(Modifier::BOLD),
@@ -1814,10 +1818,7 @@ mod tests {
         );
         assert_eq!(
             spans("\x1b[48;2;1;2;3m y"),
-            vec![(
-                " y".to_owned(),
-                RStyle::default().bg(Color::Rgb(1, 2, 3))
-            )]
+            vec![(" y".to_owned(), RStyle::default().bg(Color::Rgb(1, 2, 3)))]
         );
     }
 
@@ -1843,6 +1844,9 @@ mod tests {
 
     #[test]
     fn trailing_escape_without_text_adds_nothing() {
-        assert_eq!(spans("x\x1b[31m"), vec![("x".to_owned(), RStyle::default())]);
+        assert_eq!(
+            spans("x\x1b[31m"),
+            vec![("x".to_owned(), RStyle::default())]
+        );
     }
 }

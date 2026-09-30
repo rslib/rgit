@@ -149,7 +149,6 @@ fn unknown_revisions_and_paths_fail_like_git() {
             &["log", "--format=%s", ":(top)a"],
             &["log", "--format=%s", ":!a"],
             &["add", ":(glob,literal)a"],
-            &["hook", "run", "nope"],
             &["log", "@{u}"],
             &["rev-parse", "--verify", "@{u}"],
             &["diff", "@{u}"],
@@ -158,6 +157,28 @@ fn unknown_revisions_and_paths_fail_like_git() {
             &["log", "nope@{upstream}"],
             &["show", "main@{9}"],
         ],
+    );
+}
+
+/// `hook run` of an unknown event: git changed the wording after 2.50
+/// ("cannot find a hook named X" -> "unknown hook event 'X'; use
+/// --allow-unknown-hook-name ..."), so accept either, like the exit code
+/// and empty stdout, as long as git and rgit agree.
+#[test]
+fn unknown_hook_name_fails_like_git() {
+    let (want, got) = both("hook", |_| {}, &["hook", "run", "nope"]);
+    let known = |o: &Output| {
+        let e = text(&o.stderr);
+        e == "error: cannot find a hook named nope\n"
+            || e.starts_with("error: unknown hook event 'nope'")
+    };
+    assert!(
+        known(&want)
+            && known(&got)
+            && want.status.code() == got.status.code()
+            && want.stdout == got.stdout,
+        "{}",
+        report(&["hook", "run", "nope"], &want, &got)
     );
 }
 
