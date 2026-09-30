@@ -47,9 +47,36 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # The parity tests null out global git config and commit as the
+      # current user; dotless CI hostnames make git's identity
+      # auto-detection fail, so hand it one.
+      GIT_AUTHOR_NAME: rgit CI
+      GIT_AUTHOR_EMAIL: ci@example.com
+      GIT_COMMITTER_NAME: rgit CI
+      GIT_COMMITTER_EMAIL: ci@example.com
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
       - run: cargo test --all-targets
+
+  musl:
+    name: Musl build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-unknown-linux-musl
+          rustflags: ""
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build (musl has cfg'd code the gnu build never compiles)
+        run: cargo build --locked --target x86_64-unknown-linux-musl -p rgit-cli
+      - name: The binary is static
+        run: |
+          bin=target/x86_64-unknown-linux-musl/debug/rgit
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          ! ldd "$bin" 2>&1 | grep -q '=>'

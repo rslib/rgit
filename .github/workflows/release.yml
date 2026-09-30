@@ -41,10 +41,10 @@ jobs:
         include:
           - name: linux-x86_64
             runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - name: linux-aarch64
             runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
           - name: macos-aarch64
             runner: macos-latest
             target: aarch64-apple-darwin
@@ -57,8 +57,21 @@ jobs:
         with:
           target: ${{ matrix.target }}
           rustflags: ""
+      - name: Install musl tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} -p rgit-cli
+      - name: The Linux binary is static
+        if: runner.os == 'Linux'
+        run: |
+          bin=target/${{ matrix.target }}/release/rgit
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          if ldd "$bin" 2>&1 | grep -q '=>'; then
+            echo "$bin links shared libraries"
+            exit 1
+          fi
       - name: The binary runs and reports the version
         run: |
           out=$(target/${{ matrix.target }}/release/rgit --version)

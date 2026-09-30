@@ -59,15 +59,28 @@ impl Regex {
             },
             posix::RegMatch { so: -1, eo: -1 },
         ];
-        // A non-null pointer even for an empty slice; REG_STARTEND bounds it.
-        let ptr = if text.is_empty() {
-            c"".as_ptr().cast()
-        } else {
-            text.as_ptr()
+        #[cfg(not(target_env = "musl"))]
+        let (ptr, eflags) = {
+            // A non-null pointer even for an empty slice; REG_STARTEND bounds it.
+            let ptr = if text.is_empty() {
+                c"".as_ptr().cast()
+            } else {
+                text.as_ptr()
+            };
+            (ptr.cast::<libc::c_char>(), libc::REG_STARTEND)
         };
-        // SAFETY: REG_STARTEND keeps regexec inside text[..len].
-        let rc =
-            unsafe { posix::regexec(&*self.0, ptr.cast(), 2, m.as_mut_ptr(), libc::REG_STARTEND) };
+        // musl has no REG_STARTEND: match a NUL-terminated copy so offsets
+        // stay relative to text.
+        // ponytail: an interior NUL truncates the match (glibc matches past
+        // it); userdiff text is source code, so reintroduce STARTEND-free
+        // bounded matching only if that ever matters.
+        #[cfg(target_env = "musl")]
+        let c = std::ffi::CString::new(text).ok()?;
+        #[cfg(target_env = "musl")]
+        let (ptr, eflags) = (c.as_ptr(), 0);
+        // SAFETY: REG_STARTEND keeps regexec inside text[..len]; on musl it
+        // reads the NUL-terminated copy, alive for the call.
+        let rc = unsafe { posix::regexec(&*self.0, ptr, 2, m.as_mut_ptr(), eflags) };
         if rc != 0 {
             return None;
         }
