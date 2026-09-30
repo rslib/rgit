@@ -31,7 +31,7 @@ use rmcp::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
         GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation,
         ListPromptsResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptMessage, Role,
-        ServerCapabilities, ServerInfo, Tool,
+        ServerCapabilities, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
     transport::stdio,
@@ -307,12 +307,12 @@ pub fn http_router_rooted(root: std::path::PathBuf) -> axum::Router {
 }
 
 impl ServerHandler for RgitMcp {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // from_build_env() reports rmcp's own name/version, so set ours.
         let mut info = Implementation::from_build_env();
         info.name = "rgit".to_owned();
         info.version = env!("CARGO_PKG_VERSION").to_owned();
-        ServerInfo::new(
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()

@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use base64::Engine;
 use keyring::Entry;
 use octocrab::Octocrab;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;

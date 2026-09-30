@@ -22,9 +22,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
-octocrab = "0.44"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-toml = "0.8"
+octocrab = "0.54"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
+toml = "1"
 
 # Release/install builds only (dev debug builds are untouched). A smaller binary
 # makes the one-time macOS code-signature check on first launch - the "slow

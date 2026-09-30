@@ -282,16 +282,16 @@ impl Session {
 
     fn open_http(url: &str, config: Option<&git2::Config>) -> Result<Self, GitError> {
         let base = url.trim_end_matches('/').to_owned();
-        let agent = ureq::AgentBuilder::new().user_agent(AGENT).build();
+        let agent: ureq::Agent = ureq::Agent::config_builder().user_agent(AGENT).build().into();
         let info = format!("{base}/info/refs?service=git-upload-pack");
         let mut auth: Option<String> = None;
         let resp = loop {
-            let mut req = agent.get(&info).set("Git-Protocol", "version=2");
+            let mut req = agent.get(&info).header("Git-Protocol", "version=2");
             if let Some(a) = &auth {
-                req = req.set("Authorization", a);
+                req = req.header("Authorization", a);
             }
             match req.call() {
-                Err(ureq::Error::Status(401, _)) if auth.is_none() => {
+                Err(ureq::Error::StatusCode(401)) if auth.is_none() => {
                     auth = Some(http_auth(url, config).ok_or_else(|| {
                         GitError::Other(format!("Authentication failed for '{url}'"))
                     })?);
@@ -299,7 +299,7 @@ impl Session {
                 r => break r.map_err(http_error)?,
             }
         };
-        let mut body = resp.into_reader();
+        let mut body = resp.into_body().into_reader();
         let mut first = match read_line(&mut body)? {
             Pkt::Data(d) => text(d)?,
             _ => return Err(GitError::Other("invalid server response".into())),
@@ -416,14 +416,14 @@ impl Session {
             Wire::Http { agent, base, auth } => {
                 let mut req = agent
                     .post(&format!("{base}/git-upload-pack"))
-                    .set("Git-Protocol", "version=2")
-                    .set("Content-Type", "application/x-git-upload-pack-request")
-                    .set("Accept", "application/x-git-upload-pack-result");
+                    .header("Git-Protocol", "version=2")
+                    .header("Content-Type", "application/x-git-upload-pack-request")
+                    .header("Accept", "application/x-git-upload-pack-result");
                 if let Some(a) = auth {
-                    req = req.set("Authorization", a);
+                    req = req.header("Authorization", a.as_str());
                 }
                 Ok(Box::new(
-                    req.send_bytes(&body).map_err(http_error)?.into_reader(),
+                    req.send(&body).map_err(http_error)?.into_body().into_reader(),
                 ))
             }
         }
@@ -681,10 +681,9 @@ fn url_credentials(url: &str) -> Option<(String, String)> {
 
 fn http_error(e: ureq::Error) -> GitError {
     match e {
-        ureq::Error::Status(code, r) => GitError::Other(format!(
-            "unable to access '{}': The requested URL returned error: {code}",
-            r.get_url()
-        )),
+        ureq::Error::StatusCode(code) => {
+            GitError::Other(format!("the requested URL returned error: {code}"))
+        }
         e => GitError::Other(e.to_string()),
     }
 }

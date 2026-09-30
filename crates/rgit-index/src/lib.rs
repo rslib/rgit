@@ -223,7 +223,7 @@ fn symbol_chunks(path: &str, text: &str) -> Option<Vec<FileChunk>> {
     while let Some(m) = it.next() {
         let mut def = None;
         let mut name = String::new();
-        for c in m.captures {
+        for c in m.captures() {
             let cap = names[c.index as usize];
             if cap.starts_with("definition") {
                 def = Some(c.node);
@@ -511,12 +511,16 @@ pub fn save(index: &Index, path: &Path) -> Result<(), IndexError> {
         std::fs::create_dir_all(dir)?;
     }
     // Persist only the records; the HNSW graph is rebuilt from them on load.
-    let bytes = bincode::serialize(&index.records).map_err(|e| IndexError::Codec(e.to_string()))?;
+    // legacy() keeps the bincode 1 wire format so existing caches stay readable.
+    let bytes = bincode::serde::encode_to_vec(&index.records, bincode::config::legacy())
+        .map_err(|e| IndexError::Codec(e.to_string()))?;
     std::fs::write(path, bytes)?;
     Ok(())
 }
 
 pub fn load(path: &Path) -> Option<Index> {
-    let records: Vec<Record> = bincode::deserialize(&std::fs::read(path).ok()?).ok()?;
+    let (records, _) =
+        bincode::serde::decode_from_slice(&std::fs::read(path).ok()?, bincode::config::legacy())
+            .ok()?;
     Some(Index::from_records(records))
 }
