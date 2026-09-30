@@ -2747,13 +2747,15 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_replay",
-            "Replay `revs` (`base..branch`) onto `onto`, or onto branch `advance`, in memory; \
-             returns the `update <ref> <new> <old>` lines for update-ref and whether it was clean.",
+            "Replay `revs` (`base..branch`) onto `onto`, or onto branch `advance`, in memory. \
+             Updates the touched refs by default; `ref_action: \"print\"` \
+             instead returns the `update <ref> <new> <old>` lines for update-ref.",
             &[
                 ("revs", "string[]", true),
                 ("onto", "string", false),
                 ("advance", "string", false),
                 ("contained", "boolean", false),
+                ("ref_action", "string", false),
             ],
         ),
         tool(
@@ -4949,6 +4951,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             advance: a.str("advance"),
             contained: a.flag("contained"),
             revs: a.strings("revs")?,
+            ref_action: a.str("ref_action").unwrap_or_else(|| "update".to_owned()),
         }),
         "git_interpret_trailers" => {
             let mut args: Vec<String> = a

@@ -161,7 +161,7 @@ pub use replace::{
     replace_convert_grafts, replace_delete, replace_edit_export, replace_edit_import,
     replace_graft, replace_list, replace_object,
 };
-pub use replay::{ReplayOpts, replay};
+pub use replay::{RefAction, ReplayOpts, replay};
 pub use rev::range_base;
 pub use show_branch::{ShowBranchOpts, show_branch, show_branch_defaults};
 pub use sign::{SignatureCheck, sign_buffer};

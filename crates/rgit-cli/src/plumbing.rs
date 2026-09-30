@@ -1282,6 +1282,7 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             advance,
             contained,
             revs,
+            ref_action,
         } => {
             match (&onto, &advance) {
                 (None, None) => {
@@ -1299,11 +1300,17 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                 }
                 _ => {}
             }
+            let ref_action = match ref_action.as_str() {
+                "update" => rgit_git::RefAction::Update,
+                "print" => rgit_git::RefAction::Print,
+                other => return Err(CliError::usage(format!("invalid --ref-action: {other}"))),
+            };
             let o = rgit_git::ReplayOpts {
                 onto,
                 advance,
                 contained,
                 revs,
+                ref_action,
             };
             let (text, clean) =
                 rgit_git::replay(&backend.git_dir(), &o).map_err(|e| fatal(e.to_string()))?;

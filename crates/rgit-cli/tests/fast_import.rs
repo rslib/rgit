@@ -252,6 +252,21 @@ fn replay_matches_git() {
     git(&dir, &["checkout", "-qb", "clash", "main~1"]);
     commit("d", "z\n", "clash");
     git(&dir, &["checkout", "-q", "main"]);
+    // git 2.53+ reworked replay: refs update silently by default (the old
+    // update lines need --ref-action=print), nothing prints on a conflict,
+    // and commits that become empty are dropped. rgit tracks the new
+    // semantics, which no flag on an older git can reproduce, so skip when
+    // the oracle predates --ref-action.
+    let usage = run("git", &dir, &["replay", "-h"], None);
+    let usage = format!(
+        "{}{}",
+        String::from_utf8_lossy(&usage.stdout),
+        String::from_utf8_lossy(&usage.stderr)
+    );
+    if !usage.contains("--ref-action") {
+        eprintln!("skipping: git predates replay --ref-action");
+        return;
+    }
     for args in [
         &["--onto", "main", "main..topic"][..],
         &["--onto", "main", "main..topic", "main..mid"],
@@ -261,10 +276,12 @@ fn replay_matches_git() {
         &["--advance", "main", "main~2..clash"],
         &["--onto", "main", "--advance", "main", "main..topic"],
     ] {
-        let mut full = vec!["replay"];
+        // The flag goes before the range so rgit's allow-hyphen revs do not
+        // swallow it.
+        let mut full = vec!["replay", "--ref-action=print"];
         full.extend_from_slice(args);
-        let want = run("git", &dir, &full, None);
         let got = rgit(&dir, &full, None);
+        let want = run("git", &dir, &full, None);
         assert_eq!(got.status.code(), want.status.code(), "{args:?}: {got:?}");
         assert_eq!(
             String::from_utf8_lossy(&got.stdout),

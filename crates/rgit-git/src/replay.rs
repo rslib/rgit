@@ -16,6 +16,17 @@ pub struct ReplayOpts {
     pub advance: Option<String>,
     pub contained: bool,
     pub revs: Vec<String>,
+    /// `--ref-action` (git 2.53+): update the refs and stay silent (the
+    /// default), or print the `update <ref> <new> <old>` lines and leave
+    /// the refs alone.
+    pub ref_action: RefAction,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefAction {
+    #[default]
+    Update,
+    Print,
 }
 
 fn fatal(msg: &str) -> GitError {
@@ -66,9 +77,8 @@ pub fn replay(git_dir: &Path, o: &ReplayOpts) -> Result<(String, bool), GitError
     let (walked, _) = topo_walk(&repo, &tips, &revs.hide, &mut HashMap::new(), None)?;
     let committer = crate::plumbing::ident(&repo, true)?;
     let mut replayed: HashMap<Oid, Oid> = HashMap::new();
-    let mut out = String::new();
+    let mut updates: Vec<(String, Oid, Oid)> = Vec::new();
     let mut last = onto;
-    let mut clean = true;
     for w in &walked {
         let [base] = w.parents[..] else {
             return Err(fatal(if w.parents.is_empty() {
@@ -79,18 +89,22 @@ pub fn replay(git_dir: &Path, o: &ReplayOpts) -> Result<(String, bool), GitError
         };
         let new_base = replayed.get(&base).copied().unwrap_or(onto);
         let pick = repo.find_commit(w.id)?;
-        let mut index = repo.merge_trees(
-            &repo.find_commit(base)?.tree()?,
-            &repo.find_commit(new_base)?.tree()?,
-            &pick.tree()?,
-            None,
-        )?;
+        let base_tree = repo.find_commit(base)?.tree()?;
+        let new_base_tree = repo.find_commit(new_base)?.tree()?;
+        let pick_tree = pick.tree()?;
+        let mut index = repo.merge_trees(&base_tree, &new_base_tree, &pick_tree, None)?;
         if index.has_conflicts() {
-            clean = false;
-            break;
+            // git prints and applies nothing when the replay is not clean.
+            return Ok((String::new(), false));
         }
         let tree = index.write_tree_to(&repo)?;
-        let id = rewrite(&repo, w.id, tree, new_base, &committer)?;
+        // A commit that becomes empty on the new base is dropped, as git's
+        // REPLAY_EMPTY_COMMIT_DROP does; an already-empty pick is kept.
+        let id = if tree == new_base_tree.id() && pick_tree.id() != base_tree.id() {
+            new_base
+        } else {
+            rewrite(&repo, w.id, tree, new_base, &committer)?
+        };
         replayed.insert(w.id, id);
         last = id;
         if advance.is_some() {
@@ -100,14 +114,32 @@ pub fn replay(git_dir: &Path, o: &ReplayOpts) -> Result<(String, bool), GitError
         names.sort();
         for name in names.iter().rev() {
             if o.contained || update.contains(name) {
-                out.push_str(&format!("update {name} {id} {}\n", w.id));
+                updates.push((name.clone(), id, w.id));
             }
         }
     }
-    if clean && let Some(name) = advance {
-        out.push_str(&format!("update {name} {last} {onto}\n"));
+    if let Some(name) = advance {
+        updates.push((name, last, onto));
     }
-    Ok((out, clean))
+    match o.ref_action {
+        RefAction::Print => Ok((
+            updates
+                .iter()
+                .map(|(name, new, old)| format!("update {name} {new} {old}\n"))
+                .collect(),
+            true,
+        )),
+        RefAction::Update => {
+            let msg = match &o.advance {
+                Some(b) => format!("replay --advance {b}"),
+                None => format!("replay --onto {onto}"),
+            };
+            for (name, new, _) in &updates {
+                repo.reference(name, *new, true, &msg)?;
+            }
+            Ok((String::new(), true))
+        }
+    }
 }
 
 /// `orig` rewritten with `tree` on `parent`: the same author, message and

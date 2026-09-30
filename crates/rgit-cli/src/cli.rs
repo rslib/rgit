@@ -3644,7 +3644,8 @@ pub enum Plumbing {
         args: Vec<String>,
     },
     /// Replay commits onto a new base without touching the working tree,
-    /// like `git replay`: prints `update <ref> <new> <old>` lines for
+    /// like `git replay`: updates the refs (git's default since 2.53), or
+    /// with --ref-action=print emits `update <ref> <new> <old>` lines for
     /// `rgit update-ref --stdin`; exits 1 on a conflict.
     Replay {
         /// Replay onto this commit, updating the branches given.
@@ -3656,6 +3657,10 @@ pub enum Plumbing {
         /// Update every branch inside the replayed range.
         #[arg(long)]
         contained: bool,
+        /// What to do with the refs the replay touches: update them
+        /// (default) or print update lines without touching them.
+        #[arg(long, value_name = "MODE", default_value = "update")]
+        ref_action: String,
         /// The commits to replay (`base..branch`).
         #[arg(value_name = "REVISION-RANGE", allow_hyphen_values = true)]
         revs: Vec<String>,
