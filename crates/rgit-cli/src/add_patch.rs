@@ -584,9 +584,8 @@ impl<'a> State<'a> {
     fn render_hunk(&self, hunk: &Hunk, delta: isize, colored: bool, out: &mut Vec<u8>) {
         let header = &hunk.header;
         if header.old_offset != 0 || header.new_offset != 0 {
-            let extra: &[u8];
-            if !colored {
-                extra = &self.plain[header.extra_start..header.extra_end];
+            let extra: &[u8] = if !colored {
+                &self.plain[header.extra_start..header.extra_end]
             } else if header.suppress_colored_line_range {
                 out.extend_from_slice(
                     &self.colored[header.colored_extra_start..header.colored_extra_end],
@@ -595,8 +594,8 @@ impl<'a> State<'a> {
                 return;
             } else {
                 out.extend_from_slice(self.c.fraginfo.as_bytes());
-                extra = &self.colored[header.colored_extra_start..header.colored_extra_end];
-            }
+                &self.colored[header.colored_extra_start..header.colored_extra_end]
+            };
             let (mut old_offset, mut new_offset) =
                 (header.old_offset as isize, header.new_offset as isize);
             if self.mode.is_reverse {

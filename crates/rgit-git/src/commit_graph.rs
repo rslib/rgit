@@ -236,8 +236,7 @@ fn murmur3(seed: u32, data: &[u8], v2: bool) -> u32 {
     let byte = |b: u8| if v2 { b as u32 } else { b as i8 as i32 as u32 };
     let (c1, c2) = (0xcc9e_2d51u32, 0x1b87_3593u32);
     let mut h = seed;
-    let blocks = data.chunks_exact(4);
-    let tail = blocks.remainder();
+    let (blocks, tail) = data.as_chunks::<4>();
     for b in blocks {
         let mut k = byte(b[0]) | byte(b[1]) << 8 | byte(b[2]) << 16 | byte(b[3]) << 24;
         k = k.wrapping_mul(c1).rotate_left(15).wrapping_mul(c2);

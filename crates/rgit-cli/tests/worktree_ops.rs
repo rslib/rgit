@@ -232,7 +232,7 @@ fn checkout_restores_paths_and_switches_like_git() {
         &["checkout", "-q", "--detach"],
         &["checkout", "--detach"],
     );
-    let feat = |d: &Path| git(d, &["branch", "feat", "HEAD~1"]).truncate(0);
+    let feat = |d: &Path| git(d, &["branch", "feat", "HEAD~1"]).clear();
     same(
         "co-B",
         feat,
@@ -241,7 +241,7 @@ fn checkout_restores_paths_and_switches_like_git() {
     );
     same(
         "co-prev",
-        |d| git(d, &["checkout", "-q", "-b", "feat"]).truncate(0),
+        |d| git(d, &["checkout", "-q", "-b", "feat"]).clear(),
         &["checkout", "-q", "-"],
         &["checkout", "-"],
     );
@@ -263,7 +263,7 @@ fn switch_creates_detaches_and_goes_back() {
         &["switch", "-q", "-c", "new", "HEAD~1"],
         &["switch", "-c", "new", "HEAD~1"],
     );
-    let feat = |d: &Path| git(d, &["branch", "feat", "HEAD~1"]).truncate(0);
+    let feat = |d: &Path| git(d, &["branch", "feat", "HEAD~1"]).clear();
     same(
         "sw-C",
         feat,
