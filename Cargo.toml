@@ -9,6 +9,14 @@ license = "MIT"
 repository = "https://github.com/rayandrew/rgit"
 rust-version = "1.96"
 
+# Releases are GitHub-only: the tag push triggers .github/workflows/release.yml,
+# which builds and publishes the binaries. No crates.io publishing.
+[workspace.metadata.release]
+publish = false
+push = true
+# One consolidated tag for the whole workspace; release.yml triggers on v*.
+tag-name = "v{{version}}"
+
 [workspace.dependencies]
 rgit-forge = { path = "crates/rgit-forge" }
 rgit-git = { path = "crates/rgit-git" }
