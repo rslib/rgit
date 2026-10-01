@@ -202,6 +202,11 @@ fn cherry_pick_applies_another_branch_commit_as_a_new_commit() {
     let feature_commit = head(&dir);
 
     git(&dir, &["checkout", "-q", "main"]);
+    // A different parent keeps the pick from reproducing the original oid
+    // when both land in the same second.
+    std::fs::write(dir.join("m.txt"), "m\n").unwrap();
+    git(&dir, &["add", "m.txt"]);
+    git(&dir, &["commit", "-qm", "Main"]);
     let before = head(&dir);
 
     let backend = Git2Backend::discover(&dir).unwrap();

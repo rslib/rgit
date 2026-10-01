@@ -1181,6 +1181,8 @@ fn status_submodule_summary_matches_git() {
     git(&dir, &["commit", "-qm", "add sub"]);
     add("sub2");
     let sub = dir.join("sub");
+    git(&sub, &["config", "user.email", "t@t"]);
+    git(&sub, &["config", "user.name", "t"]);
     for n in ["3", "4"] {
         write(&sub, "a", &format!("{n}\n"));
         git(&sub, &["commit", "-qam", &format!("lib {n}")]);
