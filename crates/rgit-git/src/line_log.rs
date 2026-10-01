@@ -281,6 +281,8 @@ struct Pair {
     new_path: String,
     old: Option<Oid>,
     new: Oid,
+    old_mode: i32,
+    new_mode: i32,
 }
 
 fn pairs(
@@ -315,6 +317,8 @@ fn pairs(
             new_path,
             old: (d.status() != Delta::Added).then(|| d.old_file().id()),
             new: d.new_file().id(),
+            old_mode: d.old_file().mode().into(),
+            new_mode: d.new_file().mode().into(),
         });
     }
     Ok(out)
@@ -347,18 +351,48 @@ fn process(
             union(&shift(&difference(rs, &hit.target), &diff), &hit.parent),
         );
         if !hit.target.is_empty() {
-            shown.push(dump(&pair, rs, &hit, old.as_deref(), &target));
+            shown.push(dump(repo, &pair, rs, &hit, old.as_deref(), &target)?);
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok((!shown.is_empty(), out, shown))
 }
 
-/// The file's diff limited to the ranges, as git's dump_diff_hacky_one
-/// prints it.
-fn dump(pair: &Pair, rs: &Ranges, diff: &DiffRanges, old: Option<&[u8]>, new: &[u8]) -> FileDiff {
+/// The file's diff limited to the ranges, with the full header git's
+/// line-log prints since 2.54 (`index`, `new file mode`, `old mode`).
+fn dump(
+    repo: &Repository,
+    pair: &Pair,
+    rs: &Ranges,
+    diff: &DiffRanges,
+    old: Option<&[u8]>,
+    new: &[u8],
+) -> Result<FileDiff, GitError> {
     let (p_lines, t_lines) = (lines(old.unwrap_or_default()), lines(new));
     let mut header = format!("diff --git a/{} b/{}\n", pair.old_path, pair.new_path);
+    match old {
+        Some(_) => {
+            if pair.old_mode != pair.new_mode {
+                header.push_str(&format!(
+                    "old mode {:o}\nnew mode {:o}\n",
+                    pair.old_mode, pair.new_mode
+                ));
+            }
+        }
+        None => header.push_str(&format!("new file mode {:o}\n", pair.new_mode)),
+    }
+    let new_abbrev = crate::plumbing::abbrev(repo, &pair.new.to_string(), 0)?;
+    header.push_str(&match pair.old {
+        Some(old_id) => {
+            let old_abbrev = crate::plumbing::abbrev(repo, &old_id.to_string(), 0)?;
+            if pair.old_mode == pair.new_mode {
+                format!("index {old_abbrev}..{new_abbrev} {:o}\n", pair.new_mode)
+            } else {
+                format!("index {old_abbrev}..{new_abbrev}\n")
+            }
+        }
+        None => format!("index {}..{new_abbrev}\n", "0".repeat(new_abbrev.len())),
+    });
     header.push_str(&match old {
         Some(_) => format!("--- a/{}\n", pair.old_path),
         None => "--- /dev/null\n".to_owned(),
@@ -377,6 +411,34 @@ fn dump(pair: &Pair, rs: &Ranges, diff: &DiffRanges, old: Option<&[u8]>, new: &[
                 text: "\\ No newline at end of file".to_owned(),
             });
         }
+    };
+    // git attaches the funcname xdiff computed for the whole-file hunk
+    // holding the range's changes: line-log inflates context to the widest
+    // range, so out-of-range changes can merge into the hunk and move its
+    // start (and the funcname search) past a function header.
+    let full = collect_diff(old.unwrap_or_default(), new)?;
+    let ctx = 3.max(rs.iter().map(|&(s, e)| e - s).max().unwrap_or(0));
+    let mut natural: Vec<(usize, usize)> = Vec::new();
+    for &(s, e) in &full.parent {
+        match natural.last_mut() {
+            Some(last) if s.saturating_sub(last.1) <= 2 * ctx => last.1 = last.1.max(e),
+            _ => natural.push((s, e)),
+        }
+    }
+    let funcname = crate::userdiff::driver(repo, &pair.old_path, crate::userdiff::Fallback::None)?
+        .and_then(|d| d.funcname)
+        .or_else(|| {
+            crate::userdiff::driver(repo, &pair.new_path, crate::userdiff::Fallback::None)
+                .ok()
+                .flatten()
+                .and_then(|d| d.funcname)
+        });
+    let func_at = |anchor: usize| -> Option<Vec<u8>> {
+        let hunk = natural.iter().find(|&&(s, e)| s <= anchor && anchor <= e)?;
+        let start = hunk.0.saturating_sub(ctx);
+        (0..start)
+            .rev()
+            .find_map(|l| crate::userdiff::func_text(funcname.as_ref(), p_lines[l], 80))
     };
     let (target, parent) = (&diff.target, &diff.parent);
     let mut j = 0;
@@ -409,6 +471,7 @@ fn dump(pair: &Pair, rs: &Ranges, diff: &DiffRanges, old: Option<&[u8]>, new: &[
         } else {
             (p_start, p_end)
         };
+        let anchor = parent[j].0;
         let mut lines = Vec::new();
         let mut t_cur = t_start;
         while j < target.len() && target[j].0 < t_end {
@@ -423,25 +486,32 @@ fn dump(pair: &Pair, rs: &Ranges, diff: &DiffRanges, old: Option<&[u8]>, new: &[
                 push(&mut lines, LineOrigin::Added, t_lines[t_cur]);
                 t_cur += 1;
             }
-            j += 1;
+            // A target range wider than this -L range (a file creation
+            // spans them all) is shared with the next range, not consumed.
+            if target[j].1 <= t_end {
+                j += 1;
+            } else {
+                break;
+            }
         }
         while t_cur < t_end {
             push(&mut lines, LineOrigin::Context, t_lines[t_cur]);
             t_cur += 1;
         }
+        let at = format!(
+            "@@ -{},{} +{},{} @@",
+            p_start + 1,
+            p_end - p_start,
+            t_start + 1,
+            t_end - t_start
+        );
         hunks.push(Hunk {
-            header: format!(
-                "@@ -{},{} +{},{} @@",
-                p_start + 1,
-                p_end - p_start,
-                t_start + 1,
-                t_end - t_start
-            ),
+            header: crate::userdiff::header_of(&at, &func_at(anchor).unwrap_or_default()),
             new_start: t_start as u32 + 1,
             lines,
         });
     }
-    FileDiff {
+    Ok(FileDiff {
         path: pair.new_path.clone(),
         old_path: None,
         status: StatusCode::Modified,
@@ -452,7 +522,7 @@ fn dump(pair: &Pair, rs: &Ranges, diff: &DiffRanges, old: Option<&[u8]>, new: &[
         sizes: (0, 0),
         modes: (0, 0),
         ids: Default::default(),
-    }
+    })
 }
 
 /// `git log -L`: for each commit of `order` (git's topological order, `tip`

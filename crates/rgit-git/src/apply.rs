@@ -1357,12 +1357,15 @@ fn fuzzy_eq(a: &[u8], b: &[u8]) -> bool {
     i == a.len() && j == b.len()
 }
 
-/// `git apply -N`: every file the patch writes goes in the index as an
-/// intent-to-add entry (changed files too, as git does).
+/// `git apply -N`: only files the patch creates go in the index, as
+/// intent-to-add entries; modifications stay worktree-only (git 2.55
+/// fixed its older mark-everything behavior, which also clobbered the
+/// rest of the index, as an undocumented bug).
 fn intent_to_add(repo: &Repository, files: &[FilePatch]) -> Result<(), GitError> {
     let mut index = repo.index()?;
     let written: Vec<(&str, u32)> = files
         .iter()
+        .filter(|f| f.created.is_some())
         .filter_map(|f| {
             let path = f.new.as_deref()?;
             let mode = [f.new_mode.as_deref(), f.created.as_deref()]

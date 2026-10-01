@@ -13242,7 +13242,8 @@ fn worktree_list(
             Some(b) => format!("[{b}]"),
             None => "(detached HEAD)".to_owned(),
         };
-        let mut line = format!("{:<width$} {head} {on}", path(w));
+        // git 2.55+ pads the path column to max width + 1 total.
+        let mut line = format!("{:<width$}{head} {on}", path(w));
         let reason = |what: &str, why: &Option<String>| match why {
             Some(r) => format!("\t{what}: {r}"),
             None => format!("\t{what}"),
@@ -14967,27 +14968,9 @@ fn changes_out(changes: &Changes, format: DiffFormat, indent: usize) -> String {
         // patch to follow.
         Changes::Combined { first, files } => return combined_out(first, files, format, indent),
         Changes::Warning(text) => text.to_string(),
-        Changes::LineLog(files) => {
-            // line-log colors an added line whole, without git diff's
-            // whitespace-error split.
-            let color = render::color_on();
-            let mut files = files.clone();
-            for l in files
-                .iter_mut()
-                .flat_map(|f| &mut f.hunks)
-                .flat_map(|h| &mut h.lines)
-            {
-                if l.origin == rgit_git::LineOrigin::Added {
-                    l.origin = rgit_git::LineOrigin::Meta;
-                    l.text = if color {
-                        format!("\x1b[32m+{}", l.text)
-                    } else {
-                        format!("+{}", l.text)
-                    };
-                }
-            }
-            render::patch(&files)
-        }
+        // Since 2.55 line-log renders through the same diff pipeline as -p:
+        // full headers and the sign colored apart from the line.
+        Changes::LineLog(files) => render::patch(files),
     };
     let text = text.trim_end_matches('\n');
     if text.is_empty() {
@@ -15006,7 +14989,7 @@ fn diff_separator(
 ) -> &'static str {
     match changes {
         Changes::Combined { .. } if pretty.blank_before_diff(true) => "\n",
-        Changes::LineLog(_) => "\n",
+        Changes::LineLog(_) if pretty.blank_before_diff(false) => "\n",
         Changes::Files(_) if pretty.blank_before_diff(false) => {
             if format.patch && format.stat {
                 "---\n"
@@ -15254,7 +15237,13 @@ fn line_log(
     let mut diffs = Vec::new();
     for (id, files) in picked {
         commits.push(crate::pretty::parse(&backend.read_object(&id)?));
-        diffs.push(vec![(None, Some(Changes::LineLog(files)))]);
+        // A merge that changed the ranges against every parent shows its
+        // header with no diff, like a diff-less merge in `log -p`.
+        if files.is_empty() {
+            diffs.push(vec![(None, None)]);
+        } else {
+            diffs.push(vec![(None, Some(Changes::LineLog(files)))]);
+        }
     }
     let format = DiffFormat {
         patch: true,

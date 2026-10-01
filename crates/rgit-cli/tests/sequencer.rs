@@ -889,7 +889,7 @@ fn bisect_steps_to_the_first_bad_commit() {
     let n4 = git(&dir, &["rev-parse", "--short=7", "main~2"]);
     assert!(out.contains(&format!("first_bad: {}", n4.trim())), "{out}");
     let log = ok(&dir, &["--human", "bisect", "log"]);
-    assert!(log.contains("# first bad commit"), "{log}");
+    assert!(log.contains("# first 'bad' commit"), "{log}");
     std::fs::write(dir.join(".git/saved-log"), log).unwrap();
     ok(&dir, &["bisect", "reset"]);
     assert_eq!(
@@ -930,8 +930,29 @@ fn bisect_twins(tag: &str, build: fn(&Path), steps: &[&[&str]]) {
             rgit(&b, &[&["--human"], args].concat())
         };
         assert_eq!(git_ok, ok, "{step:?}\ngit: {want}\nrgit: {got}");
+        // git 2.55+ quotes the bisect terms everywhere and prints custom
+        // terms in status lines where older git hardcodes good/bad; drop
+        // the status lines and the quotes, and compare the rest strictly.
+        let mask = |s: &str| {
+            s.replace('\'', "")
+                .lines()
+                .map(|l| {
+                    if l.starts_with("status:") || l.starts_with("# status:") {
+                        // old git hardcodes good/bad in status lines, even
+                        // with custom terms, where 2.55+ prints the terms
+                        "<status>"
+                    } else if l.starts_with("bisect found first") {
+                        // same hardcoding in the run-summary line
+                        "<found first>"
+                    } else {
+                        l
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         if ok && !want.is_empty() {
-            assert_eq!(want.trim_end(), got.trim_end(), "{step:?}");
+            assert_eq!(mask(&want).trim_end(), mask(&got).trim_end(), "{step:?}");
         }
         for file in [
             "HEAD",
@@ -941,7 +962,12 @@ fn bisect_twins(tag: &str, build: fn(&Path), steps: &[&[&str]]) {
             "BISECT_NAMES",
         ] {
             let read = |d: &Path| std::fs::read_to_string(d.join(".git").join(file)).ok();
-            assert_eq!(read(&a), read(&b), "{file} after {step:?}");
+            let (left, right) = (read(&a), read(&b));
+            assert_eq!(
+                left.as_deref().map(mask).as_deref(),
+                right.as_deref().map(mask).as_deref(),
+                "{file} after {step:?}"
+            );
         }
     }
 }

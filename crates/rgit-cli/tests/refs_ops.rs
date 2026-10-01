@@ -931,10 +931,30 @@ fn worktree_add_modes_list_formats_and_repair_like_git() {
     assert!(!base.join("d/a").exists() && base.join("d/.git").is_file());
     ok(&dir, &["worktree", "add", &wt("e")]);
     std::fs::remove_dir_all(base.join("e")).unwrap();
+    // git 2.55+ pads the path column to one space past the longest
+    // path; older git used two, so compare the padded listings with the
+    // run-to-run spacing collapsed.
+    let collapse = |s: &str| {
+        s.lines()
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    for args in [&["worktree", "list"][..], &["worktree", "list", "-v"]] {
+        assert_eq!(
+            collapse(&ok(
+                &dir,
+                &["--human"]
+                    .into_iter()
+                    .chain(args.iter().copied())
+                    .collect::<Vec<_>>()
+            )),
+            collapse(&git(&dir, args)),
+            "{args:?}"
+        );
+    }
     for args in [
-        &["worktree", "list"][..],
-        &["worktree", "list", "-v"],
-        &["worktree", "list", "--porcelain"],
+        &["worktree", "list", "--porcelain"][..],
         &["worktree", "list", "--porcelain", "-z"],
     ] {
         same(&dir, args);

@@ -13,6 +13,13 @@ fn git_at(dir: &Path, args: &[&str], day: u32) -> String {
         .env("GIT_AUTHOR_DATE", &date)
         .env("GIT_COMMITTER_DATE", &date)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        // Identity comes from the repo's own config in these tests; an
+        // ambient GIT_AUTHOR_*/GIT_COMMITTER_* (e.g. CI-wide env) would
+        // override it.
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL")
         .output()
         .unwrap();
     assert!(
@@ -31,6 +38,10 @@ fn same(dir: &Path, args: &[&str]) {
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("RGIT_OPLOG", "0")
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL")
             .output()
             .unwrap();
         (
@@ -46,6 +57,57 @@ fn same(dir: &Path, args: &[&str]) {
 
 fn git(dir: &Path, args: &[&str]) -> String {
     git_at(dir, args, 1)
+}
+
+/// Whether the oracle's `log -L` prints the shape rgit tracks: full diff
+/// headers (git 2.54) and no blank line between an oneline message and its
+/// diff (git 2.55). An older git cannot reproduce that output.
+fn line_log_modern() -> bool {
+    static MODERN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODERN.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("rgit-linelog-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), "a\nb\n").unwrap();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["add", "f"]);
+        run(&["commit", "-qm", "one"]);
+        std::fs::write(dir.join("f"), "a\nc\n").unwrap();
+        run(&["add", "f"]);
+        run(&["commit", "-qm", "two"]);
+        let out = run(&["log", "--oneline", "-L1,1:f"]);
+        let text = String::from_utf8_lossy(&out.stdout);
+        let blank_before_diff = text
+            .lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w[1].starts_with("diff --git") && w[0].is_empty());
+        text.contains("index ") && !blank_before_diff
+    })
+}
+
+/// The log cases an old oracle can still compare: rgit's `-L` output
+/// tracks git 2.55, so drop `log -L` cases when the oracle predates it.
+fn cmp_cases<'b, 'c>(cases: &[&'b [&'c str]]) -> Vec<&'b [&'c str]> {
+    if line_log_modern() {
+        return cases.to_vec();
+    }
+    eprintln!("skipping log -L cases: git predates 2.55 line-log output");
+    cases
+        .iter()
+        .copied()
+        .filter(|a| a.first() != Some(&"log") || !a.iter().any(|s| s.starts_with("-L")))
+        .collect()
 }
 
 fn rgit(dir: &Path, args: &[&str]) -> (String, bool) {
@@ -804,6 +866,10 @@ fn all_same(dir: &Path, cases: &[&[&str]]) {
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("RGIT_OPLOG", "0")
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL")
             .output()
             .unwrap();
         (
@@ -1033,13 +1099,17 @@ fn log_and_show_diff_merges_like_git() {
         &["log", "--color=always", "-L:helper:f.c", "--oneline"],
         &["log", "-g", "--stat", "--oneline", "-6"],
     ];
-    for args in cases {
+    for args in cmp_cases(cases) {
         same(&dir, args);
     }
 }
 
 #[test]
 fn log_traces_line_ranges_like_git() {
+    if !line_log_modern() {
+        eprintln!("skipping: git predates 2.55 line-log output");
+        return;
+    }
     let dir = merge_repo("line-log");
     let cases: &[&[&str]] = &[
         &["log", "-L:helper:f.c"],
@@ -1078,7 +1148,7 @@ fn colors_match_gits_palette() {
     git_at(&dir, &["merge", "-q", "--no-edit", "o1", "o2", "topic"], 9);
     std::fs::write(dir.join("b.txt"), "1\ntrailing  \n\nnew\n").unwrap();
     git(&dir, &["config", "color.ui", "always"]);
-    for args in [
+    let cases: &[&[&str]] = &[
         &["log", "--graph", "--oneline"][..],
         &["log", "--graph", "--oneline", "--decorate", "--all"],
         &["log", "--graph", "--stat", "-4"],
@@ -1119,7 +1189,8 @@ fn colors_match_gits_palette() {
         &["show", "-c", "--oneline", "HEAD~3"],
         &["log", "-m", "-p", "--oneline", "-1", "HEAD~3"],
         &["log", "-L2,4:b.txt", "--oneline"],
-    ] {
+    ];
+    for args in cmp_cases(cases) {
         same(&dir, args);
     }
     same(&dir, &["log", "--graph", "--oneline", "--no-color"]);
@@ -1369,9 +1440,11 @@ fn diff_names_functions_and_diffs_words_like_git() {
     git(&dir, &["config", "diff.rust.wordRegex", "[a-z]+"]);
     all_same(&dir, &[&["diff", "-p", "--word-diff"]]);
     git_at(&dir, &["commit", "-qam", "two"], 2);
+    // The log -L cases filter themselves out on a pre-2.55 oracle; blame's
+    // -L is blame's own range option and always runs.
     all_same(
         &dir,
-        &[
+        &cmp_cases(&[
             &["log", "--format=medium", "-p", "-W"],
             &["log", "--format=medium", "-p", "--word-diff"],
             &["show", "--format=medium", "--color-words"],
@@ -1380,7 +1453,7 @@ fn diff_names_functions_and_diffs_words_like_git() {
             &["log", "-L:m:a.py", "--format=%s"],
             &["blame", "-n", "-L:main", "a.c"],
             &["blame", "-n", "-L:beta", "a.rs"],
-        ],
+        ]),
     );
 }
 

@@ -189,15 +189,16 @@ impl Mode {
     }
 }
 
-const HELP_REMAINDER: &str = "j - leave this hunk undecided, see next undecided hunk\n\
-J - leave this hunk undecided, see next hunk\n\
-k - leave this hunk undecided, see previous undecided hunk\n\
-K - leave this hunk undecided, see previous hunk\n\
+const HELP_REMAINDER: &str = "j - go to the next undecided hunk, roll over at the bottom\n\
+J - go to the next hunk, roll over at the bottom\n\
+k - go to the previous undecided hunk, roll over at the top\n\
+K - go to the previous hunk, roll over at the top\n\
 g - select a hunk to go to\n\
 / - search for a hunk matching the given regex\n\
 s - split the current hunk into smaller hunks\n\
 e - manually edit the current hunk\n\
-p - print the current hunk, 'P' to use the pager\n\
+p - print the current hunk\n\
+P - print the current hunk using the pager\n\
 ? - print help\n";
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -1178,13 +1179,24 @@ impl<'a> State<'a> {
             if hunk_index >= n {
                 hunk_index = 0;
             }
+            // git scans for the nearest undecided hunk circularly, so k/j
+            // are offered whenever any other hunk is still undecided.
             let (mut undecided_previous, mut undecided_next) = (None, None);
             if n > 0 {
-                undecided_previous = (0..hunk_index)
-                    .rev()
-                    .find(|&i| self.files[f].hunks[i].use_ == Pick::Undecided);
-                undecided_next =
-                    (hunk_index + 1..n).find(|&i| self.files[f].hunks[i].use_ == Pick::Undecided);
+                for step in 1..n {
+                    let i = (hunk_index + n - step) % n;
+                    if self.files[f].hunks[i].use_ == Pick::Undecided {
+                        undecided_previous = Some(i);
+                        break;
+                    }
+                }
+                for step in 1..n {
+                    let i = (hunk_index + step) % n;
+                    if self.files[f].hunks[i].use_ == Pick::Undecided {
+                        undecided_next = Some(i);
+                        break;
+                    }
+                }
             }
             let current_use = if n > 0 {
                 self.files[f].hunks[hunk_index].use_
@@ -1214,7 +1226,7 @@ impl<'a> State<'a> {
                     permitted |= PREV_UNDECIDED;
                     keys.push_str(",k");
                 }
-                if hunk_index > 0 {
+                if n > 1 {
                     permitted |= PREV;
                     keys.push_str(",K");
                 }
@@ -1222,7 +1234,7 @@ impl<'a> State<'a> {
                     permitted |= NEXT_UNDECIDED;
                     keys.push_str(",j");
                 }
-                if hunk_index + 1 < n {
+                if n > 1 {
                     permitted |= NEXT;
                     keys.push_str(",J");
                 }
@@ -1239,7 +1251,7 @@ impl<'a> State<'a> {
                     permitted |= EDIT;
                     keys.push_str(",e");
                 }
-                keys.push_str(",p");
+                keys.push_str(",p,P");
             }
             let file = &self.files[f];
             let prompt = if file.deleted {
@@ -1303,7 +1315,7 @@ impl<'a> State<'a> {
                 }
                 'K' => {
                     if permitted & PREV != 0 {
-                        hunk_index = hunk_index.wrapping_sub(1);
+                        hunk_index = (hunk_index + n - 1) % n;
                     } else {
                         self.err("No previous hunk");
                     }

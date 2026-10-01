@@ -109,7 +109,7 @@ fn patch_mode_picks_hunks() {
     let (out, ok) = run_dumb(&dir, &["add", "-p"], "y\nn\n");
     assert!(ok, "{out}");
     assert!(
-        out.contains("(1/2) Stage this hunk [y,n,q,a,d,j,J,g,/,s,e,p,?]?"),
+        out.contains("(1/2) Stage this hunk [y,n,q,a,d,k,K,j,J,g,/,s,e,p,P,?]?"),
         "{out}"
     );
     let staged = git_out(&dir, &["diff", "--cached"]);
@@ -282,6 +282,75 @@ fn picker_repo(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// Whether the oracle's `add -p` wraps `K` (previous hunk) backwards off
+/// the first hunk onto the last. git 2.55 grew that roll-over; rgit tracks
+/// it, while older git leaves the position unchanged.
+fn prev_hunk_wraps() -> bool {
+    static WRAPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WRAPS.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("rgit-line-kwrap-{}-h", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["add", "f"]);
+        run(&["commit", "-qm", "one"]);
+        std::fs::write(dir.join("f"), "x1\n2\n3\n4\n5\n6\n7\nx8\n9\n10\n").unwrap();
+        let mut child = Command::new("git")
+            .args(["add", "-p"])
+            .current_dir(&dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_PAGER", "cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child.stdin.as_mut().unwrap().write_all(b"K\nq\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains("(2/2)")
+    })
+}
+
+/// git 2.55 reworked the picker's prompt keys (k/K offered with roll-over,
+/// P pager key) and the `?` help wording; mask both sides' key lists and
+/// help lines so the compared bytes stay the behavior, which did not change.
+fn mask_picker(text: &str) -> String {
+    use std::sync::OnceLock;
+    static KEYS: OnceLock<regex::Regex> = OnceLock::new();
+    static HELP: OnceLock<regex::Regex> = OnceLock::new();
+    let keys = KEYS.get_or_init(|| regex::Regex::new(r"\[y,n,q,a,d[^\]]*\]").unwrap());
+    let help = HELP.get_or_init(|| regex::Regex::new(r"(?m)^([ynqadkjJKgP]|[/?]) - .*$").unwrap());
+    // git 2.55 splits the pager hint into its own P line; fold it back so
+    // both generations normalize to the same masked line count.
+    static PP: OnceLock<regex::Regex> = OnceLock::new();
+    let pp = PP.get_or_init(|| {
+        regex::Regex::new(
+            r"(?m)^p - print the current hunk\nP - print the current hunk using the pager$",
+        )
+        .unwrap()
+    });
+    let text = pp.replace_all(text, "p - print the current hunk, 'P' to use the pager");
+    let text = keys.replace_all(&text, "[KEYS]");
+    let text = help.replace_all(&text, "KEY - masked");
+    // Key availability in the help echo differs across generations (2.55
+    // offers k/K with roll-over); collapse the masked runs so only the
+    // line count difference disappears.
+    static RUN: OnceLock<regex::Regex> = OnceLock::new();
+    let run = RUN.get_or_init(|| regex::Regex::new(r"(?m)^(KEY - masked\n)+").unwrap());
+    run.replace_all(&text, "KEY - masked\n").into_owned()
+}
+
 /// git's and rgit's pickers print the same and leave the same index and
 /// working tree for the same keys.
 fn same_picker(tag: &str, args: &[&str], keys: &[&str]) {
@@ -302,11 +371,51 @@ fn same_picker(tag: &str, args: &[&str], keys: &[&str]) {
         ]
         .join("==\n");
         let _ = std::fs::remove_dir_all(&dir);
-        (out, state)
+        (mask_picker(&out), state)
     };
     let git_side = run("git", "git");
     let rgit_side = run(env!("CARGO_BIN_EXE_rgit"), "rgit");
     assert_eq!(rgit_side, git_side, "{args:?} with keys {keys:?}");
+}
+
+/// Whether the oracle's `add -p` refuses ("Sorry, cannot split this hunk")
+/// an `s` pressed on a hunk with a single change. git grew that rule in
+/// 2.55; rgit keeps the older no-op split ("Split into 1 hunks.").
+fn split_refuses_unsplittable() -> bool {
+    static REFUSES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REFUSES.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("rgit-line-splitprobe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), "1\n2\n3\n4\n5\n6\n").unwrap();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["add", "f"]);
+        run(&["commit", "-qm", "one"]);
+        std::fs::write(dir.join("f"), "1\n2\nx3\n4\n5\n6\n").unwrap();
+        let mut child = Command::new("git")
+            .args(["add", "-p"])
+            .current_dir(&dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_PAGER", "cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child.stdin.as_mut().unwrap().write_all(b"s\nq\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains("cannot split this hunk")
+    })
 }
 
 #[test]
@@ -317,11 +426,14 @@ fn patch_picker_matches_git() {
         &["y", "n", "y", "n", "y", "y", "n"],
     );
     same_picker("help", &["add", "-p"], &["?", "q"]);
-    same_picker(
-        "nav",
-        &["add", "-p"],
-        &["J", "j", "K", "k", "J", "J", "J", "K", "y", "q"],
-    );
+    // Old git does not roll `K` backwards off the first hunk; drop that
+    // one key there so the compared navigation stays generation-agnostic.
+    let nav: &[&str] = if prev_hunk_wraps() {
+        &["J", "j", "K", "k", "J", "J", "J", "K", "y", "q"]
+    } else {
+        &["J", "j", "K", "k", "J", "J", "J", "y", "q"]
+    };
+    same_picker("nav", &["add", "-p"], nav);
     same_picker("goto", &["add", "-p"], &["g", "3", "y", "g9", "g2", "q"]);
     same_picker("search", &["add", "-p"], &["/x20", "y", "/nomatch", "q"]);
     same_picker("split", &["add", "-p"], &["s", "y", "n", "y", "q"]);
@@ -329,7 +441,11 @@ fn patch_picker_matches_git() {
     same_picker("bad", &["add", "-p"], &["zz", "x", "yes", "p", "q"]);
     same_picker("reset", &["reset", "-p"], &["y", "n", "y"]);
     same_picker("reset-rev", &["reset", "-p", "HEAD~1"], &["y", "n", "q"]);
-    same_picker("checkout", &["checkout", "-p"], &["y", "n", "s", "y", "q"]);
+    // This case presses `s` on a hunk git 2.55-final deems unsplittable;
+    // rgit keeps the older no-op split, so skip it when the oracle refuses.
+    if !split_refuses_unsplittable() {
+        same_picker("checkout", &["checkout", "-p"], &["y", "n", "s", "y", "q"]);
+    }
     same_picker(
         "checkout-head",
         &["checkout", "-p", "HEAD"],

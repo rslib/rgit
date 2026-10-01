@@ -496,10 +496,23 @@ impl Bisect<'_> {
         let (bad, goods, _) = self.bisect_refs(terms)?;
         let text = match (bad.is_some(), goods.len()) {
             (true, n) if n > 0 => return Ok(()),
-            (false, 0) => "status: waiting for both good and bad commits".to_owned(),
-            (false, 1) => "status: waiting for bad commit, 1 good commit known".to_owned(),
-            (false, n) => format!("status: waiting for bad commit, {n} good commits known"),
-            (true, _) => "status: waiting for good commit(s), bad commit known".to_owned(),
+            // git 2.55+ quotes the terms in every status message.
+            (false, 0) => format!(
+                "status: waiting for both '{}' and '{}' commits",
+                terms.good, terms.bad
+            ),
+            (false, 1) => format!(
+                "status: waiting for '{}' commit, 1 '{}' commit known",
+                terms.bad, terms.good
+            ),
+            (false, n) => format!(
+                "status: waiting for '{}' commit, {n} '{}' commits known",
+                terms.bad, terms.good
+            ),
+            (true, _) => format!(
+                "status: waiting for '{}' commit(s), '{}' commit known",
+                terms.good, terms.bad
+            ),
         };
         let _ = writeln!(self.out, "{text}");
         self.append("BISECT_LOG", &format!("# {text}\n"))
@@ -522,7 +535,7 @@ impl Bisect<'_> {
             (Step::FirstBad, Some(bad)) => self.append(
                 "BISECT_LOG",
                 &format!(
-                    "# first {} commit: [{bad}] {}\n",
+                    "# first '{}' commit: [{bad}] {}\n",
                     terms.bad,
                     self.subject(bad)
                 ),
@@ -538,7 +551,7 @@ impl Bisect<'_> {
                 {
                     let _ = writeln!(
                         log,
-                        "# possible first {} commit: [{oid}] {}",
+                        "# possible first '{}' commit: [{oid}] {}",
                         terms.bad,
                         self.subject(oid)
                     );
@@ -557,7 +570,7 @@ impl Bisect<'_> {
         let (bad, goods, skips) = self.bisect_refs(terms)?;
         let first_parent = self.exists("BISECT_FIRST_PARENT");
         let find_all = !skips.is_empty();
-        let bad = bad.ok_or_else(|| fail(format!("a {} revision is needed", terms.bad)))?;
+        let bad = bad.ok_or_else(|| fail(format!("a '{}' revision is needed", terms.bad)))?;
         if let Some(step) = self.check_ancestors(terms, bad, &goods, &skips, no_checkout)? {
             return Ok(step);
         }
@@ -575,7 +588,11 @@ impl Bisect<'_> {
                 self.only_skipped(terms, &tried, None);
                 return Ok(Step::OnlySkipped);
             }
-            let _ = writeln!(self.out, "{bad} was both {} and {}", terms.good, terms.bad);
+            let _ = writeln!(
+                self.out,
+                "{bad} was both '{}' and '{}'",
+                terms.good, terms.bad
+            );
             return Err(fail(""));
         };
         if all == 0 {
@@ -588,7 +605,7 @@ impl Bisect<'_> {
                 self.only_skipped(terms, &tried, Some(bad));
                 return Ok(Step::OnlySkipped);
             }
-            let _ = writeln!(self.out, "{rev} is the first {} commit", terms.bad);
+            let _ = writeln!(self.out, "{rev} is the first '{}' commit", terms.bad);
             self.show_commit(rev)?;
             return Ok(Step::FirstBad);
         }
@@ -607,7 +624,7 @@ impl Bisect<'_> {
     fn only_skipped(&mut self, terms: &Terms, tried: &[Oid], bad: Option<Oid>) {
         let _ = writeln!(
             self.out,
-            "There are only 'skip'ped commits left to test.\nThe first {} commit could be any of:",
+            "There are only 'skip'ped commits left to test.\nThe first '{}' commit could be any of:",
             terms.bad
         );
         for oid in tried.iter().chain(bad.as_ref()) {
@@ -656,14 +673,15 @@ impl Bisect<'_> {
                                  {bad} and [{good_hex}]."
                             ),
                             _ => format!(
-                                "The merge base {bad} is {b}.\nThis means the first '{g}' commit \
+                                "The merge base {bad} is '{b}'.\nThis means the first '{g}' commit \
                                  is between {bad} and [{good_hex}]."
                             ),
                         }
                     } else {
                         format!(
-                            "Some {g} revs are not ancestors of the {b} rev.\ngit bisect cannot \
-                             work properly in this case.\nMaybe you mistook {g} and {b} revs?"
+                            "Some '{g}' revs are not ancestors of the '{b}' rev.\ngit bisect \
+                             cannot work properly in this case.\nMaybe you mistook '{g}' and \
+                             '{b}' revs?"
                         )
                     }));
                 } else if goods.contains(&mb) {
@@ -672,8 +690,8 @@ impl Bisect<'_> {
                     let _ = writeln!(
                         self.out,
                         "warning: the merge base between {bad} and [{good_hex}] must be \
-                         skipped.\nSo we cannot be sure the first {} commit is between {mb} and \
-                         {bad}.\nWe continue anyway.",
+                         skipped.\nSo we cannot be sure the first '{}' commit is between {mb} \
+                         and {bad}.\nWe continue anyway.",
                         terms.bad
                     );
                 } else {
@@ -885,10 +903,16 @@ impl Bisect<'_> {
                 first = false;
                 let rc = self.verify_good(terms, &command)?;
                 if !(0..128).contains(&rc) {
-                    return Err(fail(format!("unable to verify {command} on good revision")));
+                    return Err(fail(format!(
+                        "unable to verify {command} on '{}' revision",
+                        terms.good
+                    )));
                 }
                 if rc == res {
-                    return Err(fail(format!("bogus exit code {rc} for good revision")));
+                    return Err(fail(format!(
+                        "bogus exit code {rc} for '{}' revision",
+                        terms.good
+                    )));
                 }
             }
             if !(0..128).contains(&res) {
@@ -910,7 +934,9 @@ impl Bisect<'_> {
                     return Err(fail("bisect run cannot continue any more"));
                 }
                 Ok(Step::MergeBase) => self.out.push_str("bisect run success\n"),
-                Ok(Step::FirstBad) => self.out.push_str("bisect found first bad commit\n"),
+                Ok(Step::FirstBad) => {
+                    let _ = writeln!(self.out, "bisect found first '{}' commit", terms.bad);
+                }
                 Err(e) => {
                     return Err(fail(format!(
                         "{e}\nbisect run failed: 'git bisect {state}' exited with error code 1"

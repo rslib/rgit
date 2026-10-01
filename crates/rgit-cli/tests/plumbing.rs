@@ -459,6 +459,16 @@ fn credential_cache_speaks_git_daemon_protocol() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Whether the oracle git rejects `hook run` for hook event names it
+/// does not know (git 2.55+; rgit keeps running any hook file).
+fn oracle_rejects_unknown_hooks(dir: &Path) -> bool {
+    static REJECTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REJECTS.get_or_init(|| {
+        let out = run("git", dir, &["hook", "run", "rgit-probe-nope"], &[]);
+        String::from_utf8_lossy(&out.stderr).starts_with("error: unknown hook event")
+    })
+}
+
 #[test]
 fn hook_run_matches_git() {
     let dir = repo("hook-run");
@@ -478,6 +488,13 @@ fn hook_run_matches_git() {
     write(&dir, "in.txt", b"stdin data\n");
     std::fs::create_dir_all(dir.join("hk")).unwrap();
     std::fs::copy(hooks.join("my-hook"), dir.join("hk/my-hook")).unwrap();
+    // git 2.55+ refuses to run hook event names it does not know, even
+    // when the hook file exists; every event below is a custom name, so
+    // there is nothing to compare against such an oracle.
+    if oracle_rejects_unknown_hooks(&dir) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
     for cwd in [dir.clone(), dir.join("dir")] {
         for args in [
             &["hook", "run", "my-hook", "--", "a", "b c"][..],
@@ -722,16 +739,41 @@ fn whatchanged_and_raw_match_git() {
     git(&dir, &["mv", "c.txt", "moved.txt"], &[]);
     git(&dir, &["update-index", "--chmod=+x", "e.txt"], &[]);
     commit(&dir, 6, "sixth", "T");
+    // git 2.55+ refuses whatchanged without an opt-out flag; rgit keeps
+    // the command working, so hand a new oracle its flag.
+    let flag = run(
+        "git",
+        &dir,
+        &["whatchanged", "--i-still-use-this", "-1"],
+        &[],
+    )
+    .status
+    .success();
+    for args in [
+        &["whatchanged"][..],
+        &["whatchanged", "-2"],
+        &["whatchanged", "-p", "-1"],
+        &["whatchanged", "--oneline"],
+        &["whatchanged", "--stat", "-2"],
+        &["whatchanged", "--format=%h %s", "--", "c.txt"],
+    ] {
+        let want = if flag {
+            let mut a = vec![args[0], "--i-still-use-this"];
+            a.extend(&args[1..]);
+            run("git", &dir, &a, &[])
+        } else {
+            run("git", &dir, args, &[])
+        };
+        let got = rgit(&dir, args);
+        assert!(
+            got.stdout == want.stdout && got.status.success() == want.status.success(),
+            "{args:?}"
+        );
+    }
     same(
         &dir,
         &[
-            &["whatchanged"][..],
-            &["whatchanged", "-2"],
-            &["whatchanged", "-p", "-1"],
-            &["whatchanged", "--oneline"],
-            &["whatchanged", "--stat", "-2"],
-            &["whatchanged", "--format=%h %s", "--", "c.txt"],
-            &["log", "--raw", "--oneline"],
+            &["log", "--raw", "--oneline"][..],
             &["log", "--raw", "--pretty=medium", "-p", "-2"],
             &["show", "--raw", "--format=%h", "HEAD"],
             &["diff", "--raw", "HEAD~2", "HEAD"],
@@ -1179,59 +1221,66 @@ fn grep_expressions_and_functions_match_git() {
     git(&dir, &["add", "sub", ".gitmodules"], &[]);
     git(&dir, &["config", "submodule.sub.url", "./sub"], &[]);
     commit(&dir, 7, "add sub", "T");
-    same(
-        &dir,
+    // Source-built oracles can lack USE_LIBPCRE, where git grep -P dies
+    // for patterns that are not plain literals (git compiles those
+    // without PCRE); probe with a regex pattern.
+    let pcre = {
+        let out = run("git", &dir, &["grep", "-P", "f.o"], &[]);
+        !String::from_utf8_lossy(&out.stderr).contains("USE_LIBPCRE")
+    };
+    let mut cases = vec![
+        &["grep", "-e", "foo", "--or", "-e", "bar"][..],
+        &["grep", "-e", "foo", "--and", "-e", "bar"],
+        &["grep", "-n", "--not", "-e", "foo"],
+        &["grep", "-e", "foo", "--and", "--not", "-e", "bar"],
         &[
-            &["grep", "-e", "foo", "--or", "-e", "bar"][..],
-            &["grep", "-e", "foo", "--and", "-e", "bar"],
-            &["grep", "-n", "--not", "-e", "foo"],
-            &["grep", "-e", "foo", "--and", "--not", "-e", "bar"],
-            &[
-                "grep", "(", "-e", "foo", "--or", "-e", "baz", ")", "--and", "-e", "bar",
-            ],
-            &["grep", "-e", "foo", "-e", "bar", "--and", "-e", "baz"],
-            &["grep", "-e", "foo", "--not", "-e", "bar"],
-            &["grep", "--all-match", "-e", "foo", "-e", "baz"],
-            &[
-                "grep",
-                "--all-match",
-                "-e",
-                "foo",
-                "--and",
-                "-e",
-                "bar",
-                "-e",
-                "only",
-            ],
-            &["grep", "-c", "--all-match", "-e", "foo", "-e", "baz"],
-            &["grep", "-o", "--not", "-e", "bar", "-e", "foo"],
-            &["grep", "-l", "--not", "-e", "foo"],
-            &["grep", "-e", "foo", "--and"],
-            &["grep", "(", "-e", "foo"],
-            &["grep", "-e", "-e", "foo"],
-            &["grep", "-p", "-e", "bar"],
-            &["grep", "-n", "-p", "only"],
-            &["grep", "-p", "-C1", "return"],
-            &["grep", "-W", "bar"],
-            &["grep", "-W", "-n", "baz"],
-            &["grep", "-W", "-A1", "foo"],
-            &["grep", "-p", "foo", "--", "m.x"],
-            &["grep", "-W", "foo", "--", "m.x"],
-            &["grep", "-p", "return", "--", "k.py"],
-            &["grep", "-W", "y = 2", "--", "k.py"],
-            &["grep", "-m1", "-A2", "foo"],
-            &["grep", "-P", "foo(?= only)"],
-            &["grep", "-P", "-w", "ba."],
-            &["grep", "--threads", "2", "foo"],
-            &["grep", "--untracked", "foo"],
-            &["grep", "--untracked", "--no-exclude-standard", "foo"],
-            &["grep", "--no-index", "foo"],
-            &["grep", "--no-index", "--exclude-standard", "-n", "foo"],
-            &["grep", "--recurse-submodules", "foo"],
-            &["grep", "--recurse-submodules", "--cached", "foo"],
-            &["grep", "--recurse-submodules", "foo", "HEAD"],
+            "grep", "(", "-e", "foo", "--or", "-e", "baz", ")", "--and", "-e", "bar",
         ],
-    );
+        &["grep", "-e", "foo", "-e", "bar", "--and", "-e", "baz"],
+        &["grep", "-e", "foo", "--not", "-e", "bar"],
+        &["grep", "--all-match", "-e", "foo", "-e", "baz"],
+        &[
+            "grep",
+            "--all-match",
+            "-e",
+            "foo",
+            "--and",
+            "-e",
+            "bar",
+            "-e",
+            "only",
+        ],
+        &["grep", "-c", "--all-match", "-e", "foo", "-e", "baz"],
+        &["grep", "-o", "--not", "-e", "bar", "-e", "foo"],
+        &["grep", "-l", "--not", "-e", "foo"],
+        &["grep", "-e", "foo", "--and"],
+        &["grep", "(", "-e", "foo"],
+        &["grep", "-e", "-e", "foo"],
+        &["grep", "-p", "-e", "bar"],
+        &["grep", "-n", "-p", "only"],
+        &["grep", "-p", "-C1", "return"],
+        &["grep", "-W", "bar"],
+        &["grep", "-W", "-n", "baz"],
+        &["grep", "-W", "-A1", "foo"],
+        &["grep", "-p", "foo", "--", "m.x"],
+        &["grep", "-W", "foo", "--", "m.x"],
+        &["grep", "-p", "return", "--", "k.py"],
+        &["grep", "-W", "y = 2", "--", "k.py"],
+        &["grep", "-m1", "-A2", "foo"],
+        &["grep", "--threads", "2", "foo"],
+        &["grep", "--untracked", "foo"],
+        &["grep", "--untracked", "--no-exclude-standard", "foo"],
+        &["grep", "--no-index", "foo"],
+        &["grep", "--no-index", "--exclude-standard", "-n", "foo"],
+        &["grep", "--recurse-submodules", "foo"],
+        &["grep", "--recurse-submodules", "--cached", "foo"],
+        &["grep", "--recurse-submodules", "foo", "HEAD"],
+    ];
+    if pcre {
+        cases.push(&["grep", "-P", "foo(?= only)"]);
+        cases.push(&["grep", "-P", "-w", "ba."]);
+    }
+    same(&dir, &cases);
     let bare = std::env::temp_dir().join(format!("rgit-plumbing-{}-noindex", std::process::id()));
     let _ = std::fs::remove_dir_all(&bare);
     write(&bare, "a", b"foo 1\n");
