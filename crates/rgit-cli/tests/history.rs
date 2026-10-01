@@ -457,7 +457,7 @@ fn log_walks_like_git() {
             "log",
             "--oneline",
             "--since=Jan 4 2024",
-            "--until=2024-01-07 12:00",
+            "--until=2024-01-07 noon",
         ],
         &["log", "--oneline", "--since=5.years.ago"],
         &["log", "--date=human", "--format=%ad %ah"],
