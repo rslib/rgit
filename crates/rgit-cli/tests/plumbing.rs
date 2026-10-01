@@ -1326,6 +1326,8 @@ fn var_reads_identity_and_editor() {
         ("GIT_COMMITTER_DATE", "@1700000000 -0130"),
         ("GIT_ATTR_NOSYSTEM", "1"),
         ("GIT_EDITOR", "vi"),
+        // Debian builds git with `pager` as the default, not `less`.
+        ("GIT_PAGER", "less"),
     ];
     for args in [
         &["var", "-l"][..],

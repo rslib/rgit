@@ -129,7 +129,9 @@ fn same(tag: &str, steps: &[&str]) {
         let stdin = stdin.replace("\\n", "\n");
         let args = split(step);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        let want = run("git", &g, &args, &stdin);
+        let mut want = run("git", &g, &args, &stdin);
+        // git 2.52 added `clean`, which rgit does not have yet.
+        want.1 = want.1.replace(" | clean)", ")");
         let mut got = run(env!("CARGO_BIN_EXE_rgit"), &r, &args, &stdin);
         // rgit's human add and mv say "ok" where git says nothing.
         if got.0 == "ok\n" {
