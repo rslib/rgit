@@ -3294,14 +3294,17 @@ fn multi_pack_index_writes_what_git_writes() {
     // supersedes every old pack.
     for d in [&g, &r] {
         for (i, p) in pack_files(d).iter().enumerate() {
-            if p.ends_with(".pack") {
-                let status = Command::new("touch")
-                    .arg("-t")
-                    .arg(format!("202001010000.{i:02}"))
-                    .arg(d.join(".git/objects/pack").join(p))
-                    .status()
-                    .unwrap();
-                assert!(status.success(), "touch {p}");
+            if let Some(stem) = p.strip_suffix(".pack") {
+                // Some gits rank by the .pack's mtime, others by the .idx's.
+                for name in [p.to_owned(), format!("{stem}.idx")] {
+                    let status = Command::new("touch")
+                        .arg("-t")
+                        .arg(format!("202001010000.{i:02}"))
+                        .arg(d.join(".git/objects/pack").join(&name))
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "touch {name}");
+                }
             }
         }
     }
