@@ -457,7 +457,7 @@ fn log_walks_like_git() {
             "log",
             "--oneline",
             "--since=Jan 4 2024",
-            "--until=2024-01-07 noon",
+            "--until=2024-01-07 12:00",
         ],
         &["log", "--oneline", "--since=5.years.ago"],
         &["log", "--date=human", "--format=%ad %ah"],
@@ -1368,6 +1368,8 @@ fn diff_names_functions_and_diffs_words_like_git() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["config", "user.email", "t@t"]);
+    git(&dir, &["config", "user.name", "t"]);
     git(
         &dir,
         &["config", "diff.cfg.xfuncname", "!^START\n^[A-Za-z].*$"],

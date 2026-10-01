@@ -488,8 +488,12 @@ fn parse_date_basic(s: &[u8], now: i64) -> Option<i64> {
     Some(t - offset * 60)
 }
 
-fn update_tm(tm: &mut Tm, now: &Tm, sec: i64) -> i64 {
+fn update_tm(tm: &mut Tm, now: &Tm, mut sec: i64) -> i64 {
     if tm.mday < 0 {
+        let offset = tm.mday + 1;
+        if sec == 0 && offset < 0 {
+            sec = -offset * 86400;
+        }
         tm.mday = now.mday;
     }
     if tm.mon < 0 {
@@ -526,9 +530,9 @@ fn pending_number(tm: &mut Tm, num: &mut i64) {
     }
 }
 
-fn date_time(tm: &mut Tm, now: &Tm, hour: i64) {
-    if tm.hour < hour {
-        update_tm(tm, now, 86400);
+fn date_time(tm: &mut Tm, hour: i64) {
+    if tm.mday < 0 && tm.hour < hour {
+        tm.mday = -2;
     }
     tm.hour = hour;
     tm.min = 0;
@@ -553,7 +557,7 @@ fn approxidate_alpha(
     let special = |name: &str| match_string(date, name) == name.len();
     let hour = |tm: &mut Tm, num: &mut i64, h| {
         pending_number(tm, num);
-        date_time(tm, now, h);
+        date_time(tm, h);
     };
     let ampm = |tm: &mut Tm, num: &mut i64, pm: i64| {
         let n = std::mem::take(num);
@@ -567,6 +571,7 @@ fn approxidate_alpha(
     };
     let matched = if special("yesterday") {
         *num = 0;
+        tm.mday = -1;
         update_tm(tm, now, 86400);
         true
     } else if special("noon") {
@@ -732,5 +737,16 @@ mod tests {
         assert_eq!(at("2 months ago"), Some(local_time(2023, 11, d, h, mi, s)));
         assert_eq!(at("never"), Some(0));
         assert_eq!(at("garbage"), None);
+    }
+
+    #[test]
+    fn noon_keeps_an_explicit_day_before_noon() {
+        let early = local_time(2024, 1, 10, 2, 0, 0);
+        let noon = |s| approxidate_at(s, early);
+        assert_eq!(
+            noon("2024-01-07 noon"),
+            Some(local_time(2024, 1, 7, 12, 0, 0))
+        );
+        assert_eq!(noon("noon"), Some(local_time(2024, 1, 9, 12, 0, 0)));
     }
 }
