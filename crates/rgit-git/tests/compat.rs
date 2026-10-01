@@ -537,7 +537,7 @@ fn log_filters_by_since_and_until() {
 
     let since = backend
         .log(&LogOptions {
-            since: Some(epoch("2021-01-01T00:00:00+0000")),
+            since: Some(JAN_2021),
             ..Default::default()
         })
         .unwrap();
@@ -550,7 +550,7 @@ fn log_filters_by_since_and_until() {
 
     let until = backend
         .log(&LogOptions {
-            until: Some(epoch("2021-01-01T00:00:00+0000")),
+            until: Some(JAN_2021),
             ..Default::default()
         })
         .unwrap();
@@ -562,15 +562,8 @@ fn log_filters_by_since_and_until() {
     assert!(summaries.contains(&"old") && summaries.contains(&"mid"));
 }
 
-/// Unix seconds for an RFC 2822-ish timestamp, via `date`, so the assertion
-/// uses the same clock as `commit_at`'s GIT_AUTHOR_DATE.
-fn epoch(stamp: &str) -> i64 {
-    let out = Command::new("date")
-        .args(["-j", "-f", "%Y-%m-%dT%H:%M:%S%z", stamp, "+%s"])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
-}
+/// 2021-01-01T00:00:00 UTC.
+const JAN_2021: i64 = 1_609_459_200;
 
 #[test]
 fn all_tags_orders_newest_first() {
