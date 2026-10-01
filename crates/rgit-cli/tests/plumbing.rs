@@ -1210,6 +1210,8 @@ fn grep_expressions_and_functions_match_git() {
     let sub = dir.join("sub");
     std::fs::create_dir_all(&sub).unwrap();
     git(&sub, &["init", "-q"], &[]);
+    git(&sub, &["config", "user.email", "t@t"], &[]);
+    git(&sub, &["config", "user.name", "T"], &[]);
     write(&sub, "g", b"foo in sub\n");
     git(&sub, &["add", "."], &[]);
     commit(&sub, 1, "sub", "T");
