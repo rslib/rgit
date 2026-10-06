@@ -522,6 +522,7 @@ fn dump(
         sizes: (0, 0),
         modes: (0, 0),
         ids: Default::default(),
+        loaded: true,
     })
 }
 

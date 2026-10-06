@@ -40,6 +40,49 @@ impl Git2Backend {
         Ok(Repository::open(gitdir)?)
     }
 
+    fn status_impl(&self, full: bool) -> Result<RepoStatus, GitError> {
+        let mut repo = self.repo.lock().expect("repo mutex");
+        // Reflect any staging done by plain `git` since the last refresh.
+        sync_index(&repo)?;
+        // stash_foreach needs &mut, so collect stashes before the shared reads.
+        let stashes = collect_stashes(&mut repo);
+        let entries = collect_entries(&repo)?;
+        let recent = collect_recent(&repo);
+        let head = collect_head(&repo, recent.first())?;
+
+        // A full snapshot hashes untracked files' contents (recursing into new
+        // directories) so a brand-new file shows its all-added diff in the
+        // preview, like `git diff` with --no-index would; past EAGER_UNTRACKED
+        // files (an unignored build dir, say) they are left out and
+        // `file_diff` loads one on demand. A lazy snapshot reads deltas only
+        // and `file_diff` covers every file on demand.
+        const EAGER_UNTRACKED: usize = 200;
+        let eager_untracked =
+            full && entries.iter().filter(|e| e.is_untracked()).count() <= EAGER_UNTRACKED;
+        let mut unstaged = if full {
+            extract_with_renames_par(&repo, StatusDiff::Workdir { eager_untracked })?
+        } else {
+            extract_meta(&repo, StatusDiff::Workdir { eager_untracked })?
+        };
+        drop_skipped(&repo, &mut unstaged)?;
+        let staged = if full {
+            extract_with_renames_par(&repo, StatusDiff::Staged)?
+        } else {
+            extract_meta(&repo, StatusDiff::Staged)?
+        };
+
+        Ok(RepoStatus {
+            head,
+            entries,
+            unstaged,
+            staged,
+            stashes,
+            recent,
+            state: repo_state(&repo),
+            rebase: rebase_progress(&repo),
+        })
+    }
+
     /// Discover the repository containing `start` and validate it has a worktree.
     pub fn discover(start: impl AsRef<Path>) -> Result<Self, GitError> {
         // Install the in-process, ssh-config-aware ssh transport (idempotent).
@@ -238,49 +281,11 @@ impl GitBackend for Git2Backend {
     }
 
     fn status(&self) -> Result<RepoStatus, GitError> {
-        let mut repo = self.repo.lock().expect("repo mutex");
-        // Reflect any staging done by plain `git` since the last refresh.
-        sync_index(&repo)?;
-        // stash_foreach needs &mut, so collect stashes before the shared reads.
-        let stashes = collect_stashes(&mut repo);
-        let entries = collect_entries(&repo)?;
-        let recent = collect_recent(&repo);
-        let head = collect_head(&repo, recent.first())?;
+        self.status_impl(false)
+    }
 
-        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
-        // Include untracked files (recursing into new directories) so a brand-new
-        // file shows its all-added diff in the preview, like `git diff` with
-        // --no-index would. Their contents are read and hashed in full, so past
-        // EAGER_UNTRACKED files (an unignored build dir, say) they are left out
-        // and `file_diff` loads one on demand.
-        const EAGER_UNTRACKED: usize = 200;
-        let mut wt_opts = DiffOptions::new();
-        if entries.iter().filter(|e| e.is_untracked()).count() <= EAGER_UNTRACKED {
-            wt_opts
-                .include_untracked(true)
-                .recurse_untracked_dirs(true)
-                // Emit the file's lines as additions, not just a bare "new file" delta.
-                .show_untracked_content(true);
-        }
-        let mut unstaged =
-            extract_with_renames(&repo, repo.diff_index_to_workdir(None, Some(&mut wt_opts))?)?;
-        drop_skipped(&repo, &mut unstaged)?;
-        let mut idx_opts = DiffOptions::new();
-        let staged = extract_with_renames(
-            &repo,
-            repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut idx_opts))?,
-        )?;
-
-        Ok(RepoStatus {
-            head,
-            entries,
-            unstaged,
-            staged,
-            stashes,
-            recent,
-            state: repo_state(&repo),
-            rebase: rebase_progress(&repo),
-        })
+    fn status_full(&self) -> Result<RepoStatus, GitError> {
+        self.status_impl(true)
     }
 
     fn stash_push(&self, include_untracked: bool) -> Result<String, GitError> {
@@ -11550,6 +11555,234 @@ fn extract_with_renames(repo: &Repository, mut diff: Diff) -> Result<Vec<FileDif
     fopts.renames(true);
     diff.find_similar(Some(&mut fopts))?;
     extract(repo, &diff)
+}
+
+/// Which diff `extract_with_renames_par` builds; workers rebuild it on their
+/// own repository handle.
+#[derive(Clone, Copy)]
+enum StatusDiff {
+    /// index -> workdir; whether to hash untracked file contents eagerly.
+    Workdir { eager_untracked: bool },
+    /// HEAD tree -> index.
+    Staged,
+}
+
+impl StatusDiff {
+    fn make<'a>(&self, repo: &'a Repository) -> Result<Diff<'a>, GitError> {
+        match self {
+            StatusDiff::Workdir { eager_untracked } => {
+                let mut opts = DiffOptions::new();
+                if *eager_untracked {
+                    opts.include_untracked(true)
+                        .recurse_untracked_dirs(true)
+                        // Emit the file's lines as additions, not a bare delta.
+                        .show_untracked_content(true);
+                }
+                Ok(repo.diff_index_to_workdir(None, Some(&mut opts))?)
+            }
+            StatusDiff::Staged => {
+                let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+                Ok(repo.diff_tree_to_index(
+                    head_tree.as_ref(),
+                    None,
+                    Some(&mut DiffOptions::new()),
+                )?)
+            }
+        }
+    }
+}
+
+/// `extract_with_renames`, with the per-file patch text built in parallel.
+/// `git2::Diff` is not Sync (concurrent patch creation over a shared diff
+/// corrupts output), so each worker opens its own repository handle and
+/// rebuilds the diff, extracting only its chunk. The metadata pass (delta
+/// paths, statuses, rename scores) stays sequential on the main diff; a worker
+/// whose rebuilt diff no longer matches at some index (the worktree changed
+/// mid-refresh) yields a patchless entry there until the next refresh.
+fn extract_with_renames_par(
+    repo: &Repository,
+    kind: StatusDiff,
+) -> Result<Vec<FileDiff>, GitError> {
+    let mut diff = kind.make(repo)?;
+    let mut fopts = DiffFindOptions::new();
+    fopts.renames(true);
+    diff.find_similar(Some(&mut fopts))?;
+    let count = diff.deltas().len();
+    if count < 8 || rayon::current_num_threads() < 2 {
+        return extract(repo, &diff);
+    }
+
+    struct Meta {
+        path: String,
+        old_path: Option<String>,
+        status: StatusCode,
+        similarity: u16,
+    }
+
+    let mut metas = Vec::with_capacity(count);
+    for idx in 0..count {
+        let delta = diff.get_delta(idx).expect("delta in range");
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let old_path = matches!(delta.status(), Delta::Renamed | Delta::Copied)
+            .then(|| {
+                delta
+                    .old_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
+            .flatten()
+            .filter(|old| *old != path);
+        metas.push(Meta {
+            path,
+            similarity: if old_path.is_some() {
+                similarity(repo, &delta)
+            } else {
+                0
+            },
+            old_path,
+            status: delta_status(delta.status()),
+        });
+    }
+    drop(diff);
+
+    let gitdir = repo.path().to_path_buf();
+    use rayon::prelude::*;
+    // One chunk per thread: every chunk rebuilds the whole diff on its own
+    // handle, so more chunks than threads is pure redundant work.
+    let chunk_count = rayon::current_num_threads().min(count);
+    let chunk_size = count.div_ceil(chunk_count);
+    let chunks: Vec<Result<Vec<FileDiff>, GitError>> = (0..chunk_count)
+        .into_par_iter()
+        .map(|chunk| {
+            let wrepo = Repository::open(&gitdir).map_err(GitError::from)?;
+            let mut wdiff = kind.make(&wrepo)?;
+            let mut fopts = DiffFindOptions::new();
+            fopts.renames(true);
+            wdiff.find_similar(Some(&mut fopts))?;
+            let start = chunk * chunk_size;
+            let end = ((chunk + 1) * chunk_size).min(count);
+            let mut out = Vec::with_capacity(end - start);
+            for (offset, meta) in metas[start..end].iter().enumerate() {
+                let idx = start + offset;
+                let delta = wdiff.get_delta(idx);
+                // If the worktree moved mid-refresh the rebuilt diff shifts;
+                // emit the patch only when the delta still names meta's file.
+                let aligned = delta
+                    .as_ref()
+                    .and_then(|d| d.new_file().path().or_else(|| d.old_file().path()))
+                    .is_some_and(|p| p.to_string_lossy() == meta.path);
+                let patch = aligned.then(|| Patch::from_diff(&wdiff, idx)).transpose()?;
+                let fallback = delta.map(|d| {
+                    (
+                        d.flags().is_binary(),
+                        (d.old_file().size(), d.new_file().size()),
+                        (
+                            u32::from(d.old_file().mode()),
+                            u32::from(d.new_file().mode()),
+                        ),
+                        (d.old_file().id().to_string(), d.new_file().id().to_string()),
+                    )
+                });
+                let mut file = match patch.flatten() {
+                    Some(mut patch) => patch_file(&mut patch)?,
+                    None => {
+                        let (binary, sizes, modes, ids) = fallback.unwrap_or_default();
+                        FileDiff {
+                            path: String::new(),
+                            old_path: None,
+                            status: StatusCode::Modified,
+                            hunks: Vec::new(),
+                            binary,
+                            header: String::new(),
+                            similarity: 0,
+                            sizes,
+                            modes,
+                            ids,
+                            loaded: true,
+                        }
+                    }
+                };
+                if meta.old_path.is_some() {
+                    file.similarity = meta.similarity;
+                    // libgit2 scores renames its own way; print git's score.
+                    if let Some(start) = file.header.find("similarity index ") {
+                        let end = start + file.header[start..].find('\n').unwrap_or(0);
+                        let line = format!("similarity index {}%", file.similarity);
+                        file.header.replace_range(start..end, &line);
+                    }
+                }
+                file.path = meta.path.clone();
+                file.old_path = meta.old_path.clone();
+                file.status = meta.status;
+                out.push(file);
+            }
+            Ok(out)
+        })
+        .collect();
+
+    let mut files = Vec::with_capacity(count);
+    for chunk in chunks {
+        files.extend(chunk?);
+    }
+    Ok(files)
+}
+
+/// The lazy snapshot's diff list: one delta-only [`FileDiff`] per changed
+/// file, rename pairing applied, but no patch text (`loaded: false`).
+/// `file_diff` materializes a single file on demand; `status_full` fills all.
+fn extract_meta(repo: &Repository, kind: StatusDiff) -> Result<Vec<FileDiff>, GitError> {
+    let mut diff = kind.make(repo)?;
+    let mut fopts = DiffFindOptions::new();
+    fopts.renames(true);
+    diff.find_similar(Some(&mut fopts))?;
+    let mut files = Vec::with_capacity(diff.deltas().len());
+    for idx in 0..diff.deltas().len() {
+        let delta = diff.get_delta(idx).expect("delta in range");
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let old_path = matches!(delta.status(), Delta::Renamed | Delta::Copied)
+            .then(|| {
+                delta
+                    .old_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
+            .flatten()
+            .filter(|old| *old != path);
+        files.push(FileDiff {
+            path,
+            similarity: if old_path.is_some() {
+                similarity(repo, &delta)
+            } else {
+                0
+            },
+            old_path,
+            status: delta_status(delta.status()),
+            hunks: Vec::new(),
+            binary: delta.flags().is_binary(),
+            header: String::new(),
+            sizes: (delta.old_file().size(), delta.new_file().size()),
+            modes: (
+                u32::from(delta.old_file().mode()),
+                u32::from(delta.new_file().mode()),
+            ),
+            ids: (
+                delta.old_file().id().to_string(),
+                delta.new_file().id().to_string(),
+            ),
+            loaded: false,
+        });
+    }
+    Ok(files)
 }
 
 fn extract(repo: &Repository, diff: &Diff) -> Result<Vec<FileDiff>, GitError> {

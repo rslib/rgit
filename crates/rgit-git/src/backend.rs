@@ -15,9 +15,16 @@ pub trait GitBackend: Send + Sync {
     /// The repository's working directory, e.g. to watch for changes.
     fn workdir(&self) -> &std::path::Path;
 
-    /// A full status snapshot for the status buffer: head, changed paths,
-    /// per-file diffs, and recent commits.
+    /// A status snapshot for the status buffer: head, changed paths, and
+    /// recent commits. Per-file diffs come back unloaded (`FileDiff::loaded`
+    /// is false) so the read stays fast on a tree with many changes.
     fn status(&self) -> Result<RepoStatus, GitError>;
+
+    /// `status` with every file diff materialized, for the background fill
+    /// that follows the first paint.
+    fn status_full(&self) -> Result<RepoStatus, GitError> {
+        self.status()
+    }
 
     /// The second of the index file's last write: git's racy-clean mark.
     fn index_second(&self) -> Option<i64> {

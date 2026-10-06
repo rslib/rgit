@@ -266,7 +266,7 @@ fn a_files_hunks_split_across_lanes() {
     lines[16] = "l17-CHANGED".into();
     std::fs::write(dir.join("f.txt"), lines.join("\n") + "\n").unwrap();
 
-    let st = backend.status().unwrap();
+    let st = backend.status_full().unwrap();
     let hunks = st
         .unstaged_diff("f.txt")
         .expect("f.txt is changed")

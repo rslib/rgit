@@ -511,6 +511,11 @@ async fn run_msg(
                     spawn_read(app, msg_tx, |b| b.status());
                 }
             }
+            Effect::FillDiffs => {
+                if gate.start_or_queue() {
+                    spawn_read(app, msg_tx, |b| b.status_full());
+                }
+            }
             Effect::CopyToClipboard(text) => copy_to_clipboard(&text),
             Effect::Mutate(mutation) => {
                 // These all rewrite HEAD (amend, reword, squash, uncommit), so
@@ -683,12 +688,12 @@ async fn run_msg(
                     }
                 });
             }
-            Effect::LoadFilePreview { key, path } => {
+            Effect::LoadFilePreview { key, path, staged } => {
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     let files: Vec<_> = backend
-                        .file_diff(&path, false)
+                        .file_diff(&path, staged)
                         .ok()
                         .flatten()
                         .into_iter()

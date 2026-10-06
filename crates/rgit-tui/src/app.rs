@@ -1651,6 +1651,8 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
 #[derive(Debug)]
 pub enum Effect {
     Refresh,
+    /// Load every file diff for the current (lazy) snapshot off-thread.
+    FillDiffs,
     Mutate(Mutation),
     /// Copy text to the system clipboard (OSC 52).
     CopyToClipboard(String),
@@ -1670,11 +1672,13 @@ pub enum Effect {
         key: PreviewKey,
         rev: String,
     },
-    /// Load one file's working-tree diff and build its preview off-thread, for
-    /// an untracked file the status snapshot carries no diff for.
+    /// Load one file's diff and build its preview off-thread, for a file the
+    /// status snapshot carries no diff text for (lazy snapshot, or an
+    /// untracked file past the eager limit).
     LoadFilePreview {
         key: PreviewKey,
         path: String,
+        staged: bool,
     },
     /// Build a large file diff for the preview pane off-thread.
     BuildFilePreview {
@@ -2210,7 +2214,10 @@ impl App {
                 } else {
                     status.unstaged_diff(path)
                 }?;
-                Some(build_diff(path, std::slice::from_ref(diff)))
+                // An unloaded diff is not a diff; building from it would stick
+                // an empty preview on the key.
+                diff.loaded
+                    .then(|| build_diff(path, std::slice::from_ref(diff)))
             });
             match sections {
                 Some(sections) => {
@@ -2264,14 +2271,18 @@ impl App {
             return Vec::new();
         }
         match &key {
+            // The snapshot carries no diff text for an untracked file past the
+            // eager limit, and none yet for any file in a lazy (pre-fill)
+            // snapshot; load it off-thread either way.
             PreviewKey::File { path, staged }
-                if !*staged && self.file_diff(path, false).is_none() && self.is_untracked(path) =>
+                if !self.file_diff(path, *staged).is_some_and(|d| d.loaded) =>
             {
                 let path = path.clone();
+                let staged = *staged;
                 self.set_preview_placeholder();
                 self.preview_key = Some(key.clone());
                 self.preview_followed_hunk = None;
-                vec![Effect::LoadFilePreview { key, path }]
+                vec![Effect::LoadFilePreview { key, path, staged }]
             }
             PreviewKey::File { path, staged } => {
                 // Build small diffs synchronously (no flash); defer the ones
@@ -4864,6 +4875,15 @@ fn refreshed(app: &mut App, result: RefreshResult) -> Vec<Effect> {
                 app.push_toast(ToastKind::Success, format!("{label} done"));
             }
             let mut effects = app.sync_preview();
+            // A lazy snapshot paints instantly but has no diff text; fill it in
+            // the background so stats, unfolds and hunk staging appear.
+            let needs_fill = app
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.unstaged.iter().chain(&s.staged).any(|d| !d.loaded));
+            if needs_fill {
+                effects.push(Effect::FillDiffs);
+            }
             let stale = app
                 .last_remote_fetch
                 .is_none_or(|time| time.elapsed() >= std::time::Duration::from_secs(20));

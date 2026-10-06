@@ -98,7 +98,7 @@ fn diffs_carry_hunks_for_changed_files() {
     git(&dir, &["add", "b.txt"]);
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    let status = backend.status().unwrap();
+    let status = backend.status_full().unwrap();
 
     let unstaged = status
         .unstaged_diff("a.txt")
@@ -158,11 +158,11 @@ fn stage_then_unstage_a_hunk_roundtrips() {
 
     let backend = Git2Backend::discover(&dir).unwrap();
 
-    let st = backend.status().unwrap();
+    let st = backend.status_full().unwrap();
     let new_start = st.unstaged_diff("a.txt").unwrap().hunks[0].new_start;
     backend.stage_hunk("a.txt", new_start).unwrap();
 
-    let st = backend.status().unwrap();
+    let st = backend.status_full().unwrap();
     assert!(st.unstaged_diff("a.txt").is_none(), "nothing left unstaged");
     let staged = st.staged_diff("a.txt").expect("hunk is now staged");
 
@@ -185,7 +185,7 @@ fn stage_only_selected_lines_of_a_hunk() {
     std::fs::write(dir.join("a.txt"), "a\nX\nb\nY\nc\n").unwrap();
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    let st = backend.status().unwrap();
+    let st = backend.status_full().unwrap();
     let hunk = &st.unstaged_diff("a.txt").unwrap().hunks[0];
     let x = hunk
         .lines
@@ -195,7 +195,7 @@ fn stage_only_selected_lines_of_a_hunk() {
 
     backend.stage_lines("a.txt", hunk.new_start, &[x]).unwrap();
 
-    let st = backend.status().unwrap();
+    let st = backend.status_full().unwrap();
     let staged = st.staged_diff("a.txt").unwrap();
     let staged_adds: Vec<&str> = staged.hunks[0]
         .lines
@@ -272,7 +272,7 @@ fn discard_lines_reverts_only_selected_lines() {
     std::fs::write(dir.join("a.txt"), "a\nX\nb\nY\nc\n").unwrap();
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    let st = backend.status().unwrap();
+    let st = backend.status_full().unwrap();
     let hunk = &st.unstaged_diff("a.txt").unwrap().hunks[0];
     let x = hunk
         .lines
@@ -963,7 +963,7 @@ fn staged_rename_shows_as_one_renamed_diff_not_delete_plus_add() {
     git(&dir, &["add", "-A"]);
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    let status = backend.status().unwrap();
+    let status = backend.status_full().unwrap();
 
     // The staged diff collapses to a single renamed file, not a delete + add.
     assert_eq!(status.staged.len(), 1, "one renamed file, not two");
@@ -1000,6 +1000,72 @@ fn pure_move_shows_rename_with_no_content_hunks() {
     assert_eq!(f.path, "b.txt");
     assert_eq!(f.old_path.as_deref(), Some("a.txt"));
     assert!(f.hunks.is_empty(), "a pure move has no content changes");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn many_changes_extract_in_parallel_with_renames_intact() {
+    // Past eight deltas the status extraction fans out over worker threads;
+    // the fan-out must not change the result, renames included.
+    let dir = init_repo("par-extract");
+    for i in 0..10 {
+        std::fs::write(dir.join(format!("f{i}.txt")), "one\ntwo\nthree\n").unwrap();
+    }
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "init"]);
+
+    // A rename with a small tweak plus nine plain modifications, all staged.
+    std::fs::rename(dir.join("f0.txt"), dir.join("moved.txt")).unwrap();
+    std::fs::write(dir.join("moved.txt"), "one\nTWO\nthree\n").unwrap();
+    for i in 1..10 {
+        std::fs::write(dir.join(format!("f{i}.txt")), "one\ntwo\nTHREE\n").unwrap();
+    }
+    git(&dir, &["add", "-A"]);
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    // The lazy snapshot lists every file with rename metadata but no text.
+    let lazy = backend.status().unwrap();
+    assert_eq!(
+        lazy.staged.len(),
+        10,
+        "one entry per file, rename collapsed"
+    );
+    assert!(lazy.staged.iter().all(|f| !f.loaded && f.hunks.is_empty()));
+    let moved = lazy
+        .staged
+        .iter()
+        .find(|f| f.old_path.as_deref() == Some("f0.txt"))
+        .expect("rename meta survives the lazy pass");
+    assert_eq!(moved.path, "moved.txt");
+
+    let status = backend.status_full().unwrap();
+
+    assert_eq!(
+        status.staged.len(),
+        10,
+        "one entry per file, rename collapsed"
+    );
+    let renamed = status
+        .staged
+        .iter()
+        .filter(|f| f.old_path.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(renamed.len(), 1);
+    assert_eq!(renamed[0].path, "moved.txt");
+    assert_eq!(renamed[0].old_path.as_deref(), Some("f0.txt"));
+    assert!(renamed[0].similarity > 0);
+    let removed = renamed[0]
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter(|l| matches!(l.origin, rgit_git::LineOrigin::Removed))
+        .count();
+    assert_eq!(removed, 1, "just the tweaked line");
+    for f in status.staged.iter().filter(|f| f.old_path.is_none()) {
+        assert_eq!(f.status, StatusCode::Modified);
+        assert!(!f.hunks.is_empty(), "{} keeps its patch", f.path);
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1042,7 +1108,7 @@ fn untracked_file_shows_its_all_added_diff() {
     std::fs::write(dir.join("new.txt"), "line one\nline two\n").unwrap();
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    let status = backend.status().unwrap();
+    let status = backend.status_full().unwrap();
 
     // It is listed as untracked...
     assert!(
