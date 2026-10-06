@@ -5563,12 +5563,13 @@ fn push_one(
                         format!("{local} {new} {} {}\n", r.dst, r.old)
                     })
                     .collect();
-                let hook = hook_checked(
+                let hook = hook_checked_report(
                     repo,
                     "pre-push",
                     &[remote_name, url],
                     Some(lines.as_bytes()),
                     &[],
+                    report,
                 );
                 if let Err(e) = hook {
                     *hook_failed.lock().expect("hook mutex") = Some(e.to_string());
@@ -7268,21 +7269,81 @@ pub(crate) fn hook_checked(
     stdin: Option<&[u8]>,
     env: &[(&str, &Path)],
 ) -> Result<(), GitError> {
+    hook_checked_report(repo, name, args, stdin, env, &|_| {})
+}
+
+fn hook_checked_report(
+    repo: &Repository,
+    name: &str,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    env: &[(&str, &Path)],
+    report: &dyn Fn(OpProgress),
+) -> Result<(), GitError> {
     let workdir = repo.workdir().unwrap_or(repo.path());
-    let Some(out) = run_hook_env(&hooks_dir(repo), workdir, name, args, stdin, env)? else {
-        return Ok(());
-    };
-    if out.status.success() {
-        return Ok(());
-    }
     if crate::hooks::streaming() {
-        return Err(GitError::Hook(String::new()));
+        let Some(out) = run_hook_env(&hooks_dir(repo), workdir, name, args, stdin, env)? else {
+            return Ok(());
+        };
+        return if out.status.success() {
+            Ok(())
+        } else {
+            Err(GitError::Hook(String::new()))
+        };
     }
-    let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_owned();
-    let detail = match text(&out.stderr) {
-        e if e.is_empty() => text(&out.stdout),
-        e => e,
+    let Some(hook) = crate::hooks::find_hook(&hooks_dir(repo), name) else {
+        return Ok(());
     };
+    let mut cmd = std::process::Command::new(hook);
+    cmd.args(args)
+        .current_dir(workdir)
+        .stdin(if stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn()?;
+    if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let _ = std::io::Write::write_all(&mut pipe, data);
+    }
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    let output = std::thread::scope(|scope| {
+        let stdout = child.stdout.take().expect("piped hook stdout");
+        let stderr = child.stderr.take().expect("piped hook stderr");
+        let reader = |stream: Box<dyn std::io::Read + Send>,
+                      channel: std::sync::mpsc::Sender<String>| {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stream)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let _ = channel.send(line);
+            }
+        };
+        let out_tx = line_tx.clone();
+        scope.spawn(move || reader(Box::new(stdout), out_tx));
+        let err_tx = line_tx.clone();
+        scope.spawn(move || reader(Box::new(stderr), err_tx));
+        let status = child.wait()?;
+        Ok::<_, std::io::Error>(status)
+    })?;
+    drop(line_tx);
+    let mut stdout = String::new();
+    while let Ok(line) = line_rx.recv() {
+        report(OpProgress::Line(line.clone()));
+        stdout.push_str(&line);
+        stdout.push('\n');
+    }
+    let status = output;
+    if status.success() {
+        return Ok(());
+    }
+    let detail = stdout.trim();
     Err(GitError::Hook(format!("{name} hook failed: {detail}")))
 }
 

@@ -160,7 +160,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_commit_editor(frame, editor, inner);
     }
     if let Some(console) = &app.hook_console {
-        render_hook_console(frame, console, app.tick_count, inner);
+        render_hook_console(frame, console, app.tick_count, body);
     }
     if let Some(todo) = &app.rebase_todo {
         render_rebase_todo(frame, todo, inner);
