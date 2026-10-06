@@ -292,6 +292,7 @@ async fn event_loop(
 
     // Auto-refresh on worktree changes; kept alive for the loop's duration.
     let _watcher = spawn_watcher(app.backend().workdir(), msg_tx.clone());
+    let gate = RefreshGate::default();
 
     msg_tx.send(Msg::Refresh).ok();
     tracing::info!(target: "startup", "tui initial refresh queued");
@@ -376,13 +377,13 @@ async fn event_loop(
                     resolve_key(key)
                 };
                 if let Some(msg) = msg {
-                    run_msg(&mut app, msg, &mut events, terminal, &msg_tx).await?;
+                    run_msg(&mut app, msg, &mut events, terminal, &msg_tx, &gate).await?;
                 }
                 true
             }
             Incoming::Event(Event::Mouse(m)) => {
                 if let Some(msg) = mouse_msg(&app, m) {
-                    run_msg(&mut app, msg, &mut events, terminal, &msg_tx).await?;
+                    run_msg(&mut app, msg, &mut events, terminal, &msg_tx, &gate).await?;
                 }
                 true
             }
@@ -395,7 +396,7 @@ async fn event_loop(
             }
             Incoming::Event(Event::Error) => false,
             Incoming::Msg(msg) => {
-                run_msg(&mut app, msg, &mut events, terminal, &msg_tx).await?;
+                run_msg(&mut app, msg, &mut events, terminal, &msg_tx, &gate).await?;
                 true
             }
         };
@@ -464,16 +465,52 @@ fn overlay_active(app: &App) -> bool {
         || app.leader.is_some()
 }
 
+/// Bounds concurrent status refreshes to one running plus one queued: a
+/// worktree-watch burst (an editor save, a build) must not pile up full
+/// `status()` calls that each hold the repo lock and starve user operations.
+#[derive(Default)]
+struct RefreshGate {
+    inflight: std::sync::atomic::AtomicBool,
+    queued: std::sync::atomic::AtomicBool,
+}
+
+impl RefreshGate {
+    /// Whether the caller should spawn the refresh; otherwise it is queued
+    /// behind the one already running.
+    fn start_or_queue(&self) -> bool {
+        use std::sync::atomic::Ordering::{AcqRel, Release};
+        if self.inflight.swap(true, AcqRel) {
+            self.queued.store(true, Release);
+            false
+        } else {
+            true
+        }
+    }
+
+    /// A refresh finished; whether a queued one should run now.
+    fn finish(&self) -> bool {
+        use std::sync::atomic::Ordering::{AcqRel, Release};
+        self.inflight.store(false, Release);
+        self.queued.swap(false, AcqRel)
+    }
+}
+
 async fn run_msg(
     app: &mut App,
     msg: Msg,
     events: &mut Events,
     terminal: &mut DefaultTerminal,
     msg_tx: &UnboundedSender<Msg>,
+    gate: &RefreshGate,
 ) -> std::io::Result<()> {
+    let requeue = matches!(msg, Msg::Refreshed(_)) && gate.finish();
     for effect in update(app, msg) {
         match effect {
-            Effect::Refresh => spawn_read(app, msg_tx, |b| b.status()),
+            Effect::Refresh => {
+                if gate.start_or_queue() {
+                    spawn_read(app, msg_tx, |b| b.status());
+                }
+            }
             Effect::CopyToClipboard(text) => copy_to_clipboard(&text),
             Effect::Mutate(mutation) => {
                 // These all rewrite HEAD (amend, reword, squash, uncommit), so
@@ -1071,6 +1108,9 @@ async fn run_msg(
                 });
             }
         }
+    }
+    if requeue && gate.start_or_queue() {
+        spawn_read(app, msg_tx, |b| b.status());
     }
     Ok(())
 }

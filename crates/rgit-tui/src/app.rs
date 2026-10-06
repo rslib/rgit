@@ -1935,7 +1935,7 @@ pub struct App {
     /// When the background forge snapshot was last requested.
     last_remote_fetch: Option<std::time::Instant>,
     /// Last status snapshot, for the adaptive preview pane.
-    snapshot: Option<RepoStatus>,
+    snapshot: Option<Arc<RepoStatus>>,
     /// What the preview buffer currently holds, so it is rebuilt only when the
     /// cursor moves to a different file or commit.
     preview_key: Option<PreviewKey>,
@@ -4846,8 +4846,10 @@ fn refreshed(app: &mut App, result: RefreshResult) -> Vec<Effect> {
         Ok(status) => {
             app.state = status.state;
             app.changed = status.entries.len();
-            app.snapshot = Some(status.clone());
-            app.head = Some(status.head);
+            // Shared, not cloned: at thousands of changed files the snapshot's
+            // diff text makes a deep clone per refresh visible on the UI thread.
+            app.head = Some(status.head.clone());
+            app.snapshot = Some(Arc::new(status));
             rebuild_status(app);
             app.error = None;
             // The working tree changed, so cached file diffs are stale; commit
