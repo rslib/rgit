@@ -32,6 +32,14 @@ pub struct Git2Backend {
 }
 
 impl Git2Backend {
+    /// A second handle on the same repository. Network transfers run on it so
+    /// the main lock is never held across a push or fetch; libgit2 handles are
+    /// not Sync, and a locked transfer stalls every refresh and edit behind it.
+    fn fresh_handle(&self) -> Result<Repository, GitError> {
+        let gitdir = self.repo.lock().expect("repo mutex").path().to_path_buf();
+        Ok(Repository::open(gitdir)?)
+    }
+
     /// Discover the repository containing `start` and validate it has a worktree.
     pub fn discover(start: impl AsRef<Path>) -> Result<Self, GitError> {
         // Install the in-process, ssh-config-aware ssh transport (idempotent).
@@ -3875,7 +3883,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn lane_push(&self, lane: &str) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.fresh_handle()?;
         let branch = crate::lanes::lane_branch(&repo, lane)?;
         if repo.find_branch(&branch, BranchType::Local).is_err() {
             return Err(GitError::Other(format!(
@@ -3894,7 +3902,7 @@ impl GitBackend for Git2Backend {
     fn lane_pr(&self, lane: &str) -> Result<String, GitError> {
         // detect_main locks the repo, so resolve the base before we lock.
         let base = crate::workflow::detect_main(self);
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.fresh_handle()?;
         let branch = crate::lanes::lane_branch(&repo, lane)?;
         if repo.find_branch(&branch, BranchType::Local).is_err() {
             return Err(GitError::Other(format!(
@@ -4858,7 +4866,7 @@ impl GitBackend for Git2Backend {
         all: bool,
         depth: Option<i32>,
     ) -> Result<crate::backend::FetchedRefs, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.fresh_handle()?;
         let mut remote = repo.remote_anonymous(url)?;
         remote.connect(git2::Direction::Fetch)?;
         let heads: Vec<(String, String)> = remote
@@ -4896,7 +4904,7 @@ impl GitBackend for Git2Backend {
         args: &crate::PushArgs,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.fresh_handle()?;
         let mut remote = repo.remote_anonymous(url)?;
         let mut specs = refspecs
             .iter()
@@ -4958,7 +4966,7 @@ impl GitBackend for Git2Backend {
         args: &crate::PushArgs,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.fresh_handle()?;
         let cred_guard = self.cred_prompt.lock().expect("cred mutex");
         let cred = cred_guard.as_deref();
         let remote_name = match remote {
@@ -11586,6 +11594,7 @@ fn extract(repo: &Repository, diff: &Diff) -> Result<Vec<FileDiff>, GitError> {
                     delta.old_file().id().to_string(),
                     delta.new_file().id().to_string(),
                 ),
+                loaded: true,
             },
         };
         if old_path.is_some() {
@@ -11670,6 +11679,7 @@ fn patch_file(patch: &mut Patch) -> Result<FileDiff, GitError> {
             delta.old_file().id().to_string(),
             delta.new_file().id().to_string(),
         ),
+        loaded: true,
     })
 }
 

@@ -20,6 +20,9 @@ pub struct FileDiff {
     pub modes: (u32, u32),
     /// Old and new object ids (zeros for a missing side), for `--raw`.
     pub ids: (String, String),
+    /// `false` when only the delta was read (a status snapshot): `hunks` and
+    /// `header` stay empty until loaded on demand or by a full refresh.
+    pub loaded: bool,
 }
 
 /// One `@@ ... @@` hunk.
