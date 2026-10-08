@@ -38,7 +38,9 @@ impl Git2Backend {
     /// libgit2 keeps per-handle state consistent through drop, so reusing
     /// the guarded handle after a panic is safe.
     fn repo(&self) -> std::sync::MutexGuard<'_, Repository> {
-        self.repo.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.repo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// A second handle on the same repository. Network transfers run on it so
@@ -239,14 +241,22 @@ impl Git2Backend {
                         let lines = Mutex::new(Vec::new());
                         let buffer = |p: OpProgress| {
                             if let OpProgress::Line(l) = p {
-                                lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(l);
+                                lines
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(l);
                             }
                         };
                         let result = Repository::open(&path)
                             .map_err(GitError::from)
                             .and_then(|r| self.fetch_remote(&r, name, &[], &each, &buffer, cred));
-                        let lines = lines.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        *done[i].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((lines, result));
+                        let lines = lines
+                            .into_inner()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *done[i]
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some((lines, result));
                     }
                 });
             }
@@ -254,7 +264,10 @@ impl Git2Backend {
         let mut failed = Vec::new();
         for (name, slot) in names.iter().zip(done) {
             report(OpProgress::Line(format!("Fetching {name}")));
-            let Some((lines, result)) = slot.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) else {
+            let Some((lines, result)) = slot
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            else {
                 continue;
             };
             for line in lines {
@@ -1967,21 +1980,15 @@ impl GitBackend for Git2Backend {
     }
 
     fn rebase_abort(&self) -> Result<String, GitError> {
-        self.logged("rebase abort", || {
-            crate::rebase::abort(&self.repo())
-        })
+        self.logged("rebase abort", || crate::rebase::abort(&self.repo()))
     }
 
     fn rebase_continue(&self) -> Result<String, GitError> {
-        self.logged("rebase", || {
-            crate::rebase::resume(&self.repo(), false)
-        })
+        self.logged("rebase", || crate::rebase::resume(&self.repo(), false))
     }
 
     fn rebase_skip(&self) -> Result<String, GitError> {
-        self.logged("rebase", || {
-            crate::rebase::resume(&self.repo(), true)
-        })
+        self.logged("rebase", || crate::rebase::resume(&self.repo(), true))
     }
 
     fn rebase_quit(&self) -> Result<(), GitError> {
@@ -2527,12 +2534,7 @@ impl GitBackend for Git2Backend {
         head: &str,
         limit: Option<&str>,
     ) -> Result<Vec<crate::CherryCommit>, GitError> {
-        crate::format_patch::cherry(
-            &self.repo(),
-            upstream,
-            head,
-            limit,
-        )
+        crate::format_patch::cherry(&self.repo(), upstream, head, limit)
     }
 
     fn format_patch(
@@ -2592,7 +2594,10 @@ impl GitBackend for Git2Backend {
 
     fn maintenance_run(&self, opts: &crate::MaintenanceRun) -> Result<String, GitError> {
         let repo = self.repo();
-        let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cred_guard = self
+            .cred_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prefetch = || prefetch(&repo, cred_guard.as_deref());
         crate::maintenance::run(&repo, opts, &prefetch)
     }
@@ -3331,7 +3336,10 @@ impl GitBackend for Git2Backend {
     fn prune_remote(&self, name: &str) -> Result<Vec<String>, GitError> {
         self.logged("remote prune", || {
             let repo = self.repo();
-            let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cred_guard = self
+                .cred_prompt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             // What the remote's first URL has, as git reads it.
             let (mut remote, _, _) = fetch_source(&repo, name)?;
             let ignored = std::sync::atomic::AtomicBool::new(false);
@@ -3448,7 +3456,10 @@ impl GitBackend for Git2Backend {
 
     fn remote_heads(&self, name: &str) -> Result<crate::backend::RemoteHeads, GitError> {
         let repo = self.repo();
-        let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cred_guard = self
+            .cred_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let url = remote_urls(&repo, name, false)?
             .into_iter()
             .next()
@@ -3904,13 +3915,19 @@ impl GitBackend for Git2Backend {
                 "lane {lane} has no commits yet; commit it first"
             )));
         }
-        let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cred_guard = self
+            .cred_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let remote = push_lane_branch(&repo, &branch, &|_| {}, cred_guard.as_deref())?;
         Ok(format!("pushed {branch} to {remote}"))
     }
 
     fn set_credential_prompt(&self, prompt: Box<dyn crate::CredentialPrompt>) {
-        *self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prompt);
+        *self
+            .cred_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prompt);
     }
 
     fn lane_pr(&self, lane: &str) -> Result<String, GitError> {
@@ -3923,7 +3940,10 @@ impl GitBackend for Git2Backend {
                 "lane {lane} has no commits yet; commit it first"
             )));
         }
-        let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cred_guard = self
+            .cred_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         push_lane_branch(&repo, &branch, &|_| {}, cred_guard.as_deref())?;
         drop(cred_guard);
         Ok(crate::workflow::open_pull_request(&branch, &base))
@@ -4430,12 +4450,9 @@ impl GitBackend for Git2Backend {
                     GitError::Other("rev not on the first-parent chain of HEAD".to_owned())
                 })?;
                 order.remove(rev_pos);
-                let target_pos = order
-                    .iter()
-                    .position(|&o| o == target_oid)
-                    .ok_or_else(|| {
-                        GitError::Other("target not on the first-parent chain of HEAD".to_owned())
-                    })?;
+                let target_pos = order.iter().position(|&o| o == target_oid).ok_or_else(|| {
+                    GitError::Other("target not on the first-parent chain of HEAD".to_owned())
+                })?;
                 order.insert(if before { target_pos } else { target_pos + 1 }, rev_oid);
 
                 let commits: Vec<git2::Commit> = order
@@ -4614,7 +4631,10 @@ impl GitBackend for Git2Backend {
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
         let repo = self.repo();
-        let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cred_guard = self
+            .cred_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cred = cred_guard.as_deref();
         // As in git, a group (`remotes.<group>`) stands for its remotes.
         let expand = |name: &str| -> Result<Vec<String>, GitError> {
@@ -4755,7 +4775,10 @@ impl GitBackend for Git2Backend {
         self.logged(if rebase { "pull --rebase" } else { "pull" }, || {
             let mut repo = self.repo();
             {
-                let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let cred_guard = self
+                    .cred_prompt
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let cred = cred_guard.as_deref();
                 let fetch = crate::FetchArgs {
                     depth: args.depth,
@@ -4978,7 +5001,10 @@ impl GitBackend for Git2Backend {
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
         let repo = self.fresh_handle()?;
-        let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cred_guard = self
+            .cred_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cred = cred_guard.as_deref();
         let remote_name = match remote {
             Some(r) => r.to_owned(),
@@ -5084,7 +5110,10 @@ impl GitBackend for Git2Backend {
         // Like git, push to each URL in turn and report every one.
         let lines = Mutex::new(Vec::new());
         let buffer = |p: OpProgress| match p {
-            OpProgress::Line(l) => lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(l),
+            OpProgress::Line(l) => lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(l),
             other => report(other),
         };
         let mut failed = false;
@@ -5108,10 +5137,15 @@ impl GitBackend for Git2Backend {
                     GitError::PushFailed(t) => t,
                     e => e.to_string(),
                 };
-                lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(text);
+                lines
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(text);
             }
         }
-        let lines = lines.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lines = lines
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if failed {
             return Err(GitError::PushFailed(lines.join("\n")));
         }
@@ -5561,7 +5595,9 @@ fn push_one(
                 }
             }
             if rejected && !args.dry_run && !args.atomic {
-                *rows.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = out;
+                *rows
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = out;
                 retry.store(true, Relaxed);
                 return Err(git2::Error::from_str("rejected"));
             }
@@ -5587,12 +5623,16 @@ fn push_one(
                     report,
                 );
                 if let Err(e) = hook {
-                    *hook_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.to_string());
+                    *hook_failed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.to_string());
                     stop.store(true, Relaxed);
                     return Err(git2::Error::from_str("pre-push hook failed"));
                 }
             }
-            *rows.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = out;
+            *rows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = out;
             if args.dry_run || rejected {
                 stop.store(true, Relaxed);
                 return Err(git2::Error::from_str("not pushed"));
@@ -5613,7 +5653,11 @@ fn push_one(
             .collect();
         let pushed = remote.push(&wire, Some(&mut opts));
         if retry.load(Relaxed) {
-            let out = std::mem::take(&mut *rows.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+            let out = std::mem::take(
+                &mut *rows
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
             let (bad, _): (Vec<PushRow>, Vec<PushRow>) =
                 out.into_iter().partition(|r| r.flag == '!');
             todo.retain(|(_, _, d)| !bad.iter().any(|r| r.dst == *d));
@@ -5628,7 +5672,10 @@ fn push_one(
         }
         break;
     }
-    if let Some(msg) = hook_failed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
+    if let Some(msg) = hook_failed
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
         return Err(GitError::PushFailed(
             format!("{msg}\nerror: failed to push some refs to '{url}'")
                 .trim_start()
@@ -5637,7 +5684,10 @@ fn push_one(
     }
 
     let mut all = failed;
-    all.extend(rows.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner));
+    all.extend(
+        rows.into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
     all.retain(|r| !(r.summary == "[rejected]" && followed.contains(&r.dst)));
     let at = |d: &str| specs.iter().position(|(_, _, x)| x == d);
     all.sort_by_key(|r| at(&r.dst));
@@ -5984,7 +6034,9 @@ fn do_fetch(
     {
         follow_remote_head(repo, name, &configured, &head)?;
     }
-    let updates = updates.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let updates = updates
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let rows = fetch_rows(repo, name, refspecs, &updates, &fetched, true);
     for line in crate::fetch_display::render(&url, &rows, compact_fetch(repo)) {
         report(OpProgress::Line(line));
@@ -8294,11 +8346,19 @@ fn update_each(
                     .and_then(|r| {
                         update_one(&r, prefix, name, o, &|p| {
                             if let OpProgress::Line(l) = p {
-                                lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(l);
+                                lines
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(l);
                             }
                         })
                     });
-                (lines.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner), result)
+                (
+                    lines
+                        .into_inner()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    result,
+                )
             })
             .collect()
     });
@@ -8642,7 +8702,12 @@ fn remote_callbacks<'a>(
             "Total ",
             "Resolving deltas",
         ];
-        let lines = sideband_lines(&mut pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner), data);
+        let lines = sideband_lines(
+            &mut pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            data,
+        );
         for line in lines
             .into_iter()
             .map(|line| line.trim().to_owned())
