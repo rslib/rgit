@@ -32,16 +32,25 @@ pub struct Git2Backend {
 }
 
 impl Git2Backend {
+    /// Lock the shared handle, recovering from a poison. A panic in one
+    /// operation (say, a mid-write repo seen by a refresh) must not turn
+    /// every later lock into a `PoisonError` panic and brick the session.
+    /// libgit2 keeps per-handle state consistent through drop, so reusing
+    /// the guarded handle after a panic is safe.
+    fn repo(&self) -> std::sync::MutexGuard<'_, Repository> {
+        self.repo.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A second handle on the same repository. Network transfers run on it so
     /// the main lock is never held across a push or fetch; libgit2 handles are
     /// not Sync, and a locked transfer stalls every refresh and edit behind it.
     fn fresh_handle(&self) -> Result<Repository, GitError> {
-        let gitdir = self.repo.lock().expect("repo mutex").path().to_path_buf();
+        let gitdir = self.repo().path().to_path_buf();
         Ok(Repository::open(gitdir)?)
     }
 
     fn status_impl(&self, full: bool) -> Result<RepoStatus, GitError> {
-        let mut repo = self.repo.lock().expect("repo mutex");
+        let mut repo = self.repo();
         // Reflect any staging done by plain `git` since the last refresh.
         sync_index(&repo)?;
         // stash_foreach needs &mut, so collect stashes before the shared reads.
@@ -131,7 +140,7 @@ impl Git2Backend {
         op: impl FnOnce() -> Result<T, GitError>,
     ) -> Result<T, GitError> {
         let pushed = {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             crate::oplog::snapshot(&repo, label).unwrap_or_else(|e| {
                 tracing::warn!(target: "rgit_git", "oplog snapshot failed: {e}");
                 None
@@ -141,7 +150,7 @@ impl Git2Backend {
         if result.is_err()
             && let Some(pushed) = pushed
         {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             if let Err(e) = crate::oplog::discard(&repo, &pushed) {
                 tracing::warn!(target: "rgit_git", "oplog discard failed: {e}");
             }
@@ -230,14 +239,14 @@ impl Git2Backend {
                         let lines = Mutex::new(Vec::new());
                         let buffer = |p: OpProgress| {
                             if let OpProgress::Line(l) = p {
-                                lines.lock().expect("lines mutex").push(l);
+                                lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(l);
                             }
                         };
                         let result = Repository::open(&path)
                             .map_err(GitError::from)
                             .and_then(|r| self.fetch_remote(&r, name, &[], &each, &buffer, cred));
-                        let lines = lines.into_inner().expect("lines mutex");
-                        *done[i].lock().expect("outcome mutex") = Some((lines, result));
+                        let lines = lines.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *done[i].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((lines, result));
                     }
                 });
             }
@@ -245,7 +254,7 @@ impl Git2Backend {
         let mut failed = Vec::new();
         for (name, slot) in names.iter().zip(done) {
             report(OpProgress::Line(format!("Fetching {name}")));
-            let Some((lines, result)) = slot.into_inner().expect("outcome mutex") else {
+            let Some((lines, result)) = slot.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) else {
                 continue;
             };
             for line in lines {
@@ -290,7 +299,7 @@ impl GitBackend for Git2Backend {
 
     fn stash_push(&self, include_untracked: bool) -> Result<String, GitError> {
         self.logged("stash", || {
-            let mut repo = self.repo.lock().expect("repo mutex");
+            let mut repo = self.repo();
             let sig = stash_signature(&repo, true)?;
             repo.stash_save2(&sig, None, stash_flags(include_untracked))?;
             restamp_stash(&repo, &sig)?;
@@ -304,7 +313,7 @@ impl GitBackend for Git2Backend {
         include_untracked: bool,
     ) -> Result<String, GitError> {
         self.logged("stash", || {
-            let mut repo = self.repo.lock().expect("repo mutex");
+            let mut repo = self.repo();
             let sig = stash_signature(&repo, true)?;
             repo.stash_save2(&sig, Some(message), stash_flags(include_untracked))?;
             restamp_stash(&repo, &sig)?;
@@ -322,7 +331,7 @@ impl GitBackend for Git2Backend {
     ) -> Result<String, GitError> {
         self.logged("stash", || {
             if paths.is_empty() {
-                let mut repo = self.repo.lock().expect("repo mutex");
+                let mut repo = self.repo();
                 let sig = stash_signature(&repo, true)?;
                 let mut flags = stash_flags(include_untracked || all).unwrap_or_default();
                 flags.set(git2::StashFlags::INCLUDE_IGNORED, all);
@@ -331,7 +340,7 @@ impl GitBackend for Git2Backend {
                 restamp_stash(&repo, &sig)?;
                 return Ok(stash_saved_line(&repo));
             }
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             let opts = crate::stash::Opts {
                 message,
@@ -346,14 +355,14 @@ impl GitBackend for Git2Backend {
 
     fn stash_pop(&self, index: usize) -> Result<(), GitError> {
         self.logged("stash pop", || {
-            let mut repo = self.repo.lock().expect("repo mutex");
+            let mut repo = self.repo();
             apply_stash(&mut repo, index, None, true)
         })
     }
 
     fn stash_apply(&self, index: usize) -> Result<(), GitError> {
         self.logged("stash apply", || {
-            let mut repo = self.repo.lock().expect("repo mutex");
+            let mut repo = self.repo();
             apply_stash(&mut repo, index, None, false)
         })
     }
@@ -365,7 +374,7 @@ impl GitBackend for Git2Backend {
         drop: bool,
     ) -> Result<(), GitError> {
         self.logged(if drop { "stash pop" } else { "stash apply" }, || {
-            let mut repo = self.repo.lock().expect("repo mutex");
+            let mut repo = self.repo();
             let mut opts = git2::StashApplyOptions::new();
             if restore_index {
                 opts.reinstantiate_index();
@@ -376,7 +385,7 @@ impl GitBackend for Git2Backend {
 
     fn stash_drop(&self, index: usize) -> Result<(), GitError> {
         self.logged("stash drop", || {
-            let mut repo = self.repo.lock().expect("repo mutex");
+            let mut repo = self.repo();
             repo.stash_drop(index)?;
             Ok(())
         })
@@ -390,7 +399,7 @@ impl GitBackend for Git2Backend {
         paths: &[String],
     ) -> Result<String, GitError> {
         self.logged("stash", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             let head = repo.head()?.peel_to_commit()?;
             let head_tree = head.tree()?;
@@ -436,7 +445,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn stash_create(&self, message: Option<&str>) -> Result<Option<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let head_tree = repo.head()?.peel_to_tree()?;
         let index_tree = repo.find_tree(repo.index()?.write_tree()?)?;
@@ -451,7 +460,7 @@ impl GitBackend for Git2Backend {
 
     fn stash_store(&self, rev: &str, message: Option<&str>) -> Result<(), GitError> {
         self.logged("stash store", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let commit = repo.rev_single(rev)?.peel_to_commit()?;
             if commit.parent_count() < 2 {
                 return Err(GitError::Other(format!("{rev} is not a stash-like commit")));
@@ -465,7 +474,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn log(&self, opts: &crate::LogOptions) -> Result<Vec<crate::LogEntry>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -504,7 +513,7 @@ impl GitBackend for Git2Backend {
 
     fn smartlog(&self) -> Result<Vec<crate::SmartlogEntry>, GitError> {
         use std::collections::HashMap;
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -582,7 +591,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn commit_details(&self, rev: &str) -> Result<crate::CommitDetails, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -673,7 +682,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn commit_overview(&self, rev: &str) -> Result<crate::CommitOverview, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -746,7 +755,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn commit_file_diff(&self, rev: &str, path: &str) -> Result<Option<crate::FileDiff>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let commit = repo.rev_single(rev)?.peel_to_commit()?;
         let tree = commit.tree()?;
         let parent_tree = commit.parent(0).ok().map(|p| p.tree()).transpose()?;
@@ -759,7 +768,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn diff_refs(&self, from: &str, to: &str) -> Result<Vec<crate::FileDiff>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let from_tree = repo.rev_single(from)?.peel_to_tree()?;
         let to_tree = repo.rev_single(to)?.peel_to_tree()?;
         let mut opts = DiffOptions::new();
@@ -768,7 +777,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn diff(&self, spec: &crate::DiffSpec) -> Result<Vec<crate::FileDiff>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let mut opts = DiffOptions::new();
         crate::pathspec::limit_diff(&mut opts, &spec.paths)?;
@@ -828,12 +837,12 @@ impl GitBackend for Git2Backend {
     }
 
     fn word_regex(&self, old: Option<&str>, new: &str) -> Result<Option<Vec<u8>>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         crate::userdiff::word_regex(&repo, old, new)
     }
 
     fn file_diff(&self, path: &str, staged: bool) -> Result<Option<crate::FileDiff>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let mut opts = DiffOptions::new();
         opts.pathspec(path);
@@ -871,12 +880,12 @@ impl GitBackend for Git2Backend {
     }
 
     fn blame_with(&self, opts: &crate::BlameOptions) -> Result<crate::Blame, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         crate::blame::blame(&repo, &self.workdir, opts)
     }
 
     fn index_second(&self) -> Option<i64> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         index_second(&repo)
     }
 
@@ -884,7 +893,7 @@ impl GitBackend for Git2Backend {
         let Some(since) = since else {
             return Ok(());
         };
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         // In the same second git still treats those entries as racy itself.
         if index_second(&repo).is_none_or(|now| now <= since) {
             return Ok(());
@@ -928,14 +937,14 @@ impl GitBackend for Git2Backend {
         context: Option<u32>,
         paths: &[String],
     ) -> Result<Vec<u8>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let index = repo.index()?;
         crate::wt_status::patch_diff(&repo, &index, rev, cached, reverse, context, paths)
     }
 
     fn status_text(&self, opts: &crate::StatusOpts) -> Result<crate::StatusReport, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let mut index = repo.index()?;
         if !opts.commit_all && opts.commit_paths.is_empty() {
@@ -987,7 +996,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn ignored(&self) -> Result<Vec<StatusEntry>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut opts = StatusOptions::new();
         opts.include_ignored(true).include_untracked(false);
         Ok(repo
@@ -1005,7 +1014,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn stage_all(&self) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let mut index = repo.index()?;
         index.add_all(
@@ -1018,7 +1027,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn unstage_all(&self) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         match repo.head() {
             Ok(head_ref) => {
@@ -1037,7 +1046,7 @@ impl GitBackend for Git2Backend {
 
     fn stage_file(&self, path: &str) -> Result<(), GitError> {
         let path = root_dot(path);
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         no_match(&repo, path)?;
         let mut index = repo.index()?;
@@ -1059,7 +1068,7 @@ impl GitBackend for Git2Backend {
 
     fn unstage_file(&self, path: &str) -> Result<(), GitError> {
         let path = root_dot(path);
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         no_match(&repo, path)?;
         match repo.head() {
@@ -1079,7 +1088,7 @@ impl GitBackend for Git2Backend {
 
     fn add(&self, paths: &[String], update: bool, force: bool) -> Result<(), GitError> {
         let paths = &root_dots(paths);
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         if !force {
             for p in paths {
@@ -1112,7 +1121,7 @@ impl GitBackend for Git2Backend {
     ) -> Result<(usize, usize, Vec<String>), GitError> {
         self.logged("checkout -m", || {
             let paths = &root_dots(paths);
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             let mut index = repo.index()?;
             let spec = Pathspec::new(paths)?;
@@ -1205,7 +1214,7 @@ impl GitBackend for Git2Backend {
 
     fn renormalize(&self, paths: &[String]) -> Result<(), GitError> {
         let paths = &root_dots(paths);
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let mut index = repo.index()?;
         let spec = Pathspec::new(paths)?;
@@ -1230,7 +1239,7 @@ impl GitBackend for Git2Backend {
 
     fn index_chmod(&self, paths: &[String], executable: bool) -> Result<Vec<String>, GitError> {
         let paths = &root_dots(paths);
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let mut index = repo.index()?;
         let spec = Pathspec::new(paths)?;
@@ -1260,7 +1269,7 @@ impl GitBackend for Git2Backend {
         overlay: bool,
     ) -> Result<(), GitError> {
         self.logged("restore", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             let paths = &root_dots(paths);
             let target = source
@@ -1335,7 +1344,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn stage_hunk(&self, path: &str, new_start: u32) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let mut dopts = DiffOptions::new();
         dopts.pathspec(path);
@@ -1344,7 +1353,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn unstage_hunk(&self, path: &str, new_start: u32) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let head_tree = repo.head()?.peel_to_tree()?;
         let mut dopts = DiffOptions::new();
@@ -1358,7 +1367,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn stage_lines(&self, path: &str, new_start: u32, lines: &[usize]) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let mut dopts = DiffOptions::new();
         dopts.pathspec(path);
@@ -1373,7 +1382,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn unstage_lines(&self, path: &str, new_start: u32, lines: &[usize]) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let head_tree = repo.head()?.peel_to_tree()?;
         let mut dopts = DiffOptions::new();
@@ -1390,7 +1399,7 @@ impl GitBackend for Git2Backend {
 
     fn refs(&self) -> Result<Vec<crate::RefEntry>, GitError> {
         use crate::RefKind;
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut out = Vec::new();
 
         for (kind, ty) in [
@@ -1421,7 +1430,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn list_tree(&self, rev: &str, path: &str) -> Result<Vec<crate::TreeEntry>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let commit = repo.rev_single(rev)?.peel_to_commit()?;
         let root = commit.tree()?;
         let tree = if path.is_empty() {
@@ -1462,7 +1471,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn read_blob(&self, rev: &str, path: &str) -> Result<crate::Blob, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         // An empty rev reads the index, as git's `:path` does.
         let blob = if rev.is_empty() {
             sync_index(&repo)?;
@@ -1490,7 +1499,7 @@ impl GitBackend for Git2Backend {
         paths: &[String],
     ) -> Result<std::collections::HashMap<String, crate::LastCommit>, GitError> {
         use std::collections::{HashMap, HashSet};
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -1558,7 +1567,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn list_files(&self, rev: &str) -> Result<Vec<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let tree = repo.rev_single(rev)?.peel_to_commit()?.tree()?;
         let mut out = Vec::new();
         tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
@@ -1667,13 +1676,13 @@ impl GitBackend for Git2Backend {
     }
 
     fn rev_parse(&self, rev: &str) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         Ok(repo.rev_single(rev)?.peel_to_commit()?.id().to_string())
     }
 
     fn contributors(&self) -> Result<Vec<(String, String, usize)>, GitError> {
         use std::collections::HashMap;
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut walk = repo.revwalk()?;
         if walk.push_head().is_err() {
             return Ok(Vec::new());
@@ -1700,7 +1709,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn latest_tag(&self) -> Result<Option<crate::TagInfo>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -1736,7 +1745,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn all_tags(&self) -> Result<Vec<crate::TagInfo>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -1787,7 +1796,7 @@ impl GitBackend for Git2Backend {
 
     fn checkout_detached(&self, rev: &str) -> Result<(), GitError> {
         self.logged("checkout", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let commit = repo.rev_single(rev)?.peel_to_commit()?;
             safe_checkout(&repo, commit.as_object(), "checkout")?;
             repo.set_head_detached(commit.id())?;
@@ -1802,7 +1811,7 @@ impl GitBackend for Git2Backend {
         mode: crate::CheckoutMode,
     ) -> Result<(), GitError> {
         self.logged("checkout", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             let refname = format!("refs/heads/{rev}");
             let commit = repo
@@ -1826,7 +1835,7 @@ impl GitBackend for Git2Backend {
 
     fn checkout_orphan(&self, name: &str, start: Option<&str>) -> Result<(), GitError> {
         self.logged("checkout", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             let refname = format!("refs/heads/{name}");
             if !git2::Branch::name_is_valid(name)? {
@@ -1850,7 +1859,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn commits_between(&self, base: &str) -> Result<Vec<(String, String)>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let base_oid = repo.rev_single(base)?.peel_to_commit()?.id();
         let mut walk = repo.revwalk()?;
         walk.push_head()?;
@@ -1881,7 +1890,7 @@ impl GitBackend for Git2Backend {
         max_commits: usize,
     ) -> Result<std::collections::HashMap<String, crate::FileActivity>, GitError> {
         use std::collections::HashMap;
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut acc: HashMap<String, crate::FileActivity> = HashMap::new();
         // First-parent walk: on a merge, count the mainline change once rather
         // than re-counting every side-branch commit the merge brought in.
@@ -1931,7 +1940,7 @@ impl GitBackend for Git2Backend {
 
     fn rebase_onto(&self, rev: &str, report: &dyn Fn(OpProgress)) -> Result<(), GitError> {
         self.logged("rebase", || {
-            let mut repo = self.repo.lock().expect("repo mutex");
+            let mut repo = self.repo();
             crate::rebase::replay(&mut repo, rev, None, report)
         })
     }
@@ -1943,13 +1952,13 @@ impl GitBackend for Git2Backend {
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
         self.logged("restack", || {
-            let mut repo = self.repo.lock().expect("repo mutex");
+            let mut repo = self.repo();
             crate::rebase::replay(&mut repo, upstream, Some(onto), report)
         })
     }
 
     fn branch_tip(&self, name: &str) -> Result<Option<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         match repo.find_branch(name, BranchType::Local) {
             Ok(branch) => Ok(branch.get().target().map(|oid| oid.to_string())),
             Err(e) if e.code() == ErrorCode::NotFound => Ok(None),
@@ -1959,28 +1968,28 @@ impl GitBackend for Git2Backend {
 
     fn rebase_abort(&self) -> Result<String, GitError> {
         self.logged("rebase abort", || {
-            crate::rebase::abort(&self.repo.lock().expect("repo mutex"))
+            crate::rebase::abort(&self.repo())
         })
     }
 
     fn rebase_continue(&self) -> Result<String, GitError> {
         self.logged("rebase", || {
-            crate::rebase::resume(&self.repo.lock().expect("repo mutex"), false)
+            crate::rebase::resume(&self.repo(), false)
         })
     }
 
     fn rebase_skip(&self) -> Result<String, GitError> {
         self.logged("rebase", || {
-            crate::rebase::resume(&self.repo.lock().expect("repo mutex"), true)
+            crate::rebase::resume(&self.repo(), true)
         })
     }
 
     fn rebase_quit(&self) -> Result<(), GitError> {
-        crate::rebase::quit(&self.repo.lock().expect("repo mutex"))
+        crate::rebase::quit(&self.repo())
     }
 
     fn rebase_edit_todo(&self) -> Result<(), GitError> {
-        crate::rebase::edit_todo(&self.repo.lock().expect("repo mutex"))
+        crate::rebase::edit_todo(&self.repo())
     }
 
     fn rebase_with(
@@ -1989,23 +1998,23 @@ impl GitBackend for Git2Backend {
         opts: &crate::RebaseOptions,
     ) -> Result<String, GitError> {
         self.logged("rebase", || {
-            let mut repo = self.repo.lock().expect("repo mutex");
+            let mut repo = self.repo();
             crate::rebase::start(&mut repo, upstream, opts)
         })
     }
 
     fn undo(&self) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         crate::oplog::undo(&repo)
     }
 
     fn redo(&self) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         crate::oplog::redo(&repo)
     }
 
     fn oplog(&self) -> Result<Vec<crate::OpLogEntry>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         crate::oplog::entries(&repo)
     }
 
@@ -2016,7 +2025,7 @@ impl GitBackend for Git2Backend {
             // Phase 1 (read): for each changed hunk, blame its lines to find the
             // local commit that last touched them; group hunks by that commit.
             let (base, order, groups, hunk_count) = {
-                let repo = self.repo.lock().expect("repo mutex");
+                let repo = self.repo();
                 let head = repo.head()?.peel_to_commit()?;
 
                 // Refuse if there are staged changes: a fixup would capture them too.
@@ -2116,7 +2125,7 @@ impl GitBackend for Git2Backend {
             // Phase 2 (write): one fixup commit per target, containing only that
             // target's hunks (staged one at a time from a freshly recomputed diff).
             {
-                let repo = self.repo.lock().expect("repo mutex");
+                let repo = self.repo();
                 let sig = ident_signature(&repo, true)
                     .or_else(|_| git2::Signature::now("rgit", "rgit@localhost"))?;
                 let author = ident_signature(&repo, false).unwrap_or_else(|_| sig.clone());
@@ -2157,7 +2166,7 @@ impl GitBackend for Git2Backend {
                 quiet: true,
                 ..Default::default()
             };
-            let mut repo = self.repo.lock().expect("repo mutex");
+            let mut repo = self.repo();
             if let Err(e) = crate::rebase::start(&mut repo, Some(&base.to_string()), &opts) {
                 if repo.path().join("rebase-merge").exists() {
                     let _ = crate::rebase::abort(&repo);
@@ -2172,13 +2181,13 @@ impl GitBackend for Git2Backend {
     }
 
     fn bisect(&self, args: &[String]) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::bisect::run(&repo, args)
     }
 
     fn rerere(&self, args: &[String], autoupdate: Option<bool>) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::rerere::command(&repo, args, autoupdate)
     }
@@ -2188,7 +2197,7 @@ impl GitBackend for Git2Backend {
         scope: ConfigScope,
         name: Option<&str>,
     ) -> Result<Vec<(String, String)>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let config = open_config(&repo, scope, false)?;
         let mut out = Vec::new();
         let entries = match name {
@@ -2235,7 +2244,7 @@ impl GitBackend for Git2Backend {
         opts: &crate::ApplyOpts,
     ) -> Result<String, GitError> {
         let run = || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             crate::apply::apply(&repo, files, opts)
         };
@@ -2247,7 +2256,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn notes(&self, notes_ref: Option<&str>) -> Result<Vec<(String, String)>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let notes = match repo.notes(notes_ref) {
             Ok(notes) => notes,
             Err(e) if e.code() == ErrorCode::NotFound => return Ok(Vec::new()),
@@ -2261,7 +2270,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn note_show(&self, notes_ref: Option<&str>, rev: &str) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let oid = repo.rev_single(rev)?.id();
         match repo.find_note(notes_ref, oid) {
             Ok(note) => Ok(String::from_utf8_lossy(note.message_bytes())
@@ -2282,7 +2291,7 @@ impl GitBackend for Git2Backend {
         cmd: &str,
     ) -> Result<(), GitError> {
         self.logged("notes", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let oid = repo.rev_single(rev)?.id();
             let blob = repo.blob(message.as_bytes())?;
             crate::notes::commit_notes(
@@ -2305,7 +2314,7 @@ impl GitBackend for Git2Backend {
         cmd: &str,
     ) -> Result<Vec<bool>, GitError> {
         self.logged("notes", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let oids = revs
                 .iter()
                 .map(|r| {
@@ -2336,7 +2345,7 @@ impl GitBackend for Git2Backend {
         force: bool,
     ) -> Result<(), GitError> {
         self.logged("notes", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let from = repo.rev_single(from)?.id();
             let to = repo.rev_single(to)?.id();
             crate::notes::commit_notes(
@@ -2363,7 +2372,7 @@ impl GitBackend for Git2Backend {
 
     fn notes_prune(&self, notes_ref: Option<&str>, dry_run: bool) -> Result<Vec<String>, GitError> {
         let run = || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let odb = repo.odb()?;
             let mut gone = Vec::new();
             crate::notes::commit_notes(
@@ -2395,14 +2404,14 @@ impl GitBackend for Git2Backend {
         verbosity: u8,
     ) -> Result<(String, Option<(String, i32)>), GitError> {
         self.logged("notes", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             crate::notes::merge(&repo, notes_ref, other, strategy, verbosity)
         })
     }
 
     fn notes_merge_finish(&self, commit: bool, verbosity: u8) -> Result<String, GitError> {
         self.logged("notes", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             crate::notes::merge_finish(&repo, commit, verbosity)
         })
     }
@@ -2418,7 +2427,7 @@ impl GitBackend for Git2Backend {
     ) -> Result<Vec<String>, GitError> {
         let run = || {
             crate::update_ref::update_refs(
-                &self.repo.lock().expect("repo mutex"),
+                &self.repo(),
                 updates,
                 message,
                 no_deref,
@@ -2435,18 +2444,18 @@ impl GitBackend for Git2Backend {
     }
 
     fn bundle_create(&self, path: &Path, args: &[String]) -> Result<usize, GitError> {
-        crate::bundle::create(&self.repo.lock().expect("repo mutex"), path, args)
+        crate::bundle::create(&self.repo(), path, args)
     }
 
     fn bundle_verify(
         &self,
         path: &Path,
     ) -> Result<(crate::BundleHeader, Vec<(String, String)>), GitError> {
-        crate::bundle::verify(&self.repo.lock().expect("repo mutex"), path)
+        crate::bundle::verify(&self.repo(), path)
     }
 
     fn bundle_unbundle(&self, path: &Path) -> Result<Vec<(String, String)>, GitError> {
-        crate::bundle::unbundle(&self.repo.lock().expect("repo mutex"), path)
+        crate::bundle::unbundle(&self.repo(), path)
     }
 
     fn request_pull(
@@ -2456,12 +2465,12 @@ impl GitBackend for Git2Backend {
         end: Option<&str>,
         patch: bool,
     ) -> Result<(String, Vec<String>), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         crate::format_patch::request_pull(&repo, start, url, end, patch)
     }
 
     fn range_diff(&self, opts: &crate::RangeDiffOpts) -> Result<String, GitError> {
-        crate::range_diff::range_diff(&self.repo.lock().expect("repo mutex"), opts)
+        crate::range_diff::range_diff(&self.repo(), opts)
     }
 
     fn combined_diff(
@@ -2470,7 +2479,7 @@ impl GitBackend for Git2Backend {
         paths: &[String],
         dense: bool,
     ) -> Result<Vec<crate::CombinedFile>, GitError> {
-        crate::combine::combined(&self.repo.lock().expect("repo mutex"), commit, paths, dense)
+        crate::combine::combined(&self.repo(), commit, paths, dense)
     }
 
     fn line_log(
@@ -2480,7 +2489,7 @@ impl GitBackend for Git2Backend {
         specs: &[String],
         first_parent: bool,
     ) -> Result<Vec<Option<Vec<crate::FileDiff>>>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         crate::line_log::line_log(&repo, tip, order, specs, first_parent)
     }
 
@@ -2489,7 +2498,7 @@ impl GitBackend for Git2Backend {
         commit: &str,
         paths: &[String],
     ) -> Result<Vec<crate::FileDiff>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let commit = repo.rev_single(commit)?.peel_to_commit()?;
         let Some((tree, notes)) = crate::combine::remerge_tree(&repo, &commit)? else {
             return Ok(Vec::new());
@@ -2519,7 +2528,7 @@ impl GitBackend for Git2Backend {
         limit: Option<&str>,
     ) -> Result<Vec<crate::CherryCommit>, GitError> {
         crate::format_patch::cherry(
-            &self.repo.lock().expect("repo mutex"),
+            &self.repo(),
             upstream,
             head,
             limit,
@@ -2530,43 +2539,43 @@ impl GitBackend for Git2Backend {
         &self,
         opts: &crate::FormatPatchOpts,
     ) -> Result<Vec<crate::PatchMail>, GitError> {
-        crate::format_patch::format_patch(&self.repo.lock().expect("repo mutex"), opts)
+        crate::format_patch::format_patch(&self.repo(), opts)
     }
 
     fn am(&self, args: &[String], mbox: Option<&[u8]>) -> Result<String, GitError> {
         self.logged("am", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             crate::am::am(&repo, args, mbox)
         })
     }
 
     fn archive(&self, o: &crate::ArchiveOpts) -> Result<Vec<u8>, GitError> {
-        crate::archive::archive(&self.repo.lock().expect("repo mutex"), o)
+        crate::archive::archive(&self.repo(), o)
     }
 
     fn gc(&self, opts: &crate::GcOptions) -> Result<String, GitError> {
-        crate::maintenance::gc(&self.repo.lock().expect("repo mutex"), opts)
+        crate::maintenance::gc(&self.repo(), opts)
     }
 
     fn repack(&self, opts: &crate::RepackOptions) -> Result<String, GitError> {
-        crate::maintenance::repack(&self.repo.lock().expect("repo mutex"), opts)
+        crate::maintenance::repack(&self.repo(), opts)
     }
 
     fn commit_graph(&self, op: &crate::CommitGraphOp) -> Result<Vec<String>, GitError> {
-        crate::commit_graph::run(&self.repo.lock().expect("repo mutex"), op)
+        crate::commit_graph::run(&self.repo(), op)
     }
 
     fn multi_pack_index(&self, op: &crate::MidxOp) -> Result<Vec<String>, GitError> {
-        crate::midx::run(&self.repo.lock().expect("repo mutex"), op)
+        crate::midx::run(&self.repo(), op)
     }
 
     fn pack_refs(&self, all: bool, no_prune: bool, auto: bool) -> Result<(), GitError> {
-        crate::maintenance::pack_refs(&self.repo.lock().expect("repo mutex"), all, no_prune, auto)
+        crate::maintenance::pack_refs(&self.repo(), all, no_prune, auto)
     }
 
     fn reflog_expire(&self, opts: &crate::ReflogExpire) -> Result<Vec<String>, GitError> {
-        crate::maintenance::reflog_expire(&self.repo.lock().expect("repo mutex"), opts)
+        crate::maintenance::reflog_expire(&self.repo(), opts)
     }
 
     fn reflog_delete(
@@ -2574,28 +2583,28 @@ impl GitBackend for Git2Backend {
         entries: &[String],
         opts: &crate::ReflogExpire,
     ) -> Result<(), GitError> {
-        crate::maintenance::reflog_delete(&self.repo.lock().expect("repo mutex"), entries, opts)
+        crate::maintenance::reflog_delete(&self.repo(), entries, opts)
     }
 
     fn reflog_exists(&self, name: &str) -> bool {
-        crate::maintenance::reflog_exists(&self.repo.lock().expect("repo mutex"), name)
+        crate::maintenance::reflog_exists(&self.repo(), name)
     }
 
     fn maintenance_run(&self, opts: &crate::MaintenanceRun) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
-        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        let repo = self.repo();
+        let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let prefetch = || prefetch(&repo, cred_guard.as_deref());
         crate::maintenance::run(&repo, opts, &prefetch)
     }
 
     fn fsck(&self, opts: &crate::FsckOptions) -> Result<crate::FsckReport, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::fsck::fsck(&repo, opts)
     }
 
     fn clean_candidates(&self, opts: &crate::CleanOptions) -> Result<Vec<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::clean::candidates(&repo, opts)
     }
@@ -2619,7 +2628,7 @@ impl GitBackend for Git2Backend {
         opts: crate::RmOptions,
     ) -> Result<Vec<String>, GitError> {
         let run = || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             let mut index = repo.index()?;
             let mut hits = Vec::new();
@@ -2700,7 +2709,7 @@ impl GitBackend for Git2Backend {
         dry_run: bool,
     ) -> Result<String, GitError> {
         let run = || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             let from = from.trim_end_matches('/');
             let mut to = to.trim_end_matches('/').to_owned();
@@ -2756,7 +2765,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn intent_to_add(&self, paths: &[String]) -> Result<Vec<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let paths = root_dots(paths);
         for p in &paths {
@@ -2801,7 +2810,7 @@ impl GitBackend for Git2Backend {
 
     fn checkout_side(&self, paths: &[String], ours: bool) -> Result<(), GitError> {
         let wrote = self.logged("checkout", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             let spec = Pathspec::new(root_dots(paths))?;
             let mut wrote = false;
@@ -2833,7 +2842,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn describe(&self, rev: &str, opts: &crate::DescribeOptions) -> Result<String, GitError> {
-        crate::describe::describe(&self.repo.lock().expect("repo mutex"), rev, opts)
+        crate::describe::describe(&self.repo(), rev, opts)
     }
 
     fn git(&self, args: &[String]) -> Result<String, GitError> {
@@ -2843,7 +2852,7 @@ impl GitBackend for Git2Backend {
 
     fn reset(&self, rev: &str, mode: ResetMode) -> Result<(), GitError> {
         self.logged("reset", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let target = repo.rev_single(rev)?;
             if mode == ResetMode::Merge {
                 sync_index(&repo)?;
@@ -2866,7 +2875,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn reset_paths(&self, rev: &str, paths: &[String]) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let target = repo.rev_single(rev)?.peel(ObjectType::Commit)?;
         crate::pathspec::reset_default(&repo, Some(&target), &root_dots(paths))?;
@@ -2875,7 +2884,7 @@ impl GitBackend for Git2Backend {
 
     fn pick(&self, revs: &[String], opts: &crate::PickOptions) -> Result<(), GitError> {
         self.logged(if opts.revert { "revert" } else { "cherry-pick" }, || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             use git2::RepositoryState as S;
             if !matches!(repo.state(), S::Clean | S::Bisect) {
@@ -2894,7 +2903,7 @@ impl GitBackend for Git2Backend {
 
     fn pick_continue(&self) -> Result<(), GitError> {
         self.logged("cherry-pick", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             let state = read_pick_state(&repo)?;
             let mut index = repo.index()?;
@@ -2948,7 +2957,7 @@ impl GitBackend for Git2Backend {
 
     fn pick_skip(&self) -> Result<(), GitError> {
         self.logged("cherry-pick", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let state = read_pick_state(&repo)?;
             let head = repo.head()?.peel_to_commit()?;
             repo.reset(head.as_object(), ResetType::Hard, None)?;
@@ -2959,7 +2968,7 @@ impl GitBackend for Git2Backend {
 
     fn pick_abort(&self) -> Result<String, GitError> {
         self.logged("cherry-pick abort", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let state = read_pick_state(&repo)?;
             // git's safety check: a HEAD moved since the stop is not rewound.
             let safe = std::fs::read_to_string(repo.path().join("sequencer/abort-safety"))
@@ -2979,7 +2988,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn pick_quit(&self) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         end_operation(&repo)?;
         Ok(())
     }
@@ -2992,7 +3001,7 @@ impl GitBackend for Git2Backend {
     ) -> Result<(), GitError> {
         let rev = revs.first().map(String::as_str).unwrap_or("HEAD");
         self.logged("merge", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let autostash = opts.autostash.unwrap_or_else(|| {
                 repo.config()
                     .and_then(|c| c.get_bool("merge.autoStash"))
@@ -3039,7 +3048,7 @@ impl GitBackend for Git2Backend {
 
     fn merge_abort(&self) -> Result<(), GitError> {
         self.logged("merge abort", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             // A conflicted merge has not moved HEAD, so hard-resetting to it drops the
             // half-merged index and worktree; cleanup_state clears MERGE_HEAD et al.
             let head = repo.head()?.peel_to_commit()?;
@@ -3053,7 +3062,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn merge_quit(&self) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         for file in ["MERGE_HEAD", "MERGE_MODE", "MERGE_MSG", "AUTO_MERGE"] {
             let _ = std::fs::remove_file(repo.path().join(file));
         }
@@ -3065,7 +3074,7 @@ impl GitBackend for Git2Backend {
 
     fn merge_continue(&self) -> Result<(), GitError> {
         let message = {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             if repo.state() != git2::RepositoryState::Merge {
                 return Err(GitError::Other("there is no merge to continue".into()));
             }
@@ -3079,7 +3088,7 @@ impl GitBackend for Git2Backend {
 
     fn resolve_conflict(&self, path: &str, ours: bool) -> Result<(), GitError> {
         self.logged("resolve", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let mut index = repo.index()?;
             // Find the chosen side's blob before mutating the index.
             let chosen = {
@@ -3122,7 +3131,7 @@ impl GitBackend for Git2Backend {
         message: &str,
         force: bool,
     ) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let target = repo.rev_single(rev)?;
         if message.trim().is_empty() {
             repo.tag_lightweight(name, &target, force)?;
@@ -3155,7 +3164,7 @@ impl GitBackend for Git2Backend {
                 }
             }),
         };
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let target = repo.rev_single(rev)?;
         let Some(m) = message else {
             repo.tag_lightweight(name, &target, force)?;
@@ -3178,7 +3187,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn verify_tags(&self, names: &[String]) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut out = String::new();
         let mut failed = false;
         for name in names {
@@ -3203,7 +3212,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn signature_check(&self, rev: &str, tag: bool) -> Result<crate::SignatureCheck, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let obj = repo.rev_single(rev)?;
         let kind = obj.kind().map_or("unknown", |k| k.str());
         match (tag, obj.kind()) {
@@ -3217,21 +3226,21 @@ impl GitBackend for Git2Backend {
     }
 
     fn is_ancestor(&self, ancestor: &str, rev: &str) -> Result<bool, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let a = repo.rev_single(ancestor)?.peel_to_commit()?.id();
         let r = repo.rev_single(rev)?.peel_to_commit()?.id();
         Ok(a == r || repo.graph_descendant_of(r, a)?)
     }
 
     fn delete_tag(&self, name: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         repo.tag_delete(name)?;
         Ok(())
     }
 
     fn delete_branch(&self, name: &str, force: bool) -> Result<(), GitError> {
         self.logged("delete branch", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let mut branch = repo.find_branch(name, BranchType::Local)?;
             if !force {
                 let tip = branch.get().peel_to_commit()?.id();
@@ -3256,7 +3265,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn remotes(&self) -> Result<Vec<crate::Remote>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut remotes = Vec::new();
         let names = repo.remotes()?;
         for name in names.iter().filter_map(|n| n.ok().flatten()) {
@@ -3274,13 +3283,13 @@ impl GitBackend for Git2Backend {
     }
 
     fn add_remote(&self, name: &str, url: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         repo.remote(name, url)?;
         Ok(())
     }
 
     fn remove_remote(&self, name: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         // libgit2 deletes every ref a fetch refspec writes; git only those
         // under refs/remotes, so a mirror's `refs/*:refs/*` must not reach it.
         let key = format!("remote.{name}.fetch");
@@ -3301,19 +3310,19 @@ impl GitBackend for Git2Backend {
     }
 
     fn set_remote_url(&self, name: &str, url: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         repo.remote_set_url(name, url)?;
         Ok(())
     }
 
     fn remote_urls(&self, name: &str, push: bool) -> Result<Vec<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         repo.find_remote(name)?;
         remote_urls(&repo, name, push)
     }
 
     fn set_remote_push_url(&self, name: &str, url: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         repo.find_remote(name)?;
         repo.remote_set_pushurl(name, Some(url))?;
         Ok(())
@@ -3321,8 +3330,8 @@ impl GitBackend for Git2Backend {
 
     fn prune_remote(&self, name: &str) -> Result<Vec<String>, GitError> {
         self.logged("remote prune", || {
-            let repo = self.repo.lock().expect("repo mutex");
-            let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+            let repo = self.repo();
+            let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // What the remote's first URL has, as git reads it.
             let (mut remote, _, _) = fetch_source(&repo, name)?;
             let ignored = std::sync::atomic::AtomicBool::new(false);
@@ -3358,7 +3367,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn rename_remote(&self, old: &str, new: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         // libgit2 leaves non-default refspecs and push remotes alone; git
         // moves their `refs/remotes/<old>/` and names too.
         let odd = repo.remote_rename(old, new)?;
@@ -3399,7 +3408,7 @@ impl GitBackend for Git2Backend {
         add: bool,
         delete: bool,
     ) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         repo.find_remote(name)?;
         let key = format!("remote.{name}.{}", if push { "pushurl" } else { "url" });
         let mut config = open_config(&repo, ConfigScope::Local, true)?;
@@ -3438,8 +3447,8 @@ impl GitBackend for Git2Backend {
     }
 
     fn remote_heads(&self, name: &str) -> Result<crate::backend::RemoteHeads, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
-        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        let repo = self.repo();
+        let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let url = remote_urls(&repo, name, false)?
             .into_iter()
             .next()
@@ -3462,7 +3471,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn worktrees(&self) -> Result<Vec<crate::Worktree>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut out = Vec::new();
 
         // The main worktree first, described from this repository directly.
@@ -3542,7 +3551,7 @@ impl GitBackend for Git2Backend {
         Ok(out)
     }
     fn add_worktree(&self, name: &str, path: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         repo.worktree(name, Path::new(path), None)?;
         Ok(())
     }
@@ -3557,7 +3566,7 @@ impl GitBackend for Git2Backend {
         if abs.read_dir().is_ok_and(|mut d| d.next().is_some()) || abs.is_file() {
             return Err(GitError::Other(format!("'{path}' already exists")));
         }
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let local = |b: &str| repo.find_branch(b, BranchType::Local).is_ok();
         let branch = |name: &str, start: &str, reset: bool| {
             new_worktree_branch(&repo, name, start, reset, a.track).map(|()| name.to_owned())
@@ -3662,7 +3671,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn repair_worktrees(&self, paths: &[String]) -> Result<Vec<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut fixed = Vec::new();
         let admin_root = std::fs::canonicalize(repo.commondir())?.join("worktrees");
         // A worktree at a new path: its `.git` file still names its admin
@@ -3699,19 +3708,19 @@ impl GitBackend for Git2Backend {
     }
 
     fn worktree_lock(&self, worktree: &str, reason: Option<&str>) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         find_worktree(&repo, worktree)?.lock(reason)?;
         Ok(())
     }
 
     fn worktree_unlock(&self, worktree: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         find_worktree(&repo, worktree)?.unlock()?;
         Ok(())
     }
 
     fn worktree_move(&self, worktree: &str, new_path: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let wt = find_worktree(&repo, worktree)?;
         if let Ok(git2::WorktreeLockStatus::Locked(_)) = wt.is_locked() {
             return Err(GitError::Other(format!(
@@ -3744,7 +3753,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn remove_worktree(&self, name: &str, force: bool) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let wt = find_worktree(&repo, name)?;
         if !force && Repository::open(wt.path()).is_ok_and(|r| repo_is_dirty(&r)) {
             return Err(GitError::Other(format!(
@@ -3758,7 +3767,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn prune_worktrees(&self) -> Result<Vec<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut pruned = Vec::new();
         for name in repo.worktrees()?.iter().filter_map(|t| t.ok().flatten()) {
             let Ok(wt) = repo.find_worktree(name) else {
@@ -3781,14 +3790,14 @@ impl GitBackend for Git2Backend {
         dry_run: bool,
         verbose: bool,
     ) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let cut =
             expire.map_or_else(|| Ok(crate::maintenance::now()), crate::maintenance::cutoff)?;
         Ok(crate::maintenance::prune(&repo, cut, dry_run, verbose)?.join("\n"))
     }
 
     fn config_get(&self, key: &str) -> Result<Option<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let cfg = open_config(&repo, ConfigScope::Any, false)?;
         match cfg.get_string(key) {
             Ok(v) => Ok(Some(v)),
@@ -3798,91 +3807,91 @@ impl GitBackend for Git2Backend {
     }
 
     fn config_set(&self, key: &str, value: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut cfg = repo.config()?;
         cfg.set_str(key, value)?;
         Ok(())
     }
 
     fn branch_exists(&self, name: &str) -> bool {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         repo.find_branch(name, BranchType::Local).is_ok()
     }
 
     fn lanes_active(&self) -> bool {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         crate::lanes::active(&repo)
     }
 
     fn lanes_init(&self) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         crate::lanes::init(&repo)
     }
 
     fn lanes_off(&self) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         crate::lanes::off(&repo)
     }
 
     fn lanes_state(&self) -> Result<crate::LanesState, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::lanes::state(&repo)
     }
 
     fn lane_new(&self, name: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::lanes::new_lane(&repo, name)
     }
 
     fn lane_stack(&self, name: &str, parent: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::lanes::stack(&repo, name, parent)
     }
 
     fn lane_restack(&self) -> Result<crate::RestackOutcome, GitError> {
         self.logged("lane restack", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             crate::lanes::restack(&repo)
         })
     }
 
     fn lane_assign(&self, lane: &str, path: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::lanes::assign(&repo, lane, path)
     }
 
     fn lane_assign_hunk(&self, lane: &str, path: &str, new_start: u32) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::lanes::assign_hunk(&repo, lane, path, new_start)
     }
 
     fn lane_unassign(&self, path: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::lanes::unassign(&repo, path)
     }
 
     fn lane_commit(&self, lane: &str, message: &str) -> Result<String, GitError> {
         self.logged("lane commit", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             crate::lanes::commit(&repo, lane, message)
         })
     }
 
     fn lane_rename(&self, old: &str, new: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::lanes::rename(&repo, old, new)
     }
 
     fn lane_delete(&self, name: &str) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::lanes::delete(&repo, name)
     }
@@ -3895,13 +3904,13 @@ impl GitBackend for Git2Backend {
                 "lane {lane} has no commits yet; commit it first"
             )));
         }
-        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let remote = push_lane_branch(&repo, &branch, &|_| {}, cred_guard.as_deref())?;
         Ok(format!("pushed {branch} to {remote}"))
     }
 
     fn set_credential_prompt(&self, prompt: Box<dyn crate::CredentialPrompt>) {
-        *self.cred_prompt.lock().expect("cred mutex") = Some(prompt);
+        *self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prompt);
     }
 
     fn lane_pr(&self, lane: &str) -> Result<String, GitError> {
@@ -3914,7 +3923,7 @@ impl GitBackend for Git2Backend {
                 "lane {lane} has no commits yet; commit it first"
             )));
         }
-        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         push_lane_branch(&repo, &branch, &|_| {}, cred_guard.as_deref())?;
         drop(cred_guard);
         Ok(crate::workflow::open_pull_request(&branch, &base))
@@ -3922,7 +3931,7 @@ impl GitBackend for Git2Backend {
 
     fn rename_branch(&self, old: &str, new: &str) -> Result<(), GitError> {
         self.logged("rename branch", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             repo.find_branch(old, BranchType::Local)?
                 .rename(new, false)?;
             Ok(())
@@ -3931,7 +3940,7 @@ impl GitBackend for Git2Backend {
 
     fn copy_branch(&self, old: &str, new: &str, force: bool) -> Result<(), GitError> {
         self.logged("copy branch", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let (from, to) = (format!("refs/heads/{old}"), format!("refs/heads/{new}"));
             let commit = repo.find_reference(&from)?.peel_to_commit()?;
             repo.branch(new, &commit, force)?;
@@ -3968,7 +3977,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn local_branches(&self) -> Result<Vec<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut names = Vec::new();
         for branch in repo.branches(Some(BranchType::Local))? {
             let (branch, _) = branch?;
@@ -3981,7 +3990,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn remote_branches(&self) -> Result<Vec<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut names = Vec::new();
         for branch in repo.branches(Some(BranchType::Remote))? {
             let (branch, _) = branch?;
@@ -3998,14 +4007,14 @@ impl GitBackend for Git2Backend {
 
     fn checkout_branch(&self, name: &str) -> Result<(), GitError> {
         self.logged("checkout", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             checkout(&repo, name)
         })
     }
 
     fn create_branch(&self, name: &str) -> Result<(), GitError> {
         self.logged("create branch", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let head = repo.head()?.peel_to_commit()?;
             repo.branch(name, &head, false)?;
             checkout(&repo, name)
@@ -4020,7 +4029,7 @@ impl GitBackend for Git2Backend {
         track: bool,
     ) -> Result<(), GitError> {
         self.logged("create branch", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             if !git2::Branch::name_is_valid(name)? {
                 return Err(GitError::Other(format!(
                     "'{name}' is not a valid branch name"
@@ -4052,7 +4061,7 @@ impl GitBackend for Git2Backend {
 
     fn create_branch_at(&self, name: &str, start: &str, force: bool) -> Result<(), GitError> {
         self.logged("create branch", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let commit = repo.rev_single(start)?.peel_to_commit()?;
             let mut branch = repo.branch(name, &commit, force)?;
             if repo.find_branch(start, BranchType::Remote).is_ok() {
@@ -4063,7 +4072,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn previous_checkout(&self) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let (object, reference) = repo
             .revparse_ext("@{-1}")
             .map_err(|_| GitError::Other("no previous branch to switch to".to_owned()))?;
@@ -4074,14 +4083,14 @@ impl GitBackend for Git2Backend {
     }
 
     fn set_upstream(&self, name: &str, upstream: Option<&str>) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         repo.find_branch(name, BranchType::Local)?
             .set_upstream(upstream)?;
         Ok(())
     }
 
     fn branch_upstream(&self, name: &str) -> Result<Option<(String, usize, usize)>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let branch = repo.find_branch(name, BranchType::Local)?;
         let Ok(upstream) = branch.upstream() else {
             return Ok(None);
@@ -4097,7 +4106,7 @@ impl GitBackend for Git2Backend {
     fn discard_file(&self, path: &str) -> Result<(), GitError> {
         let path = root_dot(path);
         self.logged("discard", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             no_match(&repo, path)?;
             let file = self.workdir.join(path).is_file();
@@ -4115,7 +4124,7 @@ impl GitBackend for Git2Backend {
 
     fn discard_hunk(&self, path: &str, new_start: u32) -> Result<(), GitError> {
         self.logged("discard", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             let diff = worktree_diff(&repo, path)?;
             let patch = reverse_hunk_patch(&diff, path, new_start)?;
@@ -4130,7 +4139,7 @@ impl GitBackend for Git2Backend {
 
     fn discard_lines(&self, path: &str, new_start: u32, lines: &[usize]) -> Result<(), GitError> {
         self.logged("discard", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             let diff = worktree_diff(&repo, path)?;
             let patch = partial_hunk_patch(&diff, path, new_start, lines, true)?;
@@ -4144,11 +4153,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn commit_msg_path(&self) -> PathBuf {
-        self.repo
-            .lock()
-            .expect("repo mutex")
-            .path()
-            .join("COMMIT_EDITMSG")
+        self.repo().path().join("COMMIT_EDITMSG")
     }
 
     fn commit(&self, message: &str) -> Result<(), GitError> {
@@ -4167,7 +4172,7 @@ impl GitBackend for Git2Backend {
 
     fn commit_with(&self, message: &str, opts: &CommitOptions) -> Result<(), GitError> {
         self.logged(if opts.amend { "amend" } else { "commit" }, || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             write_commit(&repo, message, opts)
         })
     }
@@ -4175,7 +4180,7 @@ impl GitBackend for Git2Backend {
     fn reword(&self, rev: &str, message: &str) -> Result<(), GitError> {
         self.logged("reword", || {
             {
-                let repo = self.repo.lock().expect("repo mutex");
+                let repo = self.repo();
                 let target = repo.rev_single(rev)?.peel_to_commit()?.id();
                 reword_commit(&repo, target, message)?;
             }
@@ -4187,7 +4192,7 @@ impl GitBackend for Git2Backend {
 
     fn uncommit(&self, n: usize) -> Result<(), GitError> {
         self.logged("uncommit", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let target = repo.rev_single(&format!("HEAD~{}", n.max(1)))?;
             repo.reset(&target, ResetType::Soft, None)?;
             Ok(())
@@ -4197,7 +4202,7 @@ impl GitBackend for Git2Backend {
     fn split(&self, rev: &str, paths: &[String]) -> Result<(), GitError> {
         self.logged("split", || {
             {
-                let repo = self.repo.lock().expect("repo mutex");
+                let repo = self.repo();
                 let branch_ref = head_branch_ref(&repo)?;
                 let target = repo.rev_single(rev)?.peel_to_commit()?;
                 let parent = target
@@ -4283,7 +4288,7 @@ impl GitBackend for Git2Backend {
         self.logged("sync", || {
             self.fetch(None, &[], &crate::FetchArgs::default(), report)?;
             {
-                let repo = self.repo.lock().expect("repo mutex");
+                let repo = self.repo();
                 let current_ref: Option<String> = repo
                     .head()
                     .ok()
@@ -4348,7 +4353,7 @@ impl GitBackend for Git2Backend {
 
     fn prune_merged(&self, base: &str) -> Result<Vec<String>, GitError> {
         self.logged("prune", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let base_oid = repo.rev_single(base)?.peel_to_commit()?.id();
             let current_ref: Option<String> = repo
                 .head()
@@ -4386,7 +4391,7 @@ impl GitBackend for Git2Backend {
     fn reorder(&self, rev: &str, target: &str, before: bool) -> Result<(), GitError> {
         self.logged("reorder", || {
             {
-                let repo = self.repo.lock().expect("repo mutex");
+                let repo = self.repo();
                 let branch_ref = head_branch_ref(&repo)?;
                 let rev_oid = repo.rev_single(rev)?.peel_to_commit()?.id();
                 let target_oid = repo.rev_single(target)?.peel_to_commit()?.id();
@@ -4421,15 +4426,16 @@ impl GitBackend for Git2Backend {
 
                 // Affected commits, oldest first; move rev relative to target.
                 let mut order: Vec<Oid> = chain.iter().rev().map(git2::Commit::id).collect();
-                let rev_pos = order
-                    .iter()
-                    .position(|&o| o == rev_oid)
-                    .expect("rev in order");
+                let rev_pos = order.iter().position(|&o| o == rev_oid).ok_or_else(|| {
+                    GitError::Other("rev not on the first-parent chain of HEAD".to_owned())
+                })?;
                 order.remove(rev_pos);
                 let target_pos = order
                     .iter()
                     .position(|&o| o == target_oid)
-                    .expect("target in order");
+                    .ok_or_else(|| {
+                        GitError::Other("target not on the first-parent chain of HEAD".to_owned())
+                    })?;
                 order.insert(if before { target_pos } else { target_pos + 1 }, rev_oid);
 
                 let commits: Vec<git2::Commit> = order
@@ -4448,7 +4454,7 @@ impl GitBackend for Git2Backend {
     fn squash_range(&self, from: &str) -> Result<(), GitError> {
         self.logged("squash", || {
             {
-                let repo = self.repo.lock().expect("repo mutex");
+                let repo = self.repo();
                 let branch_ref = head_branch_ref(&repo)?;
                 let base = repo.rev_single(from)?.peel_to_commit()?;
                 let head = repo.head()?.peel_to_commit()?;
@@ -4485,7 +4491,7 @@ impl GitBackend for Git2Backend {
     fn squash(&self, rev: &str) -> Result<(), GitError> {
         self.logged("squash", || {
             {
-                let repo = self.repo.lock().expect("repo mutex");
+                let repo = self.repo();
                 let branch_ref = head_branch_ref(&repo)?;
                 let target = repo.rev_single(rev)?.peel_to_commit()?;
                 let parent = target
@@ -4528,7 +4534,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn hooks_dir(&self) -> PathBuf {
-        hooks_dir(&self.repo.lock().expect("repo mutex"))
+        hooks_dir(&self.repo())
     }
 
     fn commit_no_verify(&self, message: &str) -> Result<(), GitError> {
@@ -4553,19 +4559,19 @@ impl GitBackend for Git2Backend {
     }
 
     fn commit_report(&self) -> Vec<String> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         commit_report(&repo)
     }
 
     fn head_message(&self) -> Option<String> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let head = repo.head().ok()?;
         let commit = head.peel_to_commit().ok()?;
         commit.message().ok().map(str::to_owned)
     }
 
     fn prepared_message(&self) -> Option<String> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         ["SQUASH_MSG", "MERGE_MSG"]
             .iter()
             .find_map(|f| std::fs::read_to_string(repo.path().join(f)).ok())
@@ -4574,7 +4580,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn staged_patch(&self) -> Result<String, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
         let mut opts = DiffOptions::new();
@@ -4593,7 +4599,7 @@ impl GitBackend for Git2Backend {
 
     fn commit_extend(&self) -> Result<(), GitError> {
         let message = {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let head = repo.head()?.peel_to_commit()?;
             head.message().unwrap_or("").to_owned()
         };
@@ -4607,8 +4613,8 @@ impl GitBackend for Git2Backend {
         args: &crate::FetchArgs,
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
-        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        let repo = self.repo();
+        let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let cred = cred_guard.as_deref();
         // As in git, a group (`remotes.<group>`) stands for its remotes.
         let expand = |name: &str| -> Result<Vec<String>, GitError> {
@@ -4705,7 +4711,7 @@ impl GitBackend for Git2Backend {
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
         let (remote, branch, rebase, ff_only, chosen, autostash) = {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             let (upstream, current) = upstream_remote(&repo)?;
             let config = repo.config()?;
             // git refuses a diverged pull until a flag or config picks merge or rebase.
@@ -4747,9 +4753,9 @@ impl GitBackend for Git2Backend {
             )
         };
         self.logged(if rebase { "pull --rebase" } else { "pull" }, || {
-            let mut repo = self.repo.lock().expect("repo mutex");
+            let mut repo = self.repo();
             {
-                let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+                let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let cred = cred_guard.as_deref();
                 let fetch = crate::FetchArgs {
                     depth: args.depth,
@@ -4972,7 +4978,7 @@ impl GitBackend for Git2Backend {
         report: &dyn Fn(OpProgress),
     ) -> Result<(), GitError> {
         let repo = self.fresh_handle()?;
-        let cred_guard = self.cred_prompt.lock().expect("cred mutex");
+        let cred_guard = self.cred_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let cred = cred_guard.as_deref();
         let remote_name = match remote {
             Some(r) => r.to_owned(),
@@ -5078,7 +5084,7 @@ impl GitBackend for Git2Backend {
         // Like git, push to each URL in turn and report every one.
         let lines = Mutex::new(Vec::new());
         let buffer = |p: OpProgress| match p {
-            OpProgress::Line(l) => lines.lock().expect("lines mutex").push(l),
+            OpProgress::Line(l) => lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(l),
             other => report(other),
         };
         let mut failed = false;
@@ -5102,10 +5108,10 @@ impl GitBackend for Git2Backend {
                     GitError::PushFailed(t) => t,
                     e => e.to_string(),
                 };
-                lines.lock().expect("lines mutex").push(text);
+                lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(text);
             }
         }
-        let lines = lines.into_inner().expect("lines mutex");
+        let lines = lines.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
         if failed {
             return Err(GitError::PushFailed(lines.join("\n")));
         }
@@ -5119,7 +5125,7 @@ impl GitBackend for Git2Backend {
         // libgit2 rejects a wildcard push refspec, so enumerate the tags and push
         // an explicit refspec for each.
         let refspecs: Vec<String> = {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             repo.tag_names(None)?
                 .iter()
                 .filter_map(|t| t.ok().flatten())
@@ -5151,7 +5157,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn submodules(&self, recursive: bool) -> Result<Vec<crate::SubmoduleInfo>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         let mut out = Vec::new();
         list_submodules(&repo, "", recursive, &mut out)?;
@@ -5165,27 +5171,27 @@ impl GitBackend for Git2Backend {
     ) -> Result<(), GitError> {
         use crate::SubmoduleOp as Op;
         if let Op::Summary { args } = op {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             return crate::submodule::summary(&repo, args, report);
         }
         self.logged("submodule", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             sync_index(&repo)?;
             submodule_op(&repo, op, report)
         })
     }
 
     fn resolve_object(&self, rev: &str) -> Result<String, GitError> {
-        crate::plumbing::resolve(&self.repo.lock().expect("repo mutex"), rev)
+        crate::plumbing::resolve(&self.repo(), rev)
     }
 
     fn object_disk(&self, id: &str) -> Result<(u64, Option<String>), GitError> {
-        crate::plumbing::object_disk(&self.repo.lock().expect("repo mutex"), id)
+        crate::plumbing::object_disk(&self.repo(), id)
     }
 
     fn diff_pair(&self, pair: &crate::RawPair, context: Option<u32>) -> Result<FileDiff, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let zero = |id: &str| id.bytes().all(|b| b == b'0');
         let content = |id: &str, side: bool| -> Result<Option<Vec<u8>>, GitError> {
             if !side {
@@ -5286,7 +5292,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn object_header(&self, id: &str) -> Result<(String, u64), GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let (size, kind) = repo.odb()?.read_header(Oid::from_str(id)?)?;
         Ok((kind.str().to_owned(), size as u64))
     }
@@ -5299,7 +5305,7 @@ impl GitBackend for Git2Backend {
         paths: &[String],
         all: bool,
     ) -> Result<crate::BisectPick<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let ids = |revs: &[String]| -> Result<Vec<Oid>, GitError> {
             revs.iter()
                 .map(|r| Ok(repo.revparse_single(r)?.peel_to_commit()?.id()))
@@ -5318,7 +5324,7 @@ impl GitBackend for Git2Backend {
     }
 
     fn convert_blob(&self, path: &str, data: &[u8], textconv: bool) -> Result<Vec<u8>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         if textconv {
             crate::plumbing::textconv(&repo, path, data)
         } else {
@@ -5327,15 +5333,15 @@ impl GitBackend for Git2Backend {
     }
 
     fn abbrev_id(&self, id: &str, min: usize) -> Result<String, GitError> {
-        crate::plumbing::abbrev(&self.repo.lock().expect("repo mutex"), id, min)
+        crate::plumbing::abbrev(&self.repo(), id, min)
     }
 
     fn full_ref_name(&self, rev: &str) -> Result<Option<String>, GitError> {
-        crate::plumbing::full_ref_name(&self.repo.lock().expect("repo mutex"), rev)
+        crate::plumbing::full_ref_name(&self.repo(), rev)
     }
 
     fn symbolic_ref(&self, name: &str) -> Result<Option<String>, GitError> {
-        crate::plumbing::symbolic_ref(&self.repo.lock().expect("repo mutex"), name)
+        crate::plumbing::symbolic_ref(&self.repo(), name)
     }
 
     fn set_symbolic_ref(
@@ -5345,22 +5351,22 @@ impl GitBackend for Git2Backend {
         message: Option<&str>,
     ) -> Result<(), GitError> {
         self.logged("symbolic-ref", || {
-            let repo = self.repo.lock().expect("repo mutex");
+            let repo = self.repo();
             repo.reference_symbolic(name, target, true, message.unwrap_or("symbolic-ref"))?;
             Ok(())
         })
     }
 
     fn git_dir(&self) -> PathBuf {
-        self.repo.lock().expect("repo mutex").path().to_path_buf()
+        self.repo().path().to_path_buf()
     }
 
     fn read_object(&self, rev: &str) -> Result<crate::RawObject, GitError> {
-        crate::plumbing::read_object(&self.repo.lock().expect("repo mutex"), rev)
+        crate::plumbing::read_object(&self.repo(), rev)
     }
 
     fn all_objects(&self) -> Result<Vec<String>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         let mut ids = std::collections::BTreeSet::new();
         repo.odb()?.foreach(|id| {
             ids.insert(id.to_string());
@@ -5375,27 +5381,27 @@ impl GitBackend for Git2Backend {
         paths: &[String],
         walk: crate::TreeWalk,
     ) -> Result<Vec<crate::TreeItem>, GitError> {
-        crate::plumbing::ls_tree(&self.repo.lock().expect("repo mutex"), rev, paths, walk)
+        crate::plumbing::ls_tree(&self.repo(), rev, paths, walk)
     }
 
     fn index_entries(&self) -> Result<Vec<crate::IndexItem>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::plumbing::index_entries(&repo)
     }
 
     fn path_states(&self, ignored: bool) -> Result<Vec<(String, crate::PathState)>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::plumbing::path_states(&repo, ignored)
     }
 
     fn ref_details(&self) -> Result<Vec<crate::RefDetail>, GitError> {
-        crate::plumbing::ref_details(&self.repo.lock().expect("repo mutex"))
+        crate::plumbing::ref_details(&self.repo())
     }
 
     fn rev_walk(&self, walk: &crate::LogOptions) -> Result<Vec<crate::WalkCommit>, GitError> {
-        crate::plumbing::rev_walk(&self.repo.lock().expect("repo mutex"), walk)
+        crate::plumbing::rev_walk(&self.repo(), walk)
     }
 
     fn list_objects(
@@ -5403,21 +5409,30 @@ impl GitBackend for Git2Backend {
         commits: &[String],
         edges: &[String],
     ) -> Result<Vec<(String, String, bool)>, GitError> {
-        crate::plumbing::list_objects(&self.repo.lock().expect("repo mutex"), commits, edges)
+        crate::plumbing::list_objects(&self.repo(), commits, edges)
     }
 
     fn merge_bases(&self, a: &str, b: &str, all: bool) -> Result<Vec<String>, GitError> {
-        crate::plumbing::merge_bases(&self.repo.lock().expect("repo mutex"), a, b, all)
+        crate::plumbing::merge_bases(&self.repo(), a, b, all)
     }
 
     fn reflog(&self, name: &str) -> Result<Vec<crate::ReflogItem>, GitError> {
-        crate::plumbing::reflog(&self.repo.lock().expect("repo mutex"), name)
+        crate::plumbing::reflog(&self.repo(), name)
     }
 
     fn git_grep(&self, q: &crate::GitGrep) -> Result<Vec<crate::GrepHit>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::plumbing::grep(&repo, &self.workdir, q)
+    }
+
+    fn paths_ignored(&self, paths: &[&std::path::Path]) -> Result<Vec<bool>, GitError> {
+        let repo = self.repo();
+        sync_index(&repo)?;
+        paths
+            .iter()
+            .map(|p| Ok(repo.is_path_ignored(p).unwrap_or(false)))
+            .collect()
     }
 
     fn check_ignore(
@@ -5425,17 +5440,17 @@ impl GitBackend for Git2Backend {
         path: &str,
         no_index: bool,
     ) -> Result<Option<crate::IgnoreRule>, GitError> {
-        let repo = self.repo.lock().expect("repo mutex");
+        let repo = self.repo();
         sync_index(&repo)?;
         crate::plumbing::check_ignore(&repo, &self.workdir, path, no_index)
     }
 
     fn ident(&self, committer: bool) -> Result<String, GitError> {
-        crate::plumbing::ident(&self.repo.lock().expect("repo mutex"), committer)
+        crate::plumbing::ident(&self.repo(), committer)
     }
 
     fn count_objects(&self) -> Result<crate::ObjectCounts, GitError> {
-        crate::plumbing::count_objects(&self.repo.lock().expect("repo mutex"))
+        crate::plumbing::count_objects(&self.repo())
     }
 }
 
@@ -5514,7 +5529,7 @@ fn push_one(
             if let Some(msg) = status
                 && let Some(row) = rows
                     .lock()
-                    .expect("rows mutex")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .iter_mut()
                     .find(|r| r.dst == refname)
             {
@@ -5546,7 +5561,7 @@ fn push_one(
                 }
             }
             if rejected && !args.dry_run && !args.atomic {
-                *rows.lock().expect("rows mutex") = out;
+                *rows.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = out;
                 retry.store(true, Relaxed);
                 return Err(git2::Error::from_str("rejected"));
             }
@@ -5572,12 +5587,12 @@ fn push_one(
                     report,
                 );
                 if let Err(e) = hook {
-                    *hook_failed.lock().expect("hook mutex") = Some(e.to_string());
+                    *hook_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.to_string());
                     stop.store(true, Relaxed);
                     return Err(git2::Error::from_str("pre-push hook failed"));
                 }
             }
-            *rows.lock().expect("rows mutex") = out;
+            *rows.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = out;
             if args.dry_run || rejected {
                 stop.store(true, Relaxed);
                 return Err(git2::Error::from_str("not pushed"));
@@ -5598,7 +5613,7 @@ fn push_one(
             .collect();
         let pushed = remote.push(&wire, Some(&mut opts));
         if retry.load(Relaxed) {
-            let out = std::mem::take(&mut *rows.lock().expect("rows mutex"));
+            let out = std::mem::take(&mut *rows.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
             let (bad, _): (Vec<PushRow>, Vec<PushRow>) =
                 out.into_iter().partition(|r| r.flag == '!');
             todo.retain(|(_, _, d)| !bad.iter().any(|r| r.dst == *d));
@@ -5613,7 +5628,7 @@ fn push_one(
         }
         break;
     }
-    if let Some(msg) = hook_failed.into_inner().expect("hook mutex") {
+    if let Some(msg) = hook_failed.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner) {
         return Err(GitError::PushFailed(
             format!("{msg}\nerror: failed to push some refs to '{url}'")
                 .trim_start()
@@ -5622,7 +5637,7 @@ fn push_one(
     }
 
     let mut all = failed;
-    all.extend(rows.into_inner().expect("rows mutex"));
+    all.extend(rows.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner));
     all.retain(|r| !(r.summary == "[rejected]" && followed.contains(&r.dst)));
     let at = |d: &str| specs.iter().position(|(_, _, x)| x == d);
     all.sort_by_key(|r| at(&r.dst));
@@ -5893,7 +5908,7 @@ fn do_fetch(
             .unwrap_or_else(|| dst.to_owned());
         updates
             .lock()
-            .expect("updates mutex")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((src, dst.to_owned(), Some(old), new));
         true
     };
@@ -5969,7 +5984,7 @@ fn do_fetch(
     {
         follow_remote_head(repo, name, &configured, &head)?;
     }
-    let updates = updates.into_inner().expect("updates mutex");
+    let updates = updates.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
     let rows = fetch_rows(repo, name, refspecs, &updates, &fetched, true);
     for line in crate::fetch_display::render(&url, &rows, compact_fetch(repo)) {
         report(OpProgress::Line(line));
@@ -8266,11 +8281,11 @@ fn update_each(
                     .and_then(|r| {
                         update_one(&r, prefix, name, o, &|p| {
                             if let OpProgress::Line(l) = p {
-                                lines.lock().expect("lines mutex").push(l);
+                                lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(l);
                             }
                         })
                     });
-                (lines.into_inner().expect("lines mutex"), result)
+                (lines.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner), result)
             })
             .collect()
     });
@@ -11660,6 +11675,15 @@ impl StatusDiff {
 /// paths, statuses, rename scores) stays sequential on the main diff; a worker
 /// whose rebuilt diff no longer matches at some index (the worktree changed
 /// mid-refresh) yields a patchless entry there until the next refresh.
+/// Per-delta metadata for the parallel patch extraction, captured on the
+/// main diff before the workers rebuild it on their own handles.
+struct DiffMeta {
+    path: String,
+    old_path: Option<String>,
+    status: StatusCode,
+    similarity: u16,
+}
+
 fn extract_with_renames_par(
     repo: &Repository,
     kind: StatusDiff,
@@ -11671,13 +11695,6 @@ fn extract_with_renames_par(
     let count = diff.deltas().len();
     if count < 8 || rayon::current_num_threads() < 2 {
         return extract(repo, &diff);
-    }
-
-    struct Meta {
-        path: String,
-        old_path: Option<String>,
-        status: StatusCode,
-        similarity: u16,
     }
 
     let mut metas = Vec::with_capacity(count);
@@ -11698,7 +11715,7 @@ fn extract_with_renames_par(
             })
             .flatten()
             .filter(|old| *old != path);
-        metas.push(Meta {
+        metas.push(DiffMeta {
             path,
             similarity: if old_path.is_some() {
                 similarity(repo, &delta)
@@ -11720,69 +11737,18 @@ fn extract_with_renames_par(
     let chunks: Vec<Result<Vec<FileDiff>, GitError>> = (0..chunk_count)
         .into_par_iter()
         .map(|chunk| {
-            let wrepo = Repository::open(&gitdir).map_err(GitError::from)?;
-            let mut wdiff = kind.make(&wrepo)?;
-            let mut fopts = DiffFindOptions::new();
-            fopts.renames(true);
-            wdiff.find_similar(Some(&mut fopts))?;
-            let start = chunk * chunk_size;
-            let end = ((chunk + 1) * chunk_size).min(count);
-            let mut out = Vec::with_capacity(end - start);
-            for (offset, meta) in metas[start..end].iter().enumerate() {
-                let idx = start + offset;
-                let delta = wdiff.get_delta(idx);
-                // If the worktree moved mid-refresh the rebuilt diff shifts;
-                // emit the patch only when the delta still names meta's file.
-                let aligned = delta
-                    .as_ref()
-                    .and_then(|d| d.new_file().path().or_else(|| d.old_file().path()))
-                    .is_some_and(|p| p.to_string_lossy() == meta.path);
-                let patch = aligned.then(|| Patch::from_diff(&wdiff, idx)).transpose()?;
-                let fallback = delta.map(|d| {
-                    (
-                        d.flags().is_binary(),
-                        (d.old_file().size(), d.new_file().size()),
-                        (
-                            u32::from(d.old_file().mode()),
-                            u32::from(d.new_file().mode()),
-                        ),
-                        (d.old_file().id().to_string(), d.new_file().id().to_string()),
-                    )
-                });
-                let mut file = match patch.flatten() {
-                    Some(mut patch) => patch_file(&mut patch)?,
-                    None => {
-                        let (binary, sizes, modes, ids) = fallback.unwrap_or_default();
-                        FileDiff {
-                            path: String::new(),
-                            old_path: None,
-                            status: StatusCode::Modified,
-                            hunks: Vec::new(),
-                            binary,
-                            header: String::new(),
-                            similarity: 0,
-                            sizes,
-                            modes,
-                            ids,
-                            loaded: true,
-                        }
-                    }
-                };
-                if meta.old_path.is_some() {
-                    file.similarity = meta.similarity;
-                    // libgit2 scores renames its own way; print git's score.
-                    if let Some(start) = file.header.find("similarity index ") {
-                        let end = start + file.header[start..].find('\n').unwrap_or(0);
-                        let line = format!("similarity index {}%", file.similarity);
-                        file.header.replace_range(start..end, &line);
-                    }
-                }
-                file.path = meta.path.clone();
-                file.old_path = meta.old_path.clone();
-                file.status = meta.status;
-                out.push(file);
+            // A panic (say, a corrupt count from a mid-refresh diff) must
+            // surface as an error here, not re-raise in the caller, which
+            // holds the repo lock and would poison it for the session.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                extract_chunk(&gitdir, kind, chunk, chunk_size, &metas)
+            }));
+            match result {
+                Ok(r) => r,
+                Err(_) => Err(GitError::Other(
+                    "diff worker panicked while the worktree changed; retry".to_owned(),
+                )),
             }
-            Ok(out)
         })
         .collect();
 
@@ -11791,6 +11757,88 @@ fn extract_with_renames_par(
         files.extend(chunk?);
     }
     Ok(files)
+}
+
+/// One worker's chunk of the parallel patch extraction: rebuild the whole
+/// diff on a private handle (git2::Diff is not Sync) and materialize the
+/// patches for `metas[chunk * chunk_size..]`.
+fn extract_chunk(
+    gitdir: &std::path::Path,
+    kind: StatusDiff,
+    chunk: usize,
+    chunk_size: usize,
+    metas: &[DiffMeta],
+) -> Result<Vec<FileDiff>, GitError> {
+    let wrepo = Repository::open(gitdir)?;
+    let mut wdiff = kind.make(&wrepo)?;
+    let mut fopts = DiffFindOptions::new();
+    fopts.renames(true);
+    wdiff.find_similar(Some(&mut fopts))?;
+    let count = wdiff.deltas().len();
+    let start = chunk * chunk_size;
+    let end = ((chunk + 1) * chunk_size).min(metas.len());
+    if start >= count || start >= metas.len() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(end - start);
+    for (offset, meta) in metas[start..end].iter().enumerate() {
+        let idx = start + offset;
+        if idx >= count {
+            break;
+        }
+        let delta = wdiff.get_delta(idx);
+        // If the worktree moved mid-refresh the rebuilt diff shifts;
+        // emit the patch only when the delta still names meta's file.
+        let aligned = delta
+            .as_ref()
+            .and_then(|d| d.new_file().path().or_else(|| d.old_file().path()))
+            .is_some_and(|p| p.to_string_lossy() == meta.path);
+        let patch = aligned.then(|| Patch::from_diff(&wdiff, idx)).transpose()?;
+        let fallback = delta.map(|d| {
+            (
+                d.flags().is_binary(),
+                (d.old_file().size(), d.new_file().size()),
+                (
+                    u32::from(d.old_file().mode()),
+                    u32::from(d.new_file().mode()),
+                ),
+                (d.old_file().id().to_string(), d.new_file().id().to_string()),
+            )
+        });
+        let mut file = match patch.flatten() {
+            Some(mut patch) => patch_file(&mut patch)?,
+            None => {
+                let (binary, sizes, modes, ids) = fallback.unwrap_or_default();
+                FileDiff {
+                    path: String::new(),
+                    old_path: None,
+                    status: StatusCode::Modified,
+                    hunks: Vec::new(),
+                    binary,
+                    header: String::new(),
+                    similarity: 0,
+                    sizes,
+                    modes,
+                    ids,
+                    loaded: true,
+                }
+            }
+        };
+        if meta.old_path.is_some() {
+            file.similarity = meta.similarity;
+            // libgit2 scores renames its own way; print git's score.
+            if let Some(start) = file.header.find("similarity index ") {
+                let end = start + file.header[start..].find('\n').unwrap_or(0);
+                let line = format!("similarity index {}%", file.similarity);
+                file.header.replace_range(start..end, &line);
+            }
+        }
+        file.path = meta.path.clone();
+        file.old_path = meta.old_path.clone();
+        file.status = meta.status;
+        out.push(file);
+    }
+    Ok(out)
 }
 
 /// The lazy snapshot's diff list: one delta-only [`FileDiff`] per changed
@@ -11939,6 +11987,10 @@ fn patch_file(patch: &mut Patch) -> Result<FileDiff, GitError> {
         let (hunk, _) = patch.hunk(h)?;
         let header = String::from_utf8_lossy(hunk.header()).trim_end().to_owned();
         let count = patch.num_lines_in_hunk(h)?;
+        // A count from a stale/mismatched patch can be garbage; libgit2
+        // itself caps a file at GIT_XDIFF_MAX_SIZE lines, so anything far
+        // past that is a corrupt count, and with_capacity would overflow.
+        let count = count.min(1 << 30);
         let mut lines = Vec::with_capacity(count);
         for l in 0..count {
             let line = patch.line_in_hunk(h, l)?;

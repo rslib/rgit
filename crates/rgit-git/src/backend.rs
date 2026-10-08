@@ -1410,6 +1410,14 @@ pub trait GitBackend: Send + Sync {
     /// Search tracked files as `git grep` does: every matching line, in path order.
     fn git_grep(&self, q: &crate::GitGrep) -> Result<Vec<crate::GrepHit>, GitError>;
 
+    /// Which of `paths` the ignore rules cover, in order. One lock
+    /// acquisition for the batch, for worktree watchers that must drop
+    /// ignored-path events without a lock per path.
+    fn paths_ignored(&self, paths: &[&std::path::Path]) -> Result<Vec<bool>, GitError> {
+        let _ = paths;
+        Ok(Vec::new())
+    }
+
     /// The rule that ignores `path`, or None when it is not ignored. Tracked
     /// paths are never ignored unless `no_index`.
     fn check_ignore(

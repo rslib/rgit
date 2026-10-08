@@ -291,7 +291,7 @@ async fn event_loop(
         .set_credential_prompt(Box::new(TuiCredentialPrompt { tx: msg_tx.clone() }));
 
     // Auto-refresh on worktree changes; kept alive for the loop's duration.
-    let _watcher = spawn_watcher(app.backend().workdir(), msg_tx.clone());
+    let _watcher = spawn_watcher(app.backend().clone(), msg_tx.clone());
     let gate = RefreshGate::default();
 
     msg_tx.send(Msg::Refresh).ok();
@@ -1123,24 +1123,80 @@ async fn run_msg(
 /// Watch the worktree and post a quiet refresh when files change. Returns the
 /// debouncer, which must be held alive for watching to continue. Degrades to
 /// manual refresh (`g`) if the watch cannot be set up.
+///
+/// Events are filtered so an agent or build churning through ignored paths
+/// does not force a full status refresh per burst: `.git` internals are
+/// dropped by path prefix, and everything else goes through one batched
+/// ignore check before a refresh is queued.
 fn spawn_watcher(
-    workdir: &Path,
+    backend: Arc<dyn GitBackend>,
     msg_tx: UnboundedSender<Msg>,
 ) -> Option<Debouncer<RecommendedWatcher>> {
+    let workdir = backend.workdir().to_path_buf();
+    let watchdir = workdir.clone();
+    let watchdir_in = workdir.clone();
     let mut debouncer = new_debouncer(
-        Duration::from_millis(400),
+        Duration::from_secs(1),
         move |res: DebounceEventResult| {
-            if res.is_ok() {
-                let _ = msg_tx.send(Msg::AutoRefresh);
+            let Ok(events) = res else {
+                return;
+            };
+            let mut interesting: Vec<std::path::PathBuf> = Vec::new();
+            for event in events {
+                if is_git_internal(&watchdir_in, &event.path) {
+                    continue;
+                }
+                interesting.push(event.path);
             }
+            if interesting.is_empty() {
+                return;
+            }
+            // `.gitignore`-driven check: one lock acquisition for the batch.
+            let backend = Arc::clone(&backend);
+            let msg_tx = msg_tx.clone();
+            std::thread::spawn(move || {
+                let paths: Vec<&std::path::Path> = interesting.iter().map(|p| p.as_path()).collect();
+                let flags = match backend.paths_ignored(&paths) {
+                    Ok(flags) => flags,
+                    Err(_) => {
+                        // Without a verdict, assume the events matter.
+                        let _ = msg_tx.send(Msg::AutoRefresh);
+                        return;
+                    }
+                };
+                if flags.into_iter().any(|ignored| !ignored) {
+                    let _ = msg_tx.send(Msg::AutoRefresh);
+                }
+            });
         },
     )
     .ok()?;
     debouncer
         .watcher()
-        .watch(workdir, RecursiveMode::Recursive)
+        .watch(&watchdir, RecursiveMode::Recursive)
         .ok()?;
     Some(debouncer)
+}
+
+/// Whether `path` is `.git` plumbing whose change cannot alter what rgit
+/// shows. Index, HEAD and refs do matter (staging, branch switches).
+fn is_git_internal(workdir: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(workdir) else {
+        return false;
+    };
+    let mut parts = rel.components();
+    if parts.next() != Some(std::path::Component::Normal(".git".as_ref())) {
+        return false;
+    }
+    let rest = rel
+        .strip_prefix(".git")
+        .expect("checked first component above");
+    if rest.as_os_str().is_empty() {
+        return true;
+    }
+    !(rest == Path::new("index")
+        || rest == Path::new("HEAD")
+        || rest.starts_with("refs"))
 }
 /// Run a synchronous read/mutation on a blocking task and report the resulting
 /// status back as a [`Msg`], so the render loop never blocks.
