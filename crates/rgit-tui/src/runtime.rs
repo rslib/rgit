@@ -2097,20 +2097,67 @@ fn strip_comments(raw: &str) -> String {
         .to_owned()
 }
 
-/// Copy `text` to the system clipboard via the OSC 52 escape sequence, which
-/// works over ssh and inside tmux (with `set -g set-clipboard on`) since the
-/// terminal, not this process, owns the clipboard.
-///
-/// Best-effort and non-blocking by construction: it only ever WRITES a payload
-/// the caller has already bounded (never the OSC 52 query form, which waits for
-/// a reply), and it swallows write errors so a stalled or broken output can
-/// never take down or hang the event loop.
+/// Copy `text` to the system clipboard. OSC 52 first (direct, then tmux-wrapped
+/// when `$TMUX` is set, since tmux filters bare sequences), then a platform
+/// clipboard command - OSC 52 is ignored by default on several terminals, and
+/// a silent drop would lose the yank.
 fn copy_to_clipboard(text: &str) {
     use std::io::Write;
-    let seq = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let payload = base64_encode(text.as_bytes());
+    let seq = format!("\x1b]52;c;{}\x07", payload);
     let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(seq.as_bytes());
+    if std::env::var_os("TMUX").is_some() {
+        // tmux's passthrough: DCS tmux; <seq> ST, with the semicolon escaped.
+        let wrapped = format!("\x1bPtmux;\x1b]52;c;{}\x07\x1b\\", payload);
+        let _ = stdout.write_all(wrapped.as_bytes());
+    } else {
+        let _ = stdout.write_all(seq.as_bytes());
+    }
     let _ = stdout.flush();
+    if osc52_untrusted() && clipboard_command(text).is_err() {
+        tracing::debug!("clipboard: OSC 52 sent and no fallback command available");
+    }
+}
+
+/// Whether the output may not honor OSC 52, so a subprocess fallback is worth
+/// running too: the terminal is unknown or on the known-ignore list. The copy
+/// is still attempted; a duplicate copy is harmless, a missing one is not.
+fn osc52_untrusted() -> bool {
+    match std::env::var("TERM_PROGRAM") {
+        Ok(program) => matches!(
+            program.as_str(),
+            "Apple_Terminal" | "iTerm.app" | "Hyper" | "vscode"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// The first available platform clipboard command, run with `text` on stdin.
+fn clipboard_command(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let (name, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+        ("pbcopy", &[])
+    } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        ("wl-copy", &[])
+    } else {
+        ("xclip", &["-selection", "clipboard"])
+    };
+    let mut child = Command::new(name)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            tracing::debug!("clipboard: no {name}: {e}");
+            e
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    // Do not wait: a hung clipboard manager must not stall the event loop.
+    Ok(())
 }
 
 /// Standard base64 (RFC 4648). Hand-rolled to avoid a direct dependency for the
