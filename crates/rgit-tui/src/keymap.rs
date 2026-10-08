@@ -641,6 +641,21 @@ pub fn resolve_commit_key(key: KeyEvent) -> Option<Msg> {
     }
 }
 
+/// Key handling while the split-commit file picker is open.
+pub fn resolve_split_picker_key(key: KeyEvent) -> Option<Msg> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('n') if ctrl => Some(Msg::SplitPickerDown),
+        KeyCode::Char('p') if ctrl => Some(Msg::SplitPickerUp),
+        KeyCode::Char('j') | KeyCode::Down => Some(Msg::SplitPickerDown),
+        KeyCode::Char('k') | KeyCode::Up => Some(Msg::SplitPickerUp),
+        KeyCode::Char(' ') | KeyCode::Char('x') => Some(Msg::SplitPickerToggle),
+        KeyCode::Enter => Some(Msg::SplitPickerRun),
+        KeyCode::Esc | KeyCode::Char('q') => Some(Msg::SplitPickerCancel),
+        _ => None,
+    }
+}
+
 /// Key handling while the interactive-rebase todo editor is open.
 pub fn resolve_rebase_key(key: KeyEvent) -> Option<Msg> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);

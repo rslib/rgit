@@ -378,6 +378,25 @@ impl RebaseTodo {
     }
 }
 
+/// The split-commit file picker: toggle which of the commit's files go in the
+/// first part, then run. Replaces the old comma-separated path prompt.
+pub struct SplitPicker {
+    pub rev: String,
+    pub files: Vec<(String, bool)>,
+    pub cursor: usize,
+}
+
+impl SplitPicker {
+    /// The chosen paths, in the commit's file order.
+    pub fn selected(&self) -> Vec<String> {
+        self.files
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+}
+
 /// The result of a background status refresh, delivered back as a [`Msg`].
 pub type RefreshResult = Result<RepoStatus, GitError>;
 
@@ -735,6 +754,16 @@ pub enum Msg {
     RebaseTodoSetAction(char),
     RebaseTodoRun,
     RebaseTodoCancel,
+    /// The split target's changed files, ready to open the file picker.
+    ShowSplitPicker {
+        rev: String,
+        files: Vec<String>,
+    },
+    SplitPickerToggle,
+    SplitPickerUp,
+    SplitPickerDown,
+    SplitPickerRun,
+    SplitPickerCancel,
     TransientChar(char),
     TransientCancel,
     PaletteOpen,
@@ -1363,10 +1392,8 @@ pub enum PromptAction {
     ReorderRev,
     /// Move `pending_reorder_rev` before the commit named by the prompt value.
     ReorderTarget,
-    /// Pick the commit to split; then prompt for the paths for the first part.
+    /// Pick the commit to split; then open the file picker for the first part.
     SplitRev,
-    /// Split `pending_split_rev`, the prompt value's paths going in the first.
-    SplitPaths,
     /// Rename `pending_move_from` to the path named by the prompt value.
     MoveFile,
     ForgeCreate,
@@ -1700,6 +1727,8 @@ pub enum Effect {
     Commit {
         amend: bool,
     },
+    /// Load a commit's file list, then open the split file picker.
+    LoadSplitFiles(String),
     /// Load the branch list, then open the checkout prompt.
     LoadBranches,
     /// Load the commit log with the given filters, then push the log view.
@@ -1959,9 +1988,9 @@ pub struct App {
     pending_push: Option<(bool, bool, bool)>,
     /// The merge transient's --no-ff toggle, stashed while the branch is picked.
     pending_merge_no_ff: bool,
-    /// The commit to reorder / split, stashed between the two chained prompts.
+    /// The commit to reorder, stashed between the two chained prompts.
     pending_reorder_rev: Option<String>,
-    pending_split_rev: Option<String>,
+    pub split_picker: Option<SplitPicker>,
     /// The file being renamed, stashed while the new name is entered.
     pending_move_from: Option<String>,
     /// First-step value of a two-step prompt (remote name, worktree name).
@@ -2098,7 +2127,7 @@ impl App {
             pending_push: None,
             pending_merge_no_ff: false,
             pending_reorder_rev: None,
-            pending_split_rev: None,
+            split_picker: None,
             pending_move_from: None,
             pending_prompt_value: None,
             pending_remote_prompt: None,
@@ -3477,6 +3506,46 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::RebaseTodoCancel => app.rebase_todo = None,
+        Msg::ShowSplitPicker { rev, files } => {
+            app.loading = false;
+            app.split_picker = Some(SplitPicker {
+                rev,
+                files: files.into_iter().map(|p| (p, false)).collect(),
+                cursor: 0,
+            });
+        }
+        Msg::SplitPickerToggle => {
+            if let Some(p) = &mut app.split_picker {
+                if let Some(on) = p.files.get_mut(p.cursor) {
+                    on.1 = !on.1;
+                }
+                if p.cursor + 1 < p.files.len() {
+                    p.cursor += 1;
+                }
+            }
+        }
+        Msg::SplitPickerRun => {
+            if let Some(p) = app.split_picker.take() {
+                let paths = p.selected();
+                if paths.is_empty() {
+                    app.push_toast(ToastKind::Error, "no files selected".into());
+                } else {
+                    app.loading = true;
+                    return vec![Effect::Mutate(Mutation::Split { rev: p.rev, paths })];
+                }
+            }
+        }
+        Msg::SplitPickerCancel => app.split_picker = None,
+        Msg::SplitPickerUp => {
+            if let Some(p) = &mut app.split_picker {
+                p.cursor = p.cursor.saturating_sub(1);
+            }
+        }
+        Msg::SplitPickerDown => {
+            if let Some(p) = &mut app.split_picker {
+                p.cursor = (p.cursor + 1).min(p.files.len().saturating_sub(1));
+            }
+        }
         Msg::RebaseTodoRun => {
             if let Some(t) = &app.rebase_todo
                 && matches!(t.entries.first().map(|e| e.action), Some('s') | Some('f'))
@@ -4186,13 +4255,7 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             } else {
                 value
             };
-            app.pending_split_rev = Some(rev);
-            revision_prompt(
-                app,
-                "Paths for the first commit (comma-separated)",
-                PromptAction::SplitPaths,
-            );
-            return Vec::new();
+            return vec![Effect::LoadSplitFiles(rev)];
         }
         // Reword is a two-step prompt: pick the commit, then its new message.
         PromptAction::RewordRev => {
@@ -4249,18 +4312,6 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         PromptAction::Squash => Mutation::Squash(value),
         PromptAction::ReorderTarget => match app.pending_reorder_rev.take() {
             Some(rev) => Mutation::Reorder { rev, target: value },
-            None => return Vec::new(),
-        },
-        PromptAction::SplitPaths => match app.pending_split_rev.take() {
-            Some(rev) => Mutation::Split {
-                rev,
-                paths: value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-            },
             None => return Vec::new(),
         },
         PromptAction::MoveFile => match app.pending_move_from.take() {

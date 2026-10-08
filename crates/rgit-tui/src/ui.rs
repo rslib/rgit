@@ -165,6 +165,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if let Some(todo) = &app.rebase_todo {
         render_rebase_todo(frame, todo, inner);
     }
+    if let Some(picker) = &app.split_picker {
+        render_split_picker(frame, picker, inner);
+    }
     if let Some(level) = app.leader {
         render_which_key(frame, level, inner);
     }
@@ -280,6 +283,64 @@ fn render_rebase_todo(frame: &mut Frame, todo: &crate::app::RebaseTodo, area: Re
             RSpan::styled(" cancel", dim),
         ]),
     };
+    frame.render_widget(Paragraph::new(footer_line), footer);
+}
+
+fn render_split_picker(frame: &mut Frame, picker: &crate::app::SplitPicker, area: Rect) {
+    let width = 82.min(area.width.saturating_sub(2));
+    let cap = (area.height.saturating_sub(6)).max(1) as usize;
+    let visible = picker.files.len().clamp(1, cap);
+    let height = visible as u16 + 4;
+    let title = format!(
+        "split {}  {}/{}",
+        picker.rev,
+        picker.cursor + 1,
+        picker.files.len()
+    );
+    let inner = popup_panel(frame, &title, width, height, area);
+    let [list, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    let vis = (list.height as usize).max(1);
+    let scroll = picker.cursor.saturating_sub(vis - 1);
+    let end = (scroll + vis).min(picker.files.len());
+    let rows: Vec<Line> = picker.files[scroll..end]
+        .iter()
+        .enumerate()
+        .map(|(vi, (path, on))| {
+            let i = scroll + vi;
+            let bar = if i == picker.cursor { "▎" } else { " " };
+            let box_char = if *on { "[x]" } else { "[ ]" };
+            let style = if *on {
+                theme::resolve(Style::Added)
+            } else {
+                theme::resolve(Style::Dim)
+            };
+            let line = Line::from(vec![
+                RSpan::styled(bar, RStyle::default().fg(theme::accent())),
+                RSpan::styled(format!("{box_char} "), style),
+                RSpan::raw(path.clone()),
+            ]);
+            if i == picker.cursor {
+                line.style(RStyle::default().bg(theme::cursor_bg()))
+            } else {
+                line
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), list);
+
+    let accent = RStyle::default().fg(theme::accent());
+    let dim = theme::resolve(Style::Dim);
+    let footer_line = Line::from(vec![
+        RSpan::styled("j/k", accent),
+        RSpan::styled(" move  ", dim),
+        RSpan::styled("space", accent),
+        RSpan::styled(" toggle  ", dim),
+        RSpan::styled("⏎", accent),
+        RSpan::styled(" split  ", dim),
+        RSpan::styled("esc", accent),
+        RSpan::styled(" cancel", dim),
+    ]);
     frame.render_widget(Paragraph::new(footer_line), footer);
 }
 

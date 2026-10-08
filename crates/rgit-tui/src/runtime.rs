@@ -13,7 +13,8 @@ use crate::app::{App, Effect, InfoKind, LaneOp, Leader, Msg, Mutation, TextOp, u
 use crate::events::{Event, Events};
 use crate::keymap::{
     self, resolve_commit_key, resolve_confirm_key, resolve_finder_key, resolve_help_key,
-    resolve_key, resolve_palette_key, resolve_prompt_key, resolve_rebase_key, resolve_search_key,
+    resolve_key, resolve_palette_key, resolve_prompt_key, resolve_rebase_key,
+    resolve_search_key, resolve_split_picker_key,
     resolve_transient_key,
 };
 use crate::ui;
@@ -342,6 +343,8 @@ async fn event_loop(
                     resolve_help_key(key)
                 } else if app.rebase_todo.is_some() {
                     resolve_rebase_key(key)
+                } else if app.split_picker.is_some() {
+                    resolve_split_picker_key(key)
                 } else if app.commit_editor.is_some() {
                     resolve_commit_key(key)
                 } else if app.palette.is_some() {
@@ -649,6 +652,21 @@ async fn run_msg(
                         .await?;
                     let _ = std::fs::remove_file(&path);
                 }
+            }
+            Effect::LoadSplitFiles(rev) => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    match backend.commit_overview(&rev) {
+                        Ok(ov) => {
+                            let files = ov.files.into_iter().map(|f| f.path).collect();
+                            let _ = msg_tx.send(Msg::ShowSplitPicker { rev, files });
+                        }
+                        Err(e) => {
+                            let _ = msg_tx.send(Msg::Error(e.to_string()));
+                        }
+                    }
+                });
             }
             Effect::LoadBranches => {
                 let backend = app.backend();
