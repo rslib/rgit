@@ -1682,6 +1682,7 @@ mod hunk_component_tests {
             sizes: (0, 0),
             modes: (0, 0),
             ids: Default::default(),
+            loaded: true,
             hunks: vec![Hunk {
                 header: "@@ -1,1 +1,2 @@".into(),
                 new_start: 1,
