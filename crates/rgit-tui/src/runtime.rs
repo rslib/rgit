@@ -697,6 +697,35 @@ async fn run_msg(
                     }
                 });
             }
+            Effect::LoadPromptCandidates(action) => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                if action == crate::app::PromptAction::MergeBranch {
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(branches) = backend.local_branches() {
+                            let options = branches
+                                .into_iter()
+                                .map(|b| (b.clone(), b))
+                                .collect();
+                            let _ = msg_tx.send(Msg::PromptCandidatesLoaded { action, options });
+                        }
+                    });
+                } else {
+                    let opts = rgit_git::LogOptions {
+                        limit: crate::app::REV_CANDIDATES,
+                        ..Default::default()
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(entries) = backend.log(&opts) {
+                            let options = entries
+                                .into_iter()
+                                .map(|e| (format!("{} {}", e.short_id, e.summary), e.short_id))
+                                .collect();
+                            let _ = msg_tx.send(Msg::PromptCandidatesLoaded { action, options });
+                        }
+                    });
+                }
+            }
             Effect::LoadBranches => {
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();

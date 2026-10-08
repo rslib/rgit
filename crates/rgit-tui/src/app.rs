@@ -618,6 +618,11 @@ pub enum Msg {
     PushRemotesLoaded(Vec<Remote>),
     /// Remote names loaded to open the next step of a remote prompt.
     RemoteNamesLoaded(Vec<String>),
+    /// Revision or branch candidates for a picker prompt, as (display, value).
+    PromptCandidatesLoaded {
+        action: PromptAction,
+        options: Vec<(String, String)>,
+    },
     WorktreeMenu,
     WorktreesLoaded(Vec<Worktree>),
     /// A worktree's changes, ready to show in a read-only inspection view.
@@ -1300,10 +1305,41 @@ fn revision_prompt(app: &mut App, label: &str, action: PromptAction) {
         input: String::new(),
         cursor: 0,
         candidates: Vec::new(),
+        values: Vec::new(),
         selected: 0,
         action,
         masked: false,
     });
+}
+
+/// The label of the picker prompt each revision-taking action opens.
+fn rev_prompt_label(action: PromptAction) -> &'static str {
+    match action {
+        PromptAction::CherryPick => "Cherry-pick",
+        PromptAction::Revert => "Revert",
+        PromptAction::Squash => "Squash into parent",
+        PromptAction::RebaseOnto => "Rebase onto",
+        PromptAction::RebaseInteractive => "Interactive rebase from",
+        PromptAction::ReorderRev => "Move which commit",
+        PromptAction::ReorderTarget => "Move it before which commit",
+        PromptAction::SplitRev => "Split which commit",
+        PromptAction::RewordRev => "Reword commit",
+        PromptAction::ResetSoft => "Reset soft to",
+        PromptAction::ResetMixed => "Reset mixed to",
+        PromptAction::ResetHard => "Reset HARD to",
+        PromptAction::MergeBranch => "Merge branch",
+        PromptAction::DiffRefs => "Diff from",
+        PromptAction::DiffRefsTo => "Diff to",
+        _ => "Pick",
+    }
+}
+
+/// Open a revision prompt backed by a picker of recent commits (or branches
+/// for a merge). Typing still works: a raw revision that matches nothing is
+/// submitted as-is.
+fn rev_picker_prompt(app: &mut App, action: PromptAction) -> Vec<Effect> {
+    app.transient = None;
+    vec![Effect::LoadPromptCandidates(action)]
 }
 
 /// The follow-up prompt of a two-step prompt's first step: stash the first
@@ -1314,6 +1350,7 @@ fn two_step_next(action: PromptAction) -> Option<(&'static str, PromptAction)> {
         PromptAction::SetRemoteUrlName => Some(("New URL", PromptAction::SetRemoteUrlUrl)),
         PromptAction::RenameRemoteOld => Some(("New remote name", PromptAction::RenameRemoteNew)),
         PromptAction::AddWorktreeName => Some(("Worktree path", PromptAction::AddWorktreePath)),
+        PromptAction::DiffRefs => Some(("Diff to (type HEAD for HEAD)", PromptAction::DiffRefsTo)),
         _ => None,
     }
 }
@@ -1330,9 +1367,8 @@ fn two_step_mutation(app: &mut App, action: PromptAction, value: String) -> Opti
         _ => None,
     }
 }
-
 /// What a submitted [`Prompt`] does with its value.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptAction {
     CheckoutBranch,
     CreateBranch,
@@ -1368,7 +1404,10 @@ pub enum PromptAction {
     AddWorktreePath,
     RemoveWorktree,
     LogAuthor,
+    /// Pick the first rev of a two-rev diff.
     DiffRefs,
+    /// Pick the second rev; blank submits HEAD (diff against HEAD).
+    DiffRefsTo,
     BisectStart,
     FlowInit,
     FlowStart,
@@ -1412,6 +1451,10 @@ pub struct Prompt {
     /// Caret position as a char index into `input`.
     pub cursor: usize,
     pub candidates: Vec<String>,
+    /// The submitted value per candidate, when display and value differ (a
+    /// commit row shows `abc1234 subject`, submits `abc1234`). Empty means the
+    /// candidate strings are the values.
+    pub values: Vec<String>,
     pub selected: usize,
     pub action: PromptAction,
     /// Render the input as dots (for secrets like a password/passphrase).
@@ -1426,40 +1469,48 @@ impl Prompt {
         self.selected = 0;
     }
 
-    /// Candidates matching the input as a case-insensitive subsequence, best
-    /// match first (word starts and dense spans rank high, then shorter).
-    pub fn filtered(&self) -> Vec<&str> {
+    /// Indices of the candidates matching the input as a case-insensitive
+    /// subsequence, best match first (word starts and dense spans rank high).
+    pub fn filtered(&self) -> Vec<usize> {
         let needle = self.input.to_lowercase();
-        let mut hits: Vec<(u32, usize, &str)> = self
+        let mut hits: Vec<(usize, u32, usize)> = self
             .candidates
             .iter()
-            .filter(|c| is_subsequence(&needle, &c.to_lowercase()))
-            .map(|c| {
+            .enumerate()
+            .filter(|(_, c)| is_subsequence(&needle, &c.to_lowercase()))
+            .map(|(i, c)| {
                 let (score, len) = (
                     fuzzy_match(&needle, &c.to_lowercase()).map_or(0, |(_, s)| s),
                     c.chars().count(),
                 );
-                (score, len, c.as_str())
+                (i, score, len)
             })
             .collect();
-        hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        hits.into_iter().map(|(_, _, c)| c).collect()
+        hits.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+        hits.into_iter().map(|(i, _, _)| i).collect()
     }
 
-    /// The matched char positions in `cand` for the current input, for
-    /// highlight rendering.
-    pub fn matched_positions(&self, cand: &str) -> Vec<usize> {
-        fuzzy_match(&self.input.to_lowercase(), &cand.to_lowercase())
-            .map(|(pos, _)| pos)
-            .unwrap_or_default()
+    /// The matched char positions in candidate `index` for the current input,
+    /// for highlight rendering.
+    pub fn matched_positions(&self, index: usize) -> Vec<usize> {
+        fuzzy_match(
+            &self.input.to_lowercase(),
+            &self.candidates[index].to_lowercase(),
+        )
+        .map(|(pos, _)| pos)
+        .unwrap_or_default()
     }
 
-    /// The value to submit: the highlighted candidate, or the raw input.
+    /// The value to submit: the highlighted candidate's value, or the raw input.
     fn value(&self) -> String {
-        self.filtered()
-            .get(self.selected)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| self.input.clone())
+        match self.filtered().get(self.selected) {
+            Some(&i) => self
+                .values
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| self.candidates[i].clone()),
+            None => self.input.clone(),
+        }
     }
 }
 
@@ -1803,12 +1854,13 @@ mod fuzzy_tests {
                 "zzz/mas-fix".into(),
                 "release/master".into(),
             ],
+            values: Vec::new(),
             selected: 0,
             action: PromptAction::CheckoutBranch,
             masked: false,
         };
         // Same word-start dense match, so the shorter candidate wins.
-        assert_eq!(p.filtered()[0], "zzz/mas-fix");
+        assert_eq!(p.candidates[p.filtered()[0]], "zzz/mas-fix");
         p.input = "HEAD~2".into();
         assert!(p.filtered().is_empty(), "raw revs match nothing");
     }
@@ -1900,6 +1952,8 @@ pub enum Effect {
     LoadPushRemotes,
     /// Load remote names, then open the prompt `pending_remote_prompt` names.
     LoadRemoteNames,
+    /// Load commit (or branch) candidates, then open the picker for `action`.
+    LoadPromptCandidates(PromptAction),
     /// Load linked worktrees, then push the worktrees view.
     LoadWorktrees,
     /// Open the worktree at `path` and load its changes, then push a read-only
@@ -1999,6 +2053,9 @@ const ASYNC_DIFF_LINES: usize = 200;
 
 /// Commits fetched per log auto-load-more step.
 const LOG_BATCH: usize = 300;
+
+/// How many recent commits a revision picker prompt offers.
+pub const REV_CANDIDATES: usize = 200;
 
 impl PreviewKey {
     /// The revision to hand `commit_details` for the async-loaded kinds; `None`
@@ -3185,6 +3242,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 input: String::new(),
                 cursor: 0,
                 candidates: Vec::new(),
+                values: Vec::new(),
                 selected: 0,
                 action: PromptAction::Credential,
                 masked,
@@ -3292,8 +3350,23 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 input: String::new(),
                 cursor: 0,
                 candidates: names,
+                values: Vec::new(),
                 selected: 0,
                 action: action.unwrap_or(PromptAction::RemoveRemote),
+                masked: false,
+            });
+        }
+        Msg::PromptCandidatesLoaded { action, options } => {
+            let (candidates, values): (Vec<String>, Vec<String>) =
+                options.into_iter().unzip();
+            app.prompt = Some(Prompt {
+                label: rev_prompt_label(action).into(),
+                input: String::new(),
+                cursor: 0,
+                candidates,
+                values,
+                selected: 0,
+                action,
                 masked: false,
             });
         }
@@ -3312,6 +3385,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     input: String::new(),
                     cursor: 0,
                     candidates: remotes.into_iter().map(|r| r.name).collect(),
+                    values: Vec::new(),
                     selected: 0,
                     action: PromptAction::PushRemote,
                     masked: false,
@@ -3343,6 +3417,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 input: String::new(),
                 cursor: 0,
                 candidates: Vec::new(),
+                values: Vec::new(),
                 selected: 0,
                 action: PromptAction::ForgeCreate,
                 masked: false,
@@ -3485,7 +3560,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.busy = None;
             app.error = Some(e);
         }
-        Msg::DiffPrompt => revision_prompt(app, "Diff (revA revB)", PromptAction::DiffRefs),
+        Msg::DiffPrompt => return rev_picker_prompt(app, PromptAction::DiffRefs),
         Msg::DiffLoaded { title, files } => {
             let mut buffer = Buffer::default();
             buffer.set_content(build_diff(&title, &files));
@@ -3520,6 +3595,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 input: String::new(),
                 cursor: 0,
                 candidates,
+                values: Vec::new(),
                 selected: 0,
                 action: PromptAction::CheckoutBranch,
                 masked: false,
@@ -3561,7 +3637,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::MergeMenu => app.transient = Some(Transient::merge()),
         Msg::ResetMenu => app.transient = Some(Transient::reset()),
         Msg::TagMenu => app.transient = Some(Transient::tag()),
-        Msg::CherryPick => revision_prompt(app, "Cherry-pick", PromptAction::CherryPick),
+        Msg::CherryPick => return rev_picker_prompt(app, PromptAction::CherryPick),
         Msg::ResolveOurs => return resolve_conflict_at(app, true),
         Msg::ResolveTheirs => return resolve_conflict_at(app, false),
         Msg::BisectStartPrompt => {
@@ -3708,7 +3784,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             buffer.set_content(sections);
             app.push_view(ViewKind::Review, buffer);
         }
-        Msg::Revert => revision_prompt(app, "Revert", PromptAction::Revert),
+        Msg::Revert => return rev_picker_prompt(app, PromptAction::Revert),
         Msg::TransientCancel => app.transient = None,
         Msg::TransientChar(c) => return transient_key(app, c),
         Msg::PaletteOpen => {
@@ -4267,7 +4343,17 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         return Vec::new();
     }
     let value = prompt.value();
-    if value.is_empty() {
+    // Blank means HEAD where a picker prompt says so (diff to, reword and
+    // split from); elsewhere a blank submit is a cancel.
+    if value.is_empty()
+        && !matches!(
+            prompt.action,
+            PromptAction::DiffRefsTo
+                | PromptAction::RewordRev
+                | PromptAction::SplitRev
+                | PromptAction::RebaseInteractive
+        )
+    {
         return Vec::new();
     }
     if let PromptAction::ForgeCreate = prompt.action {
@@ -4317,14 +4403,17 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         return Vec::new();
     }
     // A diff of two revisions (one rev diffs against HEAD).
-    if let PromptAction::DiffRefs = prompt.action {
-        let mut parts = value.split_whitespace();
-        let (from, to) = match (parts.next(), parts.next()) {
-            (Some(a), Some(b)) => (a.to_owned(), b.to_owned()),
-            (Some(a), None) => ("HEAD".to_owned(), a.to_owned()),
-            _ => return Vec::new(),
+    // Final step of a two-rev diff: the first pick is stashed as the "from".
+    if let PromptAction::DiffRefsTo = prompt.action {
+        let to = if value.trim().is_empty() {
+            "HEAD".to_owned()
+        } else {
+            value
         };
-        return vec![Effect::LoadDiff { from, to }];
+        if let Some(from) = app.pending_prompt_value.take() {
+            return vec![Effect::LoadDiff { from, to }];
+        }
+        return Vec::new();
     }
     // A log author filter loads a filtered log view, not a mutation.
     if let PromptAction::LogAuthor = prompt.action {
@@ -4402,12 +4491,7 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
                 return Vec::new();
             }
             app.pending_reorder_rev = Some(value);
-            revision_prompt(
-                app,
-                "Move it before which commit",
-                PromptAction::ReorderTarget,
-            );
-            return Vec::new();
+            return rev_picker_prompt(app, PromptAction::ReorderTarget);
         }
         // Split is two steps: pick the commit, then the paths for the first part.
         PromptAction::SplitRev => {
@@ -4449,6 +4533,7 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         // Handled above via an early return.
         PromptAction::RebaseOnto | PromptAction::MergeBranch => return Vec::new(),
         PromptAction::RebaseInteractive => return Vec::new(),
+        PromptAction::DiffRefsTo => return Vec::new(),
         PromptAction::ResetSoft => Mutation::Reset {
             rev: value,
             mode: ResetMode::Soft,
@@ -4592,12 +4677,7 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
                     base: format!("{id}~1"),
                 }]
             } else {
-                revision_prompt(
-                    app,
-                    "Interactive rebase from",
-                    PromptAction::RebaseInteractive,
-                );
-                Vec::new()
+                return rev_picker_prompt(app, PromptAction::RebaseInteractive);
             }
         }
         ActionKind::RebaseContinue => {
@@ -4610,22 +4690,12 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
             app.busy = Some("rebasing".into());
             vec![Effect::Mutate(Mutation::RebaseSkip)]
         }
-        ActionKind::ResetSoft => {
-            revision_prompt(app, "Reset soft to", PromptAction::ResetSoft);
-            Vec::new()
-        }
-        ActionKind::ResetMixed => {
-            revision_prompt(app, "Reset mixed to", PromptAction::ResetMixed);
-            Vec::new()
-        }
-        ActionKind::ResetHard => {
-            revision_prompt(app, "Reset HARD to", PromptAction::ResetHard);
-            Vec::new()
-        }
+        ActionKind::ResetSoft => rev_picker_prompt(app, PromptAction::ResetSoft),
+        ActionKind::ResetMixed => rev_picker_prompt(app, PromptAction::ResetMixed),
+        ActionKind::ResetHard => rev_picker_prompt(app, PromptAction::ResetHard),
         ActionKind::MergeBranch => {
             app.pending_merge_no_ff = t_no_ff;
-            revision_prompt(app, "Merge", PromptAction::MergeBranch);
-            Vec::new()
+            rev_picker_prompt(app, PromptAction::MergeBranch)
         }
         ActionKind::TagCreate => {
             revision_prompt(app, "Tag name", PromptAction::CreateTag);
@@ -4655,31 +4725,15 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
         ActionKind::OpStackNew => update(app, Msg::StackNewPrompt),
         ActionKind::OpRestack => update(app, Msg::Restack),
         ActionKind::OpAbsorb => update(app, Msg::Absorb),
-        ActionKind::Reword => {
-            revision_prompt(app, "Reword commit (empty = HEAD)", PromptAction::RewordRev);
-            Vec::new()
-        }
-        ActionKind::Squash => {
-            revision_prompt(app, "Squash into parent (commit)", PromptAction::Squash);
-            Vec::new()
-        }
+        ActionKind::Reword => rev_picker_prompt(app, PromptAction::RewordRev),
+        ActionKind::Squash => rev_picker_prompt(app, PromptAction::Squash),
         ActionKind::Uncommit => {
             app.transient = None;
             app.loading = true;
             vec![Effect::Mutate(Mutation::Uncommit(1))]
         }
-        ActionKind::Reorder => {
-            revision_prompt(app, "Move which commit", PromptAction::ReorderRev);
-            Vec::new()
-        }
-        ActionKind::Split => {
-            revision_prompt(
-                app,
-                "Split which commit (empty = HEAD)",
-                PromptAction::SplitRev,
-            );
-            Vec::new()
-        }
+        ActionKind::Reorder => rev_picker_prompt(app, PromptAction::ReorderRev),
+        ActionKind::Split => rev_picker_prompt(app, PromptAction::SplitRev),
         ActionKind::OpSync => open_op(app, ConsoleOp::Sync),
         ActionKind::OpSubmit => open_op(app, ConsoleOp::Submit),
         ActionKind::OpStackNext => {
@@ -5461,6 +5515,7 @@ mod tests {
             input: String::new(),
             cursor: 0,
             candidates: Vec::new(),
+            values: Vec::new(),
             selected: 0,
             action: PromptAction::CreateBranch,
             masked: false,

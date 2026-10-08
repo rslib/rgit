@@ -1053,9 +1053,9 @@ fn render_prompt(frame: &mut Frame, prompt: &crate::app::Prompt, list: Rect, inp
         .iter()
         .enumerate()
         .map(|(i, cand)| {
-            let matched = prompt.matched_positions(cand);
+            let matched = prompt.matched_positions(*cand);
             let mut spans = vec![RSpan::raw("  ")];
-            for (x, ch) in cand.chars().enumerate() {
+            for (x, ch) in prompt.candidates[*cand].chars().enumerate() {
                 let style = if matched.contains(&x) {
                     RStyle::default().fg(theme::accent())
                 } else {
