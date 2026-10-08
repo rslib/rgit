@@ -15,6 +15,7 @@ use crate::git_repo::{hooks_dir, run_hook};
 const ZERO: &str = "0000000000000000000000000000000000000000";
 
 static STREAM: AtomicBool = AtomicBool::new(false);
+static RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Let hooks write straight to the terminal (their stdout on stderr), as git
 /// runs them, instead of capturing their output for an error report.
@@ -24,6 +25,25 @@ pub fn stream_hooks() {
 
 pub(crate) fn streaming() -> bool {
     STREAM.load(Ordering::Relaxed)
+}
+
+pub fn hook_running() -> bool {
+    RUNNING.load(Ordering::Relaxed)
+}
+
+pub(crate) struct HookActivity;
+
+impl HookActivity {
+    pub(crate) fn start() -> Self {
+        RUNNING.store(true, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for HookActivity {
+    fn drop(&mut self) {
+        RUNNING.store(false, Ordering::Relaxed);
+    }
 }
 
 /// The executable `name` hook in `dir`, if there is one.

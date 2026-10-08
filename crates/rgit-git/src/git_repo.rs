@@ -7260,6 +7260,7 @@ pub(crate) fn run_hook_env(
     } else {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     }
+    let _activity = crate::hooks::HookActivity::start();
     let mut child = cmd.spawn()?;
     if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
         // A hook that exits without reading its input is not an error.
@@ -7344,17 +7345,29 @@ fn hook_checked_report(
         scope.spawn(move || reader(Box::new(stdout), out_tx));
         let err_tx = line_tx.clone();
         scope.spawn(move || reader(Box::new(stderr), err_tx));
-        let status = child.wait()?;
-        Ok::<_, std::io::Error>(status)
+        drop(line_tx);
+        let mut stdout = String::new();
+        let mut status = None;
+        let mut disconnected = false;
+        while status.is_none() || !disconnected {
+            match line_rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                Ok(line) => {
+                    report(OpProgress::Line(line.clone()));
+                    stdout.push_str(&line);
+                    stdout.push('\n');
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+        }
+        status
+            .ok_or_else(|| std::io::Error::other("hook exited without a status"))
+            .map(|status| (status, stdout))
     })?;
-    drop(line_tx);
-    let mut stdout = String::new();
-    while let Ok(line) = line_rx.recv() {
-        report(OpProgress::Line(line.clone()));
-        stdout.push_str(&line);
-        stdout.push('\n');
-    }
-    let status = output;
+    let (status, stdout) = output;
     if status.success() {
         return Ok(());
     }
@@ -8499,6 +8512,44 @@ fn prefetch(repo: &Repository, cred: Option<&dyn crate::CredentialPrompt>) -> Re
     Ok(())
 }
 
+fn sideband_lines(pending: &mut Vec<u8>, data: &[u8]) -> Vec<String> {
+    pending.extend_from_slice(data);
+    let mut lines = Vec::new();
+    while let Some(end) = pending
+        .iter()
+        .position(|byte| matches!(byte, b'\r' | b'\n'))
+    {
+        let line = String::from_utf8_lossy(&pending[..end]).into_owned();
+        let delimiter = pending[end];
+        pending.drain(..=end);
+        if delimiter == b'\r' && pending.first() == Some(&b'\n') {
+            pending.remove(0);
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+#[cfg(test)]
+mod sideband_line_tests {
+    use super::sideband_lines;
+
+    #[test]
+    fn joins_chunks_before_splitting_progress_lines() {
+        let mut pending = Vec::new();
+        assert!(sideband_lines(&mut pending, b"Count").is_empty());
+        assert_eq!(
+            sideband_lines(&mut pending, b"ing objects: 9% (6/66)\rCounting"),
+            ["Counting objects: 9% (6/66)"]
+        );
+        assert_eq!(
+            sideband_lines(&mut pending, b" objects: 31% (21/66)\rFrom remote\n"),
+            ["Counting objects: 31% (21/66)", "From remote"]
+        );
+        assert!(pending.is_empty());
+    }
+}
+
 fn remote_callbacks<'a>(
     report: &'a dyn Fn(OpProgress),
     rejected: &'a std::sync::atomic::AtomicBool,
@@ -8581,8 +8632,8 @@ fn remote_callbacks<'a>(
         }
         Err(git2::Error::from_str("no supported authentication method"))
     });
-    // The remote's own messages, without the object-counting progress git
-    // shows only on a terminal.
+    // Sideband callbacks carry arbitrary chunks, not whole progress lines.
+    let pending = std::sync::Mutex::new(Vec::new());
     cb.sideband_progress(move |data| {
         const PROGRESS: [&str; 5] = [
             "Counting objects",
@@ -8591,10 +8642,11 @@ fn remote_callbacks<'a>(
             "Total ",
             "Resolving deltas",
         ];
-        for line in String::from_utf8_lossy(data)
-            .split(['\r', '\n'])
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !PROGRESS.iter().any(|p| l.starts_with(p)))
+        let lines = sideband_lines(&mut pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner), data);
+        for line in lines
+            .into_iter()
+            .map(|line| line.trim().to_owned())
+            .filter(|line| !line.is_empty() && !PROGRESS.iter().any(|p| line.starts_with(p)))
         {
             report(OpProgress::Line(format!("remote: {line}")));
         }

@@ -826,6 +826,7 @@ pub fn spinner(title: &str) -> Spinner {
         let g = glyphs();
         let mut frame = 0usize;
         let mut message = title;
+        let mut in_hook = false;
         let mut out = stderr();
         loop {
             match rx.recv_timeout(Duration::from_millis(80)) {
@@ -848,9 +849,14 @@ pub fn spinner(title: &str) -> Spinner {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => return,
             }
-            // Hold the line while a credential prompt owns the terminal, so the
-            // animation does not scribble over the password prompt.
-            if SPINNER_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed) {
+            let hook_running = rgit_git::hook_running();
+            if hook_running && !in_hook {
+                let _ = out.write_all(b"\r");
+                let _ = out.execute(Clear(ClearType::CurrentLine));
+                let _ = out.flush();
+            }
+            in_hook = hook_running;
+            if hook_running || SPINNER_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed) {
                 continue;
             }
             let glyph = g.spinner[frame % g.spinner.len()];

@@ -120,7 +120,7 @@ pub use fsck::{FsckOptions, FsckReport};
 pub use git_repo::{
     Git2Backend, OCTOPUS_FAILED, clone, diff_no_index, init, ls_remote, pathspec_matches, run_hook,
 };
-pub use hooks::{HookWatch, hook_run, stream_hooks, watch as watch_hooks};
+pub use hooks::{HookWatch, hook_run, hook_running, stream_hooks, watch as watch_hooks};
 pub use index_ops::{
     ALL_STAGES, CheckoutIndexOpts, ReadTreeOpts, Report, checkout_index, commit_tree, mktag,
     mktree, read_tree, update_index, write_tree,
