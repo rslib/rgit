@@ -1337,6 +1337,8 @@ fn rev_prompt_label(action: PromptAction) -> &'static str {
         PromptAction::MergeBranch => "Merge branch",
         PromptAction::DiffRefs => "Diff from",
         PromptAction::DiffRefsTo => "Diff to",
+        PromptAction::BisectStart => "Bad revision",
+        PromptAction::BisectStartGood => "Good revision",
         _ => "Pick",
     }
 }
@@ -1357,7 +1359,8 @@ fn two_step_next(action: PromptAction) -> Option<(&'static str, PromptAction)> {
         PromptAction::SetRemoteUrlName => Some(("New URL", PromptAction::SetRemoteUrlUrl)),
         PromptAction::RenameRemoteOld => Some(("New remote name", PromptAction::RenameRemoteNew)),
         PromptAction::AddWorktreeName => Some(("Worktree path", PromptAction::AddWorktreePath)),
-        PromptAction::DiffRefs => Some(("Diff to (type HEAD for HEAD)", PromptAction::DiffRefsTo)),
+        PromptAction::DiffRefs => Some(("Diff to", PromptAction::DiffRefsTo)),
+        PromptAction::BisectStart => Some(("Good revision", PromptAction::BisectStartGood)),
         _ => None,
     }
 }
@@ -1416,6 +1419,8 @@ pub enum PromptAction {
     /// Pick the second rev; blank submits HEAD (diff against HEAD).
     DiffRefsTo,
     BisectStart,
+    /// Pick the good rev, with the bad rev stashed in `pending_prompt_value`.
+    BisectStartGood,
     FlowInit,
     FlowStart,
     WorkspaceNew,
@@ -3647,9 +3652,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::CherryPick => return rev_picker_prompt(app, PromptAction::CherryPick),
         Msg::ResolveOurs => return resolve_conflict_at(app, true),
         Msg::ResolveTheirs => return resolve_conflict_at(app, false),
-        Msg::BisectStartPrompt => {
-            revision_prompt(app, "Bisect (bad good)", PromptAction::BisectStart);
-        }
+        Msg::BisectStartPrompt => return rev_picker_prompt(app, PromptAction::BisectStart),
         Msg::BisectGood => return vec![bisect(app, "good")],
         Msg::BisectBad => return vec![bisect(app, "bad")],
         Msg::BisectReset => return vec![bisect(app, "reset")],
@@ -4395,18 +4398,16 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         app.loading = true;
         return vec![Effect::Mutate(mutation)];
     }
-    // Bisect start takes a bad and a good revision.
-    if let PromptAction::BisectStart = prompt.action {
-        let mut parts = value.split_whitespace();
-        if let (Some(bad), Some(good)) = (parts.next(), parts.next()) {
+    // Final step of a bisect start: fire `git bisect start <bad> <good>`.
+    if let PromptAction::BisectStartGood = prompt.action {
+        if let Some(bad) = app.pending_prompt_value.take() {
             app.busy = Some("bisecting".into());
-            return vec![Effect::Mutate(Mutation::Bisect(vec![
-                "start".into(),
-                bad.into(),
-                good.into(),
-            ]))];
+            let mut args = vec!["start".to_owned(), bad];
+            if !value.trim().is_empty() {
+                args.push(value.clone());
+            }
+            return vec![Effect::Mutate(Mutation::Bisect(args))];
         }
-        app.error = Some("expected: <bad> <good>".into());
         return Vec::new();
     }
     // A diff of two revisions (one rev diffs against HEAD).
@@ -4588,6 +4589,7 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         | PromptAction::LogAuthor
         | PromptAction::DiffRefs
         | PromptAction::BisectStart
+        | PromptAction::BisectStartGood
         | PromptAction::FlowInit
         | PromptAction::FlowStart
         | PromptAction::WorkspaceNew
