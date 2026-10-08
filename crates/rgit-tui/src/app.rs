@@ -823,9 +823,15 @@ pub enum Msg {
     /// A click in the preview pane at this viewport-row offset.
     ClickPreview(usize),
     /// Extend the mouse drag-select to this body row/char column.
-    DragRow { offset: usize, col: usize },
+    DragRow {
+        offset: usize,
+        col: usize,
+    },
     /// Extend the live mouse drag-select in the preview pane.
-    DragPreview { offset: usize, col: usize },
+    DragPreview {
+        offset: usize,
+        col: usize,
+    },
     /// A drag ended; keep the selection so `y` yanks it.
     DragEnd,
     Refresh,
@@ -1370,10 +1376,22 @@ fn two_step_next(action: PromptAction) -> Option<(&'static str, PromptAction)> {
 fn two_step_mutation(app: &mut App, action: PromptAction, value: String) -> Option<Mutation> {
     let first = app.pending_prompt_value.take()?;
     match action {
-        PromptAction::AddRemoteUrl => Some(Mutation::AddRemote { name: first, url: value }),
-        PromptAction::SetRemoteUrlUrl => Some(Mutation::SetRemoteUrl { name: first, url: value }),
-        PromptAction::RenameRemoteNew => Some(Mutation::RenameRemote { old: first, new: value }),
-        PromptAction::AddWorktreePath => Some(Mutation::AddWorktree { name: first, path: value }),
+        PromptAction::AddRemoteUrl => Some(Mutation::AddRemote {
+            name: first,
+            url: value,
+        }),
+        PromptAction::SetRemoteUrlUrl => Some(Mutation::SetRemoteUrl {
+            name: first,
+            url: value,
+        }),
+        PromptAction::RenameRemoteNew => Some(Mutation::RenameRemote {
+            old: first,
+            new: value,
+        }),
+        PromptAction::AddWorktreePath => Some(Mutation::AddWorktree {
+            name: first,
+            path: value,
+        }),
         _ => None,
     }
 }
@@ -1834,7 +1852,7 @@ fn fuzzy_match(needle: &str, haystack: &str) -> Option<(Vec<usize>, u32)> {
 
 #[cfg(test)]
 mod fuzzy_tests {
-    use super::{fuzzy_match, is_subsequence, Prompt, PromptAction};
+    use super::{Prompt, PromptAction, fuzzy_match, is_subsequence};
 
     #[test]
     fn subsequence_matches_scattered_and_rejects_reordered() {
@@ -3369,8 +3387,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             });
         }
         Msg::PromptCandidatesLoaded { action, options } => {
-            let (candidates, values): (Vec<String>, Vec<String>) =
-                options.into_iter().unzip();
+            let (candidates, values): (Vec<String>, Vec<String>) = options.into_iter().unzip();
             app.prompt = Some(Prompt {
                 label: rev_prompt_label(action).into(),
                 input: String::new(),
@@ -4700,7 +4717,7 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
                     base: format!("{id}~1"),
                 }]
             } else {
-                return rev_picker_prompt(app, PromptAction::RebaseInteractive);
+                rev_picker_prompt(app, PromptAction::RebaseInteractive)
             }
         }
         ActionKind::RebaseContinue => {

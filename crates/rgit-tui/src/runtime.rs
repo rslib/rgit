@@ -13,9 +13,8 @@ use crate::app::{App, Effect, InfoKind, LaneOp, Leader, Msg, Mutation, TextOp, u
 use crate::events::{Event, Events};
 use crate::keymap::{
     self, resolve_commit_key, resolve_confirm_key, resolve_finder_key, resolve_help_key,
-    resolve_key, resolve_palette_key, resolve_prompt_key, resolve_rebase_key,
-    resolve_search_key, resolve_split_picker_key,
-    resolve_transient_key,
+    resolve_key, resolve_palette_key, resolve_prompt_key, resolve_rebase_key, resolve_search_key,
+    resolve_split_picker_key, resolve_transient_key,
 };
 use crate::ui;
 
@@ -685,15 +684,13 @@ async fn run_msg(
             Effect::LoadSplitFiles(rev) => {
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    match backend.commit_overview(&rev) {
-                        Ok(ov) => {
-                            let files = ov.files.into_iter().map(|f| f.path).collect();
-                            let _ = msg_tx.send(Msg::ShowSplitPicker { rev, files });
-                        }
-                        Err(e) => {
-                            let _ = msg_tx.send(Msg::Error(e.to_string()));
-                        }
+                tokio::task::spawn_blocking(move || match backend.commit_overview(&rev) {
+                    Ok(ov) => {
+                        let files = ov.files.into_iter().map(|f| f.path).collect();
+                        let _ = msg_tx.send(Msg::ShowSplitPicker { rev, files });
+                    }
+                    Err(e) => {
+                        let _ = msg_tx.send(Msg::Error(e.to_string()));
                     }
                 });
             }
@@ -703,10 +700,7 @@ async fn run_msg(
                 if action == crate::app::PromptAction::MergeBranch {
                     tokio::task::spawn_blocking(move || {
                         if let Ok(branches) = backend.local_branches() {
-                            let options = branches
-                                .into_iter()
-                                .map(|b| (b.clone(), b))
-                                .collect();
+                            let options = branches.into_iter().map(|b| (b.clone(), b)).collect();
                             let _ = msg_tx.send(Msg::PromptCandidatesLoaded { action, options });
                         }
                     });
