@@ -1299,11 +1299,18 @@ fn action(key: char, label: &str, kind: ActionKind) -> TransientAction {
 
 /// Open a minibuffer prompt where the user types a revision (no candidates).
 fn revision_prompt(app: &mut App, label: &str, action: PromptAction) {
+    revision_prompt_prefilled(app, label, action, "");
+}
+
+/// [`revision_prompt`](Self::revision_prompt) with text already in the box,
+/// caret at the end - a rename prefilling the old path.
+fn revision_prompt_prefilled(app: &mut App, label: &str, action: PromptAction, prefill: &str) {
+    let cursor = prefill.chars().count();
     app.transient = None;
     app.prompt = Some(Prompt {
         label: label.into(),
-        input: String::new(),
-        cursor: 0,
+        input: prefill.to_owned(),
+        cursor,
         candidates: Vec::new(),
         values: Vec::new(),
         selected: 0,
@@ -3006,7 +3013,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::MvAtCursor => {
             if let Some(Target::File { path, .. }) = app.buffer().target_at_cursor() {
                 app.pending_move_from = Some(path.clone());
-                revision_prompt(app, &format!("Rename {path} to"), PromptAction::MoveFile);
+                revision_prompt_prefilled(app, "Rename to", PromptAction::MoveFile, &path);
             }
         }
         Msg::CodeFinderOpen => {
