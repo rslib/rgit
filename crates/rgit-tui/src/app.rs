@@ -597,6 +597,8 @@ pub enum Msg {
     RemotesLoaded(Vec<Remote>),
     /// Remotes loaded specifically to pick a push target.
     PushRemotesLoaded(Vec<Remote>),
+    /// Remote names loaded to open the next step of a remote prompt.
+    RemoteNamesLoaded(Vec<String>),
     WorktreeMenu,
     WorktreesLoaded(Vec<Worktree>),
     /// A worktree's changes, ready to show in a read-only inspection view.
@@ -1269,6 +1271,31 @@ fn revision_prompt(app: &mut App, label: &str, action: PromptAction) {
     });
 }
 
+/// The follow-up prompt of a two-step prompt's first step: stash the first
+/// value and open the second, or `None` when `action` is a single-step prompt.
+fn two_step_next(action: PromptAction) -> Option<(&'static str, PromptAction)> {
+    match action {
+        PromptAction::AddRemoteName => Some(("URL of the remote", PromptAction::AddRemoteUrl)),
+        PromptAction::SetRemoteUrlName => Some(("New URL", PromptAction::SetRemoteUrlUrl)),
+        PromptAction::RenameRemoteOld => Some(("New remote name", PromptAction::RenameRemoteNew)),
+        PromptAction::AddWorktreeName => Some(("Worktree path", PromptAction::AddWorktreePath)),
+        _ => None,
+    }
+}
+
+/// The mutation a two-step prompt's final step fires, pairing the prompt value
+/// with the first step's stored value.
+fn two_step_mutation(app: &mut App, action: PromptAction, value: String) -> Option<Mutation> {
+    let first = app.pending_prompt_value.take()?;
+    match action {
+        PromptAction::AddRemoteUrl => Some(Mutation::AddRemote { name: first, url: value }),
+        PromptAction::SetRemoteUrlUrl => Some(Mutation::SetRemoteUrl { name: first, url: value }),
+        PromptAction::RenameRemoteNew => Some(Mutation::RenameRemote { old: first, new: value }),
+        PromptAction::AddWorktreePath => Some(Mutation::AddWorktree { name: first, path: value }),
+        _ => None,
+    }
+}
+
 /// What a submitted [`Prompt`] does with its value.
 #[derive(Debug, Clone, Copy)]
 pub enum PromptAction {
@@ -1287,11 +1314,23 @@ pub enum PromptAction {
     StashMessage,
     RenameBranch,
     DeleteBranch,
-    AddRemote,
     RemoveRemote,
-    SetRemoteUrl,
-    RenameRemote,
-    AddWorktree,
+    /// Pick the remote to add; then prompt for its URL.
+    AddRemoteName,
+    /// Add `pending_prompt_value` as a remote with the prompt value as URL.
+    AddRemoteUrl,
+    /// Pick the remote whose URL changes; then prompt for the new URL.
+    SetRemoteUrlName,
+    /// Set `pending_prompt_value`'s URL to the prompt value.
+    SetRemoteUrlUrl,
+    /// Pick the remote to rename; then prompt for the new name.
+    RenameRemoteOld,
+    /// Rename `pending_prompt_value` to the prompt value.
+    RenameRemoteNew,
+    /// Pick the new worktree's name; then prompt for its path.
+    AddWorktreeName,
+    /// Add a worktree named `pending_prompt_value` at the prompt value.
+    AddWorktreePath,
     RemoveWorktree,
     LogAuthor,
     DiffRefs,
@@ -1728,6 +1767,8 @@ pub enum Effect {
     LoadRemotes,
     /// Load remotes, then open a picker to push the current branch to one.
     LoadPushRemotes,
+    /// Load remote names, then open the prompt `pending_remote_prompt` names.
+    LoadRemoteNames,
     /// Load linked worktrees, then push the worktrees view.
     LoadWorktrees,
     /// Open the worktree at `path` and load its changes, then push a read-only
@@ -1923,6 +1964,10 @@ pub struct App {
     pending_split_rev: Option<String>,
     /// The file being renamed, stashed while the new name is entered.
     pending_move_from: Option<String>,
+    /// First-step value of a two-step prompt (remote name, worktree name).
+    pending_prompt_value: Option<String>,
+    /// The second-step remote prompt to open once remote names load.
+    pending_remote_prompt: Option<PromptAction>,
     pending_lane: Option<String>,
     /// The path targeted by a pending lane-assign prompt.
     pending_lane_path: Option<String>,
@@ -2055,6 +2100,8 @@ impl App {
             pending_reorder_rev: None,
             pending_split_rev: None,
             pending_move_from: None,
+            pending_prompt_value: None,
+            pending_remote_prompt: None,
             pending_lane: None,
             pending_lane_path: None,
             pending_cred_reply: None,
@@ -3077,6 +3124,23 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.push_view(ViewKind::Stack, buffer);
         }
         Msg::RemoteMenu => app.transient = Some(Transient::remote()),
+        Msg::RemoteNamesLoaded(names) => {
+            let action = app.pending_remote_prompt.take();
+            app.prompt = Some(Prompt {
+                label: match action {
+                    Some(PromptAction::RemoveRemote) => "Remove remote".into(),
+                    Some(PromptAction::SetRemoteUrlName) => "Which remote".into(),
+                    Some(PromptAction::RenameRemoteOld) => "Which remote".into(),
+                    _ => "Which remote".into(),
+                },
+                input: String::new(),
+                cursor: 0,
+                candidates: names,
+                selected: 0,
+                action: action.unwrap_or(PromptAction::RemoveRemote),
+                masked: false,
+            });
+        }
         Msg::RemotesLoaded(remotes) => {
             let mut buffer = Buffer::default();
             buffer.set_content(build_remotes(&remotes));
@@ -3997,73 +4061,16 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             base: base.to_owned(),
         }];
     }
-    // "name url" is split into two arguments for a remote add.
-    if let PromptAction::AddRemote = prompt.action {
-        let mut parts = value.split_whitespace();
-        match (parts.next(), parts.next()) {
-            (Some(name), Some(url)) => {
-                app.loading = true;
-                return vec![Effect::Mutate(Mutation::AddRemote {
-                    name: name.to_owned(),
-                    url: url.to_owned(),
-                })];
-            }
-            _ => {
-                app.error = Some("expected: <name> <url>".into());
-                return Vec::new();
-            }
-        }
+    // Two-step prompts: stash the first value, then prompt for the second.
+    if let Some(next) = two_step_next(prompt.action) {
+        app.pending_prompt_value = Some(value.clone());
+        revision_prompt(app, next.0, next.1);
+        return Vec::new();
     }
-    // "name url" changes a remote's fetch URL (git's remote set-url).
-    if let PromptAction::SetRemoteUrl = prompt.action {
-        let mut parts = value.split_whitespace();
-        match (parts.next(), parts.next()) {
-            (Some(name), Some(url)) => {
-                app.loading = true;
-                return vec![Effect::Mutate(Mutation::SetRemoteUrl {
-                    name: name.to_owned(),
-                    url: url.to_owned(),
-                })];
-            }
-            _ => {
-                app.error = Some("expected: <name> <url>".into());
-                return Vec::new();
-            }
-        }
-    }
-    // "old new" renames a remote (git's remote rename).
-    if let PromptAction::RenameRemote = prompt.action {
-        let mut parts = value.split_whitespace();
-        match (parts.next(), parts.next()) {
-            (Some(old), Some(new)) => {
-                app.loading = true;
-                return vec![Effect::Mutate(Mutation::RenameRemote {
-                    old: old.to_owned(),
-                    new: new.to_owned(),
-                })];
-            }
-            _ => {
-                app.error = Some("expected: <old> <new>".into());
-                return Vec::new();
-            }
-        }
-    }
-    // "name path" is split into two arguments for a worktree add.
-    if let PromptAction::AddWorktree = prompt.action {
-        let mut parts = value.split_whitespace();
-        match (parts.next(), parts.next()) {
-            (Some(name), Some(path)) => {
-                app.loading = true;
-                return vec![Effect::Mutate(Mutation::AddWorktree {
-                    name: name.to_owned(),
-                    path: path.to_owned(),
-                })];
-            }
-            _ => {
-                app.error = Some("expected: <name> <path>".into());
-                return Vec::new();
-            }
-        }
+    // Final step of a two-step prompt: fire the stored first value with it.
+    if let Some(mutation) = two_step_mutation(app, prompt.action, value.clone()) {
+        app.loading = true;
+        return vec![Effect::Mutate(mutation)];
     }
     // Bisect start takes a bad and a good revision.
     if let PromptAction::BisectStart = prompt.action {
@@ -4266,10 +4273,14 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         PromptAction::RemoveRemote => Mutation::RemoveRemote(value),
         PromptAction::RemoveWorktree => Mutation::RemoveWorktree(value),
         // Handled above via an early return.
-        PromptAction::AddRemote
-        | PromptAction::SetRemoteUrl
-        | PromptAction::RenameRemote
-        | PromptAction::AddWorktree
+        PromptAction::AddRemoteName
+        | PromptAction::AddRemoteUrl
+        | PromptAction::SetRemoteUrlName
+        | PromptAction::SetRemoteUrlUrl
+        | PromptAction::RenameRemoteOld
+        | PromptAction::RenameRemoteNew
+        | PromptAction::AddWorktreeName
+        | PromptAction::AddWorktreePath
         | PromptAction::LogAuthor
         | PromptAction::DiffRefs
         | PromptAction::BisectStart
@@ -4509,27 +4520,31 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
             vec![Effect::LoadRemotes]
         }
         ActionKind::RemoteAdd => {
-            revision_prompt(app, "Add remote (name url)", PromptAction::AddRemote);
+            app.transient = None;
+            revision_prompt(app, "New remote name", PromptAction::AddRemoteName);
             Vec::new()
         }
         ActionKind::RemoteRemove => {
-            revision_prompt(app, "Remove remote", PromptAction::RemoveRemote);
-            Vec::new()
+            app.transient = None;
+            app.pending_remote_prompt = Some(PromptAction::RemoveRemote);
+            vec![Effect::LoadRemoteNames]
         }
         ActionKind::RemoteSetUrl => {
-            revision_prompt(app, "Set remote URL (name url)", PromptAction::SetRemoteUrl);
-            Vec::new()
+            app.transient = None;
+            app.pending_remote_prompt = Some(PromptAction::SetRemoteUrlName);
+            vec![Effect::LoadRemoteNames]
         }
         ActionKind::RemoteRename => {
-            revision_prompt(app, "Rename remote (old new)", PromptAction::RenameRemote);
-            Vec::new()
+            app.transient = None;
+            app.pending_remote_prompt = Some(PromptAction::RenameRemoteOld);
+            vec![Effect::LoadRemoteNames]
         }
         ActionKind::WorktreeList => {
             app.transient = None;
             vec![Effect::LoadWorktrees]
         }
         ActionKind::WorktreeAdd => {
-            revision_prompt(app, "Add worktree (name path)", PromptAction::AddWorktree);
+            revision_prompt(app, "New worktree name", PromptAction::AddWorktreeName);
             Vec::new()
         }
         ActionKind::WorktreeRemove => {

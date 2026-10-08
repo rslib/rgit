@@ -838,6 +838,17 @@ async fn run_msg(
                     }
                 });
             }
+            Effect::LoadRemoteNames => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(remotes) = backend.remotes() {
+                        let _ = msg_tx.send(Msg::RemoteNamesLoaded(
+                            remotes.into_iter().map(|r| r.name).collect(),
+                        ));
+                    }
+                });
+            }
             Effect::LoadSmartlog => {
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
