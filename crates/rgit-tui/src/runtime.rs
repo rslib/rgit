@@ -728,6 +728,28 @@ async fn run_msg(
                         continue;
                     }
                 };
+                // The editor that spawned rgit opens the file in its own
+                // running instance when it left a trace in the environment;
+                // the remote/CLI command exits at once, so restore the TUI
+                // immediately. Otherwise hand the terminal to $EDITOR at the
+                // line/column and take it back, the same suspend/resume the
+                // commit editor uses.
+                if let Some(host) = HostEditor::detect() {
+                    events.pause();
+                    ratatui::restore();
+                    let opened =
+                        tokio::task::spawn_blocking(move || host.run(&full, line, col)).await;
+                    *terminal = ratatui::init();
+                    enable_mouse_capture();
+                    events.resume();
+                    if !matches!(opened, Ok(Ok(true))) {
+                        app.push_toast(
+                            crate::app::ToastKind::Error,
+                            "could not open in host editor".into(),
+                        );
+                    }
+                    continue;
+                }
                 // Hand the terminal to $EDITOR at the line/column, then take it
                 // back, the same suspend/resume the commit editor uses.
                 events.pause();
@@ -1135,41 +1157,38 @@ fn spawn_watcher(
     let workdir = backend.workdir().to_path_buf();
     let watchdir = workdir.clone();
     let watchdir_in = workdir.clone();
-    let mut debouncer = new_debouncer(
-        Duration::from_secs(1),
-        move |res: DebounceEventResult| {
-            let Ok(events) = res else {
-                return;
-            };
-            let mut interesting: Vec<std::path::PathBuf> = Vec::new();
-            for event in events {
-                if is_git_internal(&watchdir_in, &event.path) {
-                    continue;
-                }
-                interesting.push(event.path);
+    let mut debouncer = new_debouncer(Duration::from_secs(1), move |res: DebounceEventResult| {
+        let Ok(events) = res else {
+            return;
+        };
+        let mut interesting: Vec<std::path::PathBuf> = Vec::new();
+        for event in events {
+            if is_git_internal(&watchdir_in, &event.path) {
+                continue;
             }
-            if interesting.is_empty() {
-                return;
-            }
-            // `.gitignore`-driven check: one lock acquisition for the batch.
-            let backend = Arc::clone(&backend);
-            let msg_tx = msg_tx.clone();
-            std::thread::spawn(move || {
-                let paths: Vec<&std::path::Path> = interesting.iter().map(|p| p.as_path()).collect();
-                let flags = match backend.paths_ignored(&paths) {
-                    Ok(flags) => flags,
-                    Err(_) => {
-                        // Without a verdict, assume the events matter.
-                        let _ = msg_tx.send(Msg::AutoRefresh);
-                        return;
-                    }
-                };
-                if flags.into_iter().any(|ignored| !ignored) {
+            interesting.push(event.path);
+        }
+        if interesting.is_empty() {
+            return;
+        }
+        // `.gitignore`-driven check: one lock acquisition for the batch.
+        let backend = Arc::clone(&backend);
+        let msg_tx = msg_tx.clone();
+        std::thread::spawn(move || {
+            let paths: Vec<&std::path::Path> = interesting.iter().map(|p| p.as_path()).collect();
+            let flags = match backend.paths_ignored(&paths) {
+                Ok(flags) => flags,
+                Err(_) => {
+                    // Without a verdict, assume the events matter.
                     let _ = msg_tx.send(Msg::AutoRefresh);
+                    return;
                 }
-            });
-        },
-    )
+            };
+            if flags.into_iter().any(|ignored| !ignored) {
+                let _ = msg_tx.send(Msg::AutoRefresh);
+            }
+        });
+    })
     .ok()?;
     debouncer
         .watcher()
@@ -1194,9 +1213,7 @@ fn is_git_internal(workdir: &Path, path: &Path) -> bool {
     if rest.as_os_str().is_empty() {
         return true;
     }
-    !(rest == Path::new("index")
-        || rest == Path::new("HEAD")
-        || rest.starts_with("refs"))
+    !(rest == Path::new("index") || rest == Path::new("HEAD") || rest.starts_with("refs"))
 }
 /// Run a synchronous read/mutation on a blocking task and report the resulting
 /// status back as a [`Msg`], so the render loop never blocks.
@@ -1884,6 +1901,72 @@ const COMMIT_TEMPLATE: &str = "\n\
     # Please enter the commit message for your changes. Lines starting\n\
     # with '#' are ignored, and an empty message aborts the commit.\n";
 
+/// Opening in the editor that spawned rgit, when it left a trace in the
+/// environment. `Fire` commands return immediately (the CLI talks to an
+/// already-running editor), so the caller redraws the TUI and does not wait;
+/// only the nvim path holds the terminal.
+#[derive(Debug, PartialEq, Eq)]
+enum HostEditor {
+    /// nvim job/`:!` child: `$NVIM` names the host's RPC socket.
+    Nvim(String),
+    /// vim clientserver child: `$VIM_SERVERNAME` names the host instance.
+    Vim(String),
+    /// GUI editor launched rgit from its integrated terminal; the app's CLI
+    /// targets the running instance (usually the window we came from).
+    Gui(&'static str),
+}
+
+impl HostEditor {
+    /// Detect the spawning editor from the environment, before falling back
+    /// to `$EDITOR`. `$NVIM` wins over a `$EDITOR=nvim` mention: rgit running
+    /// inside nvim opens the file in the host, not as a nested instance.
+    fn detect() -> Option<HostEditor> {
+        Self::detect_with(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+    }
+
+    /// The pure decision, parameterized over the env lookup so tests can pass
+    /// a fixed environment without mutating process state.
+    fn detect_with(env: impl Fn(&str) -> Option<String>) -> Option<HostEditor> {
+        env("NVIM").map(HostEditor::Nvim).or_else(|| {
+            env("VIM_SERVERNAME").map(HostEditor::Vim).or_else(|| {
+                let prog = env("TERM_PROGRAM")?;
+                match prog.as_str() {
+                    "vscode" | "Cursor" | "Code - OSS" => Some(HostEditor::Gui("code")),
+                    "zed" => Some(HostEditor::Gui("zed")),
+                    _ => None,
+                }
+            })
+        })
+    }
+
+    /// The shell command that opens `$1` at `line`:`col` in the host editor.
+    fn open_command(&self, line: usize, col: usize) -> String {
+        match self {
+            // Prefer nvr over the RPC socket; fall back to bare nvim --remote,
+            // which opens the file but not at the position.
+            HostEditor::Nvim(_) => format!(
+                "if command -v nvr >/dev/null 2>&1; then nvr \"+call cursor({line},{col})\" --remote-tab \"$1\"; else nvim --remote-tab \"$1\"; fi"
+            ),
+            HostEditor::Vim(name) => format!(
+                "vim --servername {name} --remote-tab \"+call cursor({line},{col})\" \"$1\""
+            ),
+            HostEditor::Gui(cli) => format!("{cli} -g \"$1\":{line}:{col}"),
+        }
+    }
+
+    /// Run the host-open command on `path`, inheriting the terminal. Returns
+    /// whether it exited successfully.
+    fn run(&self, path: &Path, line: usize, col: usize) -> std::io::Result<bool> {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(self.open_command(line.max(1), col.max(1)))
+            .arg("sh")
+            .arg(path)
+            .status()?;
+        Ok(status.success())
+    }
+}
+
 fn editor_command() -> String {
     std::env::var("GIT_EDITOR")
         .or_else(|_| std::env::var("VISUAL"))
@@ -2000,8 +2083,65 @@ fn base64_encode(input: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, editor_open_command, grep_hits, restack_note, snippet_sections};
+    use super::{
+        HostEditor, base64_encode, editor_open_command, grep_hits, restack_note, snippet_sections,
+    };
     use rgit_git::RestackOutcome;
+
+    #[test]
+    fn host_editor_detect_reads_the_environment() {
+        // (NVIM, VIM_SERVERNAME, TERM_PROGRAM) -> expected variant.
+        let cases: &[(&str, &str, &str, Option<&str>)] = &[
+            ("/tmp/nvim-socket", "", "", Some("nvim")),
+            ("", "MAIN", "", Some("vim")),
+            ("", "", "vscode", Some("gui")),
+            ("", "", "Cursor", Some("gui")),
+            ("", "", "zed", Some("gui")),
+            ("", "", "tmux", None),
+            ("", "", "", None),
+            ("/tmp/nvim-socket", "MAIN", "vscode", Some("nvim")),
+        ];
+        for (nvim, servername, term, want) in cases {
+            let vars = [
+                ("NVIM", *nvim),
+                ("VIM_SERVERNAME", *servername),
+                ("TERM_PROGRAM", *term),
+            ];
+            let env = |k: &str| {
+                vars.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| *v)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+            };
+            let got = HostEditor::detect_with(env).map(|h| match h {
+                HostEditor::Nvim(_) => "nvim",
+                HostEditor::Vim(_) => "vim",
+                HostEditor::Gui(_) => "gui",
+            });
+            assert_eq!(
+                got.map(String::from),
+                want.map(|s| s.to_string()),
+                "NVIM={nvim:?} VIM_SERVERNAME={servername:?} TERM_PROGRAM={term:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_editor_open_command_targets_the_running_instance() {
+        assert_eq!(
+            HostEditor::Nvim("/tmp/s".into()).open_command(12, 5),
+            "if command -v nvr >/dev/null 2>&1; then nvr \"+call cursor(12,5)\" --remote-tab \"$1\"; else nvim --remote-tab \"$1\"; fi"
+        );
+        assert_eq!(
+            HostEditor::Vim("MAIN".into()).open_command(12, 5),
+            "vim --servername MAIN --remote-tab \"+call cursor(12,5)\" \"$1\""
+        );
+        assert_eq!(
+            HostEditor::Gui("code").open_command(12, 5),
+            "code -g \"$1\":12:5"
+        );
+    }
 
     #[test]
     fn editor_open_command_uses_each_editors_jump_syntax() {
