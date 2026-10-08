@@ -4575,8 +4575,22 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         PromptAction::CreateTag => Mutation::CreateTag(value),
         PromptAction::DeleteTag => Mutation::DeleteTag(value),
         PromptAction::StashMessage => Mutation::StashPushMessage(value),
-        PromptAction::RemoveRemote => Mutation::RemoveRemote(value),
-        PromptAction::RemoveWorktree => Mutation::RemoveWorktree(value),
+        // Removals destroy history-independent config and working trees, so
+        // they pass through the confirm dialog before mutating.
+        PromptAction::RemoveRemote => {
+            app.confirm = Some(PendingConfirm {
+                prompt: format!("Remove remote '{value}'?"),
+                mutation: Mutation::RemoveRemote(value),
+            });
+            return Vec::new();
+        }
+        PromptAction::RemoveWorktree => {
+            app.confirm = Some(PendingConfirm {
+                prompt: format!("Remove worktree '{value}'?"),
+                mutation: Mutation::RemoveWorktree(value),
+            });
+            return Vec::new();
+        }
         // Handled above via an early return.
         PromptAction::AddRemoteName
         | PromptAction::AddRemoteUrl
