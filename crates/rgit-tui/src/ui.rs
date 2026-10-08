@@ -104,6 +104,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_code_finder(frame, app, top, list_area);
         if has_preview {
             app.preview_top = prev_area.y + 1;
+            app.preview_left = prev_area.x + 2; // border + padding
             render_preview(frame, app, prev_area);
         }
         render_action_bar(frame, app, action);
@@ -133,6 +134,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // preview is open (the change count already shows in the title bar).
     let nav_area = if has_preview { nav } else { body };
     app.body_top = nav_area.y;
+    app.body_left = nav_area.x;
     app.buffer_mut().set_height(nav_area.height as usize);
     render_body(frame, app, nav_area);
     render_scrollbar(
@@ -144,6 +146,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     );
     if has_preview {
         app.preview_top = prev.y + 1; // + the PREVIEW label row inside the pane
+        app.preview_left = prev.x + 2; // border + padding
         render_preview(frame, app, prev);
     }
     render_action_bar(frame, app, action);

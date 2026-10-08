@@ -817,6 +817,12 @@ pub enum Msg {
     ClickRow(usize),
     /// A click in the preview pane at this viewport-row offset.
     ClickPreview(usize),
+    /// Extend the mouse drag-select to this body row/char column.
+    DragRow { offset: usize, col: usize },
+    /// Extend the live mouse drag-select in the preview pane.
+    DragPreview { offset: usize, col: usize },
+    /// A drag ended; keep the selection so `y` yanks it.
+    DragEnd,
     Refresh,
     /// A refresh triggered by the file watcher; quiet (no loading indicator).
     AutoRefresh,
@@ -2138,9 +2144,19 @@ pub struct App {
     /// Terminal row where the navigator's first visible row is drawn, and the
     /// same for the preview, so a click maps to the right item under the header.
     pub body_top: u16,
+    pub body_left: u16,
     pub preview_top: u16,
+    /// The x column where pane text starts, so a mouse drag maps to a char
+    /// column (the pane's border and padding sit left of the first char).
+    pub preview_left: u16,
     /// The last click (in-preview?, row, time), for double-click fold detection.
     last_click: Option<(bool, usize, std::time::Instant)>,
+    /// Mouse-drag state: `Some(preview)` after a press records which pane a
+    /// drag would extend, `None` otherwise; `mouse_dragging` once a real drag
+    /// has started (a plain click never enters selection mode).
+    mouse_drag_pane: Option<bool>,
+    mouse_dragging: bool,
+    mouse_press_col: Option<usize>,
     /// Which regions let the terminal background show through.
     pub error: Option<String>,
     pub forge_account: Option<String>,
@@ -2249,8 +2265,13 @@ impl App {
             console_hold: config.ui.console_hold,
             split_x: None,
             body_top: 1,
+            body_left: 0,
             preview_top: 1,
+            preview_left: 0,
             last_click: None,
+            mouse_drag_pane: None,
+            mouse_dragging: false,
+            mouse_press_col: None,
             forge_account,
             forge_host,
             transparency: config.ui.transparent,
@@ -2708,6 +2729,16 @@ impl App {
                 .hook_console
                 .as_ref()
                 .is_some_and(|c| c.status == HookStatus::Running)
+    }
+
+    pub fn drag_state(&self) -> (Option<bool>, bool) {
+        (self.mouse_drag_pane, self.mouse_dragging)
+    }
+
+    pub fn drag_end(&mut self) {
+        self.mouse_drag_pane = None;
+        self.mouse_dragging = false;
+        self.mouse_press_col = None;
     }
 
     pub fn push_toast(&mut self, kind: ToastKind, text: String) {
@@ -3734,10 +3765,13 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::ClickRow(offset) => {
             // A single click moves the cursor and takes focus. A double-click
             // activates the row by type: a hunk or diff line opens the editor, a
-            // foldable file/section folds, anything else acts like Return.
+            // foldable file/section folds, anything else acts like Return. A
+            // drag from here extends a charwise selection from the click point.
             app.preview_focus = false;
+            app.mouse_drag_pane = Some(false);
             let idx = app.buffer().scroll() + offset;
             app.buffer_mut().set_cursor(idx);
+            app.mouse_press_col = Some(app.buffer().char_col());
             if app.is_double_click(false, idx) {
                 if let Some(effect) = editor_at_hunk(app) {
                     return vec![effect];
@@ -3753,13 +3787,44 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::ClickPreview(offset) => {
             if app.preview_visible {
                 app.preview_focus = true;
+                app.mouse_drag_pane = Some(true);
                 let idx = app.preview_buf.scroll() + offset;
                 app.preview_buf.set_cursor(idx);
+                app.mouse_press_col = Some(app.preview_buf.char_col());
                 if app.is_double_click(true, idx) {
                     app.preview_buf.toggle_fold();
                 }
             }
         }
+        Msg::DragRow { offset, col } => {
+            app.preview_focus = false;
+            let idx = app.buffer().scroll() + offset;
+            if app.mouse_drag_pane == Some(false) {
+                let col0 = app.mouse_press_col.unwrap_or(col);
+                app.buffer_mut().begin_mouse_selection(idx, col0);
+                app.mouse_drag_pane = None;
+                app.mouse_dragging = true;
+            }
+            if app.mouse_dragging {
+                app.buffer_mut().drag_mouse_selection(idx, col);
+            }
+        }
+        Msg::DragPreview { offset, col } => {
+            if app.preview_visible {
+                app.preview_focus = true;
+                let idx = app.preview_buf.scroll() + offset;
+                if app.mouse_drag_pane == Some(true) {
+                    let col0 = app.mouse_press_col.unwrap_or(col);
+                    app.preview_buf.begin_mouse_selection(idx, col0);
+                    app.mouse_drag_pane = None;
+                    app.mouse_dragging = true;
+                }
+                if app.mouse_dragging {
+                    app.preview_buf.drag_mouse_selection(idx, col);
+                }
+            }
+        }
+        Msg::DragEnd => app.drag_end(),
         Msg::SearchNext => {
             let from = app.buffer().cursor() + 1;
             repeat_search(app, from, true);

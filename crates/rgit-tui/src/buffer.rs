@@ -80,6 +80,28 @@ impl Buffer {
         };
     }
 
+    /// Begin a mouse drag: put the caret at (row, col) and anchor a charwise
+    /// selection there. Any other visual clears first.
+    pub fn begin_mouse_selection(&mut self, row: usize, col: usize) {
+        self.visual = None;
+        self.set_cursor(row);
+        self.col = col;
+        self.visual = Some(Visual::Char {
+            row: self.cursor,
+            col: self.col,
+        });
+    }
+
+    /// Extend the live mouse drag to (row, col), moving the caret. The anchor
+    /// stays where the drag began; a reversed drag swaps via `char_selection`.
+    pub fn drag_mouse_selection(&mut self, row: usize, col: usize) {
+        if !self.is_char_visual() {
+            return;
+        }
+        self.set_cursor(row);
+        self.col = col;
+    }
+
     /// The row span the selection covers (both visual modes), for staging and
     /// whole-row highlighting.
     pub fn selection_range(&self) -> Option<(usize, usize)> {
@@ -775,5 +797,27 @@ mod tests {
         b.move_cursor(5);
         assert_eq!(b.cursor(), 5);
         assert_eq!(b.scroll(), 4, "cursor stays within the 2-row viewport");
+    }
+
+    #[test]
+    fn mouse_drag_selects_then_yanks_text() {
+        let mut b = Buffer::default();
+        b.set_height(10);
+        b.set_content(section_with_two_files());
+        b.begin_mouse_selection(0, 1);
+        assert!(b.is_char_visual());
+        b.drag_mouse_selection(1, 3);
+        let ((r0, c0), (r1, c1)) = b.char_selection().expect("selection live");
+        assert_eq!((r0, c0), (0, 1));
+        assert_eq!((r1, c1), (1, 3));
+        // A reversed drag (release left of the anchor) still yields a span.
+        b.begin_mouse_selection(1, 3);
+        b.drag_mouse_selection(0, 1);
+        let ((r0, _), (r1, _)) = b.char_selection().expect("selection live");
+        assert_eq!((r0, r1), (0, 1));
+        // A drag without a live selection is a no-op, not a panic.
+        b.clear_selection();
+        b.drag_mouse_selection(0, 0);
+        assert!(!b.is_char_visual());
     }
 }

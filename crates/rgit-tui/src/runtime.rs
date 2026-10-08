@@ -435,6 +435,18 @@ fn mouse_msg(app: &App, m: crossterm::event::MouseEvent) -> Option<Msg> {
     const WHEEL: isize = 3;
     // The preview owns the columns at or past the split boundary.
     let over_preview = app.split_x.is_some_and(|x| m.column >= x);
+    let col = (m.column.saturating_sub(if over_preview {
+        app.preview_left
+    } else {
+        app.body_left
+    })) as usize;
+    let body = |offset: usize, focused_preview: bool| {
+        if focused_preview {
+            Msg::DragPreview { offset, col }
+        } else {
+            Msg::DragRow { offset, col }
+        }
+    };
     match m.kind {
         MouseEventKind::ScrollDown if over_preview => Some(Msg::ScrollPreview(WHEEL)),
         MouseEventKind::ScrollUp if over_preview => Some(Msg::ScrollPreview(-WHEEL)),
@@ -450,6 +462,23 @@ fn mouse_msg(app: &App, m: crossterm::event::MouseEvent) -> Option<Msg> {
                 let offset = m.row.checked_sub(app.body_top)? as usize;
                 Some(Msg::ClickRow(offset))
             }
+        }
+        // Drag extends a selection only after a press in the same pane; the
+        // press handler recorded which pane via `mouse_drag_pane`.
+        MouseEventKind::Drag(MouseButton::Left) if !overlay_active(app) => {
+            let focused_preview = app.drag_state().0.unwrap_or(app.preview_focus);
+            let top = if focused_preview {
+                app.preview_top
+            } else {
+                app.body_top
+            };
+            let offset = m.row.checked_sub(top)? as usize;
+            Some(body(offset, focused_preview))
+        }
+        // A release ends any drag; a click without motion already acted on Down.
+        MouseEventKind::Up(MouseButton::Left) => {
+            let (pending, dragging) = app.drag_state();
+            (dragging || pending.is_some()).then_some(Msg::DragEnd)
         }
         _ => None,
     }
