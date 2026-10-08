@@ -1050,12 +1050,21 @@ fn render_prompt(frame: &mut Frame, prompt: &crate::app::Prompt, list: Rect, inp
         .iter()
         .enumerate()
         .map(|(i, cand)| {
-            let line = Line::from(format!("  {cand}"));
-            if i == prompt.selected {
-                line.style(RStyle::default().bg(theme::select_bg()).fg(theme::accent()))
-            } else {
-                line.style(theme::resolve(Style::Dim))
+            let matched = prompt.matched_positions(cand);
+            let mut spans = vec![RSpan::raw("  ")];
+            for (x, ch) in cand.chars().enumerate() {
+                let style = if matched.contains(&x) {
+                    RStyle::default().fg(theme::accent())
+                } else {
+                    theme::resolve(Style::Dim)
+                };
+                spans.push(RSpan::styled(ch.to_string(), style));
             }
+            let mut line = Line::from(spans);
+            if i == prompt.selected {
+                line = line.style(RStyle::default().bg(theme::select_bg()).fg(theme::accent()));
+            }
+            line
         })
         .collect();
     frame.render_widget(Paragraph::new(rows), list);

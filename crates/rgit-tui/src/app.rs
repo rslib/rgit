@@ -1420,13 +1420,32 @@ impl Prompt {
         self.selected = 0;
     }
 
-    /// Candidates containing the current input, in order.
+    /// Candidates matching the input as a case-insensitive subsequence, best
+    /// match first (word starts and dense spans rank high, then shorter).
     pub fn filtered(&self) -> Vec<&str> {
-        self.candidates
+        let needle = self.input.to_lowercase();
+        let mut hits: Vec<(u32, usize, &str)> = self
+            .candidates
             .iter()
-            .filter(|c| c.contains(&self.input))
-            .map(String::as_str)
-            .collect()
+            .filter(|c| is_subsequence(&needle, &c.to_lowercase()))
+            .map(|c| {
+                let (score, len) = (
+                    fuzzy_match(&needle, &c.to_lowercase()).map_or(0, |(_, s)| s),
+                    c.chars().count(),
+                );
+                (score, len, c.as_str())
+            })
+            .collect();
+        hits.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        hits.into_iter().map(|(_, _, c)| c).collect()
+    }
+
+    /// The matched char positions in `cand` for the current input, for
+    /// highlight rendering.
+    pub fn matched_positions(&self, cand: &str) -> Vec<usize> {
+        fuzzy_match(&self.input.to_lowercase(), &cand.to_lowercase())
+            .map(|(pos, _)| pos)
+            .unwrap_or_default()
     }
 
     /// The value to submit: the highlighted candidate, or the raw input.
@@ -1710,6 +1729,83 @@ impl Palette {
 fn is_subsequence(needle: &str, haystack: &str) -> bool {
     let mut chars = haystack.chars();
     needle.chars().all(|n| chars.any(|h| h == n))
+}
+
+/// Which chars of `haystack` the `needle` greedily matches, and a score for
+/// ordering candidates: higher is better. Greedy left-to-right matching keeps
+/// the highlight stable; the score rewards word starts, boundaries and dense
+/// matches, fzf-style. `None` when `needle` does not match.
+fn fuzzy_match(needle: &str, haystack: &str) -> Option<(Vec<usize>, u32)> {
+    if needle.is_empty() {
+        return Some((Vec::new(), 0));
+    }
+    let hay: Vec<char> = haystack.chars().collect();
+    let mut matched = Vec::with_capacity(needle.chars().count());
+    let mut score = 0u32;
+    let mut search = 0usize;
+    for n in needle.chars() {
+        let start = search;
+        let hit = hay[start..].iter().position(|&h| h == n)? + start;
+        score += 1;
+        if hit == 0 || !hay[hit - 1].is_alphanumeric() {
+            // A match at a word start is worth more.
+            score += 8;
+        }
+        if hit == search {
+            // Dense: adjacent to the previous match.
+            score += 4;
+        }
+        matched.push(hit);
+        search = hit + 1;
+    }
+    // Shorter targets rank higher for the same match span.
+    score += (u32::try_from(hay.len()).unwrap_or(u32::MAX)).min(64) / 8;
+    Some((matched, score))
+}
+
+#[cfg(test)]
+mod fuzzy_tests {
+    use super::{fuzzy_match, is_subsequence, Prompt, PromptAction};
+
+    #[test]
+    fn subsequence_matches_scattered_and_rejects_reordered() {
+        assert!(is_subsequence("mabr", "main branch"));
+        assert!(is_subsequence("", "anything"));
+        assert!(!is_subsequence("om", "main"));
+    }
+
+    #[test]
+    fn fuzzy_match_scores_word_starts_and_dense_spans_first() {
+        let (matched, score_word_start) = fuzzy_match("lo", "log-limit").expect("match");
+        assert_eq!(matched, vec![0, 1]);
+        let (_, score_mid) = fuzzy_match("lo", "xlog-ol").expect("match");
+        assert!(score_word_start > score_mid);
+        assert!(fuzzy_match("zz", "log").is_none());
+        let (empty, zero) = fuzzy_match("", "log").expect("empty matches all");
+        assert!(empty.is_empty());
+        assert_eq!(zero, 0);
+    }
+
+    #[test]
+    fn prompt_ranks_best_candidate_first() {
+        let mut p = Prompt {
+            label: "x".into(),
+            input: "mas".into(),
+            cursor: 3,
+            candidates: vec![
+                "feature/masked".into(),
+                "zzz/mas-fix".into(),
+                "release/master".into(),
+            ],
+            selected: 0,
+            action: PromptAction::CheckoutBranch,
+            masked: false,
+        };
+        // Same word-start dense match, so the shorter candidate wins.
+        assert_eq!(p.filtered()[0], "zzz/mas-fix");
+        p.input = "HEAD~2".into();
+        assert!(p.filtered().is_empty(), "raw revs match nothing");
+    }
 }
 
 /// A side effect the runtime performs on the app's behalf. `update` returns
