@@ -2596,6 +2596,34 @@ impl App {
     fn status_buffer_mut(&mut self) -> &mut Buffer {
         &mut self.views[0].buffer
     }
+
+    /// The effect that reloads the active list view's content, so a refresh can
+    /// rebuild it; `None` for views a status refresh cannot rebuild (commit,
+    /// blame and diff views show a fixed revision; info panels are static).
+    fn reload_active_view(&mut self) -> Option<Effect> {
+        match self.active_kind() {
+            ViewKind::Log => {
+                // Re-run the view's own filters; the load-more path keeps the
+                // already-loaded count so history does not shrink.
+                let opts = self.log_options.clone()?;
+                let opts = LogOptions {
+                    limit: self.log_loaded.max(opts.limit),
+                    ..opts
+                };
+                self.log_loading = true;
+                Some(Effect::LoadLog(opts))
+            }
+            ViewKind::Lanes => Some(Effect::LoadLanes),
+            ViewKind::Smartlog => Some(Effect::LoadSmartlog),
+            ViewKind::Oplog => Some(Effect::LoadOplog),
+            ViewKind::Stack => Some(Effect::LoadStack),
+            ViewKind::Refs => Some(Effect::LoadRefs),
+            ViewKind::Remotes => Some(Effect::LoadRemotes),
+            ViewKind::Worktrees => Some(Effect::LoadWorktrees),
+            ViewKind::Forge => Some(Effect::LoadForge),
+            _ => None,
+        }
+    }
 }
 
 /// Apply a message, returning the effects the runtime should perform.
@@ -4875,6 +4903,14 @@ fn refreshed(app: &mut App, result: RefreshResult) -> Vec<Effect> {
                 app.push_toast(ToastKind::Success, format!("{label} done"));
             }
             let mut effects = app.sync_preview();
+            // A refresh only rebuilds the status buffer; a list view open above
+            // it (log, lanes, ...) would keep stale rows after a commit. Re-run
+            // its load so it rebuilds in place (set_content keeps the cursor).
+            if app.active_kind() != ViewKind::Status
+                && let Some(effect) = app.reload_active_view()
+            {
+                effects.push(effect);
+            }
             // A lazy snapshot paints instantly but has no diff text; fill it in
             // the background so stats, unfolds and hunk staging appear.
             let needs_fill = app
