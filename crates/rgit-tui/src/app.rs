@@ -5278,7 +5278,11 @@ fn rebuild_status(app: &mut App) {
     ) {
         sections.push(section);
     }
-    app.status_buffer_mut().set_content(sections);
+    // Keep a live drag selection across the rebuild: the file watcher fires
+    // any time the worktree changes, and a plain `set_content` would wipe
+    // the selection so the next `y` falls back to the current line.
+    app.status_buffer_mut()
+        .rebuild_preserving_selection(sections);
 }
 /// The REMOTE section: per-remote ahead/behind for the current branch, plus its
 /// open PR and CI rollup once loaded. `None` when there is nothing to show (no

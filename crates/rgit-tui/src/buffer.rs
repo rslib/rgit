@@ -60,6 +60,30 @@ impl Buffer {
         self.scroll_into_view();
     }
 
+    /// Replace the content while keeping a live selection (e.g. across a
+    /// status refresh from the file watcher), clamping its rows and columns
+    /// to the new bounds so it cannot point past the end. Use only when the
+    /// rebuild is the *same* buffer with refreshed data; full view changes
+    /// should still go through [`set_content`](Self::set_content).
+    pub fn rebuild_preserving_selection(&mut self, root: Vec<Section>) {
+        let saved_visual = self.visual;
+        let saved_cursor = self.cursor;
+        let saved_col = self.col;
+        self.set_content(root);
+        if saved_visual.is_some() {
+            self.visual = saved_visual;
+            let max = self.visible_len.saturating_sub(1);
+            match &mut self.visual {
+                Some(Visual::Line(r)) => *r = (*r).min(max),
+                Some(Visual::Char { row, .. }) => *row = (*row).min(max),
+                None => {}
+            }
+            self.cursor = saved_cursor.min(max);
+            self.col = saved_col.min(self.cursor_row_len());
+            self.scroll_into_view();
+        }
+    }
+
     /// Start (or clear) a linewise visual selection at the cursor - vim `V`, and
     /// the magit `v` used for line-range staging.
     pub fn toggle_selection(&mut self) {
@@ -832,6 +856,7 @@ mod tests {
         let ((r0, c0), (r1, c1)) = b.char_selection().expect("selection live");
         assert_eq!((r0, c0), (0, 1));
         assert_eq!((r1, c1), (1, 3));
+        assert!(b.selected_text().contains('\n'));
         // A reversed drag (release left of the anchor) still yields a span.
         b.begin_mouse_selection(1, 3);
         b.drag_mouse_selection(0, 1);
@@ -841,5 +866,49 @@ mod tests {
         b.clear_selection();
         b.drag_mouse_selection(0, 0);
         assert!(!b.is_char_visual());
+    }
+
+    #[test]
+    fn multi_row_drag_yanks_every_row_in_the_span() {
+        // Three rows; the runtime begin-on-first-drag then extend pattern.
+        let rows = vec![
+            Section::leaf("r0", NodeKind::File, vec![Span::plain("alpha")]),
+            Section::leaf("r1", NodeKind::File, vec![Span::plain("beta")]),
+            Section::leaf("r2", NodeKind::File, vec![Span::plain("gamma")]),
+        ];
+        let mut b = Buffer::default();
+        b.set_height(10);
+        b.set_content(rows);
+        // The first drag fires at the press row, anchoring the selection.
+        b.begin_mouse_selection(0, 1);
+        // Subsequent drags walk down through the rest of the buffer.
+        b.drag_mouse_selection(1, 2);
+        b.drag_mouse_selection(2, 3);
+        let text = b.selected_text();
+        assert!(text.contains('\n'));
+        assert!(text.starts_with("lph"));
+        assert!(text.ends_with("gamm"));
+    }
+
+    #[test]
+    fn refresh_rebuild_keeps_a_live_drag_selection() {
+        // A status refresh from the file watcher would otherwise wipe the
+        // selection between the drag and `y`, leaving the yank to fall back
+        // to the current line.
+        let rows = vec![
+            Section::leaf("r0", NodeKind::File, vec![Span::plain("alpha")]),
+            Section::leaf("r1", NodeKind::File, vec![Span::plain("beta")]),
+            Section::leaf("r2", NodeKind::File, vec![Span::plain("gamma")]),
+        ];
+        let mut b = Buffer::default();
+        b.set_height(10);
+        b.set_content(rows.clone());
+        b.begin_mouse_selection(0, 1);
+        b.drag_mouse_selection(2, 3);
+        assert!(b.selected_text().contains('\n'));
+        // The same buffer rebuilt with the same content: the drag stays live.
+        b.rebuild_preserving_selection(rows);
+        assert!(b.has_selection());
+        assert!(b.selected_text().contains('\n'));
     }
 }
