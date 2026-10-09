@@ -167,13 +167,20 @@ impl Buffer {
     /// stripped to clean code), or - with no selection - the cursor row.
     pub fn selected_text(&self) -> String {
         if let Some(((r0, c0), (r1, c1))) = self.char_selection() {
-            let texts: Vec<String> = self.rows().map(|r| row_text(&r)).collect();
+            // Selection columns live in the selectable coordinate system (the
+            // gutter is excluded by the row view), so the per-row text and
+            // the column indices share the same space.
+            let row_texts: Vec<String> = self.rows().map(|r| view(&r).selectable_text()).collect();
             if r0 == r1 {
-                return substr_inclusive(texts.get(r0).map(String::as_str).unwrap_or(""), c0, c1);
+                return substr_inclusive(
+                    row_texts.get(r0).map(String::as_str).unwrap_or(""),
+                    c0,
+                    c1,
+                );
             }
-            let end = r1.min(texts.len().saturating_sub(1));
+            let end = r1.min(row_texts.len().saturating_sub(1));
             let mut out = Vec::new();
-            for (r, t) in texts.iter().enumerate().take(end + 1).skip(r0) {
+            for (r, t) in row_texts.iter().enumerate().take(end + 1).skip(r0) {
                 let chars: Vec<char> = t.chars().collect();
                 let piece: String = if r == r0 {
                     chars[c0.min(chars.len())..].iter().collect()
@@ -190,7 +197,7 @@ impl Buffer {
         self.rows()
             .skip(lo)
             .take(hi - lo + 1)
-            .map(|r| row_yank_text(&r))
+            .map(|r| view(&r).selectable_text())
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -284,7 +291,7 @@ impl Buffer {
     fn cursor_row_len(&self) -> usize {
         self.rows()
             .nth(self.cursor)
-            .map(|r| row_text(&r).chars().count())
+            .map(|r| view(&r).selectable_len())
             .unwrap_or(0)
     }
 
@@ -355,7 +362,7 @@ impl Buffer {
     fn cursor_row_text(&self) -> String {
         self.rows()
             .nth(self.cursor)
-            .map(|r| row_text(&r))
+            .map(|r| view(&r).selectable_text())
             .unwrap_or_default()
     }
 
@@ -560,24 +567,87 @@ fn substr_inclusive(text: &str, lo: usize, hi: usize) -> String {
     chars[lo..hi.max(lo)].iter().collect()
 }
 
-/// Row text for yanking: on a diff line, strip the line-number gutter and the
-/// +/- marker so the clipboard gets clean code; other rows yank as rendered.
-fn row_yank_text(row: &Row<'_>) -> String {
-    // The diff gutter is always the first span: a fixed 10-column field of
-    // right-aligned old/new line numbers, so only digits and spaces.
+/// The width, in terminal cells, of a diff row's leading gutter (the
+/// 10-digit line-number field on one-column diff lines). Zero for any
+/// other row; the buffer relies on this so the renderer and yank never
+/// sniff row contents.
+pub fn gutter_cols(row: &Row<'_>) -> usize {
     if let Some(first) = row.spans.first() {
         let g = first.text.as_str();
-        let is_gutter =
-            g.chars().count() == 10 && g.bytes().all(|b| b.is_ascii_digit() || b == b' ');
-        if is_gutter {
-            let rest: String = row.spans[1..].iter().map(|s| s.text.as_str()).collect();
-            return rest
-                .strip_prefix(['+', '-', ' '])
-                .unwrap_or(&rest)
-                .to_owned();
+        if g.chars().count() == 10 && g.bytes().all(|b| b.is_ascii_digit() || b == b' ') {
+            return 10;
         }
     }
-    row_text(row)
+    0
+}
+
+/// A split of a row into the leading decoration (the diff gutter, excluded
+/// from any selection) and the selectable content. The buffer's selection
+/// columns and yankable text live in the content's coordinate system; the
+/// renderer and the mouse consume this rather than each computing the
+/// gutter themselves.
+pub struct RowView<'a> {
+    pub(crate) row: &'a Row<'a>,
+    pub(crate) gutter: usize,
+    pub(crate) gutter_spans: usize,
+}
+
+pub fn view<'a>(row: &'a Row<'a>) -> RowView<'a> {
+    let gutter = gutter_cols(row);
+    // The gutter is one 10-cell span on every one-column diff row today;
+    // accumulate leading spans by char count so a future layout that splits
+    // the gutter into several spans still accounts for all of them.
+    let mut gutter_spans = 0;
+    let mut used = 0;
+    for s in row.spans {
+        let l = s.text.chars().count();
+        if used + l > gutter {
+            break;
+        }
+        gutter_spans += 1;
+        used += l;
+    }
+    RowView {
+        row,
+        gutter,
+        gutter_spans,
+    }
+}
+
+/// The leading decoration spans of a row (the diff gutter, empty otherwise).
+/// Returns the slice borrowed from `row` so the renderer can splice it into
+/// the rendered line without cloning.
+pub fn gutter_spans<'a>(row: &'a Row<'a>) -> &'a [rgit_model::Span] {
+    let v = view(row);
+    &row.spans[..v.gutter_spans]
+}
+
+/// The selectable spans of a row (everything past the gutter).
+pub fn content_spans<'a>(row: &'a Row<'a>) -> &'a [rgit_model::Span] {
+    let v = view(row);
+    &row.spans[v.gutter_spans..]
+}
+
+impl<'a> RowView<'a> {
+    pub fn gutter_width(&self) -> usize {
+        self.gutter
+    }
+    pub fn content_spans(&self) -> &[rgit_model::Span] {
+        &self.row.spans[self.gutter_spans..]
+    }
+    /// The selectable text (the row with its decoration removed). For a
+    /// diff row this keeps the `+`/`-`/` ` marker and the code; for any
+    /// other row it is the full rendered text. This is what the yank
+    /// returns and what the buffer's selection columns index into.
+    pub fn selectable_text(&self) -> String {
+        self.content_spans()
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect()
+    }
+    pub fn selectable_len(&self) -> usize {
+        self.selectable_text().chars().count()
+    }
 }
 
 /// Lazy pre-order iterator over visible rows.
@@ -639,8 +709,10 @@ mod tests {
     }
 
     #[test]
-    fn yank_strips_diff_gutter_and_marker() {
+    fn yank_drops_the_diff_gutter_and_keeps_the_marker() {
         // A diff line: 10-char line-number gutter, then a +marker glued to code.
+        // The gutter is metadata and never reaches the clipboard; the `+`/`-`
+        // marker is meaningful context, so it stays.
         let added = Section::leaf(
             "h/0",
             NodeKind::DiffLine,
@@ -655,14 +727,14 @@ mod tests {
             vec![Span::plain("   2    3 "), Span::plain(" untouched")],
         );
         let mut b = buffer(vec![added, context], 10);
-        assert_eq!(b.selected_text(), "let x = 1;");
+        assert_eq!(b.selected_text(), "+let x = 1;");
         b.set_cursor(1);
-        assert_eq!(b.selected_text(), "untouched");
-        // A whole selection yields clean code on every line.
+        assert_eq!(b.selected_text(), " untouched");
+        // A whole selection yields the marker and code on every line.
         b.set_cursor(0);
         b.toggle_selection();
         b.set_cursor(1);
-        assert_eq!(b.selected_text(), "let x = 1;\nuntouched");
+        assert_eq!(b.selected_text(), "+let x = 1;\n untouched");
     }
 
     #[test]
@@ -910,5 +982,43 @@ mod tests {
         b.rebuild_preserving_selection(rows);
         assert!(b.has_selection());
         assert!(b.selected_text().contains('\n'));
+    }
+
+    #[test]
+    fn charwise_yank_of_a_diff_row_drops_the_gutter_only() {
+        use crate::buffer::{gutter_cols, view};
+        // A diff line: 10-char gutter, then "+" marker, then the code.
+        // The buffer's selection columns live in the selectable (post-gutter)
+        // coordinate system, so the yank is a substring of the selectable
+        // text (gutter excluded, marker and code kept).
+        let added = Section::leaf(
+            "h/0",
+            NodeKind::DiffLine,
+            vec![Span::plain("   1    2 "), Span::plain("+let x = 1;")],
+        );
+        let mut b = Buffer::default();
+        b.set_height(10);
+        b.set_content(vec![added]);
+        let row = b.rows().next().unwrap();
+        assert_eq!(gutter_cols(&row), 10);
+        // Selectable text is the marker plus the code.
+        assert_eq!(view(&row).selectable_text(), "+let x = 1;");
+        // Anchor on the marker, extend to the first code char: the yank is
+        // the marker and that one char, with no gutter digits.
+        b.set_cursor(0);
+        b.col = 0;
+        b.toggle_char_selection();
+        b.col = 1;
+        let text = b.selected_text();
+        assert_eq!(text, "+l");
+        assert!(!text.contains('1'), "gutter digits leaked: {text:?}");
+        // Anchor in the code, extend in the code: clean substring.
+        b.clear_selection();
+        b.set_cursor(0);
+        b.col = 5; // selectable index 5 = "x"
+        b.toggle_char_selection();
+        b.col = 7; // selectable index 7 = "="
+        let text = b.selected_text();
+        assert_eq!(text, "x =");
     }
 }

@@ -1317,7 +1317,7 @@ struct Hl {
     caret: Option<usize>,
 }
 
-fn row_prefix<'a>(row: &Row<'a>, cursorline: bool) -> Vec<RSpan<'a>> {
+fn row_prefix(row: &Row<'_>, cursorline: bool) -> Vec<RSpan<'static>> {
     let mut spans = Vec::with_capacity(row.spans.len() + 3);
     // An accent bar marks the cursor row; other rows keep the column blank.
     if cursorline {
@@ -1348,23 +1348,26 @@ fn span_style(span: &Span) -> RStyle {
     style
 }
 
-fn render_row<'a>(row: &Row<'a>, hl: Hl, width: u16) -> Line<'a> {
-    // Slow path only when a caret or a partial range needs per-cell styling;
-    // the common cursor/selection/plain rows take the cheap whole-line path.
-    if hl.caret.is_some() || matches!(hl.sel, Sel::Range(..)) {
+fn render_row(row: &Row<'_>, hl: Hl, width: u16) -> Line<'static> {
+    // A diff row has a leading decoration (the gutter) that the buffer treats
+    // as separate from the selectable content; the cell path paints both so
+    // the gutter can stay outside the selection. For every other row the
+    // cheap whole-line path is enough.
+    let v = crate::buffer::view(row);
+    let in_decoration_path =
+        hl.caret.is_some() || matches!(hl.sel, Sel::Range(..)) || v.gutter_width() > 0;
+    if in_decoration_path {
         return render_row_cells(row, hl, width);
     }
 
-    let mut spans = row_prefix(row, hl.cursorline);
+    let mut spans: Vec<RSpan<'static>> = row_prefix(row, hl.cursorline);
     for span in row.spans {
-        spans.push(RSpan::styled(span.text.as_str(), span_style(span)));
+        spans.push(RSpan::styled(span.text.to_string(), span_style(span)));
     }
     let mut line = Line::from(spans);
-    // An added/removed diff line carries a background wash that fills the row.
     let diff_bg = row_diff_bg(row);
     let highlighted = hl.cursorline || matches!(hl.sel, Sel::Full) || diff_bg.is_some();
     if highlighted {
-        // Pad so the background spans the full width even on short rows.
         let used = line.width();
         if (width as usize) > used {
             line.push_span(RSpan::raw(" ".repeat(width as usize - used)));
@@ -1394,21 +1397,32 @@ fn row_diff_bg(row: &Row) -> Option<Color> {
     }
 }
 
-/// Per-cell rendering for rows carrying a block caret or a partial selection.
-fn render_row_cells<'a>(row: &Row<'a>, hl: Hl, width: u16) -> Line<'a> {
-    // Expand the content to (char, style) cells so a caret or range can override
-    // individual columns; the cursorline/full-select tint is the line's base.
+/// Per-cell rendering for rows whose selectable content needs per-cell
+/// styling (a caret, a partial range, or a leading decoration like the diff
+/// gutter). The gutter and the content come from `buffer::view`; the cell
+/// loop only sees selectable cells, so the selection never bleeds into the
+/// gutter. The line is self-contained (clones the small gutter text) so the
+/// renderer's borrow checker does not need to thread lifetimes.
+fn render_row_cells(row: &Row<'_>, hl: Hl, width: u16) -> Line<'static> {
+    // Selectable cell array: content spans only. Selection and caret columns
+    // are in the same coordinate system.
     let mut cells: Vec<(char, RStyle)> = Vec::new();
-    for span in row.spans {
+    for span in crate::buffer::content_spans(row) {
         let style = span_style(span);
         for ch in span.text.chars() {
             cells.push((ch, style));
         }
     }
     let len = cells.len();
+    let selection_full = matches!(hl.sel, Sel::Full);
     if let Sel::Range(lo, hi) = hl.sel {
-        let hi = hi.min(len.saturating_sub(1));
-        for cell in &mut cells[lo.min(len)..(hi + 1).min(len)] {
+        let lo = lo.min(len);
+        let end = (hi + 1).min(len);
+        for cell in &mut cells[lo..end] {
+            cell.1 = cell.1.bg(theme::select_bg());
+        }
+    } else if selection_full {
+        for cell in &mut cells[..len] {
             cell.1 = cell.1.bg(theme::select_bg());
         }
     }
@@ -1419,8 +1433,17 @@ fn render_row_cells<'a>(row: &Row<'a>, hl: Hl, width: u16) -> Line<'a> {
         cells[c].1 = cells[c].1.add_modifier(Modifier::REVERSED);
     }
 
-    // Coalesce equal-styled runs back into spans to keep the line compact.
-    let mut spans = row_prefix(row, hl.cursorline);
+    let mut spans: Vec<RSpan<'static>> = Vec::new();
+    for p in row_prefix(row, hl.cursorline) {
+        spans.push(RSpan::styled(p.content.to_string(), p.style));
+    }
+    for gs in crate::buffer::gutter_spans(row) {
+        let mut style = span_style(gs);
+        if hl.cursorline && style.bg.is_none() {
+            style = style.bg(theme::cursor_bg());
+        }
+        spans.push(RSpan::styled(gs.text.to_string(), style));
+    }
     let mut i = 0;
     while i < cells.len() {
         let style = cells[i].1;
@@ -1431,7 +1454,6 @@ fn render_row_cells<'a>(row: &Row<'a>, hl: Hl, width: u16) -> Line<'a> {
         }
         spans.push(RSpan::styled(text, style));
     }
-    // A caret resting past the last char shows as a reversed cell in the pad.
     if caret_past_end {
         spans.push(RSpan::styled(
             " ",
@@ -1439,21 +1461,25 @@ fn render_row_cells<'a>(row: &Row<'a>, hl: Hl, width: u16) -> Line<'a> {
         ));
     }
 
-    let mut line = Line::from(spans);
-    let used = line.width();
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     if (width as usize) > used {
-        line.push_span(RSpan::raw(" ".repeat(width as usize - used)));
+        spans.push(RSpan::raw(" ".repeat(width as usize - used)));
     }
-    let base = if hl.cursorline {
-        RStyle::default()
-            .bg(theme::cursor_bg())
-            .add_modifier(Modifier::BOLD)
-    } else if matches!(hl.sel, Sel::Full) {
-        RStyle::default().bg(theme::select_bg())
-    } else {
-        RStyle::default()
-    };
-    line.style(base)
+
+    if hl.cursorline {
+        for span in &mut spans {
+            if span.style.bg.is_none() {
+                span.style = span.style.bg(theme::cursor_bg());
+            }
+        }
+    } else if !selection_full && let Some(bg) = row_diff_bg(row) {
+        for span in &mut spans {
+            if span.style.bg.is_none() {
+                span.style = span.style.bg(bg);
+            }
+        }
+    }
+    Line::from(spans)
 }
 
 /// The bottom bar: the item under the cursor and the verbs that apply to it,

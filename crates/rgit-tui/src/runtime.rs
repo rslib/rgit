@@ -10,7 +10,7 @@ use rgit_git::{GitBackend, GitError, RepoStatus};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{App, Effect, InfoKind, LaneOp, Leader, Msg, Mutation, TextOp, update};
-use crate::buffer::row_prefix_width;
+use crate::buffer::{gutter_cols, row_prefix_width};
 use crate::events::{Event, Events};
 use crate::keymap::{
     self, resolve_commit_key, resolve_confirm_key, resolve_finder_key, resolve_help_key,
@@ -443,16 +443,17 @@ fn mouse_msg(app: &App, m: crossterm::event::MouseEvent) -> Option<Msg> {
     let body_hit = |row: u16| -> Option<(usize, usize)> {
         let offset = row.checked_sub(app.body_top)? as usize;
         let idx = app.buffer().scroll() + offset;
-        let prefix = app
+        let (prefix, gutter) = app
             .buffer()
             .rows()
             .nth(idx)
-            .map(|r| row_prefix_width(&r))
-            .unwrap_or(0);
+            .map(|r| (row_prefix_width(&r), gutter_cols(&r)))
+            .unwrap_or((0, 0));
         let col = m
             .column
             .saturating_sub(app.body_left)
-            .saturating_sub(prefix as u16) as usize;
+            .saturating_sub(prefix as u16)
+            .saturating_sub(gutter as u16) as usize;
         Some((offset, col))
     };
     let preview_hit = |row: u16| -> Option<(usize, usize)> {
@@ -461,16 +462,17 @@ fn mouse_msg(app: &App, m: crossterm::event::MouseEvent) -> Option<Msg> {
         }
         let offset = row.checked_sub(app.preview_top)? as usize;
         let idx = app.preview_buffer().scroll() + offset;
-        let prefix = app
+        let (prefix, gutter) = app
             .preview_buffer()
             .rows()
             .nth(idx)
-            .map(|r| row_prefix_width(&r))
-            .unwrap_or(0);
+            .map(|r| (row_prefix_width(&r), gutter_cols(&r)))
+            .unwrap_or((0, 0));
         let col = m
             .column
             .saturating_sub(app.preview_left)
-            .saturating_sub(prefix as u16) as usize;
+            .saturating_sub(prefix as u16)
+            .saturating_sub(gutter as u16) as usize;
         Some((offset, col))
     };
 
