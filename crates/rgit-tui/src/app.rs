@@ -3013,11 +3013,21 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 text.truncate(end);
             }
             let lines = text.lines().count();
+            // A single fragment (no newline) is a word or substring, not a
+            // line - report its length in characters so the toast matches
+            // what is on the clipboard.
+            let (label, noun) = if text.contains('\n') {
+                (
+                    format!("{lines}"),
+                    if lines == 1 { "line" } else { "lines" },
+                )
+            } else {
+                (format!("{}", text.chars().count()), "chars")
+            };
             app.push_toast(
                 ToastKind::Success,
                 format!(
-                    "yanked {lines} line{}{}",
-                    if lines == 1 { "" } else { "s" },
+                    "yanked {label} {noun}{}",
                     if truncated { " (truncated)" } else { "" }
                 ),
             );
