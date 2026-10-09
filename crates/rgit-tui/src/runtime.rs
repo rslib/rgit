@@ -10,6 +10,7 @@ use rgit_git::{GitBackend, GitError, RepoStatus};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{App, Effect, InfoKind, LaneOp, Leader, Msg, Mutation, TextOp, update};
+use crate::buffer::row_prefix_width;
 use crate::events::{Event, Events};
 use crate::keymap::{
     self, resolve_commit_key, resolve_confirm_key, resolve_finder_key, resolve_help_key,
@@ -434,45 +435,70 @@ fn mouse_msg(app: &App, m: crossterm::event::MouseEvent) -> Option<Msg> {
     const WHEEL: isize = 3;
     // The preview owns the columns at or past the split boundary.
     let over_preview = app.split_x.is_some_and(|x| m.column >= x);
-    let col = (m.column.saturating_sub(if over_preview {
-        app.preview_left
-    } else {
-        app.body_left
-    })) as usize;
-    let body = |offset: usize, focused_preview: bool| {
-        if focused_preview {
-            Msg::DragPreview { offset, col }
-        } else {
-            Msg::DragRow { offset, col }
-        }
+
+    // A pane hit as (offset, content_col): the pane's top row, then subtract
+    // the frame/padding (pane_left) and the row's own prefix (cursor bar +
+    // indent + fold chevron) so the column lines up with the character the
+    // mouse actually hit. Prefix width is per-row, so re-compute per event.
+    let body_hit = |row: u16| -> Option<(usize, usize)> {
+        let offset = row.checked_sub(app.body_top)? as usize;
+        let idx = app.buffer().scroll() + offset;
+        let prefix = app
+            .buffer()
+            .rows()
+            .nth(idx)
+            .map(|r| row_prefix_width(&r))
+            .unwrap_or(0);
+        let col = m
+            .column
+            .saturating_sub(app.body_left)
+            .saturating_sub(prefix as u16) as usize;
+        Some((offset, col))
     };
+    let preview_hit = |row: u16| -> Option<(usize, usize)> {
+        if !app.preview_visible {
+            return None;
+        }
+        let offset = row.checked_sub(app.preview_top)? as usize;
+        let idx = app.preview_buffer().scroll() + offset;
+        let prefix = app
+            .preview_buffer()
+            .rows()
+            .nth(idx)
+            .map(|r| row_prefix_width(&r))
+            .unwrap_or(0);
+        let col = m
+            .column
+            .saturating_sub(app.preview_left)
+            .saturating_sub(prefix as u16) as usize;
+        Some((offset, col))
+    };
+
     match m.kind {
         MouseEventKind::ScrollDown if over_preview => Some(Msg::ScrollPreview(WHEEL)),
         MouseEventKind::ScrollUp if over_preview => Some(Msg::ScrollPreview(-WHEEL)),
         MouseEventKind::ScrollDown => Some(Msg::Scroll(WHEEL)),
         MouseEventKind::ScrollUp => Some(Msg::Scroll(-WHEEL)),
         MouseEventKind::Down(MouseButton::Left) if !overlay_active(app) => {
-            // Map the click to a row within the pane it landed in, accounting for
-            // the frame border and each pane's label header.
             if over_preview {
-                let offset = m.row.checked_sub(app.preview_top)? as usize;
-                Some(Msg::ClickPreview(offset))
+                let (offset, col) = preview_hit(m.row)?;
+                Some(Msg::ClickPreview { offset, col })
             } else {
-                let offset = m.row.checked_sub(app.body_top)? as usize;
-                Some(Msg::ClickRow(offset))
+                let (offset, col) = body_hit(m.row)?;
+                Some(Msg::ClickRow { offset, col })
             }
         }
         // Drag extends a selection only after a press in the same pane; the
         // press handler recorded which pane via `mouse_drag_pane`.
         MouseEventKind::Drag(MouseButton::Left) if !overlay_active(app) => {
             let focused_preview = app.drag_state().0.unwrap_or(app.preview_focus);
-            let top = if focused_preview {
-                app.preview_top
+            if focused_preview {
+                let (offset, col) = preview_hit(m.row)?;
+                Some(Msg::DragPreview { offset, col })
             } else {
-                app.body_top
-            };
-            let offset = m.row.checked_sub(top)? as usize;
-            Some(body(offset, focused_preview))
+                let (offset, col) = body_hit(m.row)?;
+                Some(Msg::DragRow { offset, col })
+            }
         }
         // A release ends any drag; a click without motion already acted on Down.
         MouseEventKind::Up(MouseButton::Left) => {

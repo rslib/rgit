@@ -342,6 +342,14 @@ impl Buffer {
         self.scroll_into_view();
     }
 
+    /// Place the caret at `(idx, col)` in one call, clamping the column to
+    /// the destination row. Used by mouse clicks that carry a column.
+    pub fn place_cursor(&mut self, idx: usize, col: usize) {
+        self.cursor = idx.min(self.visible_len.saturating_sub(1));
+        self.col = col.min(self.cursor_row_len());
+        self.scroll_into_view();
+    }
+
     /// Put the cursor on the section `id` and scroll it to the top of the view.
     pub fn jump_to(&mut self, id: &str) {
         if let Some(idx) = self.rows().position(|r| r.id == id) {
@@ -504,6 +512,20 @@ impl Buffer {
 /// The concatenated text of a row's spans, for searching.
 fn row_text(row: &Row<'_>) -> String {
     row.spans.iter().map(|s| s.text.as_str()).collect()
+}
+
+/// The width, in terminal cells, of a row's leading prefix (cursor bar + indent
+/// + fold chevron). A mouse column must subtract this to land on a content char.
+pub fn row_prefix_width(row: &Row<'_>) -> usize {
+    // The cursor bar on the cursor row is a single char; other rows use a
+    // blank cell to keep columns aligned. Glyph mode doesn't matter: the
+    // cursor bar is a single char in either mode.
+    let mut w = 1;
+    w += 2 * row.depth;
+    if row.foldable && row.depth == 0 {
+        w += 2;
+    }
+    w
 }
 
 /// The inclusive char slice `text[lo..=hi]`, clamped to the string.

@@ -818,10 +818,19 @@ pub enum Msg {
     Scroll(isize),
     /// Mouse wheel over the preview pane: scroll it without taking focus.
     ScrollPreview(isize),
-    /// Left-click on the body row at the given zero-based body offset.
-    ClickRow(usize),
-    /// A click in the preview pane at this viewport-row offset.
-    ClickPreview(usize),
+    /// Left-click on the body row at the given zero-based body offset; `col`
+    /// is the content column (the pane's prefix and frame are already
+    /// subtracted), so a drag's anchor lands on the character the mouse hit.
+    ClickRow {
+        offset: usize,
+        col: usize,
+    },
+    /// A click in the preview pane at this viewport-row offset; `col` is the
+    /// preview content column.
+    ClickPreview {
+        offset: usize,
+        col: usize,
+    },
     /// Extend the mouse drag-select to this body row/char column.
     DragRow {
         offset: usize,
@@ -3865,7 +3874,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             return app.after_cursor_move();
         }
         Msg::ScrollPreview(delta) => app.preview_buf.scroll_by(delta),
-        Msg::ClickRow(offset) => {
+        Msg::ClickRow { offset, col } => {
             // A single click moves the cursor and takes focus. A double-click
             // activates the row by type: a hunk or diff line opens the editor, a
             // foldable file/section folds, anything else acts like Return. A
@@ -3873,7 +3882,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.preview_focus = false;
             app.mouse_drag_pane = Some(false);
             let idx = app.buffer().scroll() + offset;
-            app.buffer_mut().set_cursor(idx);
+            app.buffer_mut().place_cursor(idx, col);
             app.mouse_press_col = Some(app.buffer().char_col());
             if app.is_double_click(false, idx) {
                 if let Some(effect) = editor_at_hunk(app) {
@@ -3887,12 +3896,12 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
             return app.after_cursor_move();
         }
-        Msg::ClickPreview(offset) => {
+        Msg::ClickPreview { offset, col } => {
             if app.preview_visible {
                 app.preview_focus = true;
                 app.mouse_drag_pane = Some(true);
                 let idx = app.preview_buf.scroll() + offset;
-                app.preview_buf.set_cursor(idx);
+                app.preview_buf.place_cursor(idx, col);
                 app.mouse_press_col = Some(app.preview_buf.char_col());
                 if app.is_double_click(true, idx) {
                     app.preview_buf.toggle_fold();
