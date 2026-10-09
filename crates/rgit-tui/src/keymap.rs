@@ -421,21 +421,25 @@ fn nav_defaults(profile: Profile) -> Vec<(Chord, Command)> {
         (ctrl('p'), Command::PrevLine),
         (ctrl('o'), Command::OpenEditor),
         (cx('o'), Command::OtherWindow),
+        // Readline-style navigation shared by both profiles: terminal
+        // conventions that don't fight the vim normal mode (C-b/C-a/C-e
+        // have no vim meaning; C-f drops the vim page-down convention, which
+        // rgit never bound anyway). C-d and C-u stay half-page in both
+        // because they're the more useful binding.
+        (ctrl('f'), Command::ForwardChar),
+        (ctrl('b'), Command::BackwardChar),
+        (ctrl('a'), Command::LineStart),
+        (ctrl('e'), Command::LineEnd),
+        (alt('f'), Command::WordForward),
+        (alt('b'), Command::WordBack),
     ];
     match profile {
         Profile::Magit => v.extend([
-            // Emacs point motion, word motion, and set-mark.
-            (ctrl('f'), Command::ForwardChar),
-            (ctrl('b'), Command::BackwardChar),
-            (ctrl('a'), Command::LineStart),
-            (ctrl('e'), Command::LineEnd),
+            // Emacs select/copy: set-mark, kill-region (copies on a
+            // read-only view), and the emacs M-w copy.
             (ctrl(' '), Command::SetMark),
-            // Copy the region: emacs M-w, and C-w (kill-region; on a read-only
-            // view it just copies).
             (alt('w'), Command::Copy),
             (ctrl('w'), Command::Copy),
-            (alt('f'), Command::WordForward),
-            (alt('b'), Command::WordBack),
             (key(ChordCode::Down), Command::NextLine),
             (key(ChordCode::Up), Command::PrevLine),
             (key(ChordCode::Right), Command::FocusPreview),
