@@ -518,3 +518,58 @@ async fn comments_on_a_merge_request() {
         Some("2026-01-04T03:04:05Z")
     );
 }
+
+#[tokio::test]
+async fn approves_a_merge_request_through_the_approve_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12/approve$",
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": 12,
+            "iid": 12,
+            "approvals_before_merge": null
+        })))
+        .mount(&server)
+        .await;
+
+    let review = forge(&server)
+        .review_pull_request(&repo(), 12, rgit_forge::ReviewAction::Approve, None)
+        .await
+        .expect("review");
+    assert_eq!(review.id, None);
+    assert_eq!(review.state, "approved");
+}
+
+#[tokio::test]
+async fn requests_changes_on_a_merge_request_with_a_note() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12/notes$",
+        ))
+        .and(body_partial_json(serde_json::json!({"body": "Fix the tests."})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": 100,
+            "body": "Fix the tests.",
+            "author": {"username": REVIEWER.as_str()},
+            "created_at": "2026-01-04T03:04:05Z"
+        })))
+        .mount(&server)
+        .await;
+
+    let review = forge(&server)
+        .review_pull_request(
+            &repo(),
+            12,
+            rgit_forge::ReviewAction::RequestChanges,
+            Some("Fix the tests."),
+        )
+        .await
+        .expect("review");
+    assert_eq!(review.id, Some(100));
+    assert_eq!(review.state, "changes_requested");
+    assert_eq!(review.body.as_deref(), Some("Fix the tests."));
+    assert_eq!(review.author.as_deref(), Some(REVIEWER.as_str()));
+}

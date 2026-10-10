@@ -1477,6 +1477,13 @@ const EXAMPLES: &[Entry] = &[
         "forge pr comment",
         &["rgit forge pr comment 42 --body \"<text>\""],
     ),
+    (
+        "forge pr review",
+        &[
+            "rgit forge pr review 42 --approve",
+            "rgit forge pr review 42 --request-changes --body \"<text>\"",
+        ],
+    ),
     ("stack", &["rgit stack"]),
     ("stack new", &["rgit stack new <branch>"]),
     ("stack list", &["rgit stack list"]),

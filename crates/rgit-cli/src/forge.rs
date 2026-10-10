@@ -4,7 +4,7 @@ use crate::cli::{AuthCmd, ForgeBranchCmd, ForgeCmd, PrCmd, RepoCmd};
 use anyhow::{Result, ensure};
 use rgit_forge::{
     CreatePullRequest, CreateRepository, Forge, ForgeError, ForgeTarget, MergeMethod, Provider,
-    StackEntry,
+    ReviewAction, StackEntry,
 };
 use rgit_git::GitBackend;
 use serde::Serialize;
@@ -406,6 +406,35 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 let repo = target.repo()?.clone();
                 with_forge(target, move |forge| async move {
                     print_json(forge.comment_pull_request(&repo, number, &body).await?)
+                })
+            }
+            PrCmd::Review {
+                number,
+                target,
+                repo,
+                approve,
+                request_changes,
+                comment,
+                body,
+            } => {
+                let action = match (approve, request_changes, comment) {
+                    (true, false, false) => ReviewAction::Approve,
+                    (false, true, false) => ReviewAction::RequestChanges,
+                    (false, false, true) => ReviewAction::Comment,
+                    _ => {
+                        return Err(crate::cli::CliError::usage(
+                            "pr review needs one of --approve, --request-changes or --comment",
+                        ));
+                    }
+                };
+                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                with_forge(target, move |forge| async move {
+                    print_json(
+                        forge
+                            .review_pull_request(&repo, number, action, body.as_deref())
+                            .await?,
+                    )
                 })
             }
         },

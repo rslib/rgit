@@ -423,6 +423,21 @@ impl Forge {
         }
     }
 
+    /// Review pull request `number` with `action`, carrying `body` as the
+    /// review text.
+    pub async fn review_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        action: ReviewAction,
+        body: Option<&str>,
+    ) -> Result<PullRequestReview, ForgeError> {
+        match self {
+            Self::Github(client) => client.review_pull_request(repo, number, action, body).await,
+            Self::Gitlab(client) => client.review_merge_request(repo, number, action, body).await,
+        }
+    }
+
     pub async fn current_user(&self) -> Result<User, ForgeError> {
         match self {
             Self::Github(client) => client.current_user().await,

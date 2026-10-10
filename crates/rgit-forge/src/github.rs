@@ -5,8 +5,9 @@ use super::ForgeError;
 use super::auth::{load_credential_for, refresh_if_needed};
 use super::types::{
     Branch, CheckRun, CreatePullRequest, CreateRepository, Listing, MergeMethod, Provider,
-    PullRequest, PullRequestChecks, PullRequestComment, PullRequestState, RepoRef, Repository,
-    User, normalize_check_status, page_query, rollup_from, total_from_last_page,
+    PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview, PullRequestState,
+    RepoRef, Repository, ReviewAction, User, normalize_check_status, page_query, rollup_from,
+    total_from_last_page,
 };
 
 fn api_error(error: octocrab::Error) -> ForgeError {
@@ -558,6 +559,49 @@ impl GithubClient {
             author: comment.user.map(|user| user.login),
             url: Some(comment.html_url),
             created_at: comment.created_at,
+        })
+    }
+
+    /// Review pull request `number`: approve it, request changes, or leave a
+    /// comment review, with `body` as the review text.
+    pub async fn review_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        action: ReviewAction,
+        body: Option<&str>,
+    ) -> Result<PullRequestReview, ForgeError> {
+        #[derive(Serialize)]
+        struct NewReview<'a> {
+            event: &'static str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            body: Option<&'a str>,
+        }
+        #[derive(Deserialize)]
+        struct ApiReview {
+            id: u64,
+            state: String,
+            body: Option<String>,
+            user: Option<ApiAccount>,
+            html_url: Option<String>,
+        }
+        let review: ApiReview = self
+            .api
+            .post(
+                format!("/repos/{}/{}/pulls/{number}/reviews", repo.owner, repo.name),
+                Some(&NewReview {
+                    event: action.github_event(),
+                    body,
+                }),
+            )
+            .await
+            .map_err(api_error)?;
+        Ok(PullRequestReview {
+            id: Some(review.id),
+            state: review.state.to_lowercase(),
+            body: review.body,
+            author: review.user.map(|user| user.login),
+            url: review.html_url,
         })
     }
 

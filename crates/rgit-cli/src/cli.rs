@@ -6765,6 +6765,25 @@ pub enum PrCmd {
         #[arg(long, conflicts_with = "body")]
         body_file: Option<String>,
     },
+    /// Review a pull request or merge request.
+    Review {
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        /// Approve the pull request.
+        #[arg(long, conflicts_with_all = ["request_changes", "comment"])]
+        approve: bool,
+        /// Ask for changes on the pull request.
+        #[arg(long, conflicts_with_all = ["comment"])]
+        request_changes: bool,
+        /// Leave a comment review on the pull request.
+        #[arg(long)]
+        comment: bool,
+        /// The review text.
+        #[arg(long)]
+        body: Option<String>,
+    },
     /// Merge a pull request or merge request.
     Merge {
         number: u64,

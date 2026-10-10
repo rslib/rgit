@@ -521,3 +521,36 @@ async fn comments_on_a_pull_request() {
         Some("2026-01-04T03:04:05Z")
     );
 }
+
+#[tokio::test]
+async fn approves_a_pull_request_with_a_review() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/12/reviews"))
+        .and(body_partial_json(
+            serde_json::json!({"event": "APPROVE", "body": "Ship it."}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 80,
+            "state": "APPROVED",
+            "body": "Ship it.",
+            "user": {"login": REVIEWER.as_str()},
+            "html_url": "https://github.com/owner/repo/pull/12#pullrequestreview-80",
+            "submitted_at": "2026-01-04T03:04:05Z"
+        })))
+        .mount(&server)
+        .await;
+
+    let review = forge(&server)
+        .review_pull_request(&repo(), 12, rgit_forge::ReviewAction::Approve, Some("Ship it."))
+        .await
+        .expect("review");
+    assert_eq!(review.id, Some(80));
+    assert_eq!(review.state, "approved");
+    assert_eq!(review.body.as_deref(), Some("Ship it."));
+    assert_eq!(review.author.as_deref(), Some(REVIEWER.as_str()));
+    assert_eq!(
+        review.url.as_deref(),
+        Some("https://github.com/owner/repo/pull/12#pullrequestreview-80")
+    );
+}

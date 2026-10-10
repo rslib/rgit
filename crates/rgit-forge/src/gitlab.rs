@@ -6,8 +6,9 @@ use super::ForgeError;
 use super::auth::load_credential_for;
 use super::types::{
     Branch, CheckRun, CreatePullRequest, CreateRepository, Listing, MergeMethod, Provider,
-    PullRequest, PullRequestChecks, PullRequestComment, PullRequestState, RepoRef, Repository,
-    User, normalize_check_status, page_query, rollup_from, total_from_last_page,
+    PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview, PullRequestState,
+    RepoRef, Repository, ReviewAction, User, normalize_check_status, page_query, rollup_from,
+    total_from_last_page,
 };
 
 const DEFAULT_HOST: &str = "https://gitlab.com";
@@ -728,6 +729,54 @@ impl GitlabClient {
             author: note.author.map(|user| user.username),
             url: None,
             created_at: note.created_at,
+        })
+    }
+
+    /// Review merge request `number`: an approval goes through the approve
+    /// endpoint, anything else is a note carrying the review text.
+    pub async fn review_merge_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        action: ReviewAction,
+        body: Option<&str>,
+    ) -> Result<PullRequestReview, ForgeError> {
+        let state = match action {
+            ReviewAction::Approve => "approved",
+            ReviewAction::RequestChanges => "changes_requested",
+            ReviewAction::Comment => "commented",
+        };
+        if action == ReviewAction::Approve {
+            self.http
+                .post(format!(
+                    "{}/projects/{}/merge_requests/{}/approve",
+                    self.base_url,
+                    self.project_path(repo),
+                    number
+                ))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .map_err(api_error)?
+                .error_for_status()
+                .map_err(api_error)?;
+            return Ok(PullRequestReview {
+                id: None,
+                state: state.to_owned(),
+                body: body.map(str::to_owned),
+                author: None,
+                url: None,
+            });
+        }
+        let comment = self
+            .comment_merge_request(repo, number, body.unwrap_or_default())
+            .await?;
+        Ok(PullRequestReview {
+            id: Some(comment.id),
+            state: state.to_owned(),
+            body: Some(comment.body),
+            author: comment.author,
+            url: None,
         })
     }
 
