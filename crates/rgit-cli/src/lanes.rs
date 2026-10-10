@@ -68,7 +68,8 @@ pub fn push(backend: &Arc<dyn GitBackend>, lane: &str) -> Result<String> {
 }
 
 pub fn pr(backend: &Arc<dyn GitBackend>, lane: &str) -> Result<String> {
-    Ok(backend.lane_pr(lane)?)
+    let (branch, base) = backend.lane_pr(lane)?;
+    crate::forge::ensure_pull_requests(backend, vec![(branch, base)])
 }
 
 pub fn restack(backend: &Arc<dyn GitBackend>) -> Result<String> {

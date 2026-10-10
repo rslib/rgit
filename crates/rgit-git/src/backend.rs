@@ -179,10 +179,13 @@ pub trait GitBackend: Send + Sync {
     /// bases. Op-log-safe.
     fn sync(&self, report: &dyn Fn(crate::OpProgress)) -> Result<crate::RestackOutcome, GitError>;
 
-    /// Push every branch in the current stack (bottom-up, force-with-lease) and
-    /// open or update a pull request per branch (base = its stack parent), via
-    /// the forge CLI. Returns a note per branch.
-    fn submit_stack(&self, report: &dyn Fn(crate::OpProgress)) -> Result<Vec<String>, GitError>;
+    /// Push every branch in the current stack (bottom-up, force-with-lease).
+    /// Returns `(branch, base)` pairs, base = each branch's stack parent, for
+    /// the caller to open or update pull requests with.
+    fn submit_stack(
+        &self,
+        report: &dyn Fn(crate::OpProgress),
+    ) -> Result<Vec<(String, String)>, GitError>;
 
     /// The directory git resolves hooks from (`core.hooksPath` or
     /// `<git-dir>/hooks`), so the caller can run and stream them itself.
@@ -198,6 +201,10 @@ pub trait GitBackend: Send + Sync {
     /// `["[main abc1234] subject", " 2 files changed, 5 insertions(+)"]`, to
     /// echo into the operation console and the log after committing.
     fn commit_report(&self) -> Vec<String>;
+
+    /// The full message of branch's tip commit, to fill a pull request's title
+    /// and body.
+    fn commit_message(&self, branch: &str) -> Result<String, GitError>;
 
     /// The full message of the HEAD commit, to prefill an amend editor.
     fn head_message(&self) -> Option<String>;
@@ -1214,9 +1221,9 @@ pub trait GitBackend: Send + Sync {
     /// Push a lane's branch to the remote and set its upstream (HEAD stays put).
     fn lane_push(&self, lane: &str) -> Result<String, GitError>;
 
-    /// Push a lane's branch and open a pull/merge request for it via the forge
-    /// CLI (gh/glab), against the trunk.
-    fn lane_pr(&self, lane: &str) -> Result<String, GitError>;
+    /// Push a lane's branch and return `(branch, base)` with base = the trunk,
+    /// for the caller to open a pull request against.
+    fn lane_pr(&self, lane: &str) -> Result<(String, String), GitError>;
 
     /// Install an interactive credential prompt for network operations. Backends
     /// that cannot prompt ignore it (the default), failing auth cleanly instead.

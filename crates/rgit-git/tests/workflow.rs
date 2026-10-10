@@ -135,7 +135,10 @@ fn finish_merges_feature_into_develop_with_merge_commit() {
     workflow::start(&backend, "widget").unwrap();
     commit_file(&dir, "widget.txt", "wip\n", "widget work");
 
-    let note = workflow::finish(&backend).unwrap();
+    let rgit_git::workflow::FinishOutcome::Merged(note) = workflow::finish(&backend).unwrap()
+    else {
+        panic!("gitflow finish merges locally");
+    };
     assert!(note.contains("merged feature/widget into develop"));
 
     assert_eq!(current_branch(&backend), "develop");

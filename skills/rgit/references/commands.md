@@ -111,7 +111,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `lanes rename`: Rename a lane and its branch. e.g. `rgit lanes rename <old> <new>`
   - `lanes delete`: Delete a lane (its changes return to default; its branch is kept). e.g. `rgit lanes delete <lane>`
   - `lanes push`: Push a lane's branch to the remote. e.g. `rgit lanes push <lane>`
-  - `lanes pr`: Push a lane's branch and open a pull request (via gh/glab). e.g. `rgit lanes pr <lane>`
+  - `lanes pr`: Push a lane's branch and open or update its pull request. e.g. `rgit lanes pr <lane>`
   - `lanes restack`: Move each stacked lane onto its parent lane's new tip (in the odb; the worktree is not touched). e.g. `rgit lanes restack`
 - `workspace`: Copy-on-write workspaces: instant, isolated, block-sharing clones of the whole repo (code, build, .git) for parallel work (no subcommand lists). e.g. `rgit workspace`
   - `workspace new`: Create a copy-on-write clone of the repo on a new branch. e.g. `rgit workspace new <name>`

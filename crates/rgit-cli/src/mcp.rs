@@ -1485,8 +1485,9 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_submit",
-            "Push every branch in the current stack and open a pull request per branch (via \
-             gh/glab).",
+            "Push every branch in the current stack and open or update a pull request per branch, \
+             against the origin remote's forge (GitHub or GitLab; authenticated via `rgit forge \
+             login`).",
             none,
         ),
         tool(
@@ -1608,7 +1609,8 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_lanes_pr",
-            "Push a lane's branch and open a pull/merge request via gh/glab.",
+            "Push a lane's branch and open or update its pull request against the trunk, via the \
+             origin remote's forge (GitHub or GitLab; authenticated via `rgit forge login`).",
             &[("lane", "string", true)],
         ),
         tool(

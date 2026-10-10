@@ -176,7 +176,12 @@ impl rgit_git::CredentialPrompt for TuiCredentialPrompt {
 }
 
 /// Run one lane operation and describe the result for a toast.
-fn run_lane_op(backend: &dyn GitBackend, op: &LaneOp) -> String {
+fn run_lane_op(
+    handle: &tokio::runtime::Handle,
+    backend: &dyn GitBackend,
+    forge_selection: rgit_forge::ForgeSelection,
+    op: &LaneOp,
+) -> String {
     let result = match op {
         LaneOp::New(name) => backend
             .lane_new(name)
@@ -195,7 +200,16 @@ fn run_lane_op(backend: &dyn GitBackend, op: &LaneOp) -> String {
             .lane_delete(name)
             .map(|()| format!("deleted lane {name}")),
         LaneOp::Push(lane) => backend.lane_push(lane),
-        LaneOp::Pr(lane) => backend.lane_pr(lane),
+        LaneOp::Pr(lane) => backend.lane_pr(lane).and_then(|(branch, base)| {
+            crate::forge::submit_pull_requests(
+                handle,
+                backend,
+                forge_selection,
+                vec![(branch, base)],
+            )
+            .map(|lines| lines.join("\n"))
+            .map_err(GitError::Other)
+        }),
         LaneOp::Stack { name, parent } => backend
             .lane_stack(name, parent)
             .map(|()| format!("created {name} stacked on {parent}")),
@@ -671,8 +685,10 @@ async fn run_msg(
             }
             Effect::OpConsole(op) => {
                 let backend = app.backend();
+                let handle = tokio::runtime::Handle::current();
+                let forge_selection = app.forge_selection.clone();
                 let msg_tx = msg_tx.clone();
-                tokio::spawn(op_console(backend, op, msg_tx));
+                tokio::spawn(op_console(backend, handle, forge_selection, op, msg_tx));
             }
             Effect::LoadRebaseTodo { base } => {
                 let backend = app.backend();
@@ -1000,10 +1016,14 @@ async fn run_msg(
             }
             Effect::LaneOp(op) => {
                 let backend = app.backend();
+                let fusion = app.forge_selection.clone();
+                let handle = tokio::runtime::Handle::current();
                 let auto_restack = app.auto_restack();
                 let msg_tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    let _ = msg_tx.send(Msg::LaneNotice(run_lane_op(&*backend, &op)));
+                    let _ = msg_tx.send(Msg::LaneNotice(run_lane_op(
+                        &handle, &*backend, fusion, &op,
+                    )));
                     // After committing a lane, move any child lanes onto its new
                     // tip. lane_restack works in the odb, so it is safe with the
                     // dirty worktree lanes keep (unlike the checkout-based restack).
@@ -1028,6 +1048,8 @@ async fn run_msg(
             }
             Effect::RunText(op) => {
                 let backend = app.backend();
+                let handle = tokio::runtime::Handle::current();
+                let forge_selection = app.forge_selection.clone();
                 let msg_tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     let result = match op {
@@ -1037,7 +1059,20 @@ async fn run_msg(
                         TextOp::FlowStart(name) => {
                             rgit_git::workflow::start(backend.as_ref(), &name)
                         }
-                        TextOp::FlowFinish => rgit_git::workflow::finish(backend.as_ref()),
+                        TextOp::FlowFinish => rgit_git::workflow::finish(backend.as_ref())
+                            .and_then(|outcome| match outcome {
+                                rgit_git::workflow::FinishOutcome::Merged(note) => Ok(note),
+                                rgit_git::workflow::FinishOutcome::Pushed { branch, base } => {
+                                    crate::forge::submit_pull_requests(
+                                        &handle,
+                                        backend.as_ref(),
+                                        forge_selection,
+                                        vec![(branch, base)],
+                                    )
+                                    .map(|lines| lines.join("\n"))
+                                    .map_err(GitError::Other)
+                                }
+                            }),
                         TextOp::WorkspaceNew(name) => {
                             rgit_git::workspace::create(backend.as_ref(), &name)
                         }
@@ -1495,6 +1530,8 @@ async fn commit_console(
 /// messages from there so the render loop never blocks.
 async fn op_console(
     backend: Arc<dyn GitBackend>,
+    handle: tokio::runtime::Handle,
+    forge_selection: rgit_forge::ForgeSelection,
     op: crate::app::ConsoleOp,
     msg_tx: UnboundedSender<Msg>,
 ) {
@@ -1528,10 +1565,15 @@ async fn op_console(
         ConsoleOp::Merge { rev, no_ff } => backend.merge(&rev, no_ff, false, &report),
         ConsoleOp::RebaseOnto(rev) => backend.rebase_onto(&rev, &report),
         ConsoleOp::Sync => backend.sync(&report).map(drop),
-        ConsoleOp::Submit => backend.submit_stack(&report).map(|notes| {
-            for n in notes {
-                report(rgit_git::OpProgress::Line(n));
-            }
+        ConsoleOp::Submit => backend.submit_stack(&report).and_then(|pairs| {
+            crate::forge::submit_pull_requests(&handle, backend.as_ref(), forge_selection, pairs)
+                .inspect(|lines| {
+                    for line in lines {
+                        report(rgit_git::OpProgress::Line(line.clone()));
+                    }
+                })
+                .map(|_| ())
+                .map_err(GitError::Other)
         }),
     })
     .await;

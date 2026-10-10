@@ -1,10 +1,12 @@
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::cli::{AuthCmd, ForgeBranchCmd, ForgeCmd, PrCmd, RepoCmd};
 use anyhow::{Result, ensure};
 use rgit_forge::{
-    CreatePullRequest, CreateRepository, Forge, ForgeError, ForgeTarget, Provider, PullRequestState,
+    CreatePullRequest, CreateRepository, Forge, ForgeError, ForgeTarget, Provider,
+    PullRequestState, StackEntry,
 };
+use rgit_git::GitBackend;
 use serde::Serialize;
 
 pub use rgit_forge::ForgeSelection;
@@ -234,6 +236,37 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
             }),
         },
     }
+}
+
+/// Ensure a pull request per pushed `(branch, base)` pair against the origin
+/// remote's forge, each filled from its branch's tip commit. Returns one
+/// `opened` or `updated` line per branch.
+pub fn ensure_pull_requests(
+    backend: &Arc<dyn GitBackend>,
+    pairs: Vec<(String, String)>,
+) -> Result<String> {
+    let Some(origin) = backend.config_get("remote.origin.url")? else {
+        anyhow::bail!("pushed; no pull requests: no origin remote is configured");
+    };
+    let selection = ForgeSelection::default().resolve()?;
+    let target = ForgeTarget::from_remote(&selection, &origin)?;
+    let repo = target.repo()?.clone();
+    let mut entries = Vec::with_capacity(pairs.len());
+    for (branch, base) in pairs {
+        entries.push(StackEntry {
+            message: backend.commit_message(&branch)?,
+            branch,
+            base,
+        });
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let forge = Forge::connect(&target).await?;
+        let lines = forge.ensure_pull_requests(&repo, &entries).await?;
+        Ok(lines.join("\n"))
+    })
 }
 
 /// The repository an operation acts on: the arguments, or the origin remote

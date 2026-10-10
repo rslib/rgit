@@ -68,6 +68,47 @@ pub async fn load(
     Ok(ForgeSnapshot { target, requests })
 }
 
+/// Ensure a pull request per pushed `(branch, base)` pair against the origin
+/// remote's forge, each filled from its branch's tip commit. Sync on the
+/// caller's runtime handle, so the submit and lane operations can call it from
+/// their blocking tasks (a runtime cannot be built inside one).
+pub fn submit_pull_requests(
+    handle: &tokio::runtime::Handle,
+    backend: &dyn rgit_git::GitBackend,
+    selection: ForgeSelection,
+    pairs: Vec<(String, String)>,
+) -> Result<Vec<String>, String> {
+    let origin = backend
+        .config_get("remote.origin.url")
+        .ok()
+        .flatten()
+        .ok_or_else(|| "no origin remote is configured".to_owned())?;
+    let selection = selection.resolve().map_err(|error| error.to_string())?;
+    let mut entries = Vec::with_capacity(pairs.len());
+    for (branch, base) in pairs {
+        let message = backend
+            .commit_message(&branch)
+            .map_err(|error| error.to_string())?;
+        entries.push(rgit_forge::StackEntry {
+            branch,
+            base,
+            message,
+        });
+    }
+    handle.block_on(async {
+        let target = ForgeTarget::from_remote(&selection, origin.trim())
+            .map_err(|error| error.to_string())?;
+        let repo = target.repo().map_err(|error| error.to_string())?.clone();
+        let forge = rgit_forge::Forge::connect(&target)
+            .await
+            .map_err(|error| forge_error(&target, error))?;
+        forge
+            .ensure_pull_requests(&repo, &entries)
+            .await
+            .map_err(|error| forge_error(&target, error))
+    })
+}
+
 /// Whether the remote itself, rather than the config or the account, is at
 /// fault.
 fn remote_failure(error: &ForgeError) -> bool {

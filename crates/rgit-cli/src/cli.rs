@@ -6449,7 +6449,7 @@ pub enum LanesCmd {
         /// The lane to push.
         lane: String,
     },
-    /// Push a lane's branch and open a pull request (via gh/glab).
+    /// Push a lane's branch and open or update its pull request.
     Pr {
         /// The lane to open a PR for.
         lane: String,
@@ -8523,7 +8523,9 @@ fn run_command(
             }
             if quiet { String::new() } else { out }
         }
-        Command::Submit => backend.submit_stack(&|_| {})?.join("\n"),
+        Command::Submit => {
+            crate::forge::ensure_pull_requests(backend, backend.submit_stack(&|_| {})?)?
+        }
         Command::Sync => {
             let outcome = backend.sync(&|_| {})?;
             let mut msg = String::from("synced");
@@ -9524,7 +9526,12 @@ fn run_command(
         Command::Flow { cmd } => match cmd {
             FlowCmd::Init { preset } => rgit_git::workflow::init(backend.as_ref(), &preset)?,
             FlowCmd::Start { name } => rgit_git::workflow::start(backend.as_ref(), &name)?,
-            FlowCmd::Finish => rgit_git::workflow::finish(backend.as_ref())?,
+            FlowCmd::Finish => match rgit_git::workflow::finish(backend.as_ref())? {
+                rgit_git::workflow::FinishOutcome::Merged(note) => note,
+                rgit_git::workflow::FinishOutcome::Pushed { branch, base } => {
+                    crate::forge::ensure_pull_requests(backend, vec![(branch, base)])?
+                }
+            },
             FlowCmd::Release { version, finish } => {
                 rgit_git::workflow::release(backend.as_ref(), &version, finish)?
             }

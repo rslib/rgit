@@ -3930,23 +3930,22 @@ impl GitBackend for Git2Backend {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prompt);
     }
 
-    fn lane_pr(&self, lane: &str) -> Result<String, GitError> {
+    fn lane_pr(&self, lane: &str) -> Result<(String, String), GitError> {
         // detect_main locks the repo, so resolve the base before we lock.
         let base = crate::workflow::detect_main(self);
         let repo = self.fresh_handle()?;
         let branch = crate::lanes::lane_branch(&repo, lane)?;
-        if repo.find_branch(&branch, BranchType::Local).is_err() {
-            return Err(GitError::Other(format!(
-                "lane {lane} has no commits yet; commit it first"
-            )));
-        }
-        let cred_guard = self
-            .cred_prompt
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        push_lane_branch(&repo, &branch, &|_| {}, cred_guard.as_deref())?;
-        drop(cred_guard);
-        Ok(crate::workflow::open_pull_request(&branch, &base))
+        drop(repo);
+        self.lane_push(lane)?;
+        Ok((branch, base))
+    }
+
+    fn commit_message(&self, branch: &str) -> Result<String, GitError> {
+        let repo = self.repo();
+        let commit = repo
+            .find_reference(&format!("refs/heads/{branch}"))?
+            .peel_to_commit()?;
+        Ok(commit.message().unwrap_or("").trim_end().to_owned())
     }
 
     fn rename_branch(&self, old: &str, new: &str) -> Result<(), GitError> {
@@ -4337,7 +4336,7 @@ impl GitBackend for Git2Backend {
         })
     }
 
-    fn submit_stack(&self, report: &dyn Fn(OpProgress)) -> Result<Vec<String>, GitError> {
+    fn submit_stack(&self, report: &dyn Fn(OpProgress)) -> Result<Vec<(String, String)>, GitError> {
         let parents: std::collections::HashMap<String, Option<String>> =
             self.stack_parents()?.into_iter().collect();
         let start = self
@@ -4359,16 +4358,14 @@ impl GitBackend for Git2Backend {
                 "the current branch is not in a stack".to_owned(),
             ));
         }
-        let mut notes = Vec::new();
-        for (branch, base) in &chain {
+        for (branch, _) in &chain {
             self.checkout_branch(branch)?;
             // force-with-lease + set upstream: a stack submit re-pushes rewritten
             // branches, but only when the remote still matches ours.
             self.push(None, false, true, true, report)?;
-            notes.push(crate::workflow::open_pull_request(branch, base));
         }
         let _ = self.checkout_branch(&start);
-        Ok(notes)
+        Ok(chain)
     }
 
     fn prune_merged(&self, base: &str) -> Result<Vec<String>, GitError> {
