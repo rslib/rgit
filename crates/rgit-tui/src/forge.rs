@@ -46,7 +46,12 @@ pub async fn load(
         .await
         .map_err(|error| forge_error(&target, error))?;
     let requests = forge
-        .pull_requests(target.repo().expect("remote names a repository"), 1)
+        .pull_requests(
+            target.repo().expect("remote names a repository"),
+            1,
+            rgit_forge::PullRequestState::Open,
+            None,
+        )
         .await
         .map_err(|error| forge_error(&target, error))?
         .items

@@ -180,6 +180,16 @@ pub struct Branch {
     pub protected: bool,
 }
 
+/// The state filter of a pull request list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PullRequestState {
+    #[default]
+    Open,
+    Closed,
+    Merged,
+    All,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequest {
     pub number: u64,

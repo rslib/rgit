@@ -23,7 +23,7 @@ pub use profile::{ForgeConfig, ForgeProfile, ForgeSelection, ForgeTarget};
 pub use remote::RemoteTarget;
 pub use types::{
     Branch, CreatePullRequest, CreateRepository, CredentialIdentity, Listing, PAGE_SIZE, Provider,
-    PullRequest, RepoRef, Repository, StoredCredential, User,
+    PullRequest, PullRequestState, RepoRef, Repository, StoredCredential, User,
 };
 
 /// An error from a forge operation. Every variant names the forge it came from
@@ -140,10 +140,12 @@ impl Forge {
         &self,
         repo: &RepoRef,
         page: u32,
+        state: PullRequestState,
+        head: Option<&str>,
     ) -> Result<Listing<PullRequest>, ForgeError> {
         match self {
-            Self::Github(client) => client.pull_requests(repo, page).await,
-            Self::Gitlab(client) => client.merge_requests(repo, page).await,
+            Self::Github(client) => client.pull_requests(repo, page, state, head).await,
+            Self::Gitlab(client) => client.merge_requests(repo, page, state, head).await,
         }
     }
 

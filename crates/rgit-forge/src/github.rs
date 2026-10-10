@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use super::ForgeError;
 use super::auth::{load_credential_for, refresh_if_needed};
 use super::types::{
-    Branch, CreatePullRequest, CreateRepository, Listing, Provider, PullRequest, RepoRef,
-    Repository, User, page_query, total_from_last_page,
+    Branch, CreatePullRequest, CreateRepository, Listing, Provider, PullRequest, PullRequestState,
+    RepoRef, Repository, User, page_query, total_from_last_page,
 };
 
 fn api_error(error: octocrab::Error) -> ForgeError {
@@ -16,6 +16,16 @@ fn api_error(error: octocrab::Error) -> ForgeError {
         ForgeError::api(Provider::Github, format!("{message}: {error:?}"))
     } else {
         ForgeError::api(Provider::Github, message)
+    }
+}
+
+/// The `state` query value. GitHub has no merged listing: merged pull requests
+/// arrive under `closed` and are filtered by `merged_at`.
+fn state_param(state: PullRequestState) -> &'static str {
+    match state {
+        PullRequestState::Open => "open",
+        PullRequestState::Closed | PullRequestState::Merged => "closed",
+        PullRequestState::All => "all",
     }
 }
 
@@ -157,6 +167,8 @@ impl GithubClient {
         &self,
         repo: &RepoRef,
         page: u32,
+        state: PullRequestState,
+        head: Option<&str>,
     ) -> Result<Listing<PullRequest>, ForgeError> {
         #[derive(Deserialize)]
         struct ApiRequest {
@@ -165,6 +177,7 @@ impl GithubClient {
             state: String,
             html_url: String,
             draft: bool,
+            merged_at: Option<String>,
             head: ApiRef,
             base: ApiRef,
         }
@@ -173,21 +186,49 @@ impl GithubClient {
             #[serde(rename = "ref")]
             branch: String,
         }
-        let listing: Listing<ApiRequest> = self
-            .list_page(
-                &format!("/repos/{}/{}/pulls?state=open", repo.owner, repo.name),
-                page,
-            )
-            .await?;
-        Ok(listing.map(|request| PullRequest {
-            number: request.number,
-            title: request.title,
-            state: request.state,
-            html_url: request.html_url,
-            head_branch: request.head.branch,
-            base_branch: request.base.branch,
-            draft: request.draft,
-        }))
+        let mut route = format!(
+            "/repos/{}/{}/pulls?state={}",
+            repo.owner,
+            repo.name,
+            state_param(state)
+        );
+        if let Some(branch) = head {
+            route.push_str(&format!(
+                "&head={}:{}",
+                repo.owner,
+                urlencoding::encode(branch)
+            ));
+        }
+        let listing: Listing<ApiRequest> = self.list_page(&route, page).await?;
+        // GitHub lists merged pull requests only under state=closed, so the
+        // merged filter keeps the merged_at subset and drops the page total.
+        let only_merged = state == PullRequestState::Merged;
+        let mut items = Vec::with_capacity(listing.items.len());
+        for request in listing.items {
+            if only_merged && request.merged_at.is_none() {
+                continue;
+            }
+            items.push(PullRequest {
+                number: request.number,
+                title: request.title,
+                state: request.state,
+                html_url: request.html_url,
+                head_branch: request.head.branch,
+                base_branch: request.base.branch,
+                draft: request.draft,
+            });
+        }
+        let total = if only_merged && (listing.page != 1 || listing.more) {
+            None
+        } else {
+            listing.total
+        };
+        Ok(Listing {
+            items,
+            page: listing.page,
+            more: listing.more,
+            total,
+        })
     }
 
     pub async fn create_pull_request(

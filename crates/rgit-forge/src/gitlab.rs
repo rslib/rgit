@@ -5,11 +5,20 @@ use serde::Deserialize;
 use super::ForgeError;
 use super::auth::load_credential_for;
 use super::types::{
-    Branch, CreatePullRequest, CreateRepository, Listing, Provider, PullRequest, RepoRef,
-    Repository, User, page_query, total_from_last_page,
+    Branch, CreatePullRequest, CreateRepository, Listing, Provider, PullRequest, PullRequestState,
+    RepoRef, Repository, User, page_query, total_from_last_page,
 };
 
 const DEFAULT_HOST: &str = "https://gitlab.com";
+
+fn state_param(state: PullRequestState) -> &'static str {
+    match state {
+        PullRequestState::Open => "opened",
+        PullRequestState::Closed => "closed",
+        PullRequestState::Merged => "merged",
+        PullRequestState::All => "all",
+    }
+}
 
 fn api_error(error: impl Display) -> ForgeError {
     ForgeError::api(Provider::Gitlab, error)
@@ -310,6 +319,8 @@ impl GitlabClient {
         &self,
         repo: &RepoRef,
         page: u32,
+        state: PullRequestState,
+        head: Option<&str>,
     ) -> Result<Listing<PullRequest>, ForgeError> {
         #[derive(Deserialize)]
         struct ApiMergeRequest {
@@ -321,11 +332,15 @@ impl GitlabClient {
             source_branch: String,
             target_branch: String,
         }
-        let url = format!(
-            "{}/projects/{}/merge_requests?state=opened",
+        let mut url = format!(
+            "{}/projects/{}/merge_requests?state={}",
             self.base_url,
-            self.project_path(repo)
+            self.project_path(repo),
+            state_param(state)
         );
+        if let Some(branch) = head {
+            url.push_str(&format!("&source_branch={}", urlencoding::encode(branch)));
+        }
         let listing: Listing<ApiMergeRequest> = self.list_page(&url, page).await?;
         Ok(listing.map(|request| PullRequest {
             number: request.iid,
@@ -466,6 +481,8 @@ mod tests {
                     name: "project".to_owned(),
                 },
                 2,
+                PullRequestState::Open,
+                None,
             ))
             .expect("merge requests");
         server.join().expect("server thread");
