@@ -639,6 +639,12 @@ pub enum Msg {
     ForgeMutationDone(Result<String, String>),
     ForgeCreate,
     ForgeDetails,
+    ForgeMerge,
+    ForgeCheckout,
+    ForgeRefresh,
+    ForgeReadyToggle,
+    ForgeComment,
+    ForgeChecksLoaded(Vec<crate::forge::PullRequestCi>),
     DiffPrompt,
     DiffLoaded {
         title: String,
@@ -1481,6 +1487,8 @@ pub enum PromptAction {
     /// Rename `pending_move_from` to the path named by the prompt value.
     MoveFile,
     ForgeCreate,
+    /// Merge with the method the prompt value names.
+    ForgeMerge,
 }
 
 /// A minibuffer: a label, an editable input, and optional filterable candidates.
@@ -2013,6 +2021,30 @@ pub enum Effect {
         head: String,
         base: String,
     },
+    ForgeMerge {
+        target: rgit_forge::ForgeTarget,
+        number: u64,
+        method: rgit_forge::MergeMethod,
+    },
+    ForgeCheckout {
+        target: rgit_forge::ForgeTarget,
+        number: u64,
+    },
+    ForgeReady {
+        target: rgit_forge::ForgeTarget,
+        number: u64,
+        /// Mark ready when true, a draft when false.
+        ready: bool,
+    },
+    ForgeComment {
+        target: rgit_forge::ForgeTarget,
+        number: u64,
+        body: String,
+    },
+    ForgeChecks {
+        target: rgit_forge::ForgeTarget,
+        numbers: Vec<u64>,
+    },
     /// Open the in-app commit editor (loading the HEAD message when amending).
     OpenCommitEditor {
         amend: bool,
@@ -2201,6 +2233,10 @@ pub struct App {
     forge_profiles: Vec<String>,
     forge_profile_index: usize,
     forge_close_armed: Option<(u64, std::time::Instant)>,
+    forge_merge_armed: Option<(u64, rgit_forge::MergeMethod, std::time::Instant)>,
+    /// The pull request a pending comment editor writes to, set when `a`
+    /// opens the commit editor from the forge view.
+    pending_forge_comment: Option<u64>,
     forge_open_requested: bool,
     /// When the background forge snapshot was last requested.
     last_remote_fetch: Option<std::time::Instant>,
@@ -2338,6 +2374,8 @@ impl App {
             remote_status: None,
             forge_snapshot: None,
             forge_close_armed: None,
+            forge_merge_armed: None,
+            pending_forge_comment: None,
             last_remote_fetch: None,
             forge_open_requested: false,
             snapshot: None,
@@ -2863,6 +2901,26 @@ impl App {
             resume_finder: None,
             base: None,
         });
+    }
+
+    /// The pull request under the cursor with its target, toasting why there
+    /// is none: the forge is not loaded, or the cursor is not on a request.
+    pub fn forge_at_cursor(
+        &mut self,
+    ) -> Option<(rgit_forge::ForgeTarget, crate::forge::PullRequest)> {
+        let Some(snapshot) = self.forge_snapshot.as_ref() else {
+            self.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
+            return None;
+        };
+        let index = self.buffer().cursor().saturating_sub(1);
+        let Some(request) = snapshot.requests.get(index) else {
+            self.push_toast(
+                ToastKind::Error,
+                "move onto a pull request first".to_owned(),
+            );
+            return None;
+        };
+        Some((snapshot.target.clone(), request.clone()))
     }
 
     /// Pop the active screen; returns false if already at the status root.
@@ -3493,6 +3551,83 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 number: request.number,
             }];
         }
+        Msg::ForgeMerge => {
+            let Some((target, request)) = app.forge_at_cursor() else {
+                return vec![];
+            };
+            // A chosen method arms the merge; pressing `m` again confirms it,
+            // as `x` confirms a close.
+            if let Some((number, method, armed)) = app.forge_merge_armed.take()
+                && number == request.number
+                && armed.elapsed() <= std::time::Duration::from_secs(10)
+            {
+                return vec![Effect::ForgeMerge {
+                    target,
+                    number,
+                    method,
+                }];
+            }
+            app.prompt = Some(Prompt {
+                label: "Merge method (merge, squash, rebase)".to_owned(),
+                input: "merge".to_owned(),
+                cursor: 5,
+                candidates: vec!["merge".to_owned(), "squash".to_owned(), "rebase".to_owned()],
+                values: Vec::new(),
+                selected: 0,
+                action: PromptAction::ForgeMerge,
+                masked: false,
+            });
+            return vec![];
+        }
+        Msg::ForgeCheckout => {
+            let Some((target, request)) = app.forge_at_cursor() else {
+                return vec![];
+            };
+            return vec![Effect::ForgeCheckout {
+                target,
+                number: request.number,
+            }];
+        }
+        Msg::ForgeRefresh => return vec![Effect::LoadForge],
+        Msg::ForgeReadyToggle => {
+            let Some((target, request)) = app.forge_at_cursor() else {
+                return vec![];
+            };
+            return vec![Effect::ForgeReady {
+                target,
+                number: request.number,
+                ready: request.draft,
+            }];
+        }
+        Msg::ForgeComment => {
+            let Some((_, request)) = app.forge_at_cursor() else {
+                return vec![];
+            };
+            app.pending_forge_comment = Some(request.number);
+            app.commit_editor = Some(CommitEditor::new(false, ""));
+            return vec![];
+        }
+        Msg::ForgeChecksLoaded(results) => {
+            if let Some(snapshot) = app.forge_snapshot.as_mut() {
+                for ci in results {
+                    if let Some(request) =
+                        snapshot.requests.iter_mut().find(|r| r.number == ci.number)
+                    {
+                        request.checks = ci.rollup;
+                        request.check_list = ci.checks;
+                    }
+                }
+            }
+            sync_remote_summary(app);
+            rebuild_status(app);
+            if app.active_kind() == ViewKind::Forge
+                && let Some(snapshot) = app.forge_snapshot.as_ref()
+            {
+                let sections = forge::build_view(snapshot);
+                app.buffer_mut().set_content(sections);
+            }
+            return vec![];
+        }
         Msg::ForgeMutationDone(Ok(message)) => {
             app.push_toast(ToastKind::Success, message);
             return vec![Effect::LoadForge];
@@ -3524,19 +3659,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             buffer.set_content(forge::build_view(&snapshot));
             let open_view = app.forge_open_requested;
             app.forge_open_requested = false;
-            let branch = app.head.as_ref().and_then(|head| head.branch.as_deref());
-            let request = branch.and_then(|branch| {
-                snapshot
-                    .requests
-                    .iter()
-                    .find(|request| request.branch == branch)
-            });
-            app.remote_status = Some(RemoteSummary {
-                pr: request.map(|request| (request.number, request.state.clone())),
-                title: request.map(|request| request.title.clone()),
-                checks: request.and_then(|request| request.checks.clone()),
-            });
             app.forge_snapshot = Some(snapshot);
+            sync_remote_summary(app);
             rebuild_status(app);
             if open_view {
                 app.push_view(ViewKind::Forge, buffer);
@@ -3544,6 +3668,27 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 let sections =
                     forge::build_view(app.forge_snapshot.as_ref().expect("forge snapshot"));
                 app.buffer_mut().set_content(sections);
+            }
+            // CI loads lazily after the list: every row on screen when the
+            // forge view is showing, else only the status view's row.
+            let show_all = app.active_kind() == ViewKind::Forge;
+            let branch = app.head.as_ref().and_then(|head| head.branch.clone());
+            if let Some(snapshot) = app.forge_snapshot.as_ref() {
+                let target = snapshot.target.clone();
+                let numbers: Vec<u64> = snapshot
+                    .requests
+                    .iter()
+                    .filter(|request| {
+                        show_all
+                            || branch
+                                .as_deref()
+                                .is_some_and(|b| request.branch.as_str() == b)
+                    })
+                    .map(|request| request.number)
+                    .collect();
+                if !numbers.is_empty() {
+                    return vec![Effect::ForgeChecks { target, numbers }];
+                }
             }
         }
         Msg::ForgeDetails => {
@@ -3948,9 +4093,35 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 editor.input(key);
             }
         }
-        Msg::CommitEditorCancel => app.commit_editor = None,
+        Msg::CommitEditorCancel => {
+            app.commit_editor = None;
+            app.pending_forge_comment = None;
+        }
         Msg::CommitEditorSubmit => {
-            if let Some(editor) = &app.commit_editor {
+            // A comment editor writes to its pull request instead of
+            // committing.
+            if app.pending_forge_comment.is_some() {
+                let body = app
+                    .commit_editor
+                    .as_ref()
+                    .map(|editor| editor.message())
+                    .unwrap_or_default();
+                if body.is_empty() {
+                    app.push_toast(ToastKind::Error, "empty comment".into());
+                } else if let Some(number) = app.pending_forge_comment.take() {
+                    app.commit_editor = None;
+                    match app.forge_snapshot.as_ref() {
+                        Some(snapshot) => {
+                            return vec![Effect::ForgeComment {
+                                target: snapshot.target.clone(),
+                                number,
+                                body,
+                            }];
+                        }
+                        None => app.push_toast(ToastKind::Error, "forge data is not loaded".into()),
+                    }
+                }
+            } else if let Some(editor) = &app.commit_editor {
                 let message = editor.message();
                 if message.is_empty() {
                     app.push_toast(ToastKind::Error, "empty commit message".into());
@@ -4405,6 +4576,29 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             base: base.to_owned(),
         }];
     }
+    if let PromptAction::ForgeMerge = prompt.action {
+        let method = match value.trim().to_lowercase().as_str() {
+            "merge" => rgit_forge::MergeMethod::Merge,
+            "squash" => rgit_forge::MergeMethod::Squash,
+            "rebase" => rgit_forge::MergeMethod::Rebase,
+            _ => {
+                app.error = Some("expected one of merge, squash or rebase".into());
+                return Vec::new();
+            }
+        };
+        let Some((_, request)) = app.forge_at_cursor() else {
+            return Vec::new();
+        };
+        app.forge_merge_armed = Some((request.number, method, std::time::Instant::now()));
+        app.push_toast(
+            ToastKind::Error,
+            format!(
+                "press m again within 10s to merge request #{} with {method}",
+                request.number
+            ),
+        );
+        return Vec::new();
+    }
     // Two-step prompts: stash the first value, then prompt for the second.
     if let Some(next) = two_step_next(prompt.action) {
         app.pending_prompt_value = Some(value.clone());
@@ -4636,7 +4830,8 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         | PromptAction::ReorderRev
         | PromptAction::SplitRev
         | PromptAction::Credential
-        | PromptAction::ForgeCreate => {
+        | PromptAction::ForgeCreate
+        | PromptAction::ForgeMerge => {
             return Vec::new();
         }
         PromptAction::DeleteBranch => Mutation::DeleteBranch(value),
@@ -5276,6 +5471,24 @@ fn rebuild_status(app: &mut App) {
     app.status_buffer_mut()
         .rebuild_preserving_selection(sections);
 }
+/// The current branch's pull request and CI for the REMOTE section, from the
+/// loaded snapshot.
+fn sync_remote_summary(app: &mut App) {
+    let branch = app.head.as_ref().and_then(|head| head.branch.as_deref());
+    let request = branch.and_then(|branch| {
+        app.forge_snapshot
+            .as_ref()?
+            .requests
+            .iter()
+            .find(|request| request.branch == branch)
+    });
+    app.remote_status = Some(RemoteSummary {
+        pr: request.map(|request| (request.number, request.state.clone())),
+        title: request.map(|request| request.title.clone()),
+        checks: request.and_then(|request| request.checks.clone()),
+    });
+}
+
 /// The REMOTE section: per-remote ahead/behind for the current branch, plus its
 /// open PR and CI rollup once loaded. `None` when there is nothing to show (no
 /// remotes and no loaded forge status).
@@ -5679,6 +5892,256 @@ mod tests {
         );
         assert!(app.hook_console.is_none());
         assert!(matches!(fx.as_slice(), [Effect::Refresh]));
+    }
+
+    fn forge_target() -> rgit_forge::ForgeTarget {
+        rgit_forge::ForgeTarget {
+            provider: rgit_forge::Provider::Github,
+            host: "https://github.com".to_owned(),
+            account: "default".to_owned(),
+            repo: Some(rgit_forge::RepoRef {
+                owner: "owner".to_owned(),
+                name: "repo".to_owned(),
+            }),
+        }
+    }
+
+    fn forge_request(number: u64, branch: &str, draft: bool) -> crate::forge::PullRequest {
+        crate::forge::PullRequest {
+            number,
+            title: format!("Request {number}"),
+            state: "open".to_owned(),
+            branch: branch.to_owned(),
+            checks: None,
+            url: format!("https://h/{number}"),
+            body: Some("Longer story.".to_owned()),
+            reviewers: vec!["dev-2".to_owned()],
+            draft,
+            check_list: Vec::new(),
+        }
+    }
+
+    fn forge_snapshot() -> crate::forge::ForgeSnapshot {
+        crate::forge::ForgeSnapshot {
+            target: forge_target(),
+            requests: vec![
+                forge_request(12, "feature", false),
+                forge_request(13, "other", true),
+            ],
+        }
+    }
+
+    /// An app with two loaded requests (12 open on `feature`, 13 draft on
+    /// `other`), cursor on the first.
+    fn forge_app() -> App {
+        let mut app = App::new(
+            Arc::new(rgit_git::Git2Backend::discover(".").unwrap()),
+            crate::config::Config::default(),
+        );
+        update(&mut app, Msg::ForgeLoaded(Ok(forge_snapshot())));
+        app
+    }
+
+    fn section_text(sections: &[rgit_model::Section]) -> String {
+        sections
+            .iter()
+            .flat_map(|s| s.spans.iter().map(|span| span.text.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn forge_merge_prompts_for_the_method_then_fires() {
+        let mut app = forge_app();
+        let fx = update(&mut app, Msg::ForgeMerge);
+        assert!(fx.is_empty());
+        let prompt = app.prompt.as_ref().expect("method prompt");
+        assert_eq!(prompt.action, PromptAction::ForgeMerge);
+        assert!(prompt.candidates.contains(&"squash".to_owned()));
+
+        // The defaulted `merge` arms the request; `m` again confirms it.
+        prompt_submit(&mut app);
+        assert!(app.prompt.is_none());
+        assert!(
+            app.toasts.iter().any(|t| t.text.contains("#12")),
+            "armed toast names the request"
+        );
+        let fx = update(&mut app, Msg::ForgeMerge);
+        assert!(
+            matches!(
+                fx.as_slice(),
+                [Effect::ForgeMerge {
+                    number: 12,
+                    method: rgit_forge::MergeMethod::Merge,
+                    ..
+                }]
+            ),
+            "{fx:?}"
+        );
+    }
+
+    #[test]
+    fn forge_merge_rejects_an_unknown_method() {
+        let mut app = forge_app();
+        update(&mut app, Msg::ForgeMerge);
+        app.prompt.as_mut().expect("prompt").input = "fast-forward".into();
+        prompt_submit(&mut app);
+        assert!(app.forge_merge_armed.is_none());
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|e| e.contains("merge, squash or rebase")),
+            "{:?}",
+            app.error
+        );
+    }
+
+    #[test]
+    fn forge_actions_need_a_request_under_the_cursor() {
+        let mut app = App::new(
+            Arc::new(rgit_git::Git2Backend::discover(".").unwrap()),
+            crate::config::Config::default(),
+        );
+        for msg in [
+            Msg::ForgeMerge,
+            Msg::ForgeCheckout,
+            Msg::ForgeReadyToggle,
+            Msg::ForgeComment,
+        ] {
+            assert!(update(&mut app, msg).is_empty());
+        }
+        assert!(!app.toasts.is_empty(), "each action toasts why");
+    }
+
+    #[test]
+    fn forge_checkout_refresh_and_ready_toggle() {
+        let mut app = forge_app();
+        let fx = update(&mut app, Msg::ForgeCheckout);
+        assert!(
+            matches!(fx.as_slice(), [Effect::ForgeCheckout { number: 12, .. }]),
+            "{fx:?}"
+        );
+        let fx = update(&mut app, Msg::ForgeRefresh);
+        assert!(matches!(fx.as_slice(), [Effect::LoadForge]), "{fx:?}");
+        // Request 12 is open: the toggle drafts it.
+        let fx = update(&mut app, Msg::ForgeReadyToggle);
+        assert!(
+            matches!(
+                fx.as_slice(),
+                [Effect::ForgeReady {
+                    number: 12,
+                    ready: false,
+                    ..
+                }]
+            ),
+            "{fx:?}"
+        );
+        // Onto request 13, a draft: the toggle readies it.
+        let mut buffer = Buffer::default();
+        buffer.set_content(crate::forge::build_view(
+            app.forge_snapshot.as_ref().expect("snapshot"),
+        ));
+        app.push_view(ViewKind::Forge, buffer);
+        app.buffer_mut().set_cursor(2);
+        let fx = update(&mut app, Msg::ForgeReadyToggle);
+        assert!(
+            matches!(
+                fx.as_slice(),
+                [Effect::ForgeReady {
+                    number: 13,
+                    ready: true,
+                    ..
+                }]
+            ),
+            "{fx:?}"
+        );
+    }
+
+    #[test]
+    fn forge_comment_uses_the_commit_editor() {
+        let mut app = forge_app();
+        let fx = update(&mut app, Msg::ForgeComment);
+        assert!(fx.is_empty());
+        assert!(app.commit_editor.is_some());
+        assert_eq!(app.pending_forge_comment, Some(12));
+        app.commit_editor
+            .as_mut()
+            .expect("editor")
+            .set_text("nice work");
+        let fx = update(&mut app, Msg::CommitEditorSubmit);
+        assert!(
+            matches!(
+                fx.as_slice(),
+                [Effect::ForgeComment { number: 12, body, .. }] if body == "nice work"
+            ),
+            "{fx:?}"
+        );
+        assert!(app.commit_editor.is_none());
+        assert_eq!(app.pending_forge_comment, None);
+    }
+
+    #[test]
+    fn forge_comment_keeps_the_editor_when_empty() {
+        let mut app = forge_app();
+        update(&mut app, Msg::ForgeComment);
+        let fx = update(&mut app, Msg::CommitEditorSubmit);
+        assert!(fx.is_empty());
+        assert!(
+            app.commit_editor.is_some(),
+            "empty comment keeps the editor"
+        );
+        update(&mut app, Msg::CommitEditorCancel);
+        assert!(app.commit_editor.is_none());
+        assert_eq!(app.pending_forge_comment, None);
+    }
+
+    #[test]
+    fn forge_checks_loaded_fills_the_rollup_and_status() {
+        let mut app = forge_app();
+        app.head = Some(Head {
+            branch: Some("feature".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            app.forge_snapshot.as_ref().expect("snapshot").requests[0].checks,
+            None
+        );
+        update(
+            &mut app,
+            Msg::ForgeChecksLoaded(vec![crate::forge::PullRequestCi {
+                number: 12,
+                rollup: Some("passing".to_owned()),
+                checks: vec![crate::forge::ForgeCheck {
+                    name: "build".to_owned(),
+                    status: "passing".to_owned(),
+                }],
+            }]),
+        );
+        let snapshot = app.forge_snapshot.as_ref().expect("snapshot");
+        assert_eq!(snapshot.requests[0].checks.as_deref(), Some("passing"));
+        assert_eq!(snapshot.requests[0].check_list.len(), 1);
+        assert_eq!(snapshot.requests[1].checks, None);
+        let summary = app.remote_status.as_ref().expect("status");
+        assert_eq!(summary.pr, Some((12, "open".to_owned())));
+        assert_eq!(summary.checks.as_deref(), Some("passing"));
+    }
+
+    #[test]
+    fn forge_views_show_body_reviewers_checks_and_rollup() {
+        let mut snapshot = forge_snapshot();
+        snapshot.requests[0].checks = Some("passing".to_owned());
+        snapshot.requests[0].check_list = vec![crate::forge::ForgeCheck {
+            name: "build".to_owned(),
+            status: "passing".to_owned(),
+        }];
+        let list = section_text(&crate::forge::build_view(&snapshot));
+        assert!(list.contains("#12"), "{list}");
+        assert!(list.contains("passing"), "{list}");
+        let detail =
+            section_text(crate::forge::build_detail(&snapshot, &snapshot.requests[0]).as_slice());
+        assert!(detail.contains("Longer story."), "{detail}");
+        assert!(detail.contains("dev-2"), "{detail}");
+        assert!(detail.contains("build"), "{detail}");
     }
 
     #[test]

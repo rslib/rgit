@@ -27,6 +27,11 @@ fn resolve_forge_key(key: crossterm::event::KeyEvent) -> Option<Msg> {
         KeyCode::Char('d') | KeyCode::Enter => Some(Msg::ForgeDetails),
         KeyCode::Char('x') => Some(Msg::ForgeClose),
         KeyCode::Char('o') | KeyCode::Char('O') => Some(Msg::ForgeOpen),
+        KeyCode::Char('m') => Some(Msg::ForgeMerge),
+        KeyCode::Char('C') => Some(Msg::ForgeCheckout),
+        KeyCode::Char('g') => Some(Msg::ForgeRefresh),
+        KeyCode::Char('R') => Some(Msg::ForgeReadyToggle),
+        KeyCode::Char('a') => Some(Msg::ForgeComment),
         _ if keymap::profile() == keymap::Profile::Vim => keymap::resolve_vim_key(key),
         _ => resolve_key(key),
     }
@@ -221,6 +226,89 @@ fn run_lane_op(
         Ok(s) => s,
         Err(e) => format!("error: {e}"),
     }
+}
+
+/// Check out a pull request's head branch: fetch its head commit, then create
+/// or fast-forward the local branch and switch to it. The fetch runs on the
+/// caller's thread and the git calls on a blocking thread; a local branch
+/// that has diverged is refused.
+async fn checkout_pr(
+    backend: &Arc<dyn GitBackend>,
+    target: &rgit_forge::ForgeTarget,
+    number: u64,
+) -> Result<String, String> {
+    let repo = target.repo().map_err(|error| error.to_string())?.clone();
+    let forge = rgit_forge::Forge::connect(target)
+        .await
+        .map_err(|error| error.to_string())?;
+    let pr = forge
+        .pull_request(&repo, number)
+        .await
+        .map_err(|error| error.to_string())?;
+    let branch = pr.head_branch.clone();
+    let fetch_ref = forge.pull_request_ref(number);
+    let backend = backend.clone();
+    tokio::task::spawn_blocking(move || {
+        let fetched_ref = format!("refs/rgit/pr/{number}");
+        backend
+            .fetch(
+                Some("origin"),
+                &[format!("+{fetch_ref}:{fetched_ref}")],
+                &rgit_git::FetchArgs::default(),
+                &|_: rgit_git::OpProgress| {},
+            )
+            .map_err(|_| format!("cannot fetch pull request #{number} from origin"))?;
+        let pulled = backend
+            .rev_parse(&fetched_ref)
+            .map_err(|error| error.to_string())?;
+        let on_branch = backend
+            .status()
+            .ok()
+            .and_then(|status| status.head.branch)
+            .is_some_and(|current| current == branch);
+        match backend
+            .branch_tip(&branch)
+            .map_err(|error| error.to_string())?
+        {
+            None => {
+                backend
+                    .branch_from(&branch, &pulled, false, false)
+                    .map_err(|error| error.to_string())?;
+            }
+            Some(tip) if tip == pulled => {}
+            Some(tip) => {
+                let below = backend
+                    .merge_bases(&tip, &pulled, true)
+                    .map_err(|error| error.to_string())?
+                    .iter()
+                    .any(|base| base.eq_ignore_ascii_case(&tip));
+                if below {
+                    backend
+                        .update_ref(
+                            &format!("refs/heads/{branch}"),
+                            Some(&pulled),
+                            None,
+                            false,
+                            Some(&format!("checkout: PR #{number}")),
+                        )
+                        .map_err(|error| error.to_string())?;
+                } else {
+                    return Err(format!(
+                        "local branch {branch} has diverged from the pull request's head \
+                         {pulled}; delete, reset or rename it first"
+                    ));
+                }
+            }
+        }
+        if !on_branch {
+            backend
+                .checkout_branch(&branch)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(format!("checked out {branch} (PR #{number})"))
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("forge worker failed: {error}")))
 }
 
 const TICK_HZ: f64 = 4.0;
@@ -1185,6 +1273,103 @@ async fn run_msg(
                     }
                     .await;
                     let _ = msg_tx.send(Msg::ForgeMutationDone(result));
+                });
+            }
+            Effect::ForgeMerge {
+                target,
+                number,
+                method,
+            } => {
+                let msg_tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let repo = target.repo().map_err(|error| error.to_string())?.clone();
+                        let provider = target.provider;
+                        rgit_forge::Forge::connect(&target)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .merge_pull_request(&repo, number, method, false)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("merged {provider} request #{number} with {method}"))
+                    }
+                    .await;
+                    let _ = msg_tx.send(Msg::ForgeMutationDone(result));
+                });
+            }
+            Effect::ForgeCheckout { target, number } => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    match checkout_pr(&backend, &target, number).await {
+                        Ok(message) => {
+                            let _ = msg_tx.send(Msg::ForgeMutationDone(Ok(message)));
+                            let _ = msg_tx.send(Msg::Refresh);
+                        }
+                        Err(error) => {
+                            let _ = msg_tx.send(Msg::ForgeMutationDone(Err(error)));
+                        }
+                    }
+                });
+            }
+            Effect::ForgeReady {
+                target,
+                number,
+                ready,
+            } => {
+                let msg_tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let repo = target.repo().map_err(|error| error.to_string())?.clone();
+                        let provider = target.provider;
+                        let forge = rgit_forge::Forge::connect(&target)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        if ready {
+                            forge
+                                .mark_pull_request_ready(&repo, number)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            Ok(format!("marked {provider} request #{number} ready"))
+                        } else {
+                            forge
+                                .mark_pull_request_draft(&repo, number)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            Ok(format!("marked {provider} request #{number} a draft"))
+                        }
+                    }
+                    .await;
+                    let _ = msg_tx.send(Msg::ForgeMutationDone(result));
+                });
+            }
+            Effect::ForgeComment {
+                target,
+                number,
+                body,
+            } => {
+                let msg_tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let repo = target.repo().map_err(|error| error.to_string())?.clone();
+                        let provider = target.provider;
+                        rgit_forge::Forge::connect(&target)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .comment_pull_request(&repo, number, &body)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("commented on {provider} request #{number}"))
+                    }
+                    .await;
+                    let _ = msg_tx.send(Msg::ForgeMutationDone(result));
+                });
+            }
+            Effect::ForgeChecks { target, numbers } => {
+                let msg_tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    let results = crate::forge::load_checks(&target, numbers).await;
+                    let _ = msg_tx.send(Msg::ForgeChecksLoaded(results));
                 });
             }
             Effect::ForgeCreate {
@@ -2385,6 +2570,40 @@ mod tests {
             restack_note(&mixed).as_deref(),
             Some("auto-restack (restacked 1; conflicts: b)")
         );
+    }
+
+    #[test]
+    fn forge_keys_map_to_forge_messages() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert!(matches!(
+            super::resolve_forge_key(key('m')),
+            Some(crate::app::Msg::ForgeMerge)
+        ));
+        assert!(matches!(
+            super::resolve_forge_key(key('C')),
+            Some(crate::app::Msg::ForgeCheckout)
+        ));
+        assert!(matches!(
+            super::resolve_forge_key(key('g')),
+            Some(crate::app::Msg::ForgeRefresh)
+        ));
+        assert!(matches!(
+            super::resolve_forge_key(key('R')),
+            Some(crate::app::Msg::ForgeReadyToggle)
+        ));
+        assert!(matches!(
+            super::resolve_forge_key(key('a')),
+            Some(crate::app::Msg::ForgeComment)
+        ));
+        assert!(matches!(
+            super::resolve_forge_key(key('c')),
+            Some(crate::app::Msg::ForgeCreate)
+        ));
+        assert!(matches!(
+            super::resolve_forge_key(key('x')),
+            Some(crate::app::Msg::ForgeClose)
+        ));
     }
 
     #[test]

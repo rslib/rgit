@@ -18,6 +18,31 @@ pub struct PullRequest {
     pub checks: Option<String>,
     #[serde(default)]
     pub url: String,
+    /// The request body, reviewers and draft flag, from the listing.
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub reviewers: Vec<String>,
+    #[serde(default)]
+    pub draft: bool,
+    /// One row per CI check on the head commit, filled lazily after the list.
+    #[serde(default)]
+    pub check_list: Vec<ForgeCheck>,
+}
+
+/// One CI check on a pull request's head commit.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ForgeCheck {
+    pub name: String,
+    pub status: String,
+}
+
+/// One pull request's CI: the rollup plus one row per check.
+#[derive(Debug, Clone)]
+pub struct PullRequestCi {
+    pub number: u64,
+    pub rollup: Option<String>,
+    pub checks: Vec<ForgeCheck>,
 }
 
 /// The loaded forge state: the account and repository, plus its open requests.
@@ -64,6 +89,10 @@ pub async fn load(
             branch: pr.head_branch,
             checks: None,
             url: pr.html_url,
+            body: pr.body,
+            reviewers: pr.reviewers,
+            draft: pr.draft,
+            check_list: Vec::new(),
         })
         .collect();
     Ok(ForgeSnapshot { target, requests })
@@ -108,6 +137,58 @@ pub fn submit_pull_requests(
             .await
             .map_err(|error| forge_error(&target, error))
     })
+}
+
+/// Fetch the CI of `numbers` against `target`, skipping the requests that
+/// fail so one bad request cannot hide the rest.
+pub async fn load_checks(target: &ForgeTarget, numbers: Vec<u64>) -> Vec<PullRequestCi> {
+    let Ok(repo) = target.repo().cloned() else {
+        return Vec::new();
+    };
+    let Ok(forge) = rgit_forge::Forge::connect(target).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(numbers.len());
+    for number in numbers {
+        let Ok(checks) = forge.pull_request_checks(&repo, number).await else {
+            continue;
+        };
+        let rollup = (!checks.checks.is_empty()).then(|| rollup_name(checks.rollup));
+        out.push(PullRequestCi {
+            number,
+            rollup,
+            checks: checks
+                .checks
+                .into_iter()
+                .map(|check| ForgeCheck {
+                    name: check.name,
+                    status: check.status,
+                })
+                .collect(),
+        });
+    }
+    out
+}
+
+/// A check rollup as the list and detail rows print it.
+fn rollup_name(rollup: rgit_forge::CheckRollup) -> String {
+    match rollup {
+        rgit_forge::CheckRollup::Passing => "passing",
+        rgit_forge::CheckRollup::Failing => "failing",
+        rgit_forge::CheckRollup::Pending => "pending",
+        rgit_forge::CheckRollup::None => "none",
+    }
+    .to_owned()
+}
+
+/// The mark and style a check status prints with, shared by the list and the
+/// detail view.
+fn check_mark(status: &str) -> (&'static str, Style) {
+    match status {
+        "passing" => ("\u{2714}", Style::Added),
+        "failing" => ("\u{2718}", Style::Deleted),
+        _ => ("\u{2022}", Style::Dim),
+    }
 }
 
 /// Whether the remote itself, rather than the config or the account, is at
@@ -175,11 +256,7 @@ pub fn build_view(snapshot: &ForgeSnapshot) -> Vec<Section> {
             Span::new(format!(" {} ", pr.state), state_style),
         ];
         if let Some(checks) = &pr.checks {
-            let (sym, style) = match checks.as_str() {
-                "passing" => ("\u{2714}", Style::Added),
-                "failing" => ("\u{2718}", Style::Deleted),
-                _ => ("\u{2022}", Style::Dim),
-            };
+            let (sym, style) = check_mark(checks);
             spans.push(Span::new(format!(" {sym} {checks} "), style));
         }
         spans.push(Span::plain(format!(" {}", pr.title)));
@@ -200,7 +277,8 @@ pub fn build_placeholder() -> Vec<Section> {
     )]
 }
 
-/// Render the selected request metadata for inspection before mutation.
+/// Render the selected request for inspection before mutation: its metadata,
+/// body, reviewers and check list.
 pub fn build_detail(snapshot: &ForgeSnapshot, request: &PullRequest) -> Vec<Section> {
     let row = |id: &str, label: &str, value: String| {
         Section::leaf(
@@ -212,7 +290,7 @@ pub fn build_detail(snapshot: &ForgeSnapshot, request: &PullRequest) -> Vec<Sect
             ],
         )
     };
-    vec![
+    let mut sections = vec![
         Section::leaf(
             "forge/detail/title",
             NodeKind::Section,
@@ -234,7 +312,56 @@ pub fn build_detail(snapshot: &ForgeSnapshot, request: &PullRequest) -> Vec<Sect
         row("forge/detail/state", "State", request.state.clone()),
         row("forge/detail/branch", "Branch", request.branch.clone()),
         row("forge/detail/url", "URL", request.url.clone()),
-    ]
+    ];
+    if request.draft {
+        sections.push(row("forge/detail/draft", "Draft", "yes".to_owned()));
+    }
+    let reviewers = if request.reviewers.is_empty() {
+        "none".to_owned()
+    } else {
+        request.reviewers.join(", ")
+    };
+    sections.push(row("forge/detail/reviewers", "Reviewers", reviewers));
+    if let Some(body) = request
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+    {
+        sections.push(Section::leaf(
+            "forge/detail/body",
+            NodeKind::Info,
+            vec![Span::new("Body:", Style::Dim)],
+        ));
+        for (i, line) in body.lines().enumerate() {
+            sections.push(Section::leaf(
+                format!("forge/detail/body/{i}"),
+                NodeKind::Info,
+                vec![Span::plain(line)],
+            ));
+        }
+    }
+    if request.check_list.is_empty() {
+        sections.push(row("forge/detail/checks", "Checks", "none".to_owned()));
+    } else {
+        sections.push(Section::leaf(
+            "forge/detail/checks",
+            NodeKind::Info,
+            vec![Span::new("Checks:", Style::Dim)],
+        ));
+        for (i, check) in request.check_list.iter().enumerate() {
+            let (sym, style) = check_mark(&check.status);
+            sections.push(Section::leaf(
+                format!("forge/detail/check/{i}"),
+                NodeKind::Info,
+                vec![
+                    Span::new(format!("{sym} "), style),
+                    Span::plain(check.name.clone()),
+                ],
+            ));
+        }
+    }
+    sections
 }
 
 #[cfg(test)]

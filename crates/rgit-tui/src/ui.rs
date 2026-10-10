@@ -1727,9 +1727,23 @@ fn context_hints(app: &App) -> (Option<String>, Vec<(&'static str, &'static str)
         ),
         ViewKind::Info => (None, vec![("q", "back")]),
         ViewKind::Blame => (None, vec![("^o", "editor"), ("q", "back")]),
-        ViewKind::Remotes | ViewKind::Worktrees | ViewKind::Forge | ViewKind::Review => {
-            (None, vec![("q", "back")])
-        }
+        ViewKind::Forge => (
+            Some("pull requests".into()),
+            vec![
+                ("m", "merge"),
+                ("C", "checkout"),
+                ("g", "refresh"),
+                ("R", "ready/draft"),
+                ("a", "comment"),
+                ("c", "create"),
+                ("d", "details"),
+                ("x", "close"),
+                ("o", "open"),
+                ("]", "profile"),
+                ("q", "back"),
+            ],
+        ),
+        ViewKind::Remotes | ViewKind::Worktrees | ViewKind::Review => (None, vec![("q", "back")]),
     }
 }
 
@@ -1803,6 +1817,21 @@ const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("a", "absorb changes into the owning commits"),
             ("f", "workflow status (flow init/start/finish: palette)"),
             ("w", "copy-on-write workspaces (new: palette)"),
+        ],
+    ),
+    (
+        "Forge (pull requests)",
+        &[
+            ("m", "merge (pick a method, press again to confirm)"),
+            ("C", "check out the request"),
+            ("g", "refresh"),
+            ("R", "toggle ready / draft"),
+            ("a", "comment"),
+            ("c", "create a request"),
+            ("d / RET", "details"),
+            ("x", "close (press again to confirm)"),
+            ("o", "open in the browser"),
+            ("]", "next forge profile"),
         ],
     ),
 ];
