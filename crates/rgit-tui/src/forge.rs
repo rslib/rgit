@@ -241,14 +241,27 @@ pub fn build_detail(snapshot: &ForgeSnapshot, request: &PullRequest) -> Vec<Sect
 mod tests {
     use super::*;
 
+    fn random_name(prefix: &str) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .subsec_nanos();
+        format!("{prefix}-{nanos:x}")
+    }
+
     #[test]
     fn detects_supported_remote_providers() {
         let selection = ForgeSelection::default();
-        let target = ForgeTarget::from_remote(&selection, "https://github.com/ray/rgit.git")
-            .expect("GitHub remote");
+        let owner = random_name("owner");
+        let remote = format!("https://github.com/{owner}/rgit.git");
+        let target = ForgeTarget::from_remote(&selection, &remote).expect("GitHub remote");
         assert_eq!(target.provider, rgit_forge::Provider::Github);
         assert_eq!(target.host, "https://github.com");
-        assert_eq!(target.repo().expect("repo").to_string(), "ray/rgit");
+        assert_eq!(
+            target.repo().expect("repo").to_string(),
+            format!("{owner}/rgit")
+        );
 
         let target =
             ForgeTarget::from_remote(&selection, "git@gitlab.com:group/subgroup/project.git")
