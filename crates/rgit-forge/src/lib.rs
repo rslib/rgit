@@ -155,6 +155,40 @@ impl Forge {
         }
     }
 
+    /// One pull request by its number (a GitLab merge request's `iid`).
+    pub async fn pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequest, ForgeError> {
+        match self {
+            Self::Github(client) => client.pull_request(repo, number).await,
+            Self::Gitlab(client) => client.pull_merge_request(repo, number).await,
+        }
+    }
+
+    /// The pull request whose head branch is `branch`, in any state; `None`
+    /// when the branch has no pull request.
+    pub async fn pull_request_for_branch(
+        &self,
+        repo: &RepoRef,
+        branch: &str,
+    ) -> Result<Option<PullRequest>, ForgeError> {
+        let mut page = 1;
+        loop {
+            let listing = self
+                .pull_requests(repo, page, PullRequestState::All, Some(branch))
+                .await?;
+            if let Some(found) = listing.items.iter().find(|pr| pr.head_branch == branch) {
+                return Ok(Some(found.clone()));
+            }
+            if !listing.more {
+                return Ok(None);
+            }
+            page += 1;
+        }
+    }
+
     pub async fn create_pull_request(
         &self,
         repo: &RepoRef,

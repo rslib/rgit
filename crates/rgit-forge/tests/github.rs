@@ -180,6 +180,46 @@ async fn ensure_pull_requests_reports_one_word_per_branch() {
 }
 
 #[tokio::test]
+async fn pulls_one_pull_request_by_number() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pr_json(12, "feature", "main")))
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .pull_request(&repo(), 12)
+        .await
+        .expect("pull request");
+    assert_eq!(pr.number, 12);
+    assert_eq!(pr.head_branch, "feature");
+    assert_mapped(&pr);
+}
+
+#[tokio::test]
+async fn finds_the_pull_request_for_a_branch() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls"))
+        .and(query_param("state", "all"))
+        .and(query_param("head", "owner:feature"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            pr_json(11, "feature-next", "main"),
+            pr_json(12, "feature", "main")
+        ])))
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .pull_request_for_branch(&repo(), "feature")
+        .await
+        .expect("search")
+        .expect("pull request");
+    assert_eq!(pr.number, 12);
+}
+
+#[tokio::test]
 async fn list_requests_the_state_and_head_filters() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

@@ -189,6 +189,25 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
             }),
         },
         ForgeCmd::Pr { cmd } => match cmd {
+            PrCmd::View { what, target, repo } => {
+                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                let what = pr_what(what)?;
+                with_forge(target, move |forge| async move {
+                    let pr = match what {
+                        PrWhat::Number(number) => forge.pull_request(&repo, number).await?,
+                        PrWhat::Branch(branch) => forge
+                            .pull_request_for_branch(&repo, &branch)
+                            .await?
+                            .ok_or_else(|| {
+                                ForgeError::Response(format!(
+                                    "no pull request for branch {branch:?}"
+                                ))
+                            })?,
+                    };
+                    print_json(pr)
+                })
+            }
             PrCmd::List { target, repo, page } => {
                 let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
@@ -364,6 +383,33 @@ fn auth_command(command: AuthCmd, selection: ForgeSelection) -> Result<String> {
         "profile": selection.profile,
         "accounts": status,
     }))?)
+}
+
+/// The pull request a `pr view` or `pr checks` argument names: a number when
+/// the argument is numeric, else a head branch.
+enum PrWhat {
+    Number(u64),
+    Branch(String),
+}
+
+fn pr_what(what: Option<String>) -> Result<PrWhat> {
+    match what {
+        Some(value) if value.chars().all(char::is_numeric) && !value.is_empty() => {
+            Ok(PrWhat::Number(value.parse()?))
+        }
+        Some(value) => Ok(PrWhat::Branch(value)),
+        None => Ok(PrWhat::Branch(current_branch()?)),
+    }
+}
+
+fn current_branch() -> Result<String> {
+    let backend = rgit_git::Git2Backend::discover(std::env::current_dir()?)
+        .map_err(|_| anyhow::anyhow!("no repository; pass a PR number or branch"))?;
+    backend
+        .status()
+        .ok()
+        .and_then(|status| status.head.branch)
+        .ok_or_else(|| anyhow::anyhow!("HEAD is detached; pass a PR number or branch"))
 }
 
 fn with_forge<F, Fut>(target: ForgeTarget, operation: F) -> Result<String>

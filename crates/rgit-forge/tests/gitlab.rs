@@ -155,6 +155,50 @@ async fn ensure_pull_request_retargets_when_the_base_differs() {
 }
 
 #[tokio::test]
+async fn pulls_one_merge_request_by_iid() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_json(12, "feature", "main")))
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .pull_request(&repo(), 12)
+        .await
+        .expect("merge request");
+    assert_eq!(pr.number, 12);
+    assert_eq!(pr.head_branch, "feature");
+    assert_mapped(&pr);
+}
+
+#[tokio::test]
+async fn finds_the_merge_request_for_a_branch() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests$",
+        ))
+        .and(query_param("state", "all"))
+        .and(query_param("source_branch", "feature"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            mr_json(11, "feature-next", "main"),
+            mr_json(12, "feature", "main")
+        ])))
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .pull_request_for_branch(&repo(), "feature")
+        .await
+        .expect("search")
+        .expect("merge request");
+    assert_eq!(pr.number, 12);
+}
+
+#[tokio::test]
 async fn list_requests_the_state_and_source_branch_filters() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

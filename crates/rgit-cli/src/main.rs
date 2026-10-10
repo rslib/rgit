@@ -984,6 +984,15 @@ fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> (Vec<String>, Option<String>)
             ),
         },
         ForgeCmd::Pr { cmd } => match cmd {
+            PrCmd::View { target, repo, .. } => {
+                let at = repo_args(target, repo);
+                (
+                    vec![format!(
+                        "Run `{base} pr checks <number>{at}` to see its checks"
+                    )],
+                    None,
+                )
+            }
             PrCmd::List { target, repo, .. } => {
                 let at = repo_args(target, repo);
                 (

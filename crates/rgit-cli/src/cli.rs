@@ -6611,6 +6611,14 @@ pub enum ForgeBranchCmd {
 
 #[derive(clap::Subcommand)]
 pub enum PrCmd {
+    /// Show one pull request or merge request by NUMBER or head BRANCH.
+    View {
+        /// A PR number or a head branch; defaults to the current branch.
+        what: Option<String>,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+    },
     /// List open pull requests or merge requests, 100 per page.
     List {
         /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.

@@ -415,6 +415,31 @@ impl GitlabClient {
         Ok(listing.map(|request| request.into_pull_request()))
     }
 
+    pub async fn pull_merge_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequest, ForgeError> {
+        let value: serde_json::Value = self
+            .http
+            .get(format!(
+                "{}/projects/{}/merge_requests/{}",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?
+            .json()
+            .await
+            .map_err(response_error)?;
+        self.merge_request_from_value(value)
+    }
+
     pub async fn create_merge_request(
         &self,
         repo: &RepoRef,

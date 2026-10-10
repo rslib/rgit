@@ -286,6 +286,22 @@ impl GithubClient {
         })
     }
 
+    pub async fn pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequest, ForgeError> {
+        let value: serde_json::Value = self
+            .api
+            .get(
+                format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.name),
+                None::<&()>,
+            )
+            .await
+            .map_err(api_error)?;
+        map_pr(value)
+    }
+
     pub async fn create_pull_request(
         &self,
         repo: &RepoRef,
