@@ -1,8 +1,22 @@
 //! GitHub HTTP stubs for the pull request operations.
 
+use std::sync::LazyLock;
+
 use rgit_forge::{EnsureOutcome, Forge, GithubClient, PullRequestState, RepoRef};
 use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn random_login(prefix: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .subsec_nanos();
+    format!("{prefix}-{nanos:x}")
+}
+
+static AUTHOR: LazyLock<String> = LazyLock::new(|| random_login("dev"));
+static REVIEWER: LazyLock<String> = LazyLock::new(|| random_login("rev"));
 
 fn repo() -> RepoRef {
     RepoRef {
@@ -18,9 +32,29 @@ fn pr_json(number: u64, head: &str, base: &str) -> serde_json::Value {
         "state": "open",
         "html_url": format!("https://github.com/owner/repo/pull/{number}"),
         "draft": false,
+        "body": " Longer story.",
+        "user": {"login": AUTHOR.as_str()},
+        "created_at": "2026-01-02T03:04:05Z",
+        "updated_at": "2026-01-03T03:04:05Z",
+        "mergeable": true,
+        "merged": false,
+        "labels": [{"name": "ci"}, {"name": "forge"}],
+        "requested_reviewers": [{"login": REVIEWER.as_str()}],
         "head": {"ref": head, "sha": "abc"},
         "base": {"ref": base, "sha": "def"}
     })
+}
+
+fn assert_mapped(pr: &rgit_forge::PullRequest) {
+    assert_eq!(pr.author.as_deref(), Some(AUTHOR.as_str()));
+    assert_eq!(pr.body.as_deref(), Some(" Longer story."));
+    assert_eq!(pr.created_at.as_deref(), Some("2026-01-02T03:04:05Z"));
+    assert_eq!(pr.updated_at.as_deref(), Some("2026-01-03T03:04:05Z"));
+    assert_eq!(pr.head_sha.as_deref(), Some("abc"));
+    assert_eq!(pr.mergeable, Some(true));
+    assert!(!pr.merged);
+    assert_eq!(pr.labels, vec!["ci", "forge"]);
+    assert_eq!(pr.reviewers, vec![REVIEWER.clone()]);
 }
 
 fn forge(server: &MockServer) -> Forge {
@@ -71,6 +105,7 @@ async fn ensure_pull_request_creates_when_no_open_pr_matches() {
     assert_eq!(ensured.pull_request.number, 12);
     assert_eq!(ensured.pull_request.head_branch, "feature");
     assert_eq!(ensured.pull_request.base_branch, "main");
+    assert_mapped(&ensured.pull_request);
 }
 
 #[tokio::test]

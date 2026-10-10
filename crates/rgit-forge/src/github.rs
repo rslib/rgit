@@ -39,14 +39,36 @@ struct ApiPullRequest {
     html_url: String,
     draft: bool,
     merged_at: Option<String>,
+    #[serde(default)]
+    merged: bool,
+    user: Option<ApiAccount>,
+    body: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    mergeable: Option<bool>,
+    #[serde(default)]
+    labels: Vec<ApiLabel>,
+    #[serde(default)]
+    requested_reviewers: Vec<ApiAccount>,
     head: ApiRef,
     base: ApiRef,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiAccount {
+    login: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiLabel {
+    name: String,
 }
 
 #[derive(serde::Deserialize)]
 struct ApiRef {
     #[serde(rename = "ref")]
     branch: String,
+    sha: Option<String>,
 }
 
 impl From<ApiPullRequest> for PullRequest {
@@ -59,6 +81,19 @@ impl From<ApiPullRequest> for PullRequest {
             head_branch: request.head.branch,
             base_branch: request.base.branch,
             draft: request.draft,
+            author: request.user.map(|user| user.login),
+            body: request.body,
+            created_at: request.created_at,
+            updated_at: request.updated_at,
+            head_sha: request.head.sha,
+            mergeable: request.mergeable,
+            merged: request.merged,
+            labels: request.labels.into_iter().map(|label| label.name).collect(),
+            reviewers: request
+                .requested_reviewers
+                .into_iter()
+                .map(|user| user.login)
+                .collect(),
         }
     }
 }

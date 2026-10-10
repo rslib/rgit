@@ -1255,6 +1255,7 @@ mod tests {
             head_branch: "feat".to_owned(),
             base_branch: "main".to_owned(),
             draft: false,
+            ..Default::default()
         };
         assert_eq!(
             badge_html(&pr),

@@ -190,7 +190,7 @@ pub enum PullRequestState {
     All,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PullRequest {
     pub number: u64,
     pub title: String,
@@ -199,6 +199,20 @@ pub struct PullRequest {
     pub head_branch: String,
     pub base_branch: String,
     pub draft: bool,
+    /// The head author's login or username.
+    pub author: Option<String>,
+    pub body: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    /// The commit id the head branch points at.
+    pub head_sha: Option<String>,
+    /// Whether the forge will accept a merge of this branch; `None` when it
+    /// has not computed a verdict (GitHub list entries never carry one).
+    pub mergeable: Option<bool>,
+    pub merged: bool,
+    pub labels: Vec<String>,
+    /// The requested reviewers' logins or usernames.
+    pub reviewers: Vec<String>,
 }
 
 /// What `Forge::ensure_pull_request` did: opened a new pull request, or worked

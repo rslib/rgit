@@ -28,6 +28,86 @@ fn response_error(error: impl Display) -> ForgeError {
     ForgeError::Response(error.to_string())
 }
 
+/// The merge request shape of GitLab's API; rgit's type flattens the branches
+/// and maps `merge_status` onto `mergeable`.
+#[derive(Deserialize)]
+struct ApiMergeRequest {
+    iid: u64,
+    title: String,
+    state: String,
+    web_url: String,
+    #[serde(default)]
+    draft: bool,
+    author: Option<ApiAccount>,
+    description: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    sha: Option<String>,
+    merge_status: Option<String>,
+    labels: Option<serde_json::Value>,
+    reviewers: Option<Vec<ApiAccount>>,
+    source_branch: String,
+    target_branch: String,
+}
+
+#[derive(Deserialize)]
+struct ApiAccount {
+    username: String,
+}
+
+impl ApiMergeRequest {
+    fn into_pull_request(self) -> PullRequest {
+        let merged = self.state == "merged";
+        PullRequest {
+            number: self.iid,
+            title: self.title,
+            state: self.state,
+            html_url: self.web_url,
+            head_branch: self.source_branch,
+            base_branch: self.target_branch,
+            draft: self.draft,
+            author: self.author.map(|user| user.username),
+            body: self.description,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            head_sha: self.sha,
+            mergeable: self
+                .merge_status
+                .map(|status| status.starts_with("can_be_")),
+            merged,
+            labels: labels_from_value(self.labels),
+            reviewers: self
+                .reviewers
+                .unwrap_or_default()
+                .into_iter()
+                .map(|user| user.username)
+                .collect(),
+        }
+    }
+}
+
+/// `labels` is a string array (`["bug"]`) or, with labels details on, a
+/// `[{"name": "bug"}]` object array.
+fn labels_from_value(value: Option<serde_json::Value>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                serde_json::Value::String(name) => Some(name),
+                serde_json::Value::Object(fields) => fields
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .map(str::to_owned),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub struct GitlabClient {
     http: reqwest::Client,
     token: String,
@@ -322,16 +402,6 @@ impl GitlabClient {
         state: PullRequestState,
         head: Option<&str>,
     ) -> Result<Listing<PullRequest>, ForgeError> {
-        #[derive(Deserialize)]
-        struct ApiMergeRequest {
-            iid: u64,
-            title: String,
-            state: String,
-            web_url: String,
-            draft: bool,
-            source_branch: String,
-            target_branch: String,
-        }
         let mut url = format!(
             "{}/projects/{}/merge_requests?state={}",
             self.base_url,
@@ -342,15 +412,7 @@ impl GitlabClient {
             url.push_str(&format!("&source_branch={}", urlencoding::encode(branch)));
         }
         let listing: Listing<ApiMergeRequest> = self.list_page(&url, page).await?;
-        Ok(listing.map(|request| PullRequest {
-            number: request.iid,
-            title: request.title,
-            state: request.state,
-            html_url: request.web_url,
-            head_branch: request.source_branch,
-            base_branch: request.target_branch,
-            draft: request.draft,
-        }))
+        Ok(listing.map(|request| request.into_pull_request()))
     }
 
     pub async fn create_merge_request(
@@ -441,27 +503,8 @@ impl GitlabClient {
         &self,
         value: serde_json::Value,
     ) -> Result<PullRequest, ForgeError> {
-        #[derive(Deserialize)]
-        struct ApiMergeRequest {
-            iid: u64,
-            title: String,
-            state: String,
-            web_url: String,
-            #[serde(default)]
-            draft: bool,
-            source_branch: String,
-            target_branch: String,
-        }
         let request: ApiMergeRequest = serde_json::from_value(value).map_err(response_error)?;
-        Ok(PullRequest {
-            number: request.iid,
-            title: request.title,
-            state: request.state,
-            html_url: request.web_url,
-            head_branch: request.source_branch,
-            base_branch: request.target_branch,
-            draft: request.draft,
-        })
+        Ok(request.into_pull_request())
     }
 }
 

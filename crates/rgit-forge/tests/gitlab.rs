@@ -1,8 +1,22 @@
 //! GitLab HTTP stubs for the pull request (merge request) operations.
 
+use std::sync::LazyLock;
+
 use rgit_forge::{EnsureOutcome, Forge, GitlabClient, PullRequestState, RepoRef};
 use wiremock::matchers::{body_json, body_string, method, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn random_username(prefix: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .subsec_nanos();
+    format!("{prefix}-{nanos:x}")
+}
+
+static AUTHOR: LazyLock<String> = LazyLock::new(|| random_username("dev"));
+static REVIEWER: LazyLock<String> = LazyLock::new(|| random_username("rev"));
 
 fn repo() -> RepoRef {
     RepoRef {
@@ -18,9 +32,29 @@ fn mr_json(iid: u64, source: &str, target: &str) -> serde_json::Value {
         "state": "opened",
         "web_url": format!("https://gitlab.example/group/project/-/merge_requests/{iid}"),
         "draft": false,
+        "author": {"username": AUTHOR.as_str()},
+        "description": " Longer story.",
+        "created_at": "2026-01-02T03:04:05Z",
+        "updated_at": "2026-01-03T03:04:05Z",
+        "sha": "abc123",
+        "merge_status": "can_be_merged",
+        "labels": ["ci", "forge"],
+        "reviewers": [{"username": REVIEWER.as_str()}],
         "source_branch": source,
         "target_branch": target
     })
+}
+
+fn assert_mapped(pr: &rgit_forge::PullRequest) {
+    assert_eq!(pr.author.as_deref(), Some(AUTHOR.as_str()));
+    assert_eq!(pr.body.as_deref(), Some(" Longer story."));
+    assert_eq!(pr.created_at.as_deref(), Some("2026-01-02T03:04:05Z"));
+    assert_eq!(pr.updated_at.as_deref(), Some("2026-01-03T03:04:05Z"));
+    assert_eq!(pr.head_sha.as_deref(), Some("abc123"));
+    assert_eq!(pr.mergeable, Some(true));
+    assert!(!pr.merged);
+    assert_eq!(pr.labels, vec!["ci", "forge"]);
+    assert_eq!(pr.reviewers, vec![REVIEWER.clone()]);
 }
 
 fn forge(server: &MockServer) -> Forge {
@@ -75,6 +109,7 @@ async fn ensure_pull_request_creates_when_no_open_mr_matches() {
     assert_eq!(ensured.pull_request.number, 12);
     assert_eq!(ensured.pull_request.head_branch, "feature");
     assert_eq!(ensured.pull_request.base_branch, "main");
+    assert_mapped(&ensured.pull_request);
 }
 
 #[tokio::test]
