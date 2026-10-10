@@ -212,7 +212,7 @@ mod tests {
             account = "work"
             host = "https://gitlab.example.com"
             [profiles.personal]
-            account = "ray"
+            account = "dev"
             "#,
         )
         .expect("parsable profile config");
@@ -247,18 +247,32 @@ mod tests {
         assert!(error.to_string().contains("OWNER/REPO"));
     }
 
+    fn random_name(prefix: &str) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .subsec_nanos();
+        format!("{prefix}-{nanos:x}")
+    }
+
     #[test]
     fn a_remote_names_the_provider_and_repository() {
+        let account = random_name("account");
+        let owner = random_name("owner");
         let selection = ForgeSelection {
-            account: Some("ray".to_owned()),
+            account: Some(account.clone()),
             ..ForgeSelection::default()
         };
-        let target =
-            ForgeTarget::from_remote(&selection, "git@github.com:ray/rgit.git").expect("remote");
+        let remote = format!("git@github.com:{owner}/rgit.git");
+        let target = ForgeTarget::from_remote(&selection, &remote).expect("remote");
         assert_eq!(target.provider, Provider::Github);
-        assert_eq!(target.account, "ray");
+        assert_eq!(target.account, account);
         assert_eq!(target.host, "https://github.com");
-        assert_eq!(target.repo().expect("repo").to_string(), "ray/rgit");
+        assert_eq!(
+            target.repo().expect("repo").to_string(),
+            format!("{owner}/rgit")
+        );
 
         let error = ForgeTarget::from_remote(&selection, "https://example.com/a/b")
             .expect_err("unsupported remote");
