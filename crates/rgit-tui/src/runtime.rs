@@ -1108,9 +1108,7 @@ async fn run_msg(
             }
             Effect::LoadForge => {
                 let backend = app.backend();
-                let workdir = backend.workdir().to_path_buf();
-                let forge_account = app.forge_account.clone();
-                let forge_host = app.forge_host.clone();
+                let forge_selection = app.forge_selection.clone();
                 let msg_tx = msg_tx.clone();
                 tokio::spawn(async move {
                     let started = Instant::now();
@@ -1124,12 +1122,7 @@ async fn run_msg(
                     .flatten();
                     let handle = tokio::runtime::Handle::current();
                     let result = tokio::task::spawn_blocking(move || {
-                        handle.block_on(crate::forge::load(
-                            origin,
-                            workdir,
-                            forge_account,
-                            forge_host,
-                        ))
+                        handle.block_on(crate::forge::load(origin, forge_selection))
                     })
                     .await
                     .unwrap_or_else(|error| Err(format!("forge worker failed: {error}")));
@@ -1141,40 +1134,18 @@ async fn run_msg(
                     let _ = msg_tx.send(Msg::ForgeLoaded(result));
                 });
             }
-            Effect::ForgeClose {
-                provider,
-                host,
-                account,
-                repository,
-                number,
-            } => {
+            Effect::ForgeClose { target, number } => {
                 let msg_tx = msg_tx.clone();
                 tokio::spawn(async move {
                     let result = async {
-                        let repo = rgit_forge::RepoRef::parse(&repository)
+                        let repo = target.repo().map_err(|error| error.to_string())?.clone();
+                        let provider = target.provider;
+                        rgit_forge::Forge::connect(&target)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .close_pull_request(&repo, number)
+                            .await
                             .map_err(|error| error.to_string())?;
-                        match provider.as_str() {
-                            "github" => {
-                                let client =
-                                    rgit_forge::GithubClient::from_environment_for(&account)
-                                        .await
-                                        .map_err(|error| error.to_string())?;
-                                client
-                                    .close_pull_request(&repo, number)
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                            }
-                            "gitlab" => {
-                                let client =
-                                    rgit_forge::GitlabClient::from_environment_for(&host, &account)
-                                        .map_err(|error| error.to_string())?;
-                                client
-                                    .close_merge_request(&repo, number)
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                            }
-                            _ => return Err("unsupported forge provider".to_owned()),
-                        }
                         Ok(format!("closed {provider} request #{number}"))
                     }
                     .await;
@@ -1182,10 +1153,7 @@ async fn run_msg(
                 });
             }
             Effect::ForgeCreate {
-                provider,
-                host,
-                account,
-                repository,
+                target,
                 title,
                 head,
                 base,
@@ -1193,8 +1161,8 @@ async fn run_msg(
                 let msg_tx = msg_tx.clone();
                 tokio::spawn(async move {
                     let result = async {
-                        let repo = rgit_forge::RepoRef::parse(&repository)
-                            .map_err(|error| error.to_string())?;
+                        let repo = target.repo().map_err(|error| error.to_string())?.clone();
+                        let provider = target.provider;
                         let request = rgit_forge::CreatePullRequest {
                             title,
                             head,
@@ -1202,28 +1170,12 @@ async fn run_msg(
                             body: None,
                             draft: false,
                         };
-                        match provider.as_str() {
-                            "github" => {
-                                let client =
-                                    rgit_forge::GithubClient::from_environment_for(&account)
-                                        .await
-                                        .map_err(|error| error.to_string())?;
-                                client
-                                    .create_pull_request(&repo, &request)
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                            }
-                            "gitlab" => {
-                                let client =
-                                    rgit_forge::GitlabClient::from_environment_for(&host, &account)
-                                        .map_err(|error| error.to_string())?;
-                                client
-                                    .create_merge_request(&repo, &request)
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                            }
-                            _ => return Err("unsupported forge provider".to_owned()),
-                        }
+                        rgit_forge::Forge::connect(&target)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .create_pull_request(&repo, &request)
+                            .await
+                            .map_err(|error| error.to_string())?;
                         Ok(format!("created {provider} request"))
                     }
                     .await;

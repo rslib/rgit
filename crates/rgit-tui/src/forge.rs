@@ -1,7 +1,6 @@
 //! Native forge integration detected from the current Git remote.
 
-use std::path::PathBuf;
-
+use rgit_forge::{ForgeError, ForgeSelection, ForgeTarget};
 use rgit_model::{NodeKind, Section, Span, Style};
 use serde::Deserialize;
 
@@ -21,126 +20,77 @@ pub struct PullRequest {
     pub url: String,
 }
 
+/// The loaded forge state: the account and repository, plus its open requests.
 #[derive(Debug, Clone)]
 pub struct ForgeSnapshot {
-    pub provider: String,
-    pub host: String,
-    pub account: String,
-    pub repository: String,
+    pub target: ForgeTarget,
     pub requests: Vec<PullRequest>,
 }
 
 pub async fn load(
     origin: Option<String>,
-    _workdir: PathBuf,
-    configured_account: Option<String>,
-    configured_host: Option<String>,
+    selection: ForgeSelection,
 ) -> Result<ForgeSnapshot, String> {
-    let configured_host_for_detection = configured_host.as_deref();
-    let Some((provider, remote_host, repo)) = origin
-        .as_deref()
-        .and_then(|url| parse_forge_remote(url, configured_host_for_detection))
-    else {
-        return Err("the current remote is not a supported forge repository".to_owned());
+    let selection = selection.resolve().map_err(|error| error.to_string())?;
+    let Some(origin) = origin else {
+        return Err(unsupported_remote());
     };
-    let account = configured_account
-        .or_else(|| std::env::var("RGIT_FORGE_ACCOUNT").ok())
-        .unwrap_or_else(|| "default".to_owned());
-    let host = configured_host.unwrap_or(remote_host);
-    let repository = format!("{}/{}", repo.owner, repo.name);
-    let requests = match provider.as_str() {
-        "github" => {
-            let client = rgit_forge::GithubClient::from_environment_for(&account)
-                .await
-                .map_err(|error| forge_error(&provider, &host, &account, error))?;
-            client
-                .pull_requests(&repo, 1)
-                .await
-                .map_err(|error| forge_error(&provider, &host, &account, error))?
-                .items
-                .into_iter()
-                .map(|pr| PullRequest {
-                    number: pr.number,
-                    title: pr.title,
-                    state: pr.state,
-                    branch: pr.head_branch,
-                    checks: None,
-                    url: pr.html_url,
-                })
-                .collect()
+    let target = ForgeTarget::from_remote(&selection, &origin).map_err(|error| {
+        if remote_failure(&error) {
+            unsupported_remote()
+        } else {
+            error.to_string()
         }
-        "gitlab" => {
-            let client = rgit_forge::GitlabClient::from_environment_for(&host, &account)
-                .map_err(|error| forge_error(&provider, &host, &account, error))?;
-            client
-                .merge_requests(&repo, 1)
-                .await
-                .map_err(|error| forge_error(&provider, &host, &account, error))?
-                .items
-                .into_iter()
-                .map(|mr| PullRequest {
-                    number: mr.number,
-                    title: mr.title,
-                    state: mr.state,
-                    branch: mr.head_branch,
-                    checks: None,
-                    url: mr.html_url,
-                })
-                .collect()
-        }
-        _ => return Err("the current remote is not a supported forge repository".to_owned()),
-    };
-    Ok(ForgeSnapshot {
-        provider,
-        host,
-        account,
-        repository,
-        requests,
-    })
+    })?;
+    let forge = rgit_forge::Forge::connect(&target)
+        .await
+        .map_err(|error| forge_error(&target, error))?;
+    let requests = forge
+        .pull_requests(target.repo().expect("remote names a repository"), 1)
+        .await
+        .map_err(|error| forge_error(&target, error))?
+        .items
+        .into_iter()
+        .map(|pr| PullRequest {
+            number: pr.number,
+            title: pr.title,
+            state: pr.state,
+            branch: pr.head_branch,
+            checks: None,
+            url: pr.html_url,
+        })
+        .collect();
+    Ok(ForgeSnapshot { target, requests })
 }
 
-fn forge_error(provider: &str, host: &str, account: &str, error: impl std::fmt::Display) -> String {
-    format!("{provider} forge ({host}, account {account}): {error}")
+/// Whether the remote itself, rather than the config or the account, is at
+/// fault.
+fn remote_failure(error: &ForgeError) -> bool {
+    matches!(
+        error,
+        ForgeError::InvalidRemote(_)
+            | ForgeError::UnsupportedHost(_)
+            | ForgeError::InvalidRepository(_)
+    )
 }
 
-/// Parse GitHub and GitLab remote URLs, including SSH and nested GitLab groups.
-pub fn parse_forge_remote(
-    url: &str,
-    configured_gitlab_host: Option<&str>,
-) -> Option<(String, String, rgit_forge::RepoRef)> {
-    let value = url.trim().trim_end_matches(".git");
-    let (host, path) = if value.contains("://") {
-        let (_, authority_path) = value.split_once("://")?;
-        let (authority, path) = authority_path.split_once('/')?;
-        (
-            authority
-                .rsplit_once('@')
-                .map(|(_, host)| host)
-                .unwrap_or(authority),
-            path,
-        )
-    } else {
-        let (authority, path) = value.split_once(':')?;
-        (authority.rsplit_once('@').map(|(_, host)| host)?, path)
-    };
-    let provider = if host.eq_ignore_ascii_case("github.com") {
-        "github"
-    } else if host.eq_ignore_ascii_case("gitlab.com")
-        || configured_gitlab_host
-            .is_some_and(|configured| configured.trim_end_matches('/').contains(host))
-        || std::env::var("GITLAB_HOST")
-            .ok()
-            .is_some_and(|configured| configured.trim_end_matches('/').contains(host))
-    {
-        "gitlab"
-    } else {
-        return None;
-    };
-    Some((
-        provider.to_owned(),
-        format!("https://{host}"),
-        rgit_forge::RepoRef::parse(path).ok()?,
-    ))
+fn unsupported_remote() -> String {
+    "the current remote is not a supported forge repository".to_owned()
+}
+
+fn forge_error(target: &ForgeTarget, error: impl std::fmt::Display) -> String {
+    format!(
+        "{} forge ({}, account {}): {error}",
+        target.provider, target.host, target.account
+    )
+}
+
+fn repository(target: &ForgeTarget) -> String {
+    target
+        .repo
+        .as_ref()
+        .map(rgit_forge::RepoRef::to_string)
+        .unwrap_or_default()
 }
 
 /// Render the forge context and pull-request list as view content.
@@ -150,8 +100,11 @@ pub fn build_view(snapshot: &ForgeSnapshot) -> Vec<Section> {
         NodeKind::DiffLine,
         vec![Span::new(
             format!(
-                "{} {} ({}) · account {}",
-                snapshot.provider, snapshot.repository, snapshot.host, snapshot.account
+                "{} {} ({}) \u{b7} account {}",
+                snapshot.target.provider,
+                repository(&snapshot.target),
+                snapshot.target.host,
+                snapshot.target.account
             ),
             Style::Dim,
         )],
@@ -188,12 +141,13 @@ pub fn build_view(snapshot: &ForgeSnapshot) -> Vec<Section> {
     }));
     sections
 }
+
 pub fn build_placeholder() -> Vec<Section> {
     vec![Section::leaf(
         "forge/loading",
         NodeKind::Info,
         vec![Span::new(
-            "forge data is not loaded · press Ctrl-G to load".to_owned(),
+            "forge data is not loaded \u{b7} press Ctrl-G to load".to_owned(),
             Style::Dim,
         )],
     )]
@@ -221,14 +175,14 @@ pub fn build_detail(snapshot: &ForgeSnapshot, request: &PullRequest) -> Vec<Sect
             "forge/detail/context",
             "Forge",
             format!(
-                "{} · {} · account {}",
-                snapshot.provider, snapshot.host, snapshot.account
+                "{} \u{b7} {} \u{b7} account {}",
+                snapshot.target.provider, snapshot.target.host, snapshot.target.account
             ),
         ),
         row(
             "forge/detail/repository",
             "Repository",
-            snapshot.repository.clone(),
+            repository(&snapshot.target),
         ),
         row("forge/detail/state", "State", request.state.clone()),
         row("forge/detail/branch", "Branch", request.branch.clone()),
@@ -242,26 +196,32 @@ mod tests {
 
     #[test]
     fn detects_supported_remote_providers() {
-        let (provider, host, repo) =
-            parse_forge_remote("https://github.com/ray/rgit.git", None).expect("GitHub remote");
-        assert_eq!(provider, "github");
-        assert_eq!(host, "https://github.com");
-        assert_eq!(repo.owner, "ray");
-        assert_eq!(repo.name, "rgit");
+        let selection = ForgeSelection::default();
+        let target = ForgeTarget::from_remote(&selection, "https://github.com/ray/rgit.git")
+            .expect("GitHub remote");
+        assert_eq!(target.provider, rgit_forge::Provider::Github);
+        assert_eq!(target.host, "https://github.com");
+        assert_eq!(target.repo().expect("repo").to_string(), "ray/rgit");
 
-        let (provider, _, repo) =
-            parse_forge_remote("git@gitlab.com:group/subgroup/project.git", None)
+        let target =
+            ForgeTarget::from_remote(&selection, "git@gitlab.com:group/subgroup/project.git")
                 .expect("GitLab remote");
-        assert_eq!(provider, "gitlab");
-        assert_eq!(repo.owner, "group");
-        assert_eq!(repo.name, "subgroup/project");
-        assert!(parse_forge_remote("https://example.com/a/b", None).is_none());
+        assert_eq!(target.provider, rgit_forge::Provider::Gitlab);
+        assert_eq!(target.repo().expect("repo").owner, "group");
+        assert_eq!(target.repo().expect("repo").name, "subgroup/project");
+
+        assert!(ForgeTarget::from_remote(&selection, "https://example.com/a/b").is_err());
+
+        let self_hosted = ForgeSelection {
+            host: Some("https://gitlab.internal.example".to_owned()),
+            ..ForgeSelection::default()
+        };
         assert!(
-            parse_forge_remote(
-                "https://gitlab.internal.example/group/project",
-                Some("https://gitlab.internal.example")
+            ForgeTarget::from_remote(
+                &self_hosted,
+                "https://gitlab.internal.example/group/project"
             )
-            .is_some()
+            .is_ok()
         );
     }
 }

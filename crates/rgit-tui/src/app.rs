@@ -2004,17 +2004,11 @@ pub enum Effect {
     /// Load forge pull requests, then push the forge view.
     LoadForge,
     ForgeClose {
-        provider: String,
-        host: String,
-        account: String,
-        repository: String,
+        target: rgit_forge::ForgeTarget,
         number: u64,
     },
     ForgeCreate {
-        provider: String,
-        host: String,
-        account: String,
-        repository: String,
+        target: rgit_forge::ForgeTarget,
         title: String,
         head: String,
         base: String,
@@ -2204,7 +2198,7 @@ pub struct App {
     /// until loaded or when the forge is unavailable.
     remote_status: Option<RemoteSummary>,
     forge_snapshot: Option<ForgeSnapshot>,
-    forge_profiles: Vec<(String, Option<String>, Option<String>)>,
+    forge_profiles: Vec<String>,
     forge_profile_index: usize,
     forge_close_armed: Option<(u64, std::time::Instant)>,
     forge_open_requested: bool,
@@ -2255,8 +2249,7 @@ pub struct App {
     mouse_press_col: Option<usize>,
     /// Which regions let the terminal background show through.
     pub error: Option<String>,
-    pub forge_account: Option<String>,
-    pub forge_host: Option<String>,
+    pub forge_selection: rgit_forge::ForgeSelection,
     pub transparency: crate::config::Transparency,
     pub should_quit: bool,
 }
@@ -2276,19 +2269,13 @@ impl App {
             Some("true" | "yes" | "on" | "1")
         );
         let gpg_sign = config.commit.gpg_sign || git_wants_sign;
-        let (forge_account, forge_host) = config.forge.context();
-        let mut forge_profiles: Vec<_> = config
-            .forge
-            .profiles
-            .iter()
-            .map(|(name, profile)| (name.clone(), profile.account.clone(), profile.host.clone()))
-            .collect();
-        forge_profiles.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut forge_profiles: Vec<_> = config.forge.profiles.keys().cloned().collect();
+        forge_profiles.sort();
         let forge_profile_index = config
             .forge
             .default_profile
             .as_ref()
-            .and_then(|name| forge_profiles.iter().position(|profile| &profile.0 == name))
+            .and_then(|name| forge_profiles.iter().position(|profile| profile == name))
             .unwrap_or(0);
         Self {
             backend,
@@ -2342,6 +2329,10 @@ impl App {
             pending_lane: None,
             pending_lane_path: None,
             pending_cred_reply: None,
+            forge_selection: rgit_forge::ForgeSelection {
+                profile: config.forge.default_profile.clone(),
+                ..Default::default()
+            },
             forge_profiles,
             forge_profile_index,
             remote_status: None,
@@ -2368,8 +2359,6 @@ impl App {
             mouse_drag_pane: None,
             mouse_dragging: false,
             mouse_press_col: None,
-            forge_account,
-            forge_host,
             transparency: config.ui.transparent,
             error: None,
             should_quit: false,
@@ -3449,9 +3438,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 return vec![];
             }
             app.forge_profile_index = (app.forge_profile_index + 1) % app.forge_profiles.len();
-            let (name, account, host) = app.forge_profiles[app.forge_profile_index].clone();
-            app.forge_account = account;
-            app.forge_host = host;
+            let name = app.forge_profiles[app.forge_profile_index].clone();
+            app.forge_selection.profile = Some(name.clone());
             app.push_toast(ToastKind::Success, format!("forge profile: {name}"));
             return vec![Effect::LoadForge];
         }
@@ -3501,10 +3489,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 return vec![];
             }
             return vec![Effect::ForgeClose {
-                provider: snapshot.provider.clone(),
-                host: snapshot.host.clone(),
-                account: snapshot.account.clone(),
-                repository: snapshot.repository.clone(),
+                target: snapshot.target.clone(),
                 number: request.number,
             }];
         }
@@ -4414,10 +4399,7 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             return Vec::new();
         };
         return vec![Effect::ForgeCreate {
-            provider: snapshot.provider.clone(),
-            host: snapshot.host.clone(),
-            account: snapshot.account.clone(),
-            repository: snapshot.repository.clone(),
+            target: snapshot.target.clone(),
             title: title.to_owned(),
             head: head.to_owned(),
             base: base.to_owned(),
@@ -5354,7 +5336,7 @@ fn build_remote_section(
         vec![Span::new(
             format!(
                 "{} · {} · account {} (Ctrl-G for details)",
-                forge.provider, forge.host, forge.account
+                forge.target.provider, forge.target.host, forge.target.account
             ),
             Style::Dim,
         )]

@@ -470,11 +470,11 @@ fn main() -> ! {
             finish(
                 forge::run(
                     cmd,
-                    forge::ForgeContext {
+                    forge::ForgeSelection {
                         profile,
-                        provider: None,
                         account,
                         host,
+                        ..Default::default()
                     },
                 )
                 .map(|text| {
