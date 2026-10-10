@@ -703,6 +703,33 @@ impl GitlabClient {
             .map_err(response_error)?;
         self.merge_request_from_value(value)
     }
+
+    /// Mark merge request `number` ready or draft by adding or removing the
+    /// `Draft: ` title prefix GitLab reads.
+    pub async fn set_merge_request_draft(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        draft: bool,
+    ) -> Result<PullRequest, ForgeError> {
+        let current = self.pull_merge_request(repo, number).await?;
+        const PREFIX: &str = "Draft:";
+        let drafted = current.title.starts_with(PREFIX);
+        if draft == drafted {
+            return Ok(current);
+        }
+        let title = if draft {
+            format!("{PREFIX} {}", current.title)
+        } else {
+            current
+                .title
+                .trim_start_matches(PREFIX)
+                .trim_start()
+                .to_owned()
+        };
+        self.edit_merge_request(repo, number, Some(&title), None, None)
+            .await
+    }
 }
 
 #[cfg(test)]

@@ -359,6 +359,28 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                     )
                 })
             }
+            PrCmd::Ready {
+                number,
+                target,
+                repo,
+            } => {
+                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                with_forge(target, |forge| async move {
+                    print_json(forge.mark_pull_request_ready(&repo, number).await?)
+                })
+            }
+            PrCmd::Draft {
+                number,
+                target,
+                repo,
+            } => {
+                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                with_forge(target, |forge| async move {
+                    print_json(forge.mark_pull_request_draft(&repo, number).await?)
+                })
+            }
         },
         ForgeCmd::Browse {
             number,

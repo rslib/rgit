@@ -1056,6 +1056,15 @@ fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> (Vec<String>, Option<String>)
                     None,
                 )
             }
+            PrCmd::Ready { target, repo, .. } | PrCmd::Draft { target, repo, .. } => {
+                let at = repo_args(target, repo);
+                (
+                    vec![format!(
+                        "Run `{base} pr view <number>{at}` to see the pull request"
+                    )],
+                    None,
+                )
+            }
         },
         ForgeCmd::Browse { .. } => (Vec::new(), None),
     }

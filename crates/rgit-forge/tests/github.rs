@@ -3,7 +3,7 @@
 use std::sync::LazyLock;
 
 use rgit_forge::{EnsureOutcome, Forge, GithubClient, PullRequestState, RepoRef};
-use wiremock::matchers::{body_partial_json, method, path, query_param};
+use wiremock::matchers::{body_partial_json, body_string_contains, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn random_login(prefix: &str) -> String {
@@ -28,6 +28,7 @@ fn repo() -> RepoRef {
 fn pr_json(number: u64, head: &str, base: &str) -> serde_json::Value {
     serde_json::json!({
         "number": number,
+        "node_id": format!("PR_node_{number}"),
         "title": "Title",
         "state": "open",
         "html_url": format!("https://github.com/owner/repo/pull/{number}"),
@@ -399,4 +400,68 @@ async fn edits_the_title_and_base_of_a_pull_request() {
     assert_eq!(pr.title, "New title");
     assert_eq!(pr.base_branch, "main");
     assert_mapped(&pr);
+}
+
+#[tokio::test]
+async fn marks_a_pull_request_ready_through_graphql() {
+    let server = MockServer::start().await;
+    let mut ready = pr_json(12, "feature", "main");
+    ready["draft"] = serde_json::json!(false);
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ready))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("markPullRequestReadyForReview"))
+        .and(body_string_contains("PR_node_12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "markPullRequestReadyForReview": {
+                    "pullRequest": {"id": "PR_node_12", "isDraft": false}
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .mark_pull_request_ready(&repo(), 12)
+        .await
+        .expect("ready");
+    assert_eq!(pr.number, 12);
+    assert!(!pr.draft);
+}
+
+#[tokio::test]
+async fn marks_a_pull_request_draft_through_graphql() {
+    let server = MockServer::start().await;
+    let mut draft = pr_json(12, "feature", "main");
+    draft["draft"] = serde_json::json!(true);
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(draft))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("convertPullRequestToDraft"))
+        .and(body_string_contains("PR_node_12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "convertPullRequestToDraft": {
+                    "pullRequest": {"id": "PR_node_12", "isDraft": true}
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .mark_pull_request_draft(&repo(), 12)
+        .await
+        .expect("draft");
+    assert_eq!(pr.number, 12);
+    assert!(pr.draft);
 }

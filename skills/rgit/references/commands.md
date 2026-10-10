@@ -172,6 +172,8 @@ Every command with what it does and example invocations. Run `rgit <command> --h
     - `forge pr checkout`: Check out a pull request's head branch, fetching its head commit. e.g. `rgit forge pr checkout 42`, `rgit forge pr checkout 42 owner/repo`
     - `forge pr close`: Close a pull request or merge request. e.g. `rgit forge pr close 42 --yes`, `rgit forge pr close 42 owner/repo --yes`
     - `forge pr edit`: Change a pull request's title, body or base branch. e.g. `rgit forge pr edit 42 --title "<title>"`, `rgit forge pr edit 42 --base main`
+    - `forge pr ready`: Mark a pull request ready for review. e.g. `rgit forge pr ready 42`
+    - `forge pr draft`: Mark a pull request a draft. e.g. `rgit forge pr draft 42`
     - `forge pr merge`: Merge a pull request or merge request. e.g. `rgit forge pr merge 42 --yes`, `rgit forge pr merge 42 --method squash --delete-branch --yes`
   - `forge browse`: Open the forge repository or one pull request in the browser. e.g. `rgit forge browse`, `rgit forge browse 42`, `rgit forge browse 42 owner/repo --print`
 

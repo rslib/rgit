@@ -6731,6 +6731,20 @@ pub enum PrCmd {
         #[arg(long)]
         base: Option<String>,
     },
+    /// Mark a pull request ready for review.
+    Ready {
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+    },
+    /// Mark a pull request a draft.
+    Draft {
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+    },
     /// Merge a pull request or merge request.
     Merge {
         number: u64,

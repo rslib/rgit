@@ -374,6 +374,30 @@ impl Forge {
         }
     }
 
+    /// Mark pull request `number` ready for review.
+    pub async fn mark_pull_request_ready(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequest, ForgeError> {
+        match self {
+            Self::Github(client) => client.set_pull_request_draft(repo, number, false).await,
+            Self::Gitlab(client) => client.set_merge_request_draft(repo, number, false).await,
+        }
+    }
+
+    /// Mark pull request `number` a draft.
+    pub async fn mark_pull_request_draft(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequest, ForgeError> {
+        match self {
+            Self::Github(client) => client.set_pull_request_draft(repo, number, true).await,
+            Self::Gitlab(client) => client.set_merge_request_draft(repo, number, true).await,
+        }
+    }
+
     pub async fn current_user(&self) -> Result<User, ForgeError> {
         match self {
             Self::Github(client) => client.current_user().await,

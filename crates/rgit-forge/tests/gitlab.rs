@@ -403,3 +403,62 @@ async fn edits_the_title_and_description_of_a_merge_request() {
     assert_eq!(pr.title, "New title");
     assert_eq!(pr.body.as_deref(), Some("New story."));
 }
+
+#[tokio::test]
+async fn marks_a_merge_request_ready_by_dropping_the_prefix() {
+    let server = MockServer::start().await;
+    let mut draft = mr_json(12, "feature", "main");
+    draft["title"] = serde_json::json!("Draft: Title");
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(draft))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .and(body_partial_json(serde_json::json!({"title": "Title"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_json(12, "feature", "main")))
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .mark_pull_request_ready(&repo(), 12)
+        .await
+        .expect("ready");
+    assert_eq!(pr.number, 12);
+    assert_eq!(pr.title, "Title");
+}
+
+#[tokio::test]
+async fn marks_a_merge_request_draft_by_prefixing_the_title() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_json(12, "feature", "main")))
+        .mount(&server)
+        .await;
+    let mut draft = mr_json(12, "feature", "main");
+    draft["title"] = serde_json::json!("Draft: Title");
+    draft["draft"] = serde_json::json!(true);
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .and(body_partial_json(serde_json::json!({"title": "Draft: Title"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(draft))
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .mark_pull_request_draft(&repo(), 12)
+        .await
+        .expect("draft");
+    assert_eq!(pr.number, 12);
+    assert_eq!(pr.title, "Draft: Title");
+}

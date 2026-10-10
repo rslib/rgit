@@ -299,15 +299,54 @@ impl GithubClient {
         repo: &RepoRef,
         number: u64,
     ) -> Result<PullRequest, ForgeError> {
-        let value: serde_json::Value = self
-            .api
+        self.pull_request_value(repo, number).await.and_then(map_pr)
+    }
+
+    async fn pull_request_value(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<serde_json::Value, ForgeError> {
+        self.api
             .get(
                 format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.name),
                 None::<&()>,
             )
             .await
+            .map_err(api_error)
+    }
+
+    /// Mark pull request `number` ready for review or draft. REST cannot flip
+    /// the draft flag, so this goes through GraphQL, then reports the pull
+    /// request as REST sees it.
+    pub async fn set_pull_request_draft(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        draft: bool,
+    ) -> Result<PullRequest, ForgeError> {
+        let value = self.pull_request_value(repo, number).await?;
+        let node_id = value.get("node_id").and_then(|id| id.as_str()).ok_or_else(|| {
+            ForgeError::Response(format!(
+                "pull request {number} of {repo} has no node id"
+            ))
+        })?;
+        let mutation = if draft {
+            "convertPullRequestToDraft"
+        } else {
+            "markPullRequestReadyForReview"
+        };
+        let _: serde_json::Value = self
+            .api
+            .graphql(&serde_json::json!({
+                "query": format!(
+                    "mutation($id: ID!) {{ {mutation}(input: {{pullRequestId: $id}}) {{ pullRequest {{ id isDraft }} }} }}"
+                ),
+                "variables": { "id": node_id },
+            }))
+            .await
             .map_err(api_error)?;
-        map_pr(value)
+        self.pull_request(repo, number).await
     }
 
     /// The checks of pull request `number`'s head commit: GitHub's check runs
