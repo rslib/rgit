@@ -134,7 +134,7 @@ impl Style {
 
 /// A commit through a pretty format's common placeholders (git's
 /// rebase.instructionFormat).
-// ponytail: the placeholders todo lines use; the full pretty engine lives in
+// the placeholders todo lines use; the full pretty engine lives in
 // rgit-cli.
 fn pretty(repo: &Repository, oid: Oid, format: &str) -> String {
     let Ok(c) = repo.find_commit(oid) else {

@@ -312,7 +312,7 @@ fn severity_config(repo: &Repository) -> (HashMap<String, Level>, std::collectio
 
 /// Whether a tree entry name is `.<base>` as HFS+ or NTFS would see it
 /// (any case, trailing dots or spaces, the `<short>~1`..`~4` short names).
-// ponytail: HFS+ ignorable code points and NTFS hashed short names are not
+// HFS+ ignorable code points and NTFS hashed short names are not
 // matched.
 fn is_dotfile(name: &str, base: &str, short: &str) -> bool {
     let n = name.trim_end_matches(['.', ' ']).to_ascii_lowercase();

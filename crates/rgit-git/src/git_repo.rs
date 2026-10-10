@@ -10687,7 +10687,7 @@ pub(crate) fn checkout_merged(
             "your local changes would be overwritten by {verb}; commit or stash them first"
         )));
     }
-    // ponytail: zdiff3 is written as diff3; libgit2's checkout has no zdiff3.
+    // zdiff3 is written as diff3; libgit2's checkout has no zdiff3.
     let diff3 = repo
         .config()
         .and_then(|c| c.get_string("merge.conflictStyle"))

@@ -30,7 +30,7 @@ fn note_map(tree: Option<&Tree>) -> Result<BTreeMap<Oid, Oid>, GitError> {
 /// Write the notes as git's write_notes_tree lays them out: a note's fanout
 /// grows by one directory level while every one of the 16 nibbles at the
 /// next even 16-tree level holds two or more notes (notes.c determine_fanout).
-// ponytail: drops non-note entries, and does not keep a fanout that only
+// drops non-note entries, and does not keep a fanout that only
 // unread subtrees of the old tree would have held up.
 fn write_map(repo: &Repository, map: &BTreeMap<Oid, Oid>) -> Result<Oid, GitError> {
     let hexes: Vec<(String, Oid)> = map.iter().map(|(o, b)| (o.to_string(), *b)).collect();

@@ -544,7 +544,7 @@ pub struct Widened(Vec<(String, Oid)>);
 /// Write out every skip-worktree file and clear its bit, so a command that
 /// moves HEAD, the index or the files can run on a full working tree; then
 /// [`narrow`] puts sparsity back. `None` when the repository is not sparse.
-// ponytail: materializes every skipped file for the length of the command;
+// materializes every skipped file for the length of the command;
 // teach the checkouts themselves about skip-worktree if sparse trees get huge.
 pub fn widen(git_dir: &Path) -> Result<Option<Widened>, GitError> {
     let repo = Repository::open(git_dir)?;

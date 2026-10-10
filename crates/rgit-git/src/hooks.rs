@@ -133,7 +133,7 @@ impl HookWatch {
     /// through `prepared` and `committed` (a refusing `prepared` puts the refs
     /// back and runs `aborted`), then `post-index-change` with its
     /// `<worktree updated> <skip-worktree changed>` flags.
-    // ponytail: the hook sees one transaction per command, after the refs
+    // the hook sees one transaction per command, after the refs
     // moved, and an abort restores the refs but not their reflogs; a
     // refdb-backend wrapper would give git's per-update, before-write view.
     pub fn finish(self, flags: impl FnOnce() -> (bool, bool)) -> Result<(), GitError> {

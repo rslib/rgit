@@ -71,7 +71,7 @@ impl Regex {
         };
         // musl has no REG_STARTEND: match a NUL-terminated copy so offsets
         // stay relative to text.
-        // ponytail: an interior NUL truncates the match (glibc matches past
+        // an interior NUL truncates the match (glibc matches past
         // it); userdiff text is source code, so reintroduce STARTEND-free
         // bounded matching only if that ever matters.
         #[cfg(target_env = "musl")]

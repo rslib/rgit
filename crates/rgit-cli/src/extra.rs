@@ -563,7 +563,7 @@ pub fn packs(
         }
         Extra::Backfill { .. } => {
             if rgit_git::is_partial_clone(&repo()?) {
-                // ponytail: libgit2 cannot fetch objects on demand; a partial
+                // libgit2 cannot fetch objects on demand; a partial
                 // clone's missing blobs stay missing.
                 return Err(fatal(
                     "backfill of a partial clone is not supported: libgit2 cannot fetch missing objects",

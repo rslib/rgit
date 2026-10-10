@@ -1266,7 +1266,7 @@ pub fn cache_daemon(debug: bool, socket: Option<String>) -> ! {
     }));
     let watch = state.clone();
     let path = socket.clone();
-    // ponytail: a once-a-second expiry check instead of poll() with git's
+    // a once-a-second expiry check instead of poll() with git's
     // exact wakeup; exit timing is off by under a second.
     std::thread::spawn(move || {
         loop {

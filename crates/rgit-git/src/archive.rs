@@ -210,7 +210,7 @@ enum CrlfAction {
 /// convert_to_working_tree for an archived file at tree path `path`: ident,
 /// then LF to CRLF, then the smudge filter, as its `ident`, `text`/`crlf`,
 /// `eol` and `filter` attributes and core.autocrlf / core.eol say.
-// ponytail: filter.<driver>.process and working-tree-encoding are not run.
+// filter.<driver>.process and working-tree-encoding are not run.
 fn to_worktree(
     repo: &Repository,
     attrs: &Attributes,

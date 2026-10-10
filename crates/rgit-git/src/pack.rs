@@ -275,7 +275,7 @@ fn find_deltas(entries: &[Entry], list: &[usize], o: &DeltaOpts) -> Vec<(usize, 
 
 /// Write `ids` as a new pack with git's delta search, its `.idx` (v2) and,
 /// with pack.writeReverseIndex, its `.rev`; its `pack-<hash>` name.
-// ponytail: every object is held in memory while packing; stream them if
+// every object is held in memory while packing; stream them if
 // packs outgrow RAM.
 pub(crate) fn write_pack(
     repo: &Repository,
@@ -527,7 +527,7 @@ fn links(kind: ObjectType, data: &[u8]) -> Vec<Oid> {
 /// bitmap per selected commit (the ref tips and every 100th commit), as
 /// git's pack-bitmap v1 with the full-DAG option. False (and nothing
 /// written) when the pack lacks a reachable object.
-// ponytail: each selected commit's trees are walked afresh (only commit
+// each selected commit's trees are walked afresh (only commit
 // bitmaps are reused); memoize tree bitmaps if large repos need it.
 pub(crate) fn write_bitmap(repo: &Repository, pack: &Path, tips: &[Oid]) -> Result<bool, GitError> {
     let idx = crate::maintenance::idx_offsets(&pack.with_extension("idx"));

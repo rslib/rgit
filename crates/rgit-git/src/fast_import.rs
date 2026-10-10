@@ -115,7 +115,7 @@ pub fn fast_import(
             0, 0, 0
         )
     };
-    // ponytail: git's counters without the pack and memory ones; rgit
+    // git's counters without the pack and memory ones; rgit
     // writes loose objects.
     let stats = format!(
         "fast-import statistics:\n{bar}\n\
@@ -718,7 +718,7 @@ impl Importer<'_> {
                 let commit = self
                     .commitish(target)?
                     .ok_or_else(|| die(format!("Invalid ref name or SHA1 expression: {target}")))?;
-                // ponytail: notes stay flat (no fanout), as git keeps them under 256 notes.
+                // notes stay flat (no fanout), as git keeps them under 256 notes.
                 files.insert(commit.to_string(), (0o100644, id));
             }
             "ls" | "cat-blob" => self.query(l, Some(files))?,
@@ -794,7 +794,7 @@ impl Importer<'_> {
         Ok(())
     }
 
-    // ponytail: rebuilds every tree of a commit from its flat file list;
+    // rebuilds every tree of a commit from its flat file list;
     // cache unchanged subtrees if big imports get slow.
     fn build_tree(&mut self, files: &Files) -> Result<Oid, GitError> {
         let mut dirs: BTreeMap<&str, Files> = BTreeMap::new();

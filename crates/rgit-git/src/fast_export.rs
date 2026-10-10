@@ -149,7 +149,7 @@ pub(crate) struct Walked {
 /// first tip name reaching each commit (git's revision_sources).
 /// `treesame` simplifies history as a pathspec does, leaving out commits
 /// that match a parent.
-// ponytail: git walks a commit-graph repo incrementally (init_topo_walk);
+// git walks a commit-graph repo incrementally (init_topo_walk);
 // this is the limited walk, whose tie-breaks can differ there.
 pub(crate) fn topo_walk(
     repo: &Repository,
