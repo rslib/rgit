@@ -5,8 +5,8 @@ use super::ForgeError;
 use super::auth::{load_credential_for, refresh_if_needed};
 use super::types::{
     Branch, CheckRun, CreatePullRequest, CreateRepository, Listing, MergeMethod, Provider,
-    PullRequest, PullRequestChecks, PullRequestState, RepoRef, Repository, User,
-    normalize_check_status, page_query, rollup_from, total_from_last_page,
+    PullRequest, PullRequestChecks, PullRequestComment, PullRequestState, RepoRef, Repository,
+    User, normalize_check_status, page_query, rollup_from, total_from_last_page,
 };
 
 fn api_error(error: octocrab::Error) -> ForgeError {
@@ -520,6 +520,45 @@ impl GithubClient {
             .await
             .map_err(api_error)
             .and_then(map_pr)
+    }
+
+    /// Comment `body` on pull request `number`.
+    pub async fn comment_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        body: &str,
+    ) -> Result<PullRequestComment, ForgeError> {
+        #[derive(Serialize)]
+        struct NewComment<'a> {
+            body: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct ApiComment {
+            id: u64,
+            body: String,
+            user: Option<ApiAccount>,
+            html_url: String,
+            created_at: Option<String>,
+        }
+        let comment: ApiComment = self
+            .api
+            .post(
+                format!(
+                    "/repos/{}/{}/issues/{number}/comments",
+                    repo.owner, repo.name
+                ),
+                Some(&NewComment { body }),
+            )
+            .await
+            .map_err(api_error)?;
+        Ok(PullRequestComment {
+            id: comment.id,
+            body: comment.body,
+            author: comment.user.map(|user| user.login),
+            url: Some(comment.html_url),
+            created_at: comment.created_at,
+        })
     }
 
     /// Change the title, body and base branch pull request `number` carries;

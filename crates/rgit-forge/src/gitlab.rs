@@ -6,8 +6,8 @@ use super::ForgeError;
 use super::auth::load_credential_for;
 use super::types::{
     Branch, CheckRun, CreatePullRequest, CreateRepository, Listing, MergeMethod, Provider,
-    PullRequest, PullRequestChecks, PullRequestState, RepoRef, Repository, User,
-    normalize_check_status, page_query, rollup_from, total_from_last_page,
+    PullRequest, PullRequestChecks, PullRequestComment, PullRequestState, RepoRef, Repository,
+    User, normalize_check_status, page_query, rollup_from, total_from_last_page,
 };
 
 const DEFAULT_HOST: &str = "https://gitlab.com";
@@ -688,6 +688,47 @@ impl GitlabClient {
             .await
             .map_err(response_error)?;
         self.merge_request_from_value(value)
+    }
+
+    /// Comment `body` on merge request `number`.
+    pub async fn comment_merge_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        body: &str,
+    ) -> Result<PullRequestComment, ForgeError> {
+        #[derive(Deserialize)]
+        struct ApiNote {
+            id: u64,
+            body: String,
+            author: Option<ApiAccount>,
+            created_at: Option<String>,
+        }
+        let note: ApiNote = self
+            .http
+            .post(format!(
+                "{}/projects/{}/merge_requests/{}/notes",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "body": body }))
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?
+            .json()
+            .await
+            .map_err(response_error)?;
+        Ok(PullRequestComment {
+            id: note.id,
+            body: note.body,
+            author: note.author.map(|user| user.username),
+            url: None,
+            created_at: note.created_at,
+        })
     }
 
     /// Change the title, description and target branch merge request `number`

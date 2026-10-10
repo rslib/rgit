@@ -1473,6 +1473,10 @@ const EXAMPLES: &[Entry] = &[
     ("forge pr ready", &["rgit forge pr ready 42"]),
     ("forge pr draft", &["rgit forge pr draft 42"]),
     ("forge pr reopen", &["rgit forge pr reopen 42"]),
+    (
+        "forge pr comment",
+        &["rgit forge pr comment 42 --body \"<text>\""],
+    ),
     ("stack", &["rgit stack"]),
     ("stack new", &["rgit stack new <branch>"]),
     ("stack list", &["rgit stack list"]),

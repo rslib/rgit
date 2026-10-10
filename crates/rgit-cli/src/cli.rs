@@ -6752,6 +6752,19 @@ pub enum PrCmd {
         target: Option<String>,
         repo: Option<String>,
     },
+    /// Comment on a pull request or merge request.
+    Comment {
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        /// The comment text.
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the comment text from this file (`-` for stdin).
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<String>,
+    },
     /// Merge a pull request or merge request.
     Merge {
         number: u64,

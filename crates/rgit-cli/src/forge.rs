@@ -392,6 +392,22 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                     print_json(forge.reopen_pull_request(&repo, number).await?)
                 })
             }
+            PrCmd::Comment {
+                number,
+                target,
+                repo,
+                body,
+                body_file,
+            } => {
+                let body = read_body(body, body_file)?.ok_or_else(|| {
+                    crate::cli::CliError::usage("pr comment needs --body or --body-file")
+                })?;
+                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                with_forge(target, move |forge| async move {
+                    print_json(forge.comment_pull_request(&repo, number, &body).await?)
+                })
+            }
         },
         ForgeCmd::Browse {
             number,

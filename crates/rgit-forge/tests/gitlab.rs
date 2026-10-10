@@ -487,3 +487,34 @@ async fn reopens_a_closed_merge_request() {
     assert_eq!(pr.state, "opened");
     assert_mapped(&pr);
 }
+
+#[tokio::test]
+async fn comments_on_a_merge_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12/notes$",
+        ))
+        .and(body_partial_json(serde_json::json!({"body": "Nice work."})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": 99,
+            "body": "Nice work.",
+            "author": {"username": AUTHOR.as_str()},
+            "created_at": "2026-01-04T03:04:05Z"
+        })))
+        .mount(&server)
+        .await;
+
+    let comment = forge(&server)
+        .comment_pull_request(&repo(), 12, "Nice work.")
+        .await
+        .expect("comment");
+    assert_eq!(comment.id, 99);
+    assert_eq!(comment.body, "Nice work.");
+    assert_eq!(comment.author.as_deref(), Some(AUTHOR.as_str()));
+    assert_eq!(comment.url, None);
+    assert_eq!(
+        comment.created_at.as_deref(),
+        Some("2026-01-04T03:04:05Z")
+    );
+}

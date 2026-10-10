@@ -341,7 +341,7 @@ pub struct PullRequestComment {
     pub id: u64,
     pub body: String,
     pub author: Option<String>,
-    pub url: String,
+    pub url: Option<String>,
     pub created_at: Option<String>,
 }
 

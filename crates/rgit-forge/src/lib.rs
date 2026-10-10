@@ -410,6 +410,19 @@ impl Forge {
         }
     }
 
+    /// Comment `body` on pull request `number`.
+    pub async fn comment_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        body: &str,
+    ) -> Result<PullRequestComment, ForgeError> {
+        match self {
+            Self::Github(client) => client.comment_pull_request(repo, number, body).await,
+            Self::Gitlab(client) => client.comment_merge_request(repo, number, body).await,
+        }
+    }
+
     pub async fn current_user(&self) -> Result<User, ForgeError> {
         match self {
             Self::Github(client) => client.current_user().await,
