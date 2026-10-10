@@ -327,11 +327,12 @@ impl GithubClient {
         draft: bool,
     ) -> Result<PullRequest, ForgeError> {
         let value = self.pull_request_value(repo, number).await?;
-        let node_id = value.get("node_id").and_then(|id| id.as_str()).ok_or_else(|| {
-            ForgeError::Response(format!(
-                "pull request {number} of {repo} has no node id"
-            ))
-        })?;
+        let node_id = value
+            .get("node_id")
+            .and_then(|id| id.as_str())
+            .ok_or_else(|| {
+                ForgeError::Response(format!("pull request {number} of {repo} has no node id"))
+            })?;
         let mutation = if draft {
             "convertPullRequestToDraft"
         } else {

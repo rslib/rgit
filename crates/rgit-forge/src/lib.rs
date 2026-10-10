@@ -366,10 +366,14 @@ impl Forge {
     ) -> Result<PullRequest, ForgeError> {
         match self {
             Self::Github(client) => {
-                client.edit_pull_request(repo, number, title, body, base).await
+                client
+                    .edit_pull_request(repo, number, title, body, base)
+                    .await
             }
             Self::Gitlab(client) => {
-                client.edit_merge_request(repo, number, title, body, base).await
+                client
+                    .edit_merge_request(repo, number, title, body, base)
+                    .await
             }
         }
     }
@@ -434,7 +438,11 @@ impl Forge {
     ) -> Result<PullRequestReview, ForgeError> {
         match self {
             Self::Github(client) => client.review_pull_request(repo, number, action, body).await,
-            Self::Gitlab(client) => client.review_merge_request(repo, number, action, body).await,
+            Self::Gitlab(client) => {
+                client
+                    .review_merge_request(repo, number, action, body)
+                    .await
+            }
         }
     }
 

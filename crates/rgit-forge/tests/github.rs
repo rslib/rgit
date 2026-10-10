@@ -324,7 +324,9 @@ async fn merges_a_pull_request_and_deletes_its_branch() {
     let server = MockServer::start().await;
     Mock::given(method("PUT"))
         .and(path("/repos/owner/repo/pulls/12/merge"))
-        .and(body_partial_json(serde_json::json!({"merge_method": "squash"})))
+        .and(body_partial_json(
+            serde_json::json!({"merge_method": "squash"}),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "merged": true,
             "message": "Pull Request successfully merged",
@@ -360,7 +362,9 @@ async fn merge_reports_when_the_forge_refuses() {
     let server = MockServer::start().await;
     Mock::given(method("PUT"))
         .and(path("/repos/owner/repo/pulls/12/merge"))
-        .and(body_partial_json(serde_json::json!({"merge_method": "merge"})))
+        .and(body_partial_json(
+            serde_json::json!({"merge_method": "merge"}),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "merged": false,
             "message": "Head branch is behind the base branch"
@@ -516,10 +520,7 @@ async fn comments_on_a_pull_request() {
         comment.url.as_deref(),
         Some("https://github.com/owner/repo/pull/12#issuecomment-99")
     );
-    assert_eq!(
-        comment.created_at.as_deref(),
-        Some("2026-01-04T03:04:05Z")
-    );
+    assert_eq!(comment.created_at.as_deref(), Some("2026-01-04T03:04:05Z"));
 }
 
 #[tokio::test]
@@ -542,7 +543,12 @@ async fn approves_a_pull_request_with_a_review() {
         .await;
 
     let review = forge(&server)
-        .review_pull_request(&repo(), 12, rgit_forge::ReviewAction::Approve, Some("Ship it."))
+        .review_pull_request(
+            &repo(),
+            12,
+            rgit_forge::ReviewAction::Approve,
+            Some("Ship it."),
+        )
         .await
         .expect("review");
     assert_eq!(review.id, Some(80));

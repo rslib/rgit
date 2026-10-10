@@ -3,7 +3,9 @@
 use std::sync::LazyLock;
 
 use rgit_forge::{EnsureOutcome, Forge, GitlabClient, PullRequestState, RepoRef};
-use wiremock::matchers::{body_json, body_partial_json, body_string, method, path_regex, query_param};
+use wiremock::matchers::{
+    body_json, body_partial_json, body_string, method, path_regex, query_param,
+};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn random_username(prefix: &str) -> String {
@@ -340,11 +342,9 @@ async fn merge_with_rebase_rebases_onto_the_target_first() {
         .and(path_regex(
             r"^/api/v4/projects/group(%2F|/)project/merge_requests/12/rebase$",
         ))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "rebase_in_progress": true
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "rebase_in_progress": true
+        })))
         .mount(&server)
         .await;
     Mock::given(method("PUT"))
@@ -450,7 +450,9 @@ async fn marks_a_merge_request_draft_by_prefixing_the_title() {
         .and(path_regex(
             r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
         ))
-        .and(body_partial_json(serde_json::json!({"title": "Draft: Title"})))
+        .and(body_partial_json(
+            serde_json::json!({"title": "Draft: Title"}),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(draft))
         .mount(&server)
         .await;
@@ -513,10 +515,7 @@ async fn comments_on_a_merge_request() {
     assert_eq!(comment.body, "Nice work.");
     assert_eq!(comment.author.as_deref(), Some(AUTHOR.as_str()));
     assert_eq!(comment.url, None);
-    assert_eq!(
-        comment.created_at.as_deref(),
-        Some("2026-01-04T03:04:05Z")
-    );
+    assert_eq!(comment.created_at.as_deref(), Some("2026-01-04T03:04:05Z"));
 }
 
 #[tokio::test]
@@ -549,7 +548,9 @@ async fn requests_changes_on_a_merge_request_with_a_note() {
         .and(path_regex(
             r"^/api/v4/projects/group(%2F|/)project/merge_requests/12/notes$",
         ))
-        .and(body_partial_json(serde_json::json!({"body": "Fix the tests."})))
+        .and(body_partial_json(
+            serde_json::json!({"body": "Fix the tests."}),
+        ))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
             "id": 100,
             "body": "Fix the tests.",
