@@ -6548,7 +6548,7 @@ pub enum ForgeCmd {
         #[command(subcommand)]
         cmd: ForgeBranchCmd,
     },
-    /// List, create, or close pull requests (merge requests on GitLab).
+    /// Work with pull requests: view, create, edit, merge, review and comment (merge requests on GitLab).
     Pr {
         #[command(subcommand)]
         cmd: PrCmd,
@@ -6685,14 +6685,21 @@ pub enum PrCmd {
         /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
         target: Option<String>,
         repo: Option<String>,
+        /// The pull request title; defaults to the head branch's tip commit subject.
         #[arg(long)]
-        title: String,
+        title: Option<String>,
+        /// The head branch; defaults to the current branch.
         #[arg(long)]
-        head: String,
+        head: Option<String>,
+        /// The base branch; defaults to the stack parent, else the default branch.
         #[arg(long)]
-        base: String,
-        #[arg(long)]
+        base: Option<String>,
+        /// The pull request body; defaults to the rest of the tip commit message.
+        #[arg(long, conflicts_with = "body_file")]
         body: Option<String>,
+        /// Read the body from this file (`-` for stdin).
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<String>,
         #[arg(long)]
         draft: bool,
     },

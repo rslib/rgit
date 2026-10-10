@@ -265,19 +265,37 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 head,
                 base,
                 body,
+                body_file,
                 draft,
             } => {
                 let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
-                let request = CreatePullRequest {
-                    title,
-                    head,
-                    base,
-                    body,
-                    draft,
-                };
                 let repo = target.repo()?.clone();
-                with_forge(target, |forge| async move {
-                    print_json(forge.create_pull_request(&repo, &request).await?)
+                let body = read_body(body, body_file)?;
+                let create =
+                    resolve_create_defaults(&std::env::current_dir()?, title, head, base, body)?;
+                with_forge(target, move |forge| async move {
+                    let base = match create.base {
+                        Some(base) => base,
+                        None => forge
+                            .repository(&repo)
+                            .await?
+                            .default_branch
+                            .unwrap_or_else(|| "main".to_owned()),
+                    };
+                    print_json(
+                        forge
+                            .create_pull_request(
+                                &repo,
+                                &CreatePullRequest {
+                                    title: create.title,
+                                    head: create.head,
+                                    base,
+                                    body: create.body,
+                                    draft,
+                                },
+                            )
+                            .await?,
+                    )
                 })
             }
             PrCmd::Checkout {
@@ -764,6 +782,66 @@ fn read_body(body: Option<String>, body_file: Option<String>) -> Result<Option<S
     }
 }
 
+/// A `pr create` with its flag gaps filled: the head from the current branch,
+/// the base from the stack parent when the branch is stacked (else the forge
+/// default branch, resolved by the caller), and the title and body from the
+/// head's tip commit message.
+struct ResolvedCreate {
+    title: String,
+    head: String,
+    base: Option<String>,
+    body: Option<String>,
+}
+
+fn resolve_create_defaults(
+    dir: &std::path::Path,
+    title: Option<String>,
+    head: Option<String>,
+    base: Option<String>,
+    body: Option<String>,
+) -> Result<ResolvedCreate> {
+    if title.is_some() && head.is_some() && base.is_some() && body.is_some() {
+        return Ok(ResolvedCreate {
+            title: title.unwrap_or_default(),
+            head: head.unwrap_or_default(),
+            base,
+            body,
+        });
+    }
+    let backend = rgit_git::Git2Backend::discover(dir)
+        .map_err(|error| anyhow::anyhow!("no repository: {error}"))?;
+    let head = match head {
+        Some(head) => head,
+        None => backend
+            .status()
+            .ok()
+            .and_then(|status| status.head.branch)
+            .ok_or_else(|| anyhow::anyhow!("HEAD is detached; pass --head"))?,
+    };
+    let base = match base {
+        Some(base) => Some(base),
+        None => backend.config_get(&format!("branch.{head}.rgit-stack-parent"))?,
+    };
+    let (title, body) = match (title, body) {
+        (Some(title), body) => (title, body),
+        (None, body) => {
+            let (filled, filled_body) =
+                rgit_forge::fill_from_commit(&backend.commit_message(&head)?);
+            ensure!(
+                !filled.is_empty(),
+                "cannot fill the title from the {head} commit message; pass --title"
+            );
+            (filled, body.or(filled_body))
+        }
+    };
+    Ok(ResolvedCreate {
+        title,
+        head,
+        base,
+        body,
+    })
+}
+
 fn print_json<T: Serialize>(value: T) -> Result<String, ForgeError> {
     serde_json::to_string_pretty(&value).map_err(|error| ForgeError::Response(error.to_string()))
 }
@@ -771,6 +849,96 @@ fn print_json<T: Serialize>(value: T) -> Result<String, ForgeError> {
 #[cfg(test)]
 mod tests {
     use super::{AuthCmd, CheckoutAction, ForgeSelection, checkout_move};
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn fresh_repo(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rgit-forge-create-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        git(&dir, &["init", "-b", "main", "-q"]);
+        git(
+            &dir,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "Add a thing\n\nIn detail.",
+            ],
+        );
+        dir
+    }
+
+    #[test]
+    fn create_defaults_fill_from_the_branch_and_commit() {
+        let dir = fresh_repo("fill");
+        let create =
+            super::resolve_create_defaults(&dir, None, None, None, None).expect("defaults");
+        assert_eq!(create.head, "main");
+        assert_eq!(create.title, "Add a thing");
+        assert_eq!(create.body.as_deref(), Some("In detail."));
+        assert_eq!(create.base, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_defaults_take_the_stack_parent_as_base() {
+        let dir = fresh_repo("stack");
+        git(
+            &dir,
+            &["config", "branch.main.rgit-stack-parent", "develop"],
+        );
+        let create = super::resolve_create_defaults(
+            &dir,
+            Some("Title".to_owned()),
+            None,
+            None,
+            Some("Body.".to_owned()),
+        )
+        .expect("defaults");
+        assert_eq!(create.head, "main");
+        assert_eq!(create.title, "Title");
+        assert_eq!(create.body.as_deref(), Some("Body."));
+        assert_eq!(create.base.as_deref(), Some("develop"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_defaults_keep_explicit_flags_without_a_repo() {
+        let dir = std::env::temp_dir().join("rgit-forge-create-missing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let create = super::resolve_create_defaults(
+            &dir,
+            Some("Title".to_owned()),
+            Some("feature".to_owned()),
+            Some("main".to_owned()),
+            Some("Body.".to_owned()),
+        )
+        .expect("defaults");
+        assert_eq!(create.head, "feature");
+        assert_eq!(create.title, "Title");
+        assert_eq!(create.body.as_deref(), Some("Body."));
+        assert_eq!(create.base.as_deref(), Some("main"));
+    }
 
     #[test]
     fn checkout_moves_by_local_tip() {

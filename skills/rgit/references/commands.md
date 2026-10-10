@@ -164,11 +164,11 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `forge branch`: List or delete branches on the forge. e.g. `rgit forge branch list`
     - `forge branch list`: List remote branches, 100 per page. e.g. `rgit forge branch list`, `rgit forge branch list owner/repo`
     - `forge branch delete`: Delete a remote branch after explicit confirmation. e.g. `rgit forge branch delete <branch> --yes`, `rgit forge branch delete <branch> owner/repo --yes`
-  - `forge pr`: List, create, or close pull requests (merge requests on GitLab). e.g. `rgit forge pr list`
+  - `forge pr`: Work with pull requests: view, create, edit, merge, review and comment (merge requests on GitLab). e.g. `rgit forge pr list`
     - `forge pr view`: Show one pull request or merge request by NUMBER or head BRANCH. e.g. `rgit forge pr view`, `rgit forge pr view 42`, `rgit forge pr view feature owner/repo`
     - `forge pr checks`: Show the CI checks on a pull request's head commit (its jobs for GitLab). e.g. `rgit forge pr checks`, `rgit forge pr checks 42`, `rgit forge pr checks 42 owner/repo`
     - `forge pr list`: List pull requests or merge requests, 100 per page. e.g. `rgit forge pr list`, `rgit forge pr list owner/repo`, `rgit forge pr list --page 2`, `rgit forge pr list --state merged --author <login> --head <branch>`
-    - `forge pr create`: Create a pull request or merge request. e.g. `rgit forge pr create --title "<title>" --head <branch> --base main`
+    - `forge pr create`: Create a pull request or merge request. e.g. `rgit forge pr create`, `rgit forge pr create --title "<title>" --head <branch> --base main`
     - `forge pr checkout`: Check out a pull request's head branch, fetching its head commit. e.g. `rgit forge pr checkout 42`, `rgit forge pr checkout 42 owner/repo`
     - `forge pr close`: Close a pull request or merge request. e.g. `rgit forge pr close 42 --yes`, `rgit forge pr close 42 owner/repo --yes`
     - `forge pr edit`: Change a pull request's title, body or base branch. e.g. `rgit forge pr edit 42 --title "<title>"`, `rgit forge pr edit 42 --base main`

@@ -1447,7 +1447,10 @@ const EXAMPLES: &[Entry] = &[
     ),
     (
         "forge pr create",
-        &["rgit forge pr create --title \"<title>\" --head <branch> --base main"],
+        &[
+            "rgit forge pr create",
+            "rgit forge pr create --title \"<title>\" --head <branch> --base main",
+        ],
     ),
     (
         "forge pr close",
