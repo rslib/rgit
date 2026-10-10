@@ -2090,7 +2090,7 @@ pub enum Command {
         #[command(subcommand)]
         cmd: FlowCmd,
     },
-    /// Manage GitHub repositories, branches, and pull requests without gh.
+    /// Manage GitHub repositories, branches, and pull requests with the native API.
     Forge {
         /// Named forge profile from the rgit config file.
         #[arg(long)]
