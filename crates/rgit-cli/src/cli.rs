@@ -6609,6 +6609,30 @@ pub enum ForgeBranchCmd {
     },
 }
 
+/// The state filter of `forge pr list`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum PrListState {
+    /// Open pull requests (the default).
+    Open,
+    /// Closed, not merged.
+    Closed,
+    /// Merged.
+    Merged,
+    /// Every state.
+    All,
+}
+
+impl From<PrListState> for rgit_forge::PullRequestState {
+    fn from(state: PrListState) -> Self {
+        match state {
+            PrListState::Open => Self::Open,
+            PrListState::Closed => Self::Closed,
+            PrListState::Merged => Self::Merged,
+            PrListState::All => Self::All,
+        }
+    }
+}
+
 #[derive(clap::Subcommand)]
 pub enum PrCmd {
     /// Show one pull request or merge request by NUMBER or head BRANCH.
@@ -6627,11 +6651,20 @@ pub enum PrCmd {
         target: Option<String>,
         repo: Option<String>,
     },
-    /// List open pull requests or merge requests, 100 per page.
+    /// List pull requests or merge requests, 100 per page.
     List {
         /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
         target: Option<String>,
         repo: Option<String>,
+        /// Which state to list; open by default.
+        #[arg(long, value_enum, default_value = "open")]
+        state: PrListState,
+        /// Only pull requests whose head author is this login.
+        #[arg(long)]
+        author: Option<String>,
+        /// Only pull requests whose head branch is this.
+        #[arg(long)]
+        head: Option<String>,
         /// Which page of 100 to show.
         #[arg(long, default_value_t = 1)]
         page: u32,

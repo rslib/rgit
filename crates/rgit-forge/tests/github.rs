@@ -271,6 +271,35 @@ async fn combines_check_runs_and_statuses_for_checks() {
 }
 
 #[tokio::test]
+async fn list_keeps_only_the_requests_of_the_author() {
+    let server = MockServer::start().await;
+    let own = pr_json(12, "feature", "main");
+    let mut other = pr_json(13, "other", "main");
+    other["user"] = serde_json::json!({"login": "someoneelse"});
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls"))
+        .and(query_param("state", "all"))
+        .and(query_param("head", "owner:feature"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([own, other])))
+        .mount(&server)
+        .await;
+
+    let listing = forge(&server)
+        .pull_requests(
+            &repo(),
+            1,
+            PullRequestState::All,
+            Some("feature"),
+            Some(&AUTHOR),
+        )
+        .await
+        .expect("listing");
+    assert_eq!(listing.items.len(), 1);
+    assert_eq!(listing.items[0].number, 12);
+    assert_eq!(listing.items[0].author.as_deref(), Some(AUTHOR.as_str()));
+}
+
+#[tokio::test]
 async fn list_requests_the_state_and_head_filters() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -282,7 +311,7 @@ async fn list_requests_the_state_and_head_filters() {
         .await;
 
     let listing = forge(&server)
-        .pull_requests(&repo(), 1, PullRequestState::All, Some("feat-a"))
+        .pull_requests(&repo(), 1, PullRequestState::All, Some("feat-a"), None)
         .await
         .expect("listing");
     assert!(listing.items.is_empty());

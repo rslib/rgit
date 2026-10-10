@@ -3,8 +3,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use crate::cli::{AuthCmd, ForgeBranchCmd, ForgeCmd, PrCmd, RepoCmd};
 use anyhow::{Result, ensure};
 use rgit_forge::{
-    CreatePullRequest, CreateRepository, Forge, ForgeError, ForgeTarget, Provider,
-    PullRequestState, StackEntry,
+    CreatePullRequest, CreateRepository, Forge, ForgeError, ForgeTarget, Provider, StackEntry,
 };
 use rgit_git::GitBackend;
 use serde::Serialize;
@@ -239,13 +238,21 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                     print_json(forge.pull_request_checks(&repo, number).await?)
                 })
             }
-            PrCmd::List { target, repo, page } => {
+            PrCmd::List {
+                target,
+                repo,
+                state,
+                author,
+                head,
+                page,
+            } => {
                 let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
-                with_forge(target, |forge| async move {
+                let state = state.into();
+                with_forge(target, move |forge| async move {
                     print_json(
                         forge
-                            .pull_requests(&repo, page, PullRequestState::Open, None)
+                            .pull_requests(&repo, page, state, head.as_deref(), author.as_deref())
                             .await?,
                     )
                 })

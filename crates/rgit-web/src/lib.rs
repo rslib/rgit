@@ -522,7 +522,13 @@ async fn forge_badges(b: &dyn GitBackend, branch: &str) -> String {
         return String::new();
     };
     let Ok(listing) = forge
-        .pull_requests(&repo, 1, rgit_forge::PullRequestState::Open, Some(branch))
+        .pull_requests(
+            &repo,
+            1,
+            rgit_forge::PullRequestState::Open,
+            Some(branch),
+            None,
+        )
         .await
     else {
         return String::new();

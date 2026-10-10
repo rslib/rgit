@@ -402,6 +402,7 @@ impl GitlabClient {
         page: u32,
         state: PullRequestState,
         head: Option<&str>,
+        author: Option<&str>,
     ) -> Result<Listing<PullRequest>, ForgeError> {
         let mut url = format!(
             "{}/projects/{}/merge_requests?state={}",
@@ -411,6 +412,9 @@ impl GitlabClient {
         );
         if let Some(branch) = head {
             url.push_str(&format!("&source_branch={}", urlencoding::encode(branch)));
+        }
+        if let Some(author) = author {
+            url.push_str(&format!("&author_username={}", urlencoding::encode(author)));
         }
         let listing: Listing<ApiMergeRequest> = self.list_page(&url, page).await?;
         Ok(listing.map(|request| request.into_pull_request()))
@@ -656,6 +660,7 @@ mod tests {
                 },
                 2,
                 PullRequestState::Open,
+                None,
                 None,
             ))
             .expect("merge requests");

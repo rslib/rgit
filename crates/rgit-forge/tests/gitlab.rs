@@ -253,6 +253,33 @@ async fn a_merge_request_without_a_pipeline_has_no_checks() {
 }
 
 #[tokio::test]
+async fn list_requests_the_author_filter() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests$",
+        ))
+        .and(query_param("state", "all"))
+        .and(query_param("author_username", AUTHOR.as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([mr_json(12, "feature", "main")]))
+                .insert_header("X-Total", "1")
+                .insert_header("X-Next-Page", ""),
+        )
+        .mount(&server)
+        .await;
+
+    let listing = forge(&server)
+        .pull_requests(&repo(), 1, PullRequestState::All, None, Some(&AUTHOR))
+        .await
+        .expect("listing");
+    assert_eq!(listing.items.len(), 1);
+    assert_eq!(listing.items[0].number, 12);
+    assert_eq!(listing.total, Some(1));
+}
+
+#[tokio::test]
 async fn list_requests_the_state_and_source_branch_filters() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -266,7 +293,7 @@ async fn list_requests_the_state_and_source_branch_filters() {
         .await;
 
     let listing = forge(&server)
-        .pull_requests(&repo(), 1, PullRequestState::Closed, Some("feat-a"))
+        .pull_requests(&repo(), 1, PullRequestState::Closed, Some("feat-a"), None)
         .await
         .expect("listing");
     assert!(listing.items.is_empty());

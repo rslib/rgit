@@ -142,16 +142,19 @@ impl Forge {
         }
     }
 
+    /// One page of pull requests, by `state`, head branch and head author;
+    /// `head` and `author` filter without matching anything when unset.
     pub async fn pull_requests(
         &self,
         repo: &RepoRef,
         page: u32,
         state: PullRequestState,
         head: Option<&str>,
+        author: Option<&str>,
     ) -> Result<Listing<PullRequest>, ForgeError> {
         match self {
-            Self::Github(client) => client.pull_requests(repo, page, state, head).await,
-            Self::Gitlab(client) => client.merge_requests(repo, page, state, head).await,
+            Self::Github(client) => client.pull_requests(repo, page, state, head, author).await,
+            Self::Gitlab(client) => client.merge_requests(repo, page, state, head, author).await,
         }
     }
 
@@ -177,7 +180,7 @@ impl Forge {
         let mut page = 1;
         loop {
             let listing = self
-                .pull_requests(repo, page, PullRequestState::All, Some(branch))
+                .pull_requests(repo, page, PullRequestState::All, Some(branch), None)
                 .await?;
             if let Some(found) = listing.items.iter().find(|pr| pr.head_branch == branch) {
                 return Ok(Some(found.clone()));
@@ -227,7 +230,7 @@ impl Forge {
         let mut page = 1;
         loop {
             let listing = self
-                .pull_requests(repo, page, PullRequestState::Open, Some(head))
+                .pull_requests(repo, page, PullRequestState::Open, Some(head), None)
                 .await?;
             if let Some(existing) = listing.items.iter().find(|pr| pr.head_branch == head) {
                 return if existing.base_branch != base {

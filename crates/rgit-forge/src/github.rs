@@ -249,6 +249,7 @@ impl GithubClient {
         page: u32,
         state: PullRequestState,
         head: Option<&str>,
+        author: Option<&str>,
     ) -> Result<Listing<PullRequest>, ForgeError> {
         let mut route = format!(
             "/repos/{}/{}/pulls?state={}",
@@ -265,16 +266,22 @@ impl GithubClient {
         }
         let listing: Listing<ApiPullRequest> = self.list_page(&route, page).await?;
         // GitHub lists merged pull requests only under state=closed, so the
-        // merged filter keeps the merged_at subset and drops the page total.
+        // merged filter keeps the merged_at subset and drops the page total;
+        // the author filter is applied here because GitHub's pull list has no
+        // server-side equivalent, and it drops the total for the same reason.
         let only_merged = state == PullRequestState::Merged;
         let mut items = Vec::with_capacity(listing.items.len());
         for request in listing.items {
             if only_merged && request.merged_at.is_none() {
                 continue;
             }
-            items.push(request.into());
+            let mapped: PullRequest = request.into();
+            if author.is_some_and(|author| mapped.author.as_deref() != Some(author)) {
+                continue;
+            }
+            items.push(mapped);
         }
-        let total = if only_merged && (listing.page != 1 || listing.more) {
+        let total = if (only_merged || author.is_some()) && (listing.page != 1 || listing.more) {
             None
         } else {
             listing.total
