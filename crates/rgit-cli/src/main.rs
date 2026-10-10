@@ -1103,6 +1103,12 @@ fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> (Vec<String>, Option<String>)
 fn forge_output(text: String, list_cmd: Option<&str>) -> Output {
     match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(mut map)) if map.get("items").is_some_and(Value::is_array) => {
+            let human = match map.get("items") {
+                Some(items) if list_cmd.is_some_and(|cmd| cmd.contains(" pr list")) => {
+                    Some(crate::forge::human_pull_request_list(items))
+                }
+                _ => None,
+            };
             let Some(Value::Array(items)) = map.remove("items") else {
                 unreachable!("checked above")
             };
@@ -1122,7 +1128,7 @@ fn forge_output(text: String, list_cmd: Option<&str>) -> Output {
             };
             let shown = rows.len() as u64;
             let first = (page - 1) * u64::from(rgit_forge::PAGE_SIZE) + 1;
-            let mut out = Output::new(text);
+            let mut out = Output::new(human.unwrap_or(text));
             match total {
                 Some(total) if total > shown && shown > 0 => {
                     out = out.with(
@@ -1148,6 +1154,8 @@ fn forge_output(text: String, list_cmd: Option<&str>) -> Output {
         }
         Ok(Value::Object(mut map)) => {
             map.retain(|_, v| !v.is_null());
+            let human = crate::forge::human_forge_text(&Value::Object(map.clone()), list_cmd);
+            let text = human.unwrap_or(text);
             match map.remove("accounts") {
                 Some(Value::Array(items)) => {
                     let rows = objects(items);
@@ -1740,5 +1748,128 @@ mod tests {
             hints,
             ["Run `rgit forge --profile work pr list o/r` to see the remaining pull requests"]
         );
+    }
+
+    #[test]
+    fn forge_output_prints_human_text_for_pr_results() {
+        let pr = r#"{"number":12,"title":"Add forge PRs","state":"open","html_url":"https://h/12","head_branch":"feature","base_branch":"main","draft":false,"author":"dev-1","body":null,"labels":[],"reviewers":[]}"#;
+        let out = forge_output(pr.to_owned(), None);
+        assert!(
+            out.text.starts_with("#12 Add forge PRs [open]"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("feature -> main by dev-1"),
+            "{}",
+            out.text
+        );
+
+        let checks =
+            r#"{"rollup":"passing","checks":[{"name":"build","status":"passing","url":null}]}"#;
+        let out = forge_output(checks.to_owned(), None);
+        assert!(out.text.starts_with("passing (1 check)"), "{}", out.text);
+
+        let listing = r#"{"items":[{"number":12,"title":"t","state":"open","html_url":"u","head_branch":"h","base_branch":"main","draft":false}],"page":1,"more":false,"total":1}"#;
+        let out = forge_output(listing.to_owned(), Some("rgit forge pr list o/r"));
+        assert_eq!(out.text, "#12 t [open] h -> main");
+    }
+
+    #[test]
+    fn every_pr_subcommand_has_hints() {
+        let prs = vec![
+            cli::PrCmd::View {
+                what: None,
+                target: None,
+                repo: None,
+            },
+            cli::PrCmd::Checks {
+                number: None,
+                target: None,
+                repo: None,
+            },
+            cli::PrCmd::List {
+                target: None,
+                repo: None,
+                state: cli::PrListState::Open,
+                author: None,
+                head: None,
+                page: 1,
+            },
+            cli::PrCmd::Create {
+                target: None,
+                repo: None,
+                title: None,
+                head: None,
+                base: None,
+                body: None,
+                body_file: None,
+                draft: false,
+            },
+            cli::PrCmd::Checkout {
+                number: 1,
+                target: None,
+                repo: None,
+            },
+            cli::PrCmd::Close {
+                number: 1,
+                target: None,
+                repo: None,
+                yes: true,
+            },
+            cli::PrCmd::Edit {
+                number: 1,
+                target: None,
+                repo: None,
+                title: None,
+                body: None,
+                body_file: None,
+                base: None,
+            },
+            cli::PrCmd::Ready {
+                number: 1,
+                target: None,
+                repo: None,
+            },
+            cli::PrCmd::Draft {
+                number: 1,
+                target: None,
+                repo: None,
+            },
+            cli::PrCmd::Reopen {
+                number: 1,
+                target: None,
+                repo: None,
+            },
+            cli::PrCmd::Comment {
+                number: 1,
+                target: None,
+                repo: None,
+                body: None,
+                body_file: None,
+            },
+            cli::PrCmd::Review {
+                number: 1,
+                target: None,
+                repo: None,
+                approve: true,
+                request_changes: false,
+                comment: false,
+                body: None,
+            },
+            cli::PrCmd::Merge {
+                number: 1,
+                target: None,
+                repo: None,
+                method: "merge".to_owned(),
+                delete_branch: false,
+                yes: true,
+            },
+        ];
+        assert_eq!(prs.len(), 13, "a PrCmd variant is missing from this test");
+        for cmd in prs {
+            let (hints, _) = forge_hints(&cli::ForgeCmd::Pr { cmd }, "rgit forge");
+            assert!(!hints.is_empty(), "a pr subcommand has no hints");
+        }
     }
 }

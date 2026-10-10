@@ -846,6 +846,152 @@ fn print_json<T: Serialize>(value: T) -> Result<String, ForgeError> {
     serde_json::to_string_pretty(&value).map_err(|error| ForgeError::Response(error.to_string()))
 }
 
+fn str_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn string_list(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Compact human text for one pull request object, as `pr view` prints it on
+/// a terminal. The structured TOON and JSON keep the full value.
+pub fn human_pull_request(value: &serde_json::Value) -> String {
+    let number = value
+        .get("number")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let title = str_field(value, "title").unwrap_or("");
+    let state = str_field(value, "state").unwrap_or("");
+    let draft = value
+        .get("draft")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let mut out = format!("#{number} {title} [{state}]");
+    if draft {
+        out.push_str(" [draft]");
+    }
+    let head = str_field(value, "head_branch").unwrap_or("");
+    let base = str_field(value, "base_branch").unwrap_or("");
+    let mut refs = format!("{head} -> {base}");
+    if let Some(author) = str_field(value, "author") {
+        refs.push_str(&format!(" by {author}"));
+    }
+    out.push('\n');
+    out.push_str(&refs);
+    if let Some(url) = str_field(value, "html_url") {
+        out.push('\n');
+        out.push_str(url);
+    }
+    if let Some(body) = str_field(value, "body")
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+    {
+        out.push_str("\n\n");
+        out.push_str(body);
+    }
+    let labels = string_list(value, "labels");
+    if !labels.is_empty() {
+        out.push_str(&format!("\nlabels: {}", labels.join(", ")));
+    }
+    let reviewers = string_list(value, "reviewers");
+    if !reviewers.is_empty() {
+        out.push_str(&format!("\nreviewers: {}", reviewers.join(", ")));
+    }
+    out
+}
+
+/// Compact human text for a pull request's checks, as `pr checks` prints
+/// them: the rollup with its count, then one mark and name per check.
+pub fn human_pull_request_checks(value: &serde_json::Value) -> String {
+    let checks = value
+        .get("checks")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if checks.is_empty() {
+        return "no checks".to_owned();
+    }
+    let rollup = str_field(value, "rollup").unwrap_or("");
+    let noun = if checks.len() == 1 { "check" } else { "checks" };
+    let mut out = format!("{rollup} ({} {noun})", checks.len());
+    for check in &checks {
+        let mark = match str_field(check, "status").unwrap_or("") {
+            "passing" => "\u{2714}",
+            "failing" => "\u{2718}",
+            _ => "\u{2022}",
+        };
+        out.push_str(&format!(
+            "\n{mark} {}",
+            str_field(check, "name").unwrap_or("")
+        ));
+        if let Some(url) = str_field(check, "url") {
+            out.push(' ');
+            out.push_str(url);
+        }
+    }
+    out
+}
+
+/// Compact human text for a pull request listing: one line per request.
+pub fn human_pull_request_list(items: &serde_json::Value) -> String {
+    let items = items.as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        return "0 open pull requests".to_owned();
+    }
+    items
+        .iter()
+        .map(|item| {
+            let number = item
+                .get("number")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let title = str_field(item, "title").unwrap_or("");
+            let state = str_field(item, "state").unwrap_or("");
+            let head = str_field(item, "head_branch").unwrap_or("");
+            let base = str_field(item, "base_branch").unwrap_or("");
+            format!("#{number} {title} [{state}] {head} -> {base}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Compact human text for a forge result: one pull request, its checks, or a
+/// pull request listing (`list_cmd` names the listing command when the result
+/// is paged). `None` keeps the JSON text, for results with no compact form.
+pub fn human_forge_text(value: &serde_json::Value, list_cmd: Option<&str>) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map)
+            if map.get("items").is_some_and(serde_json::Value::is_array) =>
+        {
+            if list_cmd.is_some_and(|cmd| cmd.contains(" pr list")) {
+                Some(human_pull_request_list(&map["items"]))
+            } else {
+                None
+            }
+        }
+        serde_json::Value::Object(map) if map.contains_key("rollup") => {
+            Some(human_pull_request_checks(value))
+        }
+        serde_json::Value::Object(map)
+            if map.contains_key("number") && map.contains_key("head_branch") =>
+        {
+            Some(human_pull_request(value))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AuthCmd, CheckoutAction, ForgeSelection, checkout_move};
@@ -994,5 +1140,138 @@ mod tests {
         assert!(output.contains("\"profile\": \"work\""));
         assert!(output.contains("\"account\": \"work\""));
         assert!(output.contains("\"source\": \"not_checked\""));
+    }
+
+    fn random_name(prefix: &str) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .subsec_nanos();
+        format!("{prefix}-{nanos:x}")
+    }
+
+    fn pr_value() -> serde_json::Value {
+        serde_json::json!({
+            "number": 12,
+            "title": "Add forge PRs",
+            "state": "open",
+            "html_url": "https://github.com/owner/repo/pull/12",
+            "head_branch": "feature",
+            "base_branch": "main",
+            "draft": false,
+            "author": random_name("author"),
+            "body": "Longer story.",
+            "labels": ["ci"],
+            "reviewers": [random_name("reviewer")]
+        })
+    }
+
+    #[test]
+    fn human_pull_request_shows_the_request_at_a_glance() {
+        let pr = pr_value();
+        let author = pr
+            .get("author")
+            .and_then(serde_json::Value::as_str)
+            .expect("author")
+            .to_owned();
+        let reviewer = pr
+            .get("reviewers")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|reviewers| reviewers.first())
+            .and_then(serde_json::Value::as_str)
+            .expect("reviewer")
+            .to_owned();
+        let text = super::human_pull_request(&pr);
+        assert!(text.starts_with("#12 Add forge PRs [open]"), "{text}");
+        assert!(
+            text.contains(&format!("feature -> main by {author}")),
+            "{text}"
+        );
+        assert!(
+            text.contains("https://github.com/owner/repo/pull/12"),
+            "{text}"
+        );
+        assert!(text.contains("Longer story."), "{text}");
+        assert!(text.contains("labels: ci"), "{text}");
+        assert!(text.contains(&format!("reviewers: {reviewer}")), "{text}");
+    }
+
+    #[test]
+    fn human_pull_request_skips_what_the_forge_did_not_report() {
+        let mut pr = pr_value();
+        pr.as_object_mut().expect("object").remove("author");
+        pr.as_object_mut().expect("object").remove("body");
+        pr.as_object_mut().expect("object").remove("labels");
+        pr.as_object_mut().expect("object").remove("reviewers");
+        let text = super::human_pull_request(&pr);
+        assert!(text.contains("feature -> main"), "{text}");
+        assert!(!text.contains("by "), "{text}");
+        assert!(!text.contains("labels:"), "{text}");
+        assert!(!text.contains("reviewers:"), "{text}");
+    }
+
+    #[test]
+    fn human_checks_roll_up_with_one_mark_per_check() {
+        let checks = serde_json::json!({
+            "rollup": "failing",
+            "checks": [
+                {"name": "build", "status": "passing", "url": serde_json::Value::Null},
+                {"name": "test", "status": "failing", "url": "https://ci/1"},
+                {"name": "lint", "status": "pending", "url": serde_json::Value::Null}
+            ]
+        });
+        let text = super::human_pull_request_checks(&checks);
+        assert!(text.starts_with("failing (3 checks)"), "{text}");
+        assert!(text.contains("\u{2714} build"), "{text}");
+        assert!(text.contains("\u{2718} test https://ci/1"), "{text}");
+        assert!(text.contains("\u{2022} lint"), "{text}");
+    }
+
+    #[test]
+    fn human_checks_say_so_when_there_are_none() {
+        let checks = serde_json::json!({"rollup": "none", "checks": []});
+        assert_eq!(super::human_pull_request_checks(&checks), "no checks");
+        let empty = serde_json::json!([]);
+        assert_eq!(
+            super::human_pull_request_list(&empty),
+            "0 open pull requests"
+        );
+    }
+
+    #[test]
+    fn human_list_shows_one_line_per_request() {
+        let items = serde_json::json!([
+            {"number": 12, "title": "First", "state": "open", "head_branch": "a", "base_branch": "main"},
+            {"number": 13, "title": "Second", "state": "open", "head_branch": "b", "base_branch": "main"}
+        ]);
+        let text = super::human_pull_request_list(&items);
+        assert_eq!(
+            text,
+            "#12 First [open] a -> main\n#13 Second [open] b -> main"
+        );
+    }
+
+    #[test]
+    fn human_forge_text_picks_the_form_by_shape() {
+        let pr = pr_value();
+        assert!(
+            super::human_forge_text(&pr, None)
+                .expect("pr form")
+                .starts_with("#12 Add forge PRs [open]")
+        );
+        let checks = serde_json::json!({"rollup": "passing", "checks": []});
+        assert_eq!(
+            super::human_forge_text(&checks, None).as_deref(),
+            Some("no checks")
+        );
+        let listing = serde_json::json!({"items": [], "page": 1});
+        assert_eq!(
+            super::human_forge_text(&listing, Some("rgit forge pr list o/r")).as_deref(),
+            Some("0 open pull requests")
+        );
+        assert!(super::human_forge_text(&listing, Some("rgit forge branch list")).is_none());
+        let repo = serde_json::json!({"name": "repo"});
+        assert!(super::human_forge_text(&repo, None).is_none());
     }
 }
