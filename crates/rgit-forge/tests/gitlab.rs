@@ -3,7 +3,7 @@
 use std::sync::LazyLock;
 
 use rgit_forge::{EnsureOutcome, Forge, GitlabClient, PullRequestState, RepoRef};
-use wiremock::matchers::{body_json, body_string, method, path_regex, query_param};
+use wiremock::matchers::{body_json, body_partial_json, body_string, method, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn random_username(prefix: &str) -> String {
@@ -298,4 +298,79 @@ async fn list_requests_the_state_and_source_branch_filters() {
         .expect("listing");
     assert!(listing.items.is_empty());
     assert!(!listing.more);
+}
+
+#[tokio::test]
+async fn merges_a_merge_request_with_squash() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .and(body_partial_json(serde_json::json!({
+            "squash": true,
+            "should_remove_source_branch": true
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let mut merged = mr_json(12, "feature", "main");
+    merged["state"] = serde_json::json!("merged");
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(merged))
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .merge_pull_request(&repo(), 12, rgit_forge::MergeMethod::Squash, true)
+        .await
+        .expect("merged");
+    assert_eq!(pr.number, 12);
+    assert!(pr.merged);
+    assert_eq!(pr.head_branch, "feature");
+}
+
+#[tokio::test]
+async fn merge_with_rebase_rebases_onto_the_target_first() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12/rebase$",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "rebase_in_progress": true
+            })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .and(body_partial_json(
+            serde_json::json!({"should_remove_source_branch": false}),
+        ))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let mut merged = mr_json(12, "feature", "main");
+    merged["state"] = serde_json::json!("merged");
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(merged))
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .merge_pull_request(&repo(), 12, rgit_forge::MergeMethod::Rebase, false)
+        .await
+        .expect("merged");
+    assert_eq!(pr.number, 12);
+    assert!(pr.merged);
 }

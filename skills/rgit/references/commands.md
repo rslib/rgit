@@ -171,6 +171,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
     - `forge pr create`: Create a pull request or merge request. e.g. `rgit forge pr create --title "<title>" --head <branch> --base main`
     - `forge pr checkout`: Check out a pull request's head branch, fetching its head commit. e.g. `rgit forge pr checkout 42`, `rgit forge pr checkout 42 owner/repo`
     - `forge pr close`: Close a pull request or merge request. e.g. `rgit forge pr close 42 --yes`, `rgit forge pr close 42 owner/repo --yes`
+    - `forge pr merge`: Merge a pull request or merge request. e.g. `rgit forge pr merge 42 --yes`, `rgit forge pr merge 42 --method squash --delete-branch --yes`
   - `forge browse`: Open the forge repository or one pull request in the browser. e.g. `rgit forge browse`, `rgit forge browse 42`, `rgit forge browse 42 owner/repo --print`
 
 ## Patches, notes, config and maintenance

@@ -1040,6 +1040,13 @@ fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> (Vec<String>, Option<String>)
                 )],
                 None,
             ),
+            PrCmd::Merge { target, repo, .. } => (
+                vec![format!(
+                    "Run `{base} pr list{}` to see the remaining pull requests",
+                    repo_args(target, repo)
+                )],
+                None,
+            ),
         },
         ForgeCmd::Browse { .. } => (Vec::new(), None),
     }

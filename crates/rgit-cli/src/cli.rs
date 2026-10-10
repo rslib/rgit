@@ -6712,6 +6712,21 @@ pub enum PrCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Merge a pull request or merge request.
+    Merge {
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        /// How to combine the head branch: merge, squash or rebase.
+        #[arg(short = 'm', long, value_parser = ["merge", "squash", "rebase"], default_value = "merge")]
+        method: String,
+        /// Delete the head branch after merging.
+        #[arg(long)]
+        delete_branch: bool,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 /// Subcommands for CoW workspaces.
 #[derive(clap::Subcommand)]

@@ -289,6 +289,73 @@ pub struct PullRequest {
     pub reviewers: Vec<String>,
 }
 
+/// How a pull request merge combines the head branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    /// The name of this method as the merge command spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Squash => "squash",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
+impl fmt::Display for MergeMethod {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.write_str(self.as_str())
+    }
+}
+
+/// What a pull request review asks: approval, changes, or a plain comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAction {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+impl ReviewAction {
+    /// The review event name GitHub's API takes for this action.
+    pub fn github_event(self) -> &'static str {
+        match self {
+            Self::Approve => "APPROVE",
+            Self::RequestChanges => "REQUEST_CHANGES",
+            Self::Comment => "COMMENT",
+        }
+    }
+}
+
+/// One comment on a pull request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestComment {
+    pub id: u64,
+    pub body: String,
+    pub author: Option<String>,
+    pub url: String,
+    pub created_at: Option<String>,
+}
+
+/// One review of a pull request. `state` is the action taken (`approved`,
+/// `changes_requested`, `commented`); GitLab approvals carry no id or body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestReview {
+    pub id: Option<u64>,
+    pub state: String,
+    pub body: Option<String>,
+    pub author: Option<String>,
+    pub url: Option<String>,
+}
+
 /// What `Forge::ensure_pull_request` did: opened a new pull request, or worked
 /// on the existing one (`retargeted` when it moved its base branch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,7 +382,7 @@ pub struct StackEntry {
 
 /// The PR title and body a tip commit message fills in, as `gh pr create
 /// --fill` does: the subject as the title, the rest of the message as the body.
-pub(crate) fn fill_from_commit(message: &str) -> (String, Option<String>) {
+pub fn fill_from_commit(message: &str) -> (String, Option<String>) {
     let message = message.trim();
     let (subject, body) = match message.split_once('\n') {
         Some((subject, body)) => (subject.trim(), body.trim()),

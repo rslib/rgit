@@ -1456,6 +1456,13 @@ const EXAMPLES: &[Entry] = &[
             "rgit forge pr close 42 owner/repo --yes",
         ],
     ),
+    (
+        "forge pr merge",
+        &[
+            "rgit forge pr merge 42 --yes",
+            "rgit forge pr merge 42 --method squash --delete-branch --yes",
+        ],
+    ),
     ("stack", &["rgit stack"]),
     ("stack new", &["rgit stack new <branch>"]),
     ("stack list", &["rgit stack list"]),

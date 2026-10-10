@@ -5,9 +5,9 @@ use serde::Deserialize;
 use super::ForgeError;
 use super::auth::load_credential_for;
 use super::types::{
-    Branch, CheckRun, CreatePullRequest, CreateRepository, Listing, Provider, PullRequest,
-    PullRequestChecks, PullRequestState, RepoRef, Repository, User, normalize_check_status,
-    page_query, rollup_from, total_from_last_page,
+    Branch, CheckRun, CreatePullRequest, CreateRepository, Listing, MergeMethod, Provider,
+    PullRequest, PullRequestChecks, PullRequestState, RepoRef, Repository, User,
+    normalize_check_status, page_query, rollup_from, total_from_last_page,
 };
 
 const DEFAULT_HOST: &str = "https://gitlab.com";
@@ -605,6 +605,54 @@ impl GitlabClient {
             .await
             .map_err(response_error)?;
         self.merge_request_from_value(value)
+    }
+
+    /// Merge request `number` with `method`: a rebase rebases onto the target
+    /// first so the merge itself is a fast-forward, a squash squashes, and
+    /// the source branch goes away when `delete_branch` is set.
+    pub async fn merge_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        method: MergeMethod,
+        delete_branch: bool,
+    ) -> Result<PullRequest, ForgeError> {
+        if method == MergeMethod::Rebase {
+            self.http
+                .post(format!(
+                    "{}/projects/{}/merge_requests/{}/rebase",
+                    self.base_url,
+                    self.project_path(repo),
+                    number
+                ))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .map_err(api_error)?
+                .error_for_status()
+                .map_err(api_error)?;
+        }
+        let mut payload = serde_json::json!({
+            "should_remove_source_branch": delete_branch,
+        });
+        if method == MergeMethod::Squash {
+            payload["squash"] = serde_json::json!(true);
+        }
+        self.http
+            .put(format!(
+                "{}/projects/{}/merge_requests/{}",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .bearer_auth(&self.token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?;
+        self.pull_merge_request(repo, number).await
     }
 
     fn merge_request_from_value(

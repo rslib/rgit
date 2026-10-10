@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use super::ForgeError;
 use super::auth::{load_credential_for, refresh_if_needed};
 use super::types::{
-    Branch, CheckRun, CreatePullRequest, CreateRepository, Listing, Provider, PullRequest,
-    PullRequestChecks, PullRequestState, RepoRef, Repository, User, normalize_check_status,
-    page_query, rollup_from, total_from_last_page,
+    Branch, CheckRun, CreatePullRequest, CreateRepository, Listing, MergeMethod, Provider,
+    PullRequest, PullRequestChecks, PullRequestState, RepoRef, Repository, User,
+    normalize_check_status, page_query, rollup_from, total_from_last_page,
 };
 
 fn api_error(error: octocrab::Error) -> ForgeError {
@@ -461,6 +461,49 @@ impl GithubClient {
             .await
             .map_err(api_error)
             .and_then(map_pr)
+    }
+
+    /// Merge pull request `number` with `method`: GitHub merges through its
+    /// merge endpoint, then reports the merged pull request.
+    pub async fn merge_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        method: MergeMethod,
+        delete_branch: bool,
+    ) -> Result<PullRequest, ForgeError> {
+        #[derive(Serialize)]
+        struct Merge<'a> {
+            merge_method: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct MergeResult {
+            merged: bool,
+            message: Option<String>,
+        }
+        let result: MergeResult = self
+            .api
+            .put(
+                format!("/repos/{}/{}/pulls/{number}/merge", repo.owner, repo.name),
+                Some(&Merge {
+                    merge_method: method.as_str(),
+                }),
+            )
+            .await
+            .map_err(api_error)?;
+        if !result.merged {
+            return Err(ForgeError::api(
+                Provider::Github,
+                result.message.unwrap_or_else(|| {
+                    format!("pull request {number} of {repo} could not be merged")
+                }),
+            ));
+        }
+        let merged = self.pull_request(repo, number).await?;
+        if delete_branch {
+            self.delete_branch(repo, &merged.head_branch).await?;
+        }
+        Ok(merged)
     }
 }
 

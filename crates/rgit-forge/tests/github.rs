@@ -317,3 +317,59 @@ async fn list_requests_the_state_and_head_filters() {
     assert!(listing.items.is_empty());
     assert!(!listing.more);
 }
+
+#[tokio::test]
+async fn merges_a_pull_request_and_deletes_its_branch() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/repos/owner/repo/pulls/12/merge"))
+        .and(body_partial_json(serde_json::json!({"merge_method": "squash"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "merged": true,
+            "message": "Pull Request successfully merged",
+            "sha": "def"
+        })))
+        .mount(&server)
+        .await;
+    let mut merged = pr_json(12, "feature", "main");
+    merged["merged"] = serde_json::json!(true);
+    merged["state"] = serde_json::json!("closed");
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(merged))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/repos/owner/repo/git/refs/heads/feature"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .merge_pull_request(&repo(), 12, rgit_forge::MergeMethod::Squash, true)
+        .await
+        .expect("merged");
+    assert_eq!(pr.number, 12);
+    assert!(pr.merged);
+    assert_eq!(pr.head_branch, "feature");
+}
+
+#[tokio::test]
+async fn merge_reports_when_the_forge_refuses() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/repos/owner/repo/pulls/12/merge"))
+        .and(body_partial_json(serde_json::json!({"merge_method": "merge"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "merged": false,
+            "message": "Head branch is behind the base branch"
+        })))
+        .mount(&server)
+        .await;
+
+    let error = forge(&server)
+        .merge_pull_request(&repo(), 12, rgit_forge::MergeMethod::Merge, false)
+        .await
+        .expect_err("refused merge");
+    assert!(error.to_string().contains("behind"), "{error}");
+}

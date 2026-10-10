@@ -8,8 +8,6 @@ mod profile;
 mod remote;
 mod types;
 
-use types::fill_from_commit;
-
 use std::fmt;
 use std::path::PathBuf;
 
@@ -25,8 +23,9 @@ pub use profile::{ForgeConfig, ForgeProfile, ForgeSelection, ForgeTarget};
 pub use remote::RemoteTarget;
 pub use types::{
     Branch, CheckRollup, CheckRun, CreatePullRequest, CreateRepository, CredentialIdentity,
-    EnsureOutcome, EnsuredPullRequest, Listing, PAGE_SIZE, Provider, PullRequest,
-    PullRequestChecks, PullRequestState, RepoRef, Repository, StackEntry, StoredCredential, User,
+    EnsureOutcome, EnsuredPullRequest, Listing, MergeMethod, PAGE_SIZE, Provider, PullRequest,
+    PullRequestChecks, PullRequestComment, PullRequestReview, PullRequestState, RepoRef,
+    Repository, ReviewAction, StackEntry, StoredCredential, User, fill_from_commit,
 };
 
 /// An error from a forge operation. Every variant names the forge it came from
@@ -329,6 +328,29 @@ impl Forge {
         match self {
             Self::Github(client) => client.close_pull_request(repo, number).await,
             Self::Gitlab(client) => client.close_merge_request(repo, number).await,
+        }
+    }
+
+    /// Merge pull request `number` with `method`, deleting its head branch
+    /// when `delete_branch` is set.
+    pub async fn merge_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        method: MergeMethod,
+        delete_branch: bool,
+    ) -> Result<PullRequest, ForgeError> {
+        match self {
+            Self::Github(client) => {
+                client
+                    .merge_pull_request(repo, number, method, delete_branch)
+                    .await
+            }
+            Self::Gitlab(client) => {
+                client
+                    .merge_pull_request(repo, number, method, delete_branch)
+                    .await
+            }
         }
     }
 

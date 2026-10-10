@@ -3,7 +3,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use crate::cli::{AuthCmd, ForgeBranchCmd, ForgeCmd, PrCmd, RepoCmd};
 use anyhow::{Result, ensure};
 use rgit_forge::{
-    CreatePullRequest, CreateRepository, Forge, ForgeError, ForgeTarget, Provider, StackEntry,
+    CreatePullRequest, CreateRepository, Forge, ForgeError, ForgeTarget, MergeMethod, Provider,
+    StackEntry,
 };
 use rgit_git::GitBackend;
 use serde::Serialize;
@@ -302,6 +303,29 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 let repo = target.repo()?.clone();
                 with_forge(target, |forge| async move {
                     print_json(forge.close_pull_request(&repo, number).await?)
+                })
+            }),
+            PrCmd::Merge {
+                target,
+                repo,
+                number,
+                method,
+                delete_branch,
+                yes,
+            } => destructive(yes, "pull request", || {
+                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                let method = match method.as_str() {
+                    "squash" => MergeMethod::Squash,
+                    "rebase" => MergeMethod::Rebase,
+                    _ => MergeMethod::Merge,
+                };
+                with_forge(target, |forge| async move {
+                    print_json(
+                        forge
+                            .merge_pull_request(&repo, number, method, delete_branch)
+                            .await?,
+                    )
                 })
             }),
         },
