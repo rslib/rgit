@@ -201,6 +201,42 @@ pub struct PullRequest {
     pub draft: bool,
 }
 
+/// What `Forge::ensure_pull_request` did: opened a new pull request, or worked
+/// on the existing one (`retargeted` when it moved its base branch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureOutcome {
+    Created,
+    Updated { retargeted: bool },
+}
+
+/// An existing or newly created pull request, with what ensure did to it.
+#[derive(Debug, Clone)]
+pub struct EnsuredPullRequest {
+    pub pull_request: PullRequest,
+    pub outcome: EnsureOutcome,
+}
+
+/// One branch to ensure a pull request for: its head branch, base branch and
+/// the tip commit message that fills the title and body.
+#[derive(Debug, Clone)]
+pub struct StackEntry {
+    pub branch: String,
+    pub base: String,
+    pub message: String,
+}
+
+/// The PR title and body a tip commit message fills in, as `gh pr create
+/// --fill` does: the subject as the title, the rest of the message as the body.
+pub(crate) fn fill_from_commit(message: &str) -> (String, Option<String>) {
+    let message = message.trim();
+    let (subject, body) = match message.split_once('\n') {
+        Some((subject, body)) => (subject.trim(), body.trim()),
+        None => (message, ""),
+    };
+    let body = (!body.is_empty()).then(|| body.to_owned());
+    (subject.to_owned(), body)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub login: String,
@@ -291,6 +327,19 @@ mod tests {
         assert_eq!(Provider::parse("GitHub").unwrap(), Provider::Github);
         assert_eq!(Provider::parse("gitlab").unwrap(), Provider::Gitlab);
         assert!(Provider::parse("gitea").is_err());
+    }
+
+    #[test]
+    fn a_commit_message_fills_the_title_and_body() {
+        let (title, body) = fill_from_commit("Add forge PRs\n\nLonger story.\n");
+        assert_eq!(title, "Add forge PRs");
+        assert_eq!(body.as_deref(), Some("Longer story."));
+        let (title, body) = fill_from_commit("Single line\n");
+        assert_eq!(title, "Single line");
+        assert_eq!(body, None);
+        let (title, body) = fill_from_commit("\n\nLead sentence\n\nMore.\n");
+        assert_eq!(title, "Lead sentence");
+        assert_eq!(body.as_deref(), Some("More."));
     }
 
     #[test]

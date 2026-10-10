@@ -8,6 +8,8 @@ mod profile;
 mod remote;
 mod types;
 
+use types::fill_from_commit;
+
 use std::fmt;
 use std::path::PathBuf;
 
@@ -22,8 +24,9 @@ pub use gitlab::GitlabClient;
 pub use profile::{ForgeConfig, ForgeProfile, ForgeSelection, ForgeTarget};
 pub use remote::RemoteTarget;
 pub use types::{
-    Branch, CreatePullRequest, CreateRepository, CredentialIdentity, Listing, PAGE_SIZE, Provider,
-    PullRequest, PullRequestState, RepoRef, Repository, StoredCredential, User,
+    Branch, CreatePullRequest, CreateRepository, CredentialIdentity, EnsureOutcome,
+    EnsuredPullRequest, Listing, PAGE_SIZE, Provider, PullRequest, PullRequestState, RepoRef,
+    Repository, StackEntry, StoredCredential, User,
 };
 
 /// An error from a forge operation. Every variant names the forge it came from
@@ -79,9 +82,12 @@ pub enum Forge {
 impl Forge {
     /// Connect to the forge of `target` with its account and host.
     pub async fn connect(target: &ForgeTarget) -> Result<Self, ForgeError> {
+        let github_base = (target.provider == Provider::Github
+            && target.host != Provider::Github.default_host())
+        .then_some(target.host.as_str());
         match target.provider {
             Provider::Github => Ok(Self::Github(
-                GithubClient::from_environment_for(&target.account).await?,
+                GithubClient::from_environment_for(&target.account, github_base).await?,
             )),
             Provider::Gitlab => Ok(Self::Gitlab(GitlabClient::from_environment_for(
                 &target.host,
@@ -157,6 +163,102 @@ impl Forge {
         match self {
             Self::Github(client) => client.create_pull_request(repo, request).await,
             Self::Gitlab(client) => client.create_merge_request(repo, request).await,
+        }
+    }
+
+    /// Find the open pull request for `head`: retarget its base when it points
+    /// elsewhere, and open one filled with `title`, `body` and `draft` when no
+    /// open pull request for the branch exists.
+    pub async fn ensure_pull_request(
+        &self,
+        repo: &RepoRef,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: Option<&str>,
+        draft: bool,
+    ) -> Result<EnsuredPullRequest, ForgeError> {
+        let mut page = 1;
+        loop {
+            let listing = self
+                .pull_requests(repo, page, PullRequestState::Open, Some(head))
+                .await?;
+            if let Some(existing) = listing.items.iter().find(|pr| pr.head_branch == head) {
+                return if existing.base_branch != base {
+                    let pull_request = self
+                        .retarget_pull_request(repo, existing.number, base)
+                        .await?;
+                    Ok(EnsuredPullRequest {
+                        pull_request,
+                        outcome: EnsureOutcome::Updated { retargeted: true },
+                    })
+                } else {
+                    Ok(EnsuredPullRequest {
+                        pull_request: existing.clone(),
+                        outcome: EnsureOutcome::Updated { retargeted: false },
+                    })
+                };
+            }
+            if !listing.more {
+                break;
+            }
+            page += 1;
+        }
+        let request = CreatePullRequest {
+            title: title.to_owned(),
+            head: head.to_owned(),
+            base: base.to_owned(),
+            body: body.map(str::to_owned),
+            draft,
+        };
+        Ok(EnsuredPullRequest {
+            pull_request: self.create_pull_request(repo, &request).await?,
+            outcome: EnsureOutcome::Created,
+        })
+    }
+
+    /// Ensure a pull request per stack entry, filling each title and body from
+    /// the entry's tip commit message the way `gh pr create --fill` does.
+    /// Returns one `opened` or `updated` line per entry, for submit reports.
+    pub async fn ensure_pull_requests(
+        &self,
+        repo: &RepoRef,
+        entries: &[StackEntry],
+    ) -> Result<Vec<String>, ForgeError> {
+        let mut lines = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (title, body) = fill_from_commit(&entry.message);
+            let ensured = self
+                .ensure_pull_request(
+                    repo,
+                    &entry.branch,
+                    &entry.base,
+                    &title,
+                    body.as_deref(),
+                    false,
+                )
+                .await?;
+            let word = match ensured.outcome {
+                EnsureOutcome::Created => "opened",
+                EnsureOutcome::Updated { .. } => "updated",
+            };
+            lines.push(format!(
+                "{word} {} ({})",
+                ensured.pull_request.html_url, entry.branch
+            ));
+        }
+        Ok(lines)
+    }
+
+    pub async fn retarget_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        base: &str,
+    ) -> Result<PullRequest, ForgeError> {
+        match self {
+            Self::Github(client) => client.retarget_pull_request(repo, number, base).await,
+            Self::Gitlab(client) => client.retarget_pull_request(repo, number, base).await,
         }
     }
 

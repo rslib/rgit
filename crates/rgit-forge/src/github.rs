@@ -29,32 +29,76 @@ fn state_param(state: PullRequestState) -> &'static str {
     }
 }
 
+/// The pull request shape of GitHub's API; rgit's type flattens `head` and
+/// `base` into branch names.
+#[derive(serde::Deserialize)]
+struct ApiPullRequest {
+    number: u64,
+    title: String,
+    state: String,
+    html_url: String,
+    draft: bool,
+    merged_at: Option<String>,
+    head: ApiRef,
+    base: ApiRef,
+}
+
+#[derive(serde::Deserialize)]
+struct ApiRef {
+    #[serde(rename = "ref")]
+    branch: String,
+}
+
+impl From<ApiPullRequest> for PullRequest {
+    fn from(request: ApiPullRequest) -> Self {
+        Self {
+            number: request.number,
+            title: request.title,
+            state: request.state,
+            html_url: request.html_url,
+            head_branch: request.head.branch,
+            base_branch: request.base.branch,
+            draft: request.draft,
+        }
+    }
+}
+
 pub struct GithubClient {
     api: Octocrab,
 }
 
 impl GithubClient {
     pub fn from_token(token: String) -> Result<Self, ForgeError> {
-        Octocrab::builder()
-            .personal_token(token)
-            .build()
-            .map(|api| Self { api })
-            .map_err(api_error)
+        Self::from_token_at(token, None)
+    }
+
+    /// A client whose API base is `base_url` instead of github.com's API;
+    /// tests point it at a local stub. `None` is octocrab's default.
+    pub fn from_token_at(token: String, base_url: Option<&str>) -> Result<Self, ForgeError> {
+        let builder = Octocrab::builder().personal_token(token);
+        let builder = match base_url {
+            Some(url) => builder.base_uri(url).map_err(api_error)?,
+            None => builder,
+        };
+        builder.build().map(|api| Self { api }).map_err(api_error)
     }
 
     pub async fn from_environment() -> Result<Self, ForgeError> {
         let account = std::env::var("RGIT_FORGE_ACCOUNT").unwrap_or_else(|_| "default".to_owned());
-        Self::from_environment_for(&account).await
+        Self::from_environment_for(&account, None).await
     }
 
-    pub async fn from_environment_for(account: &str) -> Result<Self, ForgeError> {
+    pub async fn from_environment_for(
+        account: &str,
+        base_url: Option<&str>,
+    ) -> Result<Self, ForgeError> {
         if let Some(token) = Provider::Github.env_token() {
-            return Self::from_token(token);
+            return Self::from_token_at(token, base_url);
         }
         let credential = load_credential_for("github", "github.com", account)?
             .ok_or(ForgeError::AuthenticationRequired)?;
         let credential = refresh_if_needed(credential, "github", "github.com", account).await?;
-        Self::from_token(credential.access_token)
+        Self::from_token_at(credential.access_token, base_url)
     }
 
     pub async fn repository(&self, repo: &RepoRef) -> Result<Repository, ForgeError> {
@@ -170,22 +214,6 @@ impl GithubClient {
         state: PullRequestState,
         head: Option<&str>,
     ) -> Result<Listing<PullRequest>, ForgeError> {
-        #[derive(Deserialize)]
-        struct ApiRequest {
-            number: u64,
-            title: String,
-            state: String,
-            html_url: String,
-            draft: bool,
-            merged_at: Option<String>,
-            head: ApiRef,
-            base: ApiRef,
-        }
-        #[derive(Deserialize)]
-        struct ApiRef {
-            #[serde(rename = "ref")]
-            branch: String,
-        }
         let mut route = format!(
             "/repos/{}/{}/pulls?state={}",
             repo.owner,
@@ -199,7 +227,7 @@ impl GithubClient {
                 urlencoding::encode(branch)
             ));
         }
-        let listing: Listing<ApiRequest> = self.list_page(&route, page).await?;
+        let listing: Listing<ApiPullRequest> = self.list_page(&route, page).await?;
         // GitHub lists merged pull requests only under state=closed, so the
         // merged filter keeps the merged_at subset and drops the page total.
         let only_merged = state == PullRequestState::Merged;
@@ -208,15 +236,7 @@ impl GithubClient {
             if only_merged && request.merged_at.is_none() {
                 continue;
             }
-            items.push(PullRequest {
-                number: request.number,
-                title: request.title,
-                state: request.state,
-                html_url: request.html_url,
-                head_branch: request.head.branch,
-                base_branch: request.base.branch,
-                draft: request.draft,
-            });
+            items.push(request.into());
         }
         let total = if only_merged && (listing.page != 1 || listing.more) {
             None
@@ -258,6 +278,27 @@ impl GithubClient {
             )
             .await
             .map_err(api_error)
+            .and_then(map_pr)
+    }
+
+    pub async fn retarget_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        base: &str,
+    ) -> Result<PullRequest, ForgeError> {
+        #[derive(Serialize)]
+        struct Retarget<'a> {
+            base: &'a str,
+        }
+        self.api
+            .patch(
+                format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.name),
+                Some(&Retarget { base }),
+            )
+            .await
+            .map_err(api_error)
+            .and_then(map_pr)
     }
 
     pub async fn close_pull_request(
@@ -276,5 +317,13 @@ impl GithubClient {
             )
             .await
             .map_err(api_error)
+            .and_then(map_pr)
     }
+}
+
+/// Octocrab returns the raw JSON value for a POST/PATCH; map the API's shape.
+fn map_pr(value: serde_json::Value) -> Result<PullRequest, ForgeError> {
+    serde_json::from_value::<ApiPullRequest>(value)
+        .map(PullRequest::from)
+        .map_err(|e| ForgeError::Response(e.to_string()))
 }
