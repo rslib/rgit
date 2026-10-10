@@ -24,9 +24,9 @@ pub use gitlab::GitlabClient;
 pub use profile::{ForgeConfig, ForgeProfile, ForgeSelection, ForgeTarget};
 pub use remote::RemoteTarget;
 pub use types::{
-    Branch, CreatePullRequest, CreateRepository, CredentialIdentity, EnsureOutcome,
-    EnsuredPullRequest, Listing, PAGE_SIZE, Provider, PullRequest, PullRequestState, RepoRef,
-    Repository, StackEntry, StoredCredential, User,
+    Branch, CheckRollup, CheckRun, CreatePullRequest, CreateRepository, CredentialIdentity,
+    EnsureOutcome, EnsuredPullRequest, Listing, PAGE_SIZE, Provider, PullRequest,
+    PullRequestChecks, PullRequestState, RepoRef, Repository, StackEntry, StoredCredential, User,
 };
 
 /// An error from a forge operation. Every variant names the forge it came from
@@ -186,6 +186,18 @@ impl Forge {
                 return Ok(None);
             }
             page += 1;
+        }
+    }
+
+    /// The CI checks of the pull request's head commit, with a rollup.
+    pub async fn pull_request_checks(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequestChecks, ForgeError> {
+        match self {
+            Self::Github(client) => client.pull_request_checks(repo, number).await,
+            Self::Gitlab(client) => client.pull_request_checks(repo, number).await,
         }
     }
 

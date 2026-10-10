@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use super::ForgeError;
 use super::auth::{load_credential_for, refresh_if_needed};
 use super::types::{
-    Branch, CreatePullRequest, CreateRepository, Listing, Provider, PullRequest, PullRequestState,
-    RepoRef, Repository, User, page_query, total_from_last_page,
+    Branch, CheckRun, CreatePullRequest, CreateRepository, Listing, Provider, PullRequest,
+    PullRequestChecks, PullRequestState, RepoRef, Repository, User, normalize_check_status,
+    page_query, rollup_from, total_from_last_page,
 };
 
 fn api_error(error: octocrab::Error) -> ForgeError {
@@ -300,6 +301,90 @@ impl GithubClient {
             .await
             .map_err(api_error)?;
         map_pr(value)
+    }
+
+    /// The checks of pull request `number`'s head commit: GitHub's check runs
+    /// and commit statuses combined, one entry per check.
+    pub async fn pull_request_checks(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequestChecks, ForgeError> {
+        let pr = self.pull_request(repo, number).await?;
+        let sha = pr.head_sha.ok_or_else(|| {
+            ForgeError::Response(format!(
+                "pull request {number} of {repo} has no head commit"
+            ))
+        })?;
+        #[derive(serde::Deserialize)]
+        struct ApiCheckRuns {
+            #[serde(default)]
+            check_runs: Vec<ApiCheckRun>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ApiCheckRun {
+            name: String,
+            status: String,
+            conclusion: Option<String>,
+            html_url: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ApiStatuses {
+            #[serde(default)]
+            statuses: Vec<ApiCommitStatus>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ApiCommitStatus {
+            state: String,
+            context: String,
+            target_url: Option<String>,
+        }
+        let runs: ApiCheckRuns = self
+            .api
+            .get(
+                format!(
+                    "/repos/{}/{}/commits/{sha}/check-runs?per_page=100",
+                    repo.owner, repo.name
+                ),
+                None::<&()>,
+            )
+            .await
+            .map_err(api_error)?;
+        let statuses: ApiStatuses = self
+            .api
+            .get(
+                format!(
+                    "/repos/{}/{}/commits/{sha}/status?per_page=100",
+                    repo.owner, repo.name
+                ),
+                None::<&()>,
+            )
+            .await
+            .map_err(api_error)?;
+        let mut checks = Vec::with_capacity(runs.check_runs.len() + statuses.statuses.len());
+        let mut rollups = Vec::with_capacity(checks.capacity());
+        for run in runs.check_runs {
+            let status = normalize_check_status(run.conclusion.as_deref().unwrap_or(&run.status));
+            rollups.push(status.to_owned());
+            checks.push(CheckRun {
+                name: run.name,
+                status: status.to_owned(),
+                url: run.html_url,
+            });
+        }
+        for status in statuses.statuses {
+            let normalized = normalize_check_status(&status.state);
+            rollups.push(normalized.to_owned());
+            checks.push(CheckRun {
+                name: status.context,
+                status: normalized.to_owned(),
+                url: status.target_url,
+            });
+        }
+        Ok(PullRequestChecks {
+            rollup: rollup_from(rollups),
+            checks,
+        })
     }
 
     pub async fn create_pull_request(

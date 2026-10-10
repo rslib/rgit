@@ -208,6 +208,37 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                     print_json(pr)
                 })
             }
+            PrCmd::Checks {
+                number,
+                target,
+                repo,
+            } => {
+                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                let branch = if number.is_none() {
+                    Some(current_branch()?)
+                } else {
+                    None
+                };
+                with_forge(target, move |forge| async move {
+                    let number = match (number, branch) {
+                        (Some(number), _) => number,
+                        (None, Some(branch)) => {
+                            forge
+                                .pull_request_for_branch(&repo, &branch)
+                                .await?
+                                .ok_or_else(|| {
+                                    ForgeError::Response(format!(
+                                        "no pull request for branch {branch:?}"
+                                    ))
+                                })?
+                                .number
+                        }
+                        (None, None) => unreachable!("a number or the current branch exists"),
+                    };
+                    print_json(forge.pull_request_checks(&repo, number).await?)
+                })
+            }
             PrCmd::List { target, repo, page } => {
                 let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();

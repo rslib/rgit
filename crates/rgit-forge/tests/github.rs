@@ -220,6 +220,57 @@ async fn finds_the_pull_request_for_a_branch() {
 }
 
 #[tokio::test]
+async fn combines_check_runs_and_statuses_for_checks() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pr_json(12, "feature", "main")))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/commits/abc/check-runs"))
+        .and(query_param("per_page", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "total_count": 2,
+            "check_runs": [
+                {"name": "build", "status": "completed", "conclusion": "success",
+                 "html_url": "https://ci.example/build"},
+                {"name": "publish", "status": "queued", "conclusion": null,
+                 "html_url": null}
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/commits/abc/status"))
+        .and(query_param("per_page", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "state": "success",
+            "statuses": [
+                {"state": "failure", "context": "unit", "target_url": "https://ci.example/unit"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let checks = forge(&server)
+        .pull_request_checks(&repo(), 12)
+        .await
+        .expect("checks");
+    assert_eq!(checks.rollup, rgit_forge::CheckRollup::Failing);
+    let names: Vec<&str> = checks.checks.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["build", "publish", "unit"]);
+    assert_eq!(checks.checks[0].status, "passing");
+    assert_eq!(checks.checks[1].status, "pending");
+    assert_eq!(checks.checks[1].url, None);
+    assert_eq!(checks.checks[2].status, "failing");
+    assert_eq!(
+        checks.checks[2].url.as_deref(),
+        Some("https://ci.example/unit")
+    );
+}
+
+#[tokio::test]
 async fn list_requests_the_state_and_head_filters() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

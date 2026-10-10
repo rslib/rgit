@@ -5,8 +5,9 @@ use serde::Deserialize;
 use super::ForgeError;
 use super::auth::load_credential_for;
 use super::types::{
-    Branch, CreatePullRequest, CreateRepository, Listing, Provider, PullRequest, PullRequestState,
-    RepoRef, Repository, User, page_query, total_from_last_page,
+    Branch, CheckRun, CreatePullRequest, CreateRepository, Listing, Provider, PullRequest,
+    PullRequestChecks, PullRequestState, RepoRef, Repository, User, normalize_check_status,
+    page_query, rollup_from, total_from_last_page,
 };
 
 const DEFAULT_HOST: &str = "https://gitlab.com";
@@ -438,6 +439,84 @@ impl GitlabClient {
             .await
             .map_err(response_error)?;
         self.merge_request_from_value(value)
+    }
+
+    /// The checks of merge request `iid`: the head pipeline's jobs.
+    pub async fn pull_request_checks(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequestChecks, ForgeError> {
+        #[derive(Deserialize)]
+        struct ApiPipeline {
+            id: u64,
+        }
+        #[derive(Deserialize)]
+        struct ApiHeadPipeline {
+            head_pipeline: Option<ApiPipeline>,
+        }
+        #[derive(Deserialize)]
+        struct ApiJob {
+            name: String,
+            status: String,
+            web_url: Option<String>,
+        }
+        let value: serde_json::Value = self
+            .http
+            .get(format!(
+                "{}/projects/{}/merge_requests/{}",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?
+            .json()
+            .await
+            .map_err(response_error)?;
+        let head: ApiHeadPipeline = serde_json::from_value(value).map_err(response_error)?;
+        let Some(pipeline) = head.head_pipeline else {
+            return Ok(PullRequestChecks {
+                rollup: super::types::CheckRollup::None,
+                checks: Vec::new(),
+            });
+        };
+        let jobs: Vec<ApiJob> = self
+            .http
+            .get(format!(
+                "{}/projects/{}/pipelines/{}/jobs?per_page=100",
+                self.base_url,
+                self.project_path(repo),
+                pipeline.id
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?
+            .json()
+            .await
+            .map_err(response_error)?;
+        let statuses = jobs
+            .iter()
+            .map(|job| normalize_check_status(&job.status).to_owned())
+            .collect::<Vec<_>>();
+        Ok(PullRequestChecks {
+            rollup: rollup_from(statuses),
+            checks: jobs
+                .into_iter()
+                .map(|job| CheckRun {
+                    name: job.name,
+                    status: normalize_check_status(&job.status).to_owned(),
+                    url: job.web_url,
+                })
+                .collect(),
+        })
     }
 
     pub async fn create_merge_request(

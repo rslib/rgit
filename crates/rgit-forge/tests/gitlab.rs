@@ -199,6 +199,60 @@ async fn finds_the_merge_request_for_a_branch() {
 }
 
 #[tokio::test]
+async fn lists_the_jobs_of_the_head_pipeline() {
+    let server = MockServer::start().await;
+    let mut mr = mr_json(12, "feature", "main");
+    mr["head_pipeline"] = serde_json::json!({"id": 7, "status": "running"});
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/pipelines/7/jobs$",
+        ))
+        .and(query_param("per_page", "100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"name": "build", "status": "success", "web_url": "https://ci.example/build"},
+            {"name": "spec", "status": "failed", "web_url": null}
+        ])))
+        .mount(&server)
+        .await;
+
+    let checks = forge(&server)
+        .pull_request_checks(&repo(), 12)
+        .await
+        .expect("checks");
+    assert_eq!(checks.rollup, rgit_forge::CheckRollup::Failing);
+    let names: Vec<&str> = checks.checks.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["build", "spec"]);
+    assert_eq!(checks.checks[0].status, "passing");
+    assert_eq!(checks.checks[1].status, "failing");
+}
+
+#[tokio::test]
+async fn a_merge_request_without_a_pipeline_has_no_checks() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(mr_json(12, "feature", "main")))
+        .mount(&server)
+        .await;
+
+    let checks = forge(&server)
+        .pull_request_checks(&repo(), 12)
+        .await
+        .expect("checks");
+    assert_eq!(checks.rollup, rgit_forge::CheckRollup::None);
+    assert!(checks.checks.is_empty());
+}
+
+#[tokio::test]
 async fn list_requests_the_state_and_source_branch_filters() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

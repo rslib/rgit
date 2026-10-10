@@ -161,6 +161,80 @@ pub(crate) fn page_query(route: &str, page: u32) -> String {
     format!("{route}{sep}per_page={PAGE_SIZE}&page={}", page.max(1))
 }
 
+/// One CI check on a pull request's head commit, its status normalized to
+/// `passing`, `failing`, `pending` or `skipped`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckRun {
+    pub name: String,
+    pub status: String,
+    pub url: Option<String>,
+}
+
+/// The CI rollup of a pull request's checks: `Failing` when any check fails,
+/// `Pending` when none has failed but some has not finished, `Passing` when
+/// they all pass, `None` when there are none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckRollup {
+    Passing,
+    Failing,
+    Pending,
+    None,
+}
+
+/// The checks of a pull request's head commit.
+#[derive(Debug, Clone, Serialize)]
+pub struct PullRequestChecks {
+    pub rollup: CheckRollup,
+    pub checks: Vec<CheckRun>,
+}
+
+/// The normalized status of a provider check status or conclusion.
+pub(crate) fn normalize_check_status(value: &str) -> &'static str {
+    match value {
+        "success" | "passed" => "passing",
+        "failure" | "failed" | "error" | "timed_out" | "startup_failure" | "action_required"
+        | "stale" => "failing",
+        "queued"
+        | "pending"
+        | "running"
+        | "created"
+        | "in_progress"
+        | "waiting"
+        | "waiting_for_resource"
+        | "preparing"
+        | "scheduled"
+        | "manual" => "pending",
+        _ => "skipped",
+    }
+}
+
+/// The rollup over a batch of normalized check statuses: a failing check
+/// loses, an unfinished one makes it pending, and an empty batch is `None`.
+pub(crate) fn rollup_from(statuses: impl IntoIterator<Item = String>) -> CheckRollup {
+    use CheckRollup::*;
+    let mut failing = false;
+    let mut pending = false;
+    let mut count = 0;
+    for status in statuses {
+        count += 1;
+        match status.as_str() {
+            "failing" => failing = true,
+            "pending" => pending = true,
+            _ => {}
+        }
+    }
+    if failing {
+        Failing
+    } else if pending {
+        Pending
+    } else if count == 0 {
+        None
+    } else {
+        Passing
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Repository {
     pub name: String,
@@ -362,6 +436,37 @@ mod tests {
         assert_eq!(total_from_last_page(1, 42), Some(42));
         assert_eq!(total_from_last_page(4, 7), Some(307));
         assert_eq!(total_from_last_page(5, 0), None);
+    }
+
+    #[test]
+    fn classifies_provider_check_statuses() {
+        assert_eq!(normalize_check_status("success"), "passing");
+        assert_eq!(normalize_check_status("failure"), "failing");
+        assert_eq!(normalize_check_status("timed_out"), "failing");
+        assert_eq!(normalize_check_status("error"), "failing");
+        assert_eq!(normalize_check_status("in_progress"), "pending");
+        assert_eq!(normalize_check_status("running"), "pending");
+        assert_eq!(normalize_check_status("cancelled"), "skipped");
+        assert_eq!(normalize_check_status("neutral"), "skipped");
+    }
+
+    #[test]
+    fn rolls_up_check_statuses() {
+        use CheckRollup::*;
+        assert_eq!(rollup_from(Vec::<String>::new()), None);
+        assert_eq!(rollup_from(["passing".to_owned()]), Passing);
+        assert_eq!(
+            rollup_from(["skipped".to_owned(), "passing".to_owned()]),
+            Passing
+        );
+        assert_eq!(
+            rollup_from(["passing".to_owned(), "pending".to_owned()]),
+            Pending
+        );
+        assert_eq!(
+            rollup_from(["pending".to_owned(), "failing".to_owned()]),
+            Failing
+        );
     }
 
     #[test]

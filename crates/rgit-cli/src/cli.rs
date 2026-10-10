@@ -6619,6 +6619,14 @@ pub enum PrCmd {
         target: Option<String>,
         repo: Option<String>,
     },
+    /// Show the CI checks on a pull request's head commit (its jobs for GitLab).
+    Checks {
+        /// A PR number; defaults to the pull request for the current branch.
+        number: Option<u64>,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+    },
     /// List open pull requests or merge requests, 100 per page.
     List {
         /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.

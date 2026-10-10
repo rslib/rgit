@@ -1414,6 +1414,14 @@ const EXAMPLES: &[Entry] = &[
         ],
     ),
     (
+        "forge pr checks",
+        &[
+            "rgit forge pr checks",
+            "rgit forge pr checks 42",
+            "rgit forge pr checks 42 owner/repo",
+        ],
+    ),
+    (
         "forge pr list",
         &[
             "rgit forge pr list",
