@@ -5188,6 +5188,7 @@ dependencies = [
  "hyperpolyglot",
  "maud",
  "pulldown-cmark",
+ "rgit-forge",
  "rgit-git",
  "rgit-index",
  "rst_parser",

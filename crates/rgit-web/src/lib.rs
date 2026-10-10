@@ -501,71 +501,40 @@ fn blob_page(
     .into_response())
 }
 
-/// PR + CI badges for a branch, fetched lazily via `gh` (the forge escape
-/// hatch). Empty when gh is absent/unauthenticated or there is no PR - the
-/// section simply shows nothing rather than erroring.
-fn forge_badges(workdir: &std::path::Path, branch: &str) -> String {
-    let output = std::process::Command::new("gh")
-        .current_dir(workdir)
-        .args([
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--json",
-            "number,url,statusCheckRollup",
-            "--limit",
-            "5",
-        ])
-        .output();
-    let Ok(output) = output else {
+/// PR badges for a branch, fetched from the origin remote's forge. Empty when
+/// the remote is not a supported forge, no account is set up, authentication
+/// fails or there is no open PR - the section simply shows nothing rather than
+/// erroring.
+async fn forge_badges(b: &dyn GitBackend, branch: &str) -> String {
+    let Some(origin) = b.config_get("remote.origin.url").ok().flatten() else {
         return String::new();
     };
-    if !output.status.success() {
-        return String::new();
-    }
-    let Ok(prs) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) else {
+    let Ok(selection) = rgit_forge::ForgeSelection::default().resolve() else {
         return String::new();
     };
-    let mut html = String::new();
-    for pr in &prs {
-        let num = pr["number"].as_u64().unwrap_or(0);
-        let url = pr["url"].as_str().unwrap_or("#");
-        let ci = pr["statusCheckRollup"]
-            .as_array()
-            .map(|a| ci_mark(a))
-            .unwrap_or("");
-        html.push_str(&format!(
-            "<a class=\"prbadge\" href=\"{url}\">PR #{num}{ci}</a>"
-        ));
-    }
-    html
+    let Ok(target) = rgit_forge::ForgeTarget::from_remote(&selection, &origin) else {
+        return String::new();
+    };
+    let Ok(repo) = target.repo().cloned() else {
+        return String::new();
+    };
+    let Ok(forge) = rgit_forge::Forge::connect(&target).await else {
+        return String::new();
+    };
+    let Ok(listing) = forge
+        .pull_requests(&repo, 1, rgit_forge::PullRequestState::Open, Some(branch))
+        .await
+    else {
+        return String::new();
+    };
+    listing.items.iter().take(5).map(badge_html).collect()
 }
 
-/// Aggregate a PR's check-run states into one CI mark.
-fn ci_mark(rollup: &[serde_json::Value]) -> &'static str {
-    let (mut any, mut fail, mut pending) = (false, false, false);
-    for c in rollup {
-        any = true;
-        let state = c["state"]
-            .as_str()
-            .or_else(|| c["conclusion"].as_str())
-            .unwrap_or("");
-        match state {
-            "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" => fail = true,
-            "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
-            _ => pending = true,
-        }
-    }
-    if !any {
-        ""
-    } else if fail {
-        " <span class=\"ci f\">\u{2717}</span>"
-    } else if pending {
-        " <span class=\"ci r\">\u{25cf}</span>"
-    } else {
-        " <span class=\"ci p\">\u{2713}</span>"
-    }
+fn badge_html(pr: &rgit_forge::PullRequest) -> String {
+    format!(
+        "<a class=\"prbadge\" href=\"{}\">PR #{}</a>",
+        pr.html_url, pr.number
+    )
 }
 
 fn search_page(
@@ -833,7 +802,7 @@ fn files_body(b: &dyn GitBackend) -> Result<Response, AppError> {
         .into_response())
 }
 
-fn prs_body(b: &dyn GitBackend) -> Result<Response, AppError> {
+async fn prs_body(b: &Arc<dyn GitBackend>) -> Result<Response, AppError> {
     let branch = b
         .status()
         .ok()
@@ -842,7 +811,7 @@ fn prs_body(b: &dyn GitBackend) -> Result<Response, AppError> {
     let html = if branch.is_empty() {
         String::new()
     } else {
-        forge_badges(b.workdir(), &branch)
+        forge_badges(b.as_ref(), &branch).await
     };
     Ok(([("content-type", "text/html; charset=utf-8")], html).into_response())
 }
@@ -963,7 +932,7 @@ async fn s_archive(
 }
 async fn s_prs(State(s): State<Shared>) -> Result<Response, AppError> {
     let (b, _, _) = ctx(&s, None)?;
-    prs_body(b.as_ref())
+    prs_body(&b).await
 }
 async fn s_search(
     State(s): State<Shared>,
@@ -1116,7 +1085,7 @@ async fn m_archive(
 }
 async fn m_prs(State(s): State<Shared>, Path(repo): Path<String>) -> Result<Response, AppError> {
     let (b, _, _) = ctx(&s, Some(&repo))?;
-    prs_body(b.as_ref())
+    prs_body(&b).await
 }
 async fn m_search(
     State(s): State<Shared>,
@@ -1276,23 +1245,20 @@ mod tests {
     use super::Registry;
 
     #[test]
-    fn ci_mark_aggregates_check_states() {
-        use serde_json::json;
-        assert_eq!(super::ci_mark(&[]), "");
-        let pass = [json!({"state": "SUCCESS"}), json!({"state": "SKIPPED"})];
-        assert!(
-            super::ci_mark(&pass).contains('\u{2713}'),
-            "all-pass is a check"
-        );
-        let fail = [json!({"state": "SUCCESS"}), json!({"state": "FAILURE"})];
-        assert!(
-            super::ci_mark(&fail).contains('\u{2717}'),
-            "any fail is a cross"
-        );
-        let pending = [json!({"state": "SUCCESS"}), json!({"state": "IN_PROGRESS"})];
-        assert!(
-            super::ci_mark(&pending).contains('\u{25cf}'),
-            "any pending is a dot"
+    fn a_pull_request_renders_one_badge() {
+        use super::badge_html;
+        let pr = rgit_forge::PullRequest {
+            number: 12,
+            title: "T".to_owned(),
+            state: "open".to_owned(),
+            html_url: "https://github.com/o/r/pull/12".to_owned(),
+            head_branch: "feat".to_owned(),
+            base_branch: "main".to_owned(),
+            draft: false,
+        };
+        assert_eq!(
+            badge_html(&pr),
+            "<a class=\"prbadge\" href=\"https://github.com/o/r/pull/12\">PR #12</a>"
         );
     }
 
