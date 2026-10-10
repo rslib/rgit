@@ -663,6 +663,33 @@ impl GitlabClient {
         Ok(request.into_pull_request())
     }
 
+    /// Reopen merge request `number`.
+    pub async fn reopen_merge_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequest, ForgeError> {
+        let value: serde_json::Value = self
+            .http
+            .put(format!(
+                "{}/projects/{}/merge_requests/{}",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .bearer_auth(&self.token)
+            .form(&[("state_event", "reopen")])
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?
+            .json()
+            .await
+            .map_err(response_error)?;
+        self.merge_request_from_value(value)
+    }
+
     /// Change the title, description and target branch merge request `number`
     /// carries; each `None` leaves that field alone.
     pub async fn edit_merge_request(

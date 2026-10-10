@@ -381,6 +381,17 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                     print_json(forge.mark_pull_request_draft(&repo, number).await?)
                 })
             }
+            PrCmd::Reopen {
+                number,
+                target,
+                repo,
+            } => {
+                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                with_forge(target, |forge| async move {
+                    print_json(forge.reopen_pull_request(&repo, number).await?)
+                })
+            }
         },
         ForgeCmd::Browse {
             number,

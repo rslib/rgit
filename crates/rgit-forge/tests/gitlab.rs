@@ -462,3 +462,28 @@ async fn marks_a_merge_request_draft_by_prefixing_the_title() {
     assert_eq!(pr.number, 12);
     assert_eq!(pr.title, "Draft: Title");
 }
+
+#[tokio::test]
+async fn reopens_a_closed_merge_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .and(body_string("state_event=reopen"))
+        .respond_with({
+            let mut open = mr_json(12, "feature", "main");
+            open["state"] = serde_json::json!("opened");
+            ResponseTemplate::new(200).set_body_json(open)
+        })
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .reopen_pull_request(&repo(), 12)
+        .await
+        .expect("reopened");
+    assert_eq!(pr.number, 12);
+    assert_eq!(pr.state, "opened");
+    assert_mapped(&pr);
+}

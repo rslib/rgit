@@ -398,6 +398,18 @@ impl Forge {
         }
     }
 
+    /// Reopen pull request `number`.
+    pub async fn reopen_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequest, ForgeError> {
+        match self {
+            Self::Github(client) => client.reopen_pull_request(repo, number).await,
+            Self::Gitlab(client) => client.reopen_merge_request(repo, number).await,
+        }
+    }
+
     pub async fn current_user(&self) -> Result<User, ForgeError> {
         match self {
             Self::Github(client) => client.current_user().await,

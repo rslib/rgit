@@ -502,6 +502,26 @@ impl GithubClient {
             .and_then(map_pr)
     }
 
+    /// Reopen pull request `number`.
+    pub async fn reopen_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<PullRequest, ForgeError> {
+        #[derive(Serialize)]
+        struct Update {
+            state: &'static str,
+        }
+        self.api
+            .patch(
+                format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.name),
+                Some(&Update { state: "open" }),
+            )
+            .await
+            .map_err(api_error)
+            .and_then(map_pr)
+    }
+
     /// Change the title, body and base branch pull request `number` carries;
     /// each `None` leaves that field alone.
     pub async fn edit_pull_request(

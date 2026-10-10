@@ -465,3 +465,26 @@ async fn marks_a_pull_request_draft_through_graphql() {
     assert_eq!(pr.number, 12);
     assert!(pr.draft);
 }
+
+#[tokio::test]
+async fn reopens_a_closed_pull_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/pulls/12"))
+        .and(body_partial_json(serde_json::json!({"state": "open"})))
+        .respond_with({
+            let mut open = pr_json(12, "feature", "main");
+            open["state"] = serde_json::json!("open");
+            ResponseTemplate::new(200).set_body_json(open)
+        })
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .reopen_pull_request(&repo(), 12)
+        .await
+        .expect("reopened");
+    assert_eq!(pr.number, 12);
+    assert_eq!(pr.state, "open");
+    assert_mapped(&pr);
+}
