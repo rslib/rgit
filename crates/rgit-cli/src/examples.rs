@@ -1463,6 +1463,13 @@ const EXAMPLES: &[Entry] = &[
             "rgit forge pr merge 42 --method squash --delete-branch --yes",
         ],
     ),
+    (
+        "forge pr edit",
+        &[
+            "rgit forge pr edit 42 --title \"<title>\"",
+            "rgit forge pr edit 42 --base main",
+        ],
+    ),
     ("stack", &["rgit stack"]),
     ("stack new", &["rgit stack new <branch>"]),
     ("stack list", &["rgit stack list"]),

@@ -463,6 +463,36 @@ impl GithubClient {
             .and_then(map_pr)
     }
 
+    /// Change the title, body and base branch pull request `number` carries;
+    /// each `None` leaves that field alone.
+    pub async fn edit_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        title: Option<&str>,
+        body: Option<&str>,
+        base: Option<&str>,
+    ) -> Result<PullRequest, ForgeError> {
+        let mut patch = serde_json::Map::new();
+        if let Some(title) = title {
+            patch.insert("title".to_owned(), serde_json::json!(title));
+        }
+        if let Some(body) = body {
+            patch.insert("body".to_owned(), serde_json::json!(body));
+        }
+        if let Some(base) = base {
+            patch.insert("base".to_owned(), serde_json::json!(base));
+        }
+        self.api
+            .patch(
+                format!("/repos/{}/{}/pulls/{number}", repo.owner, repo.name),
+                Some(&serde_json::Value::Object(patch)),
+            )
+            .await
+            .map_err(api_error)
+            .and_then(map_pr)
+    }
+
     /// Merge pull request `number` with `method`: GitHub merges through its
     /// merge endpoint, then reports the merged pull request.
     pub async fn merge_pull_request(

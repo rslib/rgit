@@ -374,3 +374,32 @@ async fn merge_with_rebase_rebases_onto_the_target_first() {
     assert_eq!(pr.number, 12);
     assert!(pr.merged);
 }
+
+#[tokio::test]
+async fn edits_the_title_and_description_of_a_merge_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12$",
+        ))
+        .and(body_partial_json(serde_json::json!({
+            "title": "New title",
+            "description": "New story."
+        })))
+        .respond_with({
+            let mut edited = mr_json(12, "feature", "main");
+            edited["title"] = serde_json::json!("New title");
+            edited["description"] = serde_json::json!("New story.");
+            ResponseTemplate::new(200).set_body_json(edited)
+        })
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .edit_pull_request(&repo(), 12, Some("New title"), Some("New story."), None)
+        .await
+        .expect("edited");
+    assert_eq!(pr.number, 12);
+    assert_eq!(pr.title, "New title");
+    assert_eq!(pr.body.as_deref(), Some("New story."));
+}

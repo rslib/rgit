@@ -328,6 +328,37 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                     )
                 })
             }),
+            PrCmd::Edit {
+                target,
+                repo,
+                number,
+                title,
+                body,
+                body_file,
+                base,
+            } => {
+                if title.is_none() && body.is_none() && body_file.is_none() && base.is_none() {
+                    return Err(crate::cli::CliError::usage(
+                        "pr edit needs one of --title, --body, --body-file or --base",
+                    ));
+                }
+                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                let body = read_body(body, body_file)?;
+                with_forge(target, move |forge| async move {
+                    print_json(
+                        forge
+                            .edit_pull_request(
+                                &repo,
+                                number,
+                                title.as_deref(),
+                                body.as_deref(),
+                                base.as_deref(),
+                            )
+                            .await?,
+                    )
+                })
+            }
         },
         ForgeCmd::Browse {
             number,
@@ -632,6 +663,27 @@ where
         }));
     }
     operation()
+}
+
+/// The body a `--body` flag or a `--body-file` file carries. `-` reads stdin.
+fn read_body(body: Option<String>, body_file: Option<String>) -> Result<Option<String>> {
+    match (body, body_file) {
+        (Some(_), Some(_)) => Err(crate::cli::CliError::usage(
+            "--body and --body-file cannot be given together",
+        )),
+        (body, None) => Ok(body),
+        (None, Some(path)) => {
+            let text = if path == "-" {
+                use std::io::Read;
+                let mut text = String::new();
+                std::io::stdin().read_to_string(&mut text)?;
+                text
+            } else {
+                std::fs::read_to_string(&path)?
+            };
+            Ok(Some(text))
+        }
+    }
 }
 
 fn print_json<T: Serialize>(value: T) -> Result<String, ForgeError> {

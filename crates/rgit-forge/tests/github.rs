@@ -373,3 +373,30 @@ async fn merge_reports_when_the_forge_refuses() {
         .expect_err("refused merge");
     assert!(error.to_string().contains("behind"), "{error}");
 }
+
+#[tokio::test]
+async fn edits_the_title_and_base_of_a_pull_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/pulls/12"))
+        .and(body_partial_json(
+            serde_json::json!({"title": "New title", "base": "main"}),
+        ))
+        .respond_with({
+            let mut edited = pr_json(12, "feature", "develop");
+            edited["title"] = serde_json::json!("New title");
+            edited["base"] = serde_json::json!({"ref": "main", "sha": "def"});
+            ResponseTemplate::new(200).set_body_json(edited)
+        })
+        .mount(&server)
+        .await;
+
+    let pr = forge(&server)
+        .edit_pull_request(&repo(), 12, Some("New title"), None, Some("main"))
+        .await
+        .expect("edited");
+    assert_eq!(pr.number, 12);
+    assert_eq!(pr.title, "New title");
+    assert_eq!(pr.base_branch, "main");
+    assert_mapped(&pr);
+}

@@ -6712,6 +6712,25 @@ pub enum PrCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Change a pull request's title, body or base branch.
+    Edit {
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        /// A new title.
+        #[arg(long)]
+        title: Option<String>,
+        /// A new body.
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the new body from this file (`-` for stdin).
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<String>,
+        /// Retarget the pull request onto this branch.
+        #[arg(long)]
+        base: Option<String>,
+    },
     /// Merge a pull request or merge request.
     Merge {
         number: u64,

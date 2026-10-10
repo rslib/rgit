@@ -662,6 +662,47 @@ impl GitlabClient {
         let request: ApiMergeRequest = serde_json::from_value(value).map_err(response_error)?;
         Ok(request.into_pull_request())
     }
+
+    /// Change the title, description and target branch merge request `number`
+    /// carries; each `None` leaves that field alone.
+    pub async fn edit_merge_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        title: Option<&str>,
+        body: Option<&str>,
+        base: Option<&str>,
+    ) -> Result<PullRequest, ForgeError> {
+        let mut payload = serde_json::Map::new();
+        if let Some(title) = title {
+            payload.insert("title".to_owned(), serde_json::json!(title));
+        }
+        if let Some(body) = body {
+            payload.insert("description".to_owned(), serde_json::json!(body));
+        }
+        if let Some(base) = base {
+            payload.insert("target_branch".to_owned(), serde_json::json!(base));
+        }
+        let value: serde_json::Value = self
+            .http
+            .put(format!(
+                "{}/projects/{}/merge_requests/{}",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .bearer_auth(&self.token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?
+            .json()
+            .await
+            .map_err(response_error)?;
+        self.merge_request_from_value(value)
+    }
 }
 
 #[cfg(test)]

@@ -354,6 +354,26 @@ impl Forge {
         }
     }
 
+    /// Change the title, body and base branch pull request `number` carries;
+    /// each `None` leaves that field alone.
+    pub async fn edit_pull_request(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        title: Option<&str>,
+        body: Option<&str>,
+        base: Option<&str>,
+    ) -> Result<PullRequest, ForgeError> {
+        match self {
+            Self::Github(client) => {
+                client.edit_pull_request(repo, number, title, body, base).await
+            }
+            Self::Gitlab(client) => {
+                client.edit_merge_request(repo, number, title, body, base).await
+            }
+        }
+    }
+
     pub async fn current_user(&self) -> Result<User, ForgeError> {
         match self {
             Self::Github(client) => client.current_user().await,
