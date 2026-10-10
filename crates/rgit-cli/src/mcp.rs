@@ -16,11 +16,11 @@ use serde_json::{Map, Value, json};
 
 use crate::cli::{
     AmArgs, ApplyArgs, ArchiveArgs, BisectCmd, BlameArgs, BlameFormat, BranchCmd, BranchOpts,
-    BundleCmd, CliError, Command, CommitGraphCmd, ConfigArgs, DiffFormat, FlowCmd, FormatPatchArgs,
-    HashObjectArgs, HookCmd, IndexCmd, LanesCmd, MaintenanceCmd, MergeDiffArgs, MidxCmd,
-    NoteMessage, NotesCmd, PickFlags, Plumbing, PrettyArgs, RawDiffArgs, RebaseFlags, RemoteCmd,
-    StackCmd, StashCmd, StashPush, SubmoduleCmd, TagOpts, WalkArgs, WordDiffArgs, WorkspaceCmd,
-    WorktreeCmd,
+    BundleCmd, CliError, Command, CommitGraphCmd, ConfigArgs, DiffFormat, FlowCmd, ForgeCmd,
+    FormatPatchArgs, HashObjectArgs, HookCmd, IndexCmd, LanesCmd, MaintenanceCmd, MergeDiffArgs,
+    MidxCmd, NoteMessage, NotesCmd, PickFlags, Plumbing, PrCmd, PrListState, PrettyArgs,
+    RawDiffArgs, RebaseFlags, RemoteCmd, StackCmd, StashCmd, StashPush, SubmoduleCmd, TagOpts,
+    WalkArgs, WordDiffArgs, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::toon::{Node, Obj};
@@ -72,6 +72,9 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "git_oplog",
     "git_stashes",
     "git_stash_show",
+    "git_forge_pr_list",
+    "git_forge_pr_view",
+    "git_forge_pr_checks",
     "git_branches",
     "git_lanes_list",
     "git_stack_list",
@@ -1489,6 +1492,83 @@ fn tools() -> Vec<Tool> {
              against the origin remote's forge (GitHub or GitLab; authenticated via `rgit forge \
              login`).",
             none,
+        ),
+        tool(
+            "git_forge_pr_list",
+            "Pull requests against the origin remote's forge (GitHub or GitLab): number, title, \
+             state, head branch. `state` is open (default), closed, merged or all; `author` and \
+             `head` filter; `target` names another forge repository (`OWNER/REPO`).",
+            &[
+                ("state", "string", false),
+                ("author", "string", false),
+                ("head", "string", false),
+                ("target", "string", false),
+                ("page", "integer", false),
+                FIELDS,
+            ],
+        ),
+        tool(
+            "git_forge_pr_view",
+            "One pull request: title, body, branches, author, reviewers. `number` names it, \
+             `branch` names its head branch instead; both omitted uses the current branch's \
+             request. `target` names another forge repository (`OWNER/REPO`).",
+            &[
+                ("number", "integer", false),
+                ("branch", "string", false),
+                ("target", "string", false),
+                FIELDS,
+            ],
+        ),
+        tool(
+            "git_forge_pr_checks",
+            "CI checks on a pull request's head commit (its jobs for GitLab): the rollup plus \
+             one row per check. `number` names the request, defaulting to the current branch's.",
+            &[("number", "integer", false), ("target", "string", false)],
+        ),
+        tool(
+            "git_forge_pr_create",
+            "Open a pull request from `head` (default the current branch) onto `base` (default \
+             the trunk). `title` defaults to the head's tip commit subject, `body` to the rest \
+             of its message; `draft` opens it as a draft.",
+            &[
+                ("title", "string", false),
+                ("head", "string", false),
+                ("base", "string", false),
+                ("body", "string", false),
+                ("draft", "boolean", false),
+                ("target", "string", false),
+            ],
+        ),
+        tool(
+            "git_forge_pr_comment",
+            "Comment on a pull request: `number` names it, `body` is the comment text.",
+            &[
+                ("number", "integer", true),
+                ("body", "string", true),
+                ("target", "string", false),
+            ],
+        ),
+        tool(
+            "git_forge_pr_merge",
+            "Merge a pull request: `method` is merge (default), squash or rebase, \
+             `delete_branch` removes the head branch after. Needs confirm=true, the MCP form of \
+             --yes.",
+            &[
+                ("number", "integer", true),
+                ("method", "string", false),
+                ("delete_branch", "boolean", false),
+                ("confirm", "boolean", false),
+                ("target", "string", false),
+            ],
+        ),
+        tool(
+            "git_forge_pr_close",
+            "Close a pull request. Needs confirm=true, the MCP form of --yes.",
+            &[
+                ("number", "integer", true),
+                ("confirm", "boolean", false),
+                ("target", "string", false),
+            ],
         ),
         tool(
             "git_flow_init",
@@ -4995,8 +5075,131 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
 }
 
 /// Tools that read the object store directly and have no CLI command.
+/// Merge and close reach outward: without confirm=true they refuse, as --yes does
+/// on the CLI.
+fn need_confirm(a: &Args, verb: &str) -> anyhow::Result<()> {
+    if a.flag("confirm") {
+        Ok(())
+    } else {
+        Err(anyhow::Error::new(CliError {
+            message: format!("refusing to {verb} a pull request without confirm=true"),
+            help: Some(format!("Call {} with confirm=true", a.tool)),
+            code: 2,
+        }))
+    }
+}
+
+/// A forge pull request tool: build the CLI command it mirrors and run it
+/// against the bound repository, so MCP and the CLI share one forge path.
+fn forge_pr_tool(backend: &Arc<dyn GitBackend>, a: &Args) -> anyhow::Result<Output> {
+    let number = || a.num("number")?.ok_or_else(|| a.missing("number"));
+    let cmd = ForgeCmd::Pr {
+        cmd: match a.tool {
+            "git_forge_pr_list" => PrCmd::List {
+                target: a.str("target"),
+                repo: None,
+                state: match a.str("state").as_deref() {
+                    None | Some("open") => PrListState::Open,
+                    Some("closed") => PrListState::Closed,
+                    Some("merged") => PrListState::Merged,
+                    Some("all") => PrListState::All,
+                    Some(_) => {
+                        return Err(a.invalid("state", "one of open, closed, merged or all"));
+                    }
+                },
+                author: a.str("author"),
+                head: a.str("head"),
+                page: a.num("page")?.map(|n| n as u32).unwrap_or(1),
+            },
+            "git_forge_pr_view" => {
+                let digits = a.num("number")?;
+                let branch = a.str("branch");
+                if digits.is_some() && branch.is_some() {
+                    return Err(a.invalid("branch", "either number or branch, not both"));
+                }
+                PrCmd::View {
+                    what: digits.map(|n| n.to_string()).or(branch),
+                    target: a.str("target"),
+                    repo: None,
+                }
+            }
+            "git_forge_pr_checks" => PrCmd::Checks {
+                number: a.num("number")?,
+                target: a.str("target"),
+                repo: None,
+            },
+            "git_forge_pr_create" => PrCmd::Create {
+                target: a.str("target"),
+                repo: None,
+                title: a.str("title"),
+                head: a.str("head"),
+                base: a.str("base"),
+                body: a.str("body"),
+                body_file: None,
+                draft: a.flag("draft"),
+            },
+            "git_forge_pr_comment" => PrCmd::Comment {
+                number: number()?,
+                target: a.str("target"),
+                repo: None,
+                body: Some(a.str("body").ok_or_else(|| a.missing("body"))?),
+                body_file: None,
+            },
+            "git_forge_pr_merge" => {
+                need_confirm(a, "merge")?;
+                let method = a.str("method").unwrap_or_else(|| "merge".to_owned());
+                if !matches!(method.as_str(), "merge" | "squash" | "rebase") {
+                    return Err(a.invalid("method", "one of merge, squash or rebase"));
+                }
+                PrCmd::Merge {
+                    number: number()?,
+                    target: a.str("target"),
+                    repo: None,
+                    method,
+                    delete_branch: a.flag("delete_branch"),
+                    yes: true,
+                }
+            }
+            "git_forge_pr_close" => {
+                need_confirm(a, "close")?;
+                PrCmd::Close {
+                    number: number()?,
+                    target: a.str("target"),
+                    repo: None,
+                    yes: true,
+                }
+            }
+            other => {
+                return Err(anyhow::Error::new(CliError {
+                    message: format!("unknown tool: {other}"),
+                    help: Some("Call tools/list to see the available tools".to_owned()),
+                    code: 2,
+                }));
+            }
+        },
+    };
+    let list_cmd = if a.tool == "git_forge_pr_list" {
+        Some("rgit forge pr list")
+    } else {
+        None
+    };
+    let text = crate::forge::run_in(
+        backend.workdir(),
+        cmd,
+        crate::forge::ForgeSelection::default(),
+    )?;
+    Ok(crate::forge_output(text, list_cmd))
+}
+
 fn local(backend: &Arc<dyn GitBackend>, a: &Args, full: bool) -> anyhow::Result<Output> {
     Ok(match a.tool {
+        "git_forge_pr_list"
+        | "git_forge_pr_view"
+        | "git_forge_pr_checks"
+        | "git_forge_pr_create"
+        | "git_forge_pr_comment"
+        | "git_forge_pr_merge"
+        | "git_forge_pr_close" => forge_pr_tool(backend, a)?,
         "git_tree" => {
             let rev = a.or("rev", "HEAD");
             let path = a.or("path", "");
@@ -5471,8 +5674,74 @@ mod tests {
     }
 
     #[test]
+    fn forge_merge_and_close_need_confirm() {
+        let dir = init_repo("forge-confirm");
+        let backend = open(&dir);
+        let run = |name: &str, args: Value| call(&backend, name, args);
+
+        for tool in ["git_forge_pr_merge", "git_forge_pr_close"] {
+            let refused = run(tool, json!({ "number": 1 })).unwrap_err();
+            assert!(refused.contains("confirm=true"), "{refused}");
+            // With confirm the gate passes: the call reaches target resolution
+            // (this repo has no origin remote), never the confirm refusal.
+            let attempted = run(tool, json!({ "number": 1, "confirm": true })).unwrap_err();
+            assert!(attempted.contains("no remote target"), "{attempted}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forge_pr_tools_validate_their_args() {
+        let dir = init_repo("forge-args");
+        let backend = open(&dir);
+        let run = |name: &str, args: Value| call(&backend, name, args);
+
+        let bad_state = run("git_forge_pr_list", json!({ "state": "bogus" })).unwrap_err();
+        assert!(
+            bad_state.contains("one of open, closed, merged or all"),
+            "{bad_state}"
+        );
+
+        let both = run(
+            "git_forge_pr_view",
+            json!({ "number": 1, "branch": "feature" }),
+        )
+        .unwrap_err();
+        assert!(both.contains("either number or branch"), "{both}");
+
+        let no_body = run("git_forge_pr_comment", json!({ "number": 1 })).unwrap_err();
+        assert!(no_body.contains("body required"), "{no_body}");
+
+        let no_number = run("git_forge_pr_comment", json!({ "body": "hi" })).unwrap_err();
+        assert!(no_number.contains("number required"), "{no_number}");
+
+        let bad_method = run(
+            "git_forge_pr_merge",
+            json!({ "number": 1, "confirm": true, "method": "fast-forward" }),
+        )
+        .unwrap_err();
+        assert!(
+            bad_method.contains("one of merge, squash or rebase"),
+            "{bad_method}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn every_tool_is_wired() {
-        const LOCAL: &[&str] = &["git_tree", "git_blob", "git_files", "git_grep"];
+        const LOCAL: &[&str] = &[
+            "git_tree",
+            "git_blob",
+            "git_files",
+            "git_grep",
+            "git_forge_pr_list",
+            "git_forge_pr_view",
+            "git_forge_pr_checks",
+            "git_forge_pr_create",
+            "git_forge_pr_comment",
+            "git_forge_pr_merge",
+            "git_forge_pr_close",
+        ];
         for t in tools() {
             let args = json!({});
             let wired = command(&Args {

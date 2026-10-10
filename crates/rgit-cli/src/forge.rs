@@ -22,6 +22,18 @@ fn active() -> ForgeSelection {
 }
 
 pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
+    let dir = std::env::current_dir()?;
+    run_in(&dir, command, selection)
+}
+
+/// Run a forge command with `dir` as the repository its target and branch
+/// defaults resolve from: the caller's working directory for the CLI, the
+/// bound repository for MCP.
+pub fn run_in(
+    dir: &std::path::Path,
+    command: ForgeCmd,
+    selection: ForgeSelection,
+) -> Result<String> {
     let selection = selection.resolve()?;
     if let Some(provider) = selection.provider.as_deref() {
         Provider::parse(provider)?;
@@ -127,7 +139,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
         }
         ForgeCmd::Repo { cmd } => match cmd {
             RepoCmd::View { target, repo } => {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 with_forge(target, |forge| async move {
                     print_json(forge.repository(&repo).await?)
@@ -157,7 +169,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 })
             }
             RepoCmd::Delete { target, repo, yes } => destructive(yes, "repository", || {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 let provider = target.provider;
                 with_forge(target, async move |forge| {
@@ -168,7 +180,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
         },
         ForgeCmd::Branch { cmd } => match cmd {
             ForgeBranchCmd::List { target, repo, page } => {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 with_forge(target, |forge| async move {
                     print_json(forge.branches(&repo, page).await?)
@@ -180,7 +192,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 branch,
                 yes,
             } => destructive(yes, "remote branch", || {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 with_forge(target, async move |forge| {
                     forge.delete_branch(&repo, &branch).await?;
@@ -190,9 +202,9 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
         },
         ForgeCmd::Pr { cmd } => match cmd {
             PrCmd::View { what, target, repo } => {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
-                let what = pr_what(what)?;
+                let what = pr_what(what, dir)?;
                 with_forge(target, move |forge| async move {
                     let pr = match what {
                         PrWhat::Number(number) => forge.pull_request(&repo, number).await?,
@@ -213,10 +225,10 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 target,
                 repo,
             } => {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 let branch = if number.is_none() {
-                    Some(current_branch()?)
+                    Some(current_branch(dir)?)
                 } else {
                     None
                 };
@@ -247,7 +259,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 head,
                 page,
             } => {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 let state = state.into();
                 with_forge(target, move |forge| async move {
@@ -268,11 +280,10 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 body_file,
                 draft,
             } => {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 let body = read_body(body, body_file)?;
-                let create =
-                    resolve_create_defaults(&std::env::current_dir()?, title, head, base, body)?;
+                let create = resolve_create_defaults(dir, title, head, base, body)?;
                 with_forge(target, move |forge| async move {
                     let base = match create.base {
                         Some(base) => base,
@@ -303,9 +314,9 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 target,
                 repo,
             } => {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
-                let backend = rgit_git::Git2Backend::discover(std::env::current_dir()?)
+                let backend = rgit_git::Git2Backend::discover(dir)
                     .map_err(|error| anyhow::anyhow!("no repository: {error}"))?;
                 with_forge(target, move |forge| async move {
                     checkout_pull_request(&forge, &repo, number, &backend).await
@@ -317,7 +328,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 number,
                 yes,
             } => destructive(yes, "pull request", || {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 with_forge(target, |forge| async move {
                     print_json(forge.close_pull_request(&repo, number).await?)
@@ -331,7 +342,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 delete_branch,
                 yes,
             } => destructive(yes, "pull request", || {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 let method = match method.as_str() {
                     "squash" => MergeMethod::Squash,
@@ -360,7 +371,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                         "pr edit needs one of --title, --body, --body-file or --base",
                     ));
                 }
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 let body = read_body(body, body_file)?;
                 with_forge(target, move |forge| async move {
@@ -382,7 +393,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 target,
                 repo,
             } => {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 with_forge(target, |forge| async move {
                     print_json(forge.mark_pull_request_ready(&repo, number).await?)
@@ -393,7 +404,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 target,
                 repo,
             } => {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 with_forge(target, |forge| async move {
                     print_json(forge.mark_pull_request_draft(&repo, number).await?)
@@ -404,7 +415,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 target,
                 repo,
             } => {
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 with_forge(target, |forge| async move {
                     print_json(forge.reopen_pull_request(&repo, number).await?)
@@ -420,7 +431,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 let body = read_body(body, body_file)?.ok_or_else(|| {
                     crate::cli::CliError::usage("pr comment needs --body or --body-file")
                 })?;
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 with_forge(target, move |forge| async move {
                     print_json(forge.comment_pull_request(&repo, number, &body).await?)
@@ -445,7 +456,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                         ));
                     }
                 };
-                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 with_forge(target, move |forge| async move {
                     print_json(
@@ -462,7 +473,7 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
             repo,
             print: show_url,
         } => {
-            let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+            let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
             let repo = target.repo()?.clone();
             with_forge(target, move |forge| async move {
                 let url = match number {
@@ -517,20 +528,21 @@ pub fn ensure_pull_requests(
 /// The repository an operation acts on: the arguments, or the origin remote
 /// when neither names one.
 fn resolve_target(
+    dir: &std::path::Path,
     selection: &ForgeSelection,
     target: Option<&str>,
     repo: Option<&str>,
 ) -> Result<ForgeTarget> {
     if target.is_none() && repo.is_none() {
-        let remote = origin_remote()?;
+        let remote = origin_remote(dir)?;
         return Ok(ForgeTarget::from_remote(selection, &remote)?);
     }
     Ok(ForgeTarget::from_argument(selection, target, repo)?)
 }
 
-fn origin_remote() -> Result<String> {
+fn origin_remote(dir: &std::path::Path) -> Result<String> {
     use rgit_git::GitBackend;
-    rgit_git::Git2Backend::discover(std::env::current_dir()?)
+    rgit_git::Git2Backend::discover(dir)
         .ok()
         .and_then(|backend| backend.config_get("remote.origin.url").ok().flatten())
         .ok_or_else(|| anyhow::anyhow!("no remote target; pass OWNER/REPO explicitly"))
@@ -713,18 +725,18 @@ enum PrWhat {
     Branch(String),
 }
 
-fn pr_what(what: Option<String>) -> Result<PrWhat> {
+fn pr_what(what: Option<String>, dir: &std::path::Path) -> Result<PrWhat> {
     match what {
         Some(value) if value.chars().all(char::is_numeric) && !value.is_empty() => {
             Ok(PrWhat::Number(value.parse()?))
         }
         Some(value) => Ok(PrWhat::Branch(value)),
-        None => Ok(PrWhat::Branch(current_branch()?)),
+        None => Ok(PrWhat::Branch(current_branch(dir)?)),
     }
 }
 
-fn current_branch() -> Result<String> {
-    let backend = rgit_git::Git2Backend::discover(std::env::current_dir()?)
+fn current_branch(dir: &std::path::Path) -> Result<String> {
+    let backend = rgit_git::Git2Backend::discover(dir)
         .map_err(|_| anyhow::anyhow!("no repository; pass a PR number or branch"))?;
     backend
         .status()
