@@ -533,12 +533,27 @@ async fn forge_badges(b: &dyn GitBackend, branch: &str) -> String {
     else {
         return String::new();
     };
-    listing.items.iter().take(5).map(badge_html).collect()
+    let mut badges = String::new();
+    for pr in listing.items.iter().take(5) {
+        let rollup = forge
+            .pull_request_checks(&repo, pr.number)
+            .await
+            .map(|checks| checks.rollup)
+            .unwrap_or(rgit_forge::CheckRollup::None);
+        badges.push_str(&badge_html(pr, rollup));
+    }
+    badges
 }
 
-fn badge_html(pr: &rgit_forge::PullRequest) -> String {
+fn badge_html(pr: &rgit_forge::PullRequest, rollup: rgit_forge::CheckRollup) -> String {
+    let ci = match rollup {
+        rgit_forge::CheckRollup::Passing => " <span class=\"ci p\">\u{2714} passing</span>",
+        rgit_forge::CheckRollup::Failing => " <span class=\"ci f\">\u{2718} failing</span>",
+        rgit_forge::CheckRollup::Pending => " <span class=\"ci r\">\u{2022} pending</span>",
+        rgit_forge::CheckRollup::None => "",
+    };
     format!(
-        "<a class=\"prbadge\" href=\"{}\">PR #{}</a>",
+        "<a class=\"prbadge\" href=\"{}\">PR #{}{ci}</a>",
         pr.html_url, pr.number
     )
 }
@@ -1264,8 +1279,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            badge_html(&pr),
+            badge_html(&pr, rgit_forge::CheckRollup::None),
             "<a class=\"prbadge\" href=\"https://github.com/o/r/pull/12\">PR #12</a>"
+        );
+        assert_eq!(
+            badge_html(&pr, rgit_forge::CheckRollup::Passing),
+            "<a class=\"prbadge\" href=\"https://github.com/o/r/pull/12\">PR #12 \
+             <span class=\"ci p\">\u{2714} passing</span></a>"
+        );
+        assert_eq!(
+            badge_html(&pr, rgit_forge::CheckRollup::Failing),
+            "<a class=\"prbadge\" href=\"https://github.com/o/r/pull/12\">PR #12 \
+             <span class=\"ci f\">\u{2718} failing</span></a>"
+        );
+        assert_eq!(
+            badge_html(&pr, rgit_forge::CheckRollup::Pending),
+            "<a class=\"prbadge\" href=\"https://github.com/o/r/pull/12\">PR #12 \
+             <span class=\"ci r\">\u{2022} pending</span></a>"
         );
     }
 
