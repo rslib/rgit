@@ -279,6 +279,19 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                     print_json(forge.create_pull_request(&repo, &request).await?)
                 })
             }
+            PrCmd::Checkout {
+                number,
+                target,
+                repo,
+            } => {
+                let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                let backend = rgit_git::Git2Backend::discover(std::env::current_dir()?)
+                    .map_err(|error| anyhow::anyhow!("no repository: {error}"))?;
+                with_forge(target, move |forge| async move {
+                    checkout_pull_request(&forge, &repo, number, &backend).await
+                })
+            }
             PrCmd::Close {
                 target,
                 repo,
@@ -423,6 +436,101 @@ fn auth_command(command: AuthCmd, selection: ForgeSelection) -> Result<String> {
     }))?)
 }
 
+/// What `pr checkout` does with a local branch for the fetched head: nothing
+/// to change when the branch is at the head or absent, a fast-forward when the
+/// branch is behind, and a refusal when it has moved elsewhere.
+fn checkout_move(
+    local_tip: Option<String>,
+    fetched: &str,
+    local_below: bool,
+) -> Result<CheckoutAction> {
+    match local_tip {
+        None => Ok(CheckoutAction::Create),
+        Some(tip) if tip == fetched => Ok(CheckoutAction::AtHead),
+        Some(_) if local_below => Ok(CheckoutAction::FastForward),
+        Some(_) => Err(anyhow::anyhow!(
+            "local branch has diverged from the pull request's head {fetched}; delete, reset or rename it first"
+        )),
+    }
+}
+
+enum CheckoutAction {
+    AtHead,
+    FastForward,
+    Create,
+}
+
+async fn checkout_pull_request(
+    forge: &Forge,
+    repo: &rgit_forge::RepoRef,
+    number: u64,
+    backend: &dyn GitBackend,
+) -> Result<String, ForgeError> {
+    use rgit_git::FetchArgs;
+    let pr = forge.pull_request(repo, number).await?;
+    let branch = pr.head_branch.clone();
+    let fetched_ref = format!("refs/rgit/pr/{number}");
+    let report = |_: rgit_git::OpProgress| {};
+    backend
+        .fetch(
+            Some("origin"),
+            &[format!("+{}:{fetched_ref}", forge.pull_request_ref(number))],
+            &FetchArgs::default(),
+            &report,
+        )
+        .map_err(|_| {
+            ForgeError::Response(format!(
+                "cannot fetch {repo} pull request {number} from origin"
+            ))
+        })?;
+    let pulled = backend
+        .rev_parse(&fetched_ref)
+        .map_err(|error| ForgeError::Response(error.to_string()))?;
+    let local_tip = backend
+        .branch_tip(&branch)
+        .map_err(|error| ForgeError::Response(error.to_string()))?;
+    let local_below = match &local_tip {
+        Some(tip) => backend
+            .merge_bases(tip, &pulled, true)
+            .map_err(|error| ForgeError::Response(error.to_string()))?
+            .iter()
+            .any(|base| base.eq_ignore_ascii_case(tip)),
+        None => false,
+    };
+    let action = checkout_move(local_tip, &pulled, local_below)
+        .map_err(|error| ForgeError::Response(error.to_string()))?;
+    let on_branch = backend
+        .status()
+        .ok()
+        .and_then(|status| status.head.branch)
+        .is_some_and(|current| current == branch);
+    match action {
+        CheckoutAction::AtHead => (),
+        CheckoutAction::FastForward => {
+            backend
+                .update_ref(
+                    &format!("refs/heads/{branch}"),
+                    Some(&pulled),
+                    None,
+                    false,
+                    Some(&format!("checkout: PR #{number}")),
+                )
+                .map_err(|error| ForgeError::Response(error.to_string()))?;
+        }
+        CheckoutAction::Create => {
+            backend
+                .branch_from(&branch, &pulled, false, false)
+                .map_err(|error| ForgeError::Response(error.to_string()))?;
+        }
+    }
+    if !on_branch {
+        backend
+            .checkout_branch(&branch)
+            .map_err(|error| ForgeError::Response(error.to_string()))?;
+    }
+    Ok(format!("checked out {branch} (PR #{number})"))
+}
+
 /// The pull request a `pr view` or `pr checks` argument names: a number when
 /// the argument is numeric, else a head branch.
 enum PrWhat {
@@ -484,7 +592,25 @@ fn print_json<T: Serialize>(value: T) -> Result<String, ForgeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthCmd, ForgeSelection};
+    use super::{AuthCmd, CheckoutAction, ForgeSelection, checkout_move};
+
+    #[test]
+    fn checkout_moves_by_local_tip() {
+        let fetched = "abc123";
+        assert!(matches!(
+            checkout_move(None, fetched, false).expect("move"),
+            CheckoutAction::Create
+        ));
+        assert!(matches!(
+            checkout_move(Some(fetched.to_owned()), fetched, false).expect("move"),
+            CheckoutAction::AtHead
+        ));
+        assert!(matches!(
+            checkout_move(Some("old".to_owned()), fetched, true).expect("move"),
+            CheckoutAction::FastForward
+        ));
+        assert!(checkout_move(Some("old".to_owned()), fetched, false).is_err());
+    }
 
     #[test]
     fn parses_common_remote_urls() {

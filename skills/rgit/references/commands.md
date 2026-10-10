@@ -169,6 +169,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
     - `forge pr checks`: Show the CI checks on a pull request's head commit (its jobs for GitLab). e.g. `rgit forge pr checks`, `rgit forge pr checks 42`, `rgit forge pr checks 42 owner/repo`
     - `forge pr list`: List pull requests or merge requests, 100 per page. e.g. `rgit forge pr list`, `rgit forge pr list owner/repo`, `rgit forge pr list --page 2`, `rgit forge pr list --state merged --author <login> --head <branch>`
     - `forge pr create`: Create a pull request or merge request. e.g. `rgit forge pr create --title "<title>" --head <branch> --base main`
+    - `forge pr checkout`: Check out a pull request's head branch, fetching its head commit. e.g. `rgit forge pr checkout 42`, `rgit forge pr checkout 42 owner/repo`
     - `forge pr close`: Close a pull request or merge request. e.g. `rgit forge pr close 42 --yes`, `rgit forge pr close 42 owner/repo --yes`
 
 ## Patches, notes, config and maintenance

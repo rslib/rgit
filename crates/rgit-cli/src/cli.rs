@@ -6685,6 +6685,13 @@ pub enum PrCmd {
         #[arg(long)]
         draft: bool,
     },
+    /// Check out a pull request's head branch, fetching its head commit.
+    Checkout {
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+    },
     /// Close a pull request or merge request.
     Close {
         number: u64,

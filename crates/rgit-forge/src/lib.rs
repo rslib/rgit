@@ -192,6 +192,16 @@ impl Forge {
         }
     }
 
+    /// The remote ref that carries the pull request's head commit: GitHub's
+    /// `refs/pull/N/head`, GitLab's `refs/merge-requests/N/head`; fetchable
+    /// with a refspec like `+<this>:refs/rgit/pr/N`.
+    pub fn pull_request_ref(&self, number: u64) -> String {
+        match self {
+            Self::Github(_) => format!("refs/pull/{number}/head"),
+            Self::Gitlab(_) => format!("refs/merge-requests/{number}/head"),
+        }
+    }
+
     /// The CI checks of the pull request's head commit, with a rollup.
     pub async fn pull_request_checks(
         &self,

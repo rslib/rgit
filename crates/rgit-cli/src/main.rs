@@ -1024,6 +1024,15 @@ fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> (Vec<String>, Option<String>)
                     None,
                 )
             }
+            PrCmd::Checkout { target, repo, .. } => {
+                let at = repo_args(target, repo);
+                (
+                    vec![format!(
+                        "Run `{base} pr list{at}` to see every open pull request"
+                    )],
+                    None,
+                )
+            }
             PrCmd::Close { target, repo, .. } => (
                 vec![format!(
                     "Run `{base} pr list{}` to see the remaining pull requests",
