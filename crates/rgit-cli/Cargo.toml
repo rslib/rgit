@@ -33,6 +33,7 @@ rmcp = { version = "3", features = [
     "transport-streamable-http-server",
 ] }
 axum = "0.8"
+open = "5"
 
 [[bin]]
 name = "rgit"

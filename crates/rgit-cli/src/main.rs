@@ -1041,6 +1041,7 @@ fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> (Vec<String>, Option<String>)
                 None,
             ),
         },
+        ForgeCmd::Browse { .. } => (Vec::new(), None),
     }
 }
 

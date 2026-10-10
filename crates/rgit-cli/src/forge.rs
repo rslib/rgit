@@ -305,6 +305,30 @@ pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
                 })
             }),
         },
+        ForgeCmd::Browse {
+            number,
+            target,
+            repo,
+            print: show_url,
+        } => {
+            let target = resolve_target(&selection, target.as_deref(), repo.as_deref())?;
+            let repo = target.repo()?.clone();
+            with_forge(target, move |forge| async move {
+                let url = match number {
+                    Some(number) => forge.pull_request(&repo, number).await?.html_url,
+                    None => forge.repository(&repo).await?.html_url,
+                };
+                if show_url {
+                    Ok(url)
+                } else {
+                    open::that_detached(&url).map_err(|error| ForgeError::Api {
+                        provider: forge.provider(),
+                        message: error.to_string(),
+                    })?;
+                    Ok(format!("opened {url}"))
+                }
+            })
+        }
     }
 }
 

@@ -5057,6 +5057,7 @@ dependencies = [
  "clap 4.6.7",
  "crossterm",
  "libc",
+ "open",
  "portable-pty",
  "regex",
  "rgit-forge",

@@ -6553,6 +6553,17 @@ pub enum ForgeCmd {
         #[command(subcommand)]
         cmd: PrCmd,
     },
+    /// Open the forge repository or one pull request in the browser.
+    Browse {
+        /// A PR number; opens the repository page when omitted.
+        number: Option<u64>,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        /// Print the URL instead of opening it.
+        #[arg(long)]
+        print: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
