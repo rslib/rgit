@@ -5406,7 +5406,9 @@ fn refreshed(app: &mut App, result: RefreshResult) -> Vec<Effect> {
             // diff text makes a deep clone per refresh visible on the UI thread.
             app.head = Some(status.head.clone());
             app.snapshot = Some(Arc::new(status));
+            let started = std::time::Instant::now();
             rebuild_status(app);
+            tracing::debug!(elapsed_ms = started.elapsed().as_millis(), "rebuild_status");
             app.error = None;
             // The working tree changed, so cached file diffs are stale; commit
             // and stash diffs are immutable and stay cached. Force the current

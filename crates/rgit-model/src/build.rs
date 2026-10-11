@@ -1,5 +1,7 @@
 use std::sync::OnceLock;
 
+use rayon::prelude::*;
+
 use rgit_git::{
     BlameLine, CommitDetails, CommitRef, Deco, DiffLine, FileDiff, Head, Hunk, LineOrigin,
     LogEntry, RefEntry, RefKind, Remote, RepoStatus, StatusCode, StatusEntry, Worktree,
@@ -1545,12 +1547,12 @@ fn file_section<'a>(
     id: &str,
     title: &str,
     entries: &[&StatusEntry],
-    code: impl Fn(&StatusEntry) -> StatusCode,
+    code: impl Fn(&StatusEntry) -> StatusCode + Sync,
     staged: bool,
-    diff_of: impl Fn(&str) -> Option<&'a FileDiff>,
+    diff_of: impl Fn(&str) -> Option<&'a FileDiff> + Sync,
 ) -> Section {
     let files = entries
-        .iter()
+        .par_iter()
         .map(|e| {
             let c = code(e);
             let diff = diff_of(&e.path);

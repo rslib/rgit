@@ -5155,6 +5155,7 @@ dependencies = [
 name = "rgit-model"
 version = "0.0.2"
 dependencies = [
+ "rayon",
  "rgit-git",
  "syntect",
  "two-face",

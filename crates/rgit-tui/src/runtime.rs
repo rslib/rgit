@@ -520,7 +520,9 @@ async fn event_loop(
             let _ = terminal.clear();
         }
         if redraw && (!app.signing || !was_signing) {
+            let started = Instant::now();
             terminal.draw(|frame| ui::render(frame, &mut app))?;
+            tracing::debug!(elapsed_ms = started.elapsed().as_millis(), "draw");
         }
         if app.should_quit {
             return Ok(());
@@ -665,7 +667,10 @@ async fn run_msg(
     gate: &RefreshGate,
 ) -> std::io::Result<()> {
     let requeue = matches!(msg, Msg::Refreshed(_)) && gate.finish();
-    for effect in update(app, msg) {
+    let started = Instant::now();
+    let effects = update(app, msg);
+    tracing::debug!(elapsed_ms = started.elapsed().as_millis(), "update");
+    for effect in effects {
         match effect {
             Effect::Refresh => {
                 if gate.start_or_queue() {
@@ -694,11 +699,22 @@ async fn run_msg(
                 let tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
                     let status = (|| -> Result<RepoStatus, GitError> {
+                        let started = Instant::now();
                         apply_mutation(&*backend, &mutation)?;
+                        tracing::debug!(
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "mutation applied"
+                        );
                         if restack_after && let Some(note) = auto_restack_note(&*backend)? {
                             let _ = tx.send(Msg::AutoRestackNote(note));
                         }
-                        backend.status()
+                        let started = Instant::now();
+                        let status = backend.status();
+                        tracing::debug!(
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "status after mutation"
+                        );
+                        status
                     })();
                     let _ = tx.send(Msg::Refreshed(Box::new(status)));
                 });
@@ -1512,6 +1528,7 @@ where
             elapsed_ms = started.elapsed().as_millis(),
             "git refresh completed"
         );
+        tracing::debug!(elapsed_ms = started.elapsed().as_millis(), "git read");
         let _ = msg_tx.send(Msg::Refreshed(Box::new(result)));
     });
 }
