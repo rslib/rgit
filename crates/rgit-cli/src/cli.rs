@@ -2783,14 +2783,21 @@ pub enum Command {
         #[command(subcommand)]
         cmd: Option<SubmoduleCmd>,
     },
-    /// Escape hatch: run any `git` subcommand and print its output.
+    /// Run a git subcommand that rgit does not have, such as `lfs` or
+    /// `filter-repo`. rgit takes git's own commands and flags directly.
     Git {
         /// The git subcommand and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Run the Model Context Protocol server over stdio.
-    Mcp,
+    Mcp {
+        /// List only the ten core tools (status, diff, log, show, stage,
+        /// unstage, commit, smartlog, undo, grep); what Codex and OpenCode
+        /// install, for harnesses that load every tool into the prompt.
+        #[arg(long)]
+        core: bool,
+    },
     /// Run one MCP tool with its arguments as a JSON object on stdin and print
     /// its TOON result, as the pi and omp extension does.
     Tool {
@@ -7413,12 +7420,12 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
 
 const SKILL_INTRO: &str = r#"---
 name: rgit
-description: Use for any git work in this repository - inspecting changes, committing, rewriting or undoing history, branches and stacks, and GitHub/GitLab PRs.
+description: Load before you run any git command or answer a git question in this repository, even a quick status, diff, log, add or commit. rgit replaces git for inspecting changes, staging, committing, rewriting or undoing history, branches and stacks, and GitHub/GitLab PRs.
 ---
 
 # rgit
 
-{DESCRIPTION}. Prefer `rgit` over raw `git`. Always pass `--toon` (alias `--axi`) or `--json`: without them rgit prints git's human text. Run `rgit --toon` with no other arguments first: it prints the repo's current state and the next useful commands.
+{DESCRIPTION}. Type `rgit` wherever you would type `git`. rgit takes git's commands and flags and prints git's text, so `git status --short` becomes `rgit status --short` and `git rev-parse HEAD` becomes `rgit rev-parse HEAD`. Do not run `git` or `rgit git` for a command rgit has. Always pass `--toon` (alias `--axi`) or `--json`: without them rgit prints git's human text. Run `rgit --toon` with no other arguments first: it prints the repo's current state and the next useful commands.
 
 If `rgit` is not on PATH, install it with `cargo install --locked --git https://github.com/rslib/rgit rgit-cli`.
 
@@ -7441,7 +7448,7 @@ const SKILL_RULES: &str = r#"
 - Almost every change is recorded in the op-log. `rgit undo` restores HEAD and the working tree (including uncommitted work) from before the last operation; `rgit redo` reverses it; `rgit oplog` lists it.
 - Repeating a change whose result already holds is a no-op (exit 0), for example creating an existing branch or deleting a missing tag.
 - Destructive forge operations require `--yes`.
-- For git plumbing rgit does not wrap, use `rgit git <args>`.
+- rgit runs git's plumbing too (`rgit rev-parse`, `rgit ls-files`, `rgit cat-file`, `rgit for-each-ref`). Use `rgit git <args>` only for a git tool that rgit does not have, such as `git lfs`.
 
 ## Git spellings
 
@@ -10760,7 +10767,7 @@ fn run_command(
         | Command::CredentialCache { .. }
         | Command::CredentialCacheDaemon { .. }
         | Command::Scalar { .. }
-        | Command::Mcp
+        | Command::Mcp { .. }
         | Command::Serve { .. }
         | Command::Forge { .. } => unreachable!("handled before dispatch"),
     })

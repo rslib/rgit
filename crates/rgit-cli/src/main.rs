@@ -133,7 +133,7 @@ fn main() -> ! {
     if !structured_output
         && !matches!(
             cli.command,
-            None | Some(Command::Mcp | Command::Tool { .. } | Command::Serve { .. })
+            None | Some(Command::Mcp { .. } | Command::Tool { .. } | Command::Serve { .. })
         )
     {
         rgit_git::stream_hooks();
@@ -157,7 +157,7 @@ fn main() -> ! {
 
     match cli.command {
         // The MCP server takes over stdio for the process lifetime.
-        Some(Command::Mcp) => exit(mcp::serve(discover_or_exit())),
+        Some(Command::Mcp { core }) => exit(mcp::serve(discover_or_exit(), core)),
         Some(Command::Agent { cmd }) => finish(agent::run(cmd), &emit),
         Some(Command::Tool { name }) => exit(mcp::call(discover_or_exit(), &name)),
         // What agent session hooks run: the home view, as TOON, repo or not.
@@ -1576,6 +1576,9 @@ fn compact_config() -> bool {
 /// structured output.
 const OUTPUT_HINT: &str =
     "Pass `--toon` (or `--json`) to every rgit command; without it rgit prints git's human text";
+/// Agents reach for `git` out of habit, so the home view says rgit takes its
+/// place.
+const GIT_HINT: &str = "Type `rgit` wherever you would type `git`: it takes git's commands and flags, such as `rgit status --short` or `rgit rev-parse HEAD`";
 
 fn home() -> Output {
     let bin = std::env::current_exe()
@@ -1612,12 +1615,14 @@ fn home() -> Output {
                 data.push(("recent".to_owned(), Node::List(recent)));
             }
             out.data = data;
+            help.push(GIT_HINT.to_owned());
             help.push(OUTPUT_HINT.to_owned());
             out.help = help;
             out
         }
         Err(error) => {
-            let (message, help, _) = output::translate(&error);
+            let (message, mut help, _) = output::translate(&error);
+            help.push(GIT_HINT.to_owned());
             data.push(("status".to_owned(), sanitize(message).into()));
             let mut out = Output::new(String::new());
             out.data = data;

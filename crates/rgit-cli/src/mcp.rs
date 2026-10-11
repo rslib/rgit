@@ -31,7 +31,7 @@ use rmcp::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
         GetPromptRequestParams, GetPromptResponse, GetPromptResult, Implementation,
         ListPromptsResult, ListToolsResult, PaginatedRequestParams, Prompt, PromptMessage, Role,
-        ServerCapabilities, ServerConfig, Tool,
+        ServerCapabilities, ServerConfig, Tool, ToolAnnotations,
     },
     service::{RequestContext, RoleServer},
     transport::stdio,
@@ -45,6 +45,9 @@ struct RgitMcp {
     /// inspection tools are listed and any mutating tool is refused. Stdio
     /// (`rgit mcp`, run locally by the user) is never read-only.
     read_only: bool,
+    /// When true (`rgit mcp --core`, for harnesses that load every tool into
+    /// the prompt), only [`CORE_TOOLS`] are listed and any other tool refused.
+    core_only: bool,
 }
 
 /// Tools that only inspect the repository - safe to expose over the read-only
@@ -121,6 +124,27 @@ const READ_ONLY_TOOLS: &[&str] = &[
 /// Whether a tool only reads (may be served over the read-only HTTP endpoint).
 fn is_read_only(name: &str) -> bool {
     READ_ONLY_TOOLS.contains(&name)
+}
+
+/// The tools harnesses that load every MCP tool into the prompt get (Codex,
+/// OpenCode, and omp's native set): inspect, stage, commit and undo.
+/// Defined once here; `rgit mcp --core` lists only these.
+pub const CORE_TOOLS: &[&str] = &[
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_stage",
+    "git_unstage",
+    "git_commit",
+    "git_smartlog",
+    "git_undo",
+    "git_grep",
+];
+
+/// Whether a tool is in [`CORE_TOOLS`].
+pub fn is_core(name: &str) -> bool {
+    CORE_TOOLS.contains(&name)
 }
 
 /// How a tool call's `repo` argument is resolved to a backend. The mode is
@@ -231,7 +255,7 @@ impl Registry {
 
 /// Serve MCP over stdio until the client disconnects. Returns a process exit
 /// code.
-pub fn serve(backend: Arc<dyn GitBackend>) -> i32 {
+pub fn serve(backend: Arc<dyn GitBackend>, core_only: bool) -> i32 {
     // The MCP surface never carries ANSI color.
     crate::render::set_color(false);
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -244,7 +268,7 @@ pub fn serve(backend: Arc<dyn GitBackend>) -> i32 {
             return 1;
         }
     };
-    match runtime.block_on(run(backend)) {
+    match runtime.block_on(run(backend, core_only)) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("rgit: mcp: {e}");
@@ -253,11 +277,12 @@ pub fn serve(backend: Arc<dyn GitBackend>) -> i32 {
     }
 }
 
-async fn run(backend: Arc<dyn GitBackend>) -> anyhow::Result<()> {
+async fn run(backend: Arc<dyn GitBackend>, core_only: bool) -> anyhow::Result<()> {
     let service = RgitMcp {
         registry: Registry::new(backend),
         // Local stdio, run by the user in their own shell: full read/write.
         read_only: false,
+        core_only,
     }
     .serve(stdio())
     .await?;
@@ -281,6 +306,7 @@ pub fn http_router(name: String, backend: Arc<dyn GitBackend>) -> axum::Router {
                 registry: Registry::single(name.clone(), backend.clone()),
                 // Network endpoint mirroring the read-only web viewer.
                 read_only: true,
+                core_only: false,
             })
         },
         Arc::new(LocalSessionManager::default()),
@@ -301,6 +327,7 @@ pub fn http_router_rooted(root: std::path::PathBuf) -> axum::Router {
             Ok(RgitMcp {
                 registry: Registry::rooted(root.clone()),
                 read_only: true,
+                core_only: false,
             })
         },
         Arc::new(LocalSessionManager::default()),
@@ -376,6 +403,9 @@ impl ServerHandler for RgitMcp {
         if self.read_only {
             items.retain(|t| is_read_only(&t.name));
         }
+        if self.core_only {
+            items.retain(|t| is_core(&t.name));
+        }
         Ok(ListToolsResult::with_all_items(items))
     }
 
@@ -385,6 +415,16 @@ impl ServerHandler for RgitMcp {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let name = request.name.to_string();
+        if self.core_only && !is_core(&name) {
+            let refused = anyhow::Error::new(CliError {
+                message: format!(
+                    "{name} is not in this server's core set; run `rgit mcp` (full) for all tools"
+                ),
+                help: Some("Run `rgit mcp` (stdio) for full access".to_owned()),
+                code: 1,
+            });
+            return Ok(reply(failure(&refused), true).into());
+        }
         if self.read_only && !is_read_only(&name) {
             let refused = anyhow::Error::new(CliError {
                 message: format!(
@@ -565,21 +605,40 @@ fn schema(props: &[(&str, &str, bool)]) -> Map<String, Value> {
 }
 
 fn tool(name: &'static str, description: &'static str, props: &[(&str, &str, bool)]) -> Tool {
-    Tool::new(name, description, schema(props))
+    let mut tool = Tool::new(name, description, schema(props));
+    tool.annotations = Some(ToolAnnotations::from_raw(
+        None,
+        Some(is_read_only(name)),
+        None,
+        None,
+        None,
+    ));
+    tool
 }
 
-/// Every tool as `{name, description, inputSchema}`, the shape MCP lists, for
-/// harnesses that register rgit's tools natively (the pi and omp extension).
+fn definition(tool: Tool) -> Value {
+    json!({
+        "name": tool.name,
+        "description": tool.description,
+        "inputSchema": Value::Object((*tool.input_schema).clone()),
+        "annotations": { "readOnlyHint": is_read_only(&tool.name) },
+    })
+}
+
+/// Every tool as `{name, description, inputSchema, annotations}`, the shape
+/// MCP lists, for harnesses that register rgit's tools natively (the omp
+/// extension) or rank them (pi reads them from the MCP server itself).
 pub fn definitions() -> Vec<Value> {
+    tools().into_iter().map(definition).collect()
+}
+
+/// Only [`CORE_TOOLS`], for harnesses that load every MCP tool into the
+/// prompt (Codex and OpenCode) or register rgit's tools natively (omp).
+pub fn core_definitions() -> Vec<Value> {
     tools()
         .into_iter()
-        .map(|t| {
-            json!({
-                "name": t.name,
-                "description": t.description,
-                "inputSchema": Value::Object((*t.input_schema).clone()),
-            })
-        })
+        .filter(|t| is_core(&t.name))
+        .map(definition)
         .collect()
 }
 
@@ -5756,6 +5815,36 @@ mod tests {
         }
         for name in READ_ONLY_TOOLS {
             assert!(tools().iter().any(|t| t.name == *name), "{name} is listed");
+        }
+    }
+
+    #[test]
+    fn core_set_is_listed_and_annotated() {
+        let all = tools();
+        let names: Vec<&str> = all.iter().map(|t| t.name.as_ref()).collect();
+        for name in CORE_TOOLS {
+            assert!(names.contains(name), "{name} is listed");
+        }
+        for t in tools() {
+            let hint = t
+                .annotations
+                .as_ref()
+                .and_then(|a| a.read_only_hint);
+            assert_eq!(hint, Some(is_read_only(&t.name)), "{}", t.name);
+        }
+        let core = core_definitions();
+        let mut listed: Vec<&str> = core
+            .iter()
+            .map(|d| d["name"].as_str().expect("a name"))
+            .collect();
+        listed.sort_unstable();
+        let mut want = CORE_TOOLS.to_vec();
+        want.sort_unstable();
+        assert_eq!(listed, want);
+        for d in &core {
+            let name = d["name"].as_str().expect("a name");
+            assert_eq!(d["annotations"]["readOnlyHint"], is_read_only(name));
+            assert!(d["inputSchema"]["properties"].is_object(), "{name}");
         }
     }
 }
