@@ -250,6 +250,21 @@ fn fetch_takes_remote_refspecs_tags_and_dry_run() {
 }
 
 #[test]
+fn fetch_short_non_branch_source_into_a_short_branch() {
+    let (_, up, clone) = fetch_setup("fetch-pull");
+    git(&up, &["push", "-q", "origin", "main:refs/pull/1/head"]);
+
+    ok(&clone, &["fetch", "origin", "pull/1/head:feat/x"]);
+    let refs = git(&clone, &["for-each-ref", "--format=%(refname)"]);
+    assert!(refs.contains("refs/heads/feat/x\n"), "{refs}");
+    assert!(!refs.contains("headrefs"), "{refs}");
+    assert_eq!(
+        git(&clone, &["rev-parse", "feat/x"]),
+        git(&up, &["rev-parse", "main"])
+    );
+}
+
+#[test]
 fn fetch_depth_makes_a_shallow_history() {
     let (remote, _, _) = fetch_setup("depth");
     let root = remote.parent().unwrap();

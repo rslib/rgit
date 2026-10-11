@@ -5946,9 +5946,10 @@ fn do_fetch(
     let configured = config_values(repo, &format!("remote.{name}.fetch"))?;
     let mut specs: Vec<String> = refspecs
         .iter()
+        .map(|s| full_fetch_dst(s))
         .map(|s| match args.force && !s.starts_with('+') {
             true => format!("+{s}"),
-            false => s.clone(),
+            false => s,
         })
         .collect();
     if let Some(map) = &args.refmap {
@@ -6521,6 +6522,23 @@ fn map_glob(from: &str, to: &str, name: &str) -> Option<String> {
             Some(to.replacen('*', mid, 1))
         }
     }
+}
+
+/// `src:dst` with a short `dst` spelled out as git does: `refs/tags/dst`
+/// for a tag, else `refs/heads/dst`. libgit2 joins a short `dst` onto a
+/// short non-branch `src` (`pull/1/head:x` makes `pull/1/headrefs/heads/x`).
+fn full_fetch_dst(spec: &str) -> String {
+    let Some((src, dst)) = spec.split_once(':') else {
+        return spec.to_owned();
+    };
+    if dst.is_empty() || dst.starts_with("refs/") {
+        return spec.to_owned();
+    }
+    let kind = match src.trim_start_matches('+').starts_with("refs/tags/") {
+        true => "tags",
+        false => "heads",
+    };
+    format!("{src}:refs/{kind}/{dst}")
 }
 
 /// A command-line fetch refspec as `--refmap` maps it: a bare ref gets the
