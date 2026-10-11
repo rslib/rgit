@@ -176,3 +176,26 @@ fn sparse_skipped_deletion_stays_in_the_index() {
         "mod.txt is staged: {mod_line}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn tracked_symlink_to_folder_is_staged_not_removed() {
+    let ours = mixed("paths-link-ours");
+    let theirs = mixed("paths-link-theirs");
+    for dir in [&ours, &theirs] {
+        std::os::unix::fs::symlink("dir", dir.join("link")).unwrap();
+        git(dir, &["add", "link"]);
+        git(dir, &["commit", "-q", "-m", "link"]);
+        std::fs::remove_file(dir.join("link")).unwrap();
+        std::os::unix::fs::symlink("g", dir.join("link")).unwrap();
+    }
+
+    Git2Backend::discover(&ours)
+        .unwrap()
+        .stage_paths(&owned(&["link"]))
+        .unwrap();
+    git(&theirs, &["add", "--", "link"]);
+
+    assert_eq!(index(&ours), index(&theirs));
+    assert!(index(&ours).contains("link"));
+}

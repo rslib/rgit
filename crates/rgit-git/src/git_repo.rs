@@ -1070,9 +1070,11 @@ impl GitBackend for Git2Backend {
         let mut walk = Vec::new();
         for p in paths {
             let path = Path::new(&p);
-            if self.workdir.join(path).is_file() {
+            let full = self.workdir.join(path);
+            if full.is_file() {
                 index.add_path(path)?;
-            } else if Pathspec::new([&p])?.is_plain()
+            } else if std::fs::symlink_metadata(&full).is_err()
+                && Pathspec::new([&p])?.is_plain()
                 && index.get_path(path, 0).is_some()
                 && skip(path, &[]) == 0
             {
