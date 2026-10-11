@@ -689,6 +689,30 @@ async fn creates_an_issue_resolving_assignees() {
 }
 
 #[tokio::test]
+async fn creating_an_issue_fails_for_an_unknown_assignee() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path("/api/v4/users"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+
+    let error = forge(&server)
+        .edit_issue(&repo(), 7, None, None, None, Some(&["nobody".to_owned()]))
+        .await
+        .expect_err("unknown user");
+    assert!(error.to_string().contains("nobody"), "{error}");
+    let writes = server
+        .received_requests()
+        .await
+        .expect("requests")
+        .into_iter()
+        .filter(|request| request.method.as_str() != "GET")
+        .count();
+    assert_eq!(writes, 0);
+}
+
+#[tokio::test]
 async fn closes_and_reopens_an_issue() {
     let server = MockServer::start().await;
     let mut closed = issue_json(7);

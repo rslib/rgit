@@ -399,24 +399,37 @@ pub fn render_stack_block(entries: &[(u64, String)], current: u64) -> String {
     out
 }
 
-/// The body `body` carries with the stack `block` in it: the marked section
-/// is replaced when present, else the block is appended after a blank line.
-/// Text outside the markers is left alone.
+/// The body `body` carries with the stack `block` in it: a well-formed marked
+/// section (the first end marker and the last start marker before it) is
+/// replaced, else the block is appended after a blank line. Without such a
+/// pair, lines that are only a stray marker are dropped so a later run cannot
+/// pair them with the new block. Other text is left alone.
 pub fn upsert_stack_block(body: Option<&str>, block: &str) -> String {
     let body = body.unwrap_or("");
-    match (body.find(STACK_START), body.find(STACK_END)) {
-        (Some(start), Some(end)) if start < end => {
-            let end = end + STACK_END.len();
-            format!("{}{block}{}", &body[..start], &body[end..])
-        }
-        _ => {
-            let trimmed = body.trim_end();
-            if trimmed.is_empty() {
-                block.to_owned()
-            } else {
-                format!("{trimmed}\n\n{block}")
-            }
-        }
+    if let Some(end) = body.find(STACK_END)
+        && let Some(start) = body[..end].rfind(STACK_START)
+    {
+        let end = end + STACK_END.len();
+        return format!("{}{block}{}", &body[..start], &body[end..]);
+    }
+    // Rejoining lines turns CRLF into LF, so only a body with a stray marker
+    // goes through it.
+    let kept = if body.contains(STACK_START) || body.contains(STACK_END) {
+        body.lines()
+            .filter(|line| {
+                let line = line.trim();
+                line != STACK_START && line != STACK_END
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        body.to_owned()
+    };
+    let trimmed = kept.trim_end();
+    if trimmed.is_empty() {
+        block.to_owned()
+    } else {
+        format!("{trimmed}\n\n{block}")
     }
 }
 
@@ -564,6 +577,44 @@ mod tests {
         assert_eq!(
             upsert_stack_block(Some(&body), &new),
             format!("Intro.\n\n{new}\n\nOutro.")
+        );
+    }
+
+    #[test]
+    fn stack_block_survives_an_orphan_start_marker() {
+        let block = render_stack_block(&[(12, "feat-a".to_owned())], 12);
+        let body = format!("Intro.\n{STACK_START}\nMy notes.");
+        let once = upsert_stack_block(Some(&body), &block);
+        assert_eq!(once, format!("Intro.\nMy notes.\n\n{block}"));
+        let twice = upsert_stack_block(Some(&once), &block);
+        assert_eq!(twice, once);
+        assert_eq!(twice.matches(STACK_START).count(), 1);
+    }
+
+    #[test]
+    fn stack_block_ignores_an_end_marker_before_the_start() {
+        let block = render_stack_block(&[(12, "feat-a".to_owned())], 12);
+        let body = format!("A\n{STACK_END}\nB\n{STACK_START}\nC");
+        let out = upsert_stack_block(Some(&body), &block);
+        assert_eq!(out, format!("A\nB\nC\n\n{block}"));
+    }
+
+    #[test]
+    fn stack_block_keeps_crlf_line_ends() {
+        let block = render_stack_block(&[(12, "feat-a".to_owned())], 12);
+        let out = upsert_stack_block(Some("One.\r\nTwo.\r\n"), &block);
+        assert_eq!(out, format!("One.\r\nTwo.\n\n{block}"));
+    }
+
+    #[test]
+    fn stack_block_keeps_a_prose_mention_of_the_marker() {
+        let old = render_stack_block(&[(12, "feat-a".to_owned())], 12);
+        let new = render_stack_block(&[(13, "feat-b".to_owned())], 13);
+        let prose = format!("Write {STACK_START} to start a table.");
+        let body = format!("{prose}\n\n{old}");
+        assert_eq!(
+            upsert_stack_block(Some(&body), &new),
+            format!("{prose}\n\n{new}")
         );
     }
 

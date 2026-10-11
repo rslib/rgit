@@ -987,8 +987,8 @@ impl GitlabClient {
         self.issue_from_value(value)
     }
 
-    /// The user ids of `usernames`, looked up one by one; unknown names are
-    /// skipped so one typo cannot block the issue.
+    /// The user ids of `usernames`, looked up one by one; a name that does not
+    /// resolve is an error, so a typo cannot silently drop an assignee.
     async fn user_ids(&self, usernames: &[String]) -> Result<Vec<u64>, ForgeError> {
         #[derive(Deserialize)]
         struct ApiUser {
@@ -1012,7 +1012,11 @@ impl GitlabClient {
                 .json()
                 .await
                 .map_err(response_error)?;
-            ids.extend(users.into_iter().map(|user| user.id));
+            let user = users
+                .into_iter()
+                .next()
+                .ok_or_else(|| ForgeError::Response(format!("no GitLab user named {username}")))?;
+            ids.push(user.id);
         }
         Ok(ids)
     }

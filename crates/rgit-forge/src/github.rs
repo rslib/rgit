@@ -89,7 +89,7 @@ impl From<ApiPullRequest> for PullRequest {
             updated_at: request.updated_at,
             head_sha: request.head.sha,
             mergeable: request.mergeable,
-            merged: request.merged,
+            merged: request.merged || request.merged_at.is_some(),
             labels: request.labels.into_iter().map(|label| label.name).collect(),
             reviewers: request
                 .requested_reviewers
@@ -790,6 +790,7 @@ impl GithubClient {
         struct Update {
             state: &'static str,
         }
+        self.issue(repo, number).await?;
         let issue: ApiIssue = self
             .api
             .patch(
@@ -808,6 +809,7 @@ impl GithubClient {
         number: u64,
         body: &str,
     ) -> Result<PullRequestComment, ForgeError> {
+        self.issue(repo, number).await?;
         self.comment_pull_request(repo, number, body).await
     }
 
@@ -822,6 +824,7 @@ impl GithubClient {
         labels: Option<&[String]>,
         assignees: Option<&[String]>,
     ) -> Result<Issue, ForgeError> {
+        self.issue(repo, number).await?;
         let mut patch = serde_json::Map::new();
         if let Some(title) = title {
             patch.insert("title".to_owned(), serde_json::json!(title));

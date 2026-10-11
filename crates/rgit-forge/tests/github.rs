@@ -162,12 +162,6 @@ async fn ensure_pull_requests_reports_one_word_per_branch() {
         .respond_with(ResponseTemplate::new(201).set_body_json(pr_json(12, "feat-a", "main")))
         .mount(&server)
         .await;
-    Mock::given(method("PATCH"))
-        .and(path("/repos/owner/repo/pulls/12"))
-        .and(body_string_contains("rgit-stack"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(pr_json(12, "feat-a", "main")))
-        .mount(&server)
-        .await;
 
     let lines = forge(&server)
         .ensure_pull_requests(
@@ -184,6 +178,14 @@ async fn ensure_pull_requests_reports_one_word_per_branch() {
         lines,
         vec!["opened https://github.com/owner/repo/pull/12 (feat-a)"]
     );
+    let patches = server
+        .received_requests()
+        .await
+        .expect("requests")
+        .into_iter()
+        .filter(|request| request.method.as_str() == "PATCH")
+        .count();
+    assert_eq!(patches, 0, "a single request gets no stack block");
 }
 
 #[tokio::test]
@@ -722,6 +724,16 @@ async fn closes_and_reopens_an_issue() {
     let server = MockServer::start().await;
     let mut closed = issue_json(7);
     closed["state"] = serde_json::json!("closed");
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues/8"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(8)))
+        .mount(&server)
+        .await;
     Mock::given(method("PATCH"))
         .and(path("/repos/owner/repo/issues/7"))
         .and(body_partial_json(serde_json::json!({"state": "closed"})))
@@ -750,6 +762,11 @@ async fn closes_and_reopens_an_issue() {
 #[tokio::test]
 async fn comments_on_an_issue() {
     let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7)))
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/repos/owner/repo/issues/7/comments"))
         .and(body_partial_json(
@@ -779,6 +796,11 @@ async fn edits_an_issue() {
     let server = MockServer::start().await;
     let mut edited = issue_json(7);
     edited["title"] = serde_json::json!("Fix login faster");
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7)))
+        .mount(&server)
+        .await;
     Mock::given(method("PATCH"))
         .and(path("/repos/owner/repo/issues/7"))
         .and(body_partial_json(serde_json::json!({
@@ -803,4 +825,58 @@ async fn edits_an_issue() {
         .expect("edited");
     assert_eq!(issue.title, "Fix login faster");
     assert_eq!(issue.labels, vec!["bug"]);
+}
+
+#[tokio::test]
+async fn issue_actions_refuse_a_pull_request_number() {
+    let server = MockServer::start().await;
+    let mut as_issue = pr_json(12, "feature", "main");
+    as_issue["pull_request"] = serde_json::json!({"url": "https://api.github.com/x"});
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(as_issue))
+        .mount(&server)
+        .await;
+    let forge = forge(&server);
+
+    let error = forge.close_issue(&repo(), 12).await.expect_err("close");
+    assert!(error.to_string().contains("pull request"), "{error}");
+    forge
+        .comment_issue(&repo(), 12, "hi")
+        .await
+        .expect_err("comment");
+    forge
+        .edit_issue(&repo(), 12, Some("t"), None, None, None)
+        .await
+        .expect_err("edit");
+
+    let writes: Vec<_> = server
+        .received_requests()
+        .await
+        .expect("requests")
+        .into_iter()
+        .filter(|request| request.method.as_str() != "GET")
+        .collect();
+    assert!(writes.is_empty(), "{writes:?}");
+}
+
+#[tokio::test]
+async fn list_marks_a_pull_request_merged_from_merged_at() {
+    let server = MockServer::start().await;
+    let mut merged = pr_json(5, "feature", "main");
+    merged["state"] = serde_json::json!("closed");
+    merged["merged_at"] = serde_json::json!("2026-01-05T03:04:05Z");
+    merged.as_object_mut().expect("object").remove("merged");
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([merged])))
+        .mount(&server)
+        .await;
+
+    let found = forge(&server)
+        .pull_request_for_branch(&repo(), "feature")
+        .await
+        .expect("lookup")
+        .expect("found");
+    assert!(found.merged);
 }

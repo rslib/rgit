@@ -311,10 +311,12 @@ impl Forge {
             .collect();
         let mut lines = Vec::with_capacity(entries.len());
         for (entry, one) in entries.iter().zip(ensured.iter()) {
-            let block = render_stack_block(&table, one.pull_request.number);
-            let body = upsert_stack_block(one.pull_request.body.as_deref(), &block);
-            self.edit_pull_request(repo, one.pull_request.number, None, Some(&body), None)
-                .await?;
+            if table.len() >= 2 {
+                let block = render_stack_block(&table, one.pull_request.number);
+                let body = upsert_stack_block(one.pull_request.body.as_deref(), &block);
+                self.edit_pull_request(repo, one.pull_request.number, None, Some(&body), None)
+                    .await?;
+            }
             let word = match one.outcome {
                 EnsureOutcome::Created => "opened",
                 EnsureOutcome::Updated { .. } => "updated",
