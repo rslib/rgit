@@ -69,7 +69,9 @@ pub fn restack(backend: &Arc<dyn GitBackend>) -> Result<String> {
 /// record the new parent and restack: when a parent pull request is merged,
 /// each child's pull request base moves to the parent's base and the stack
 /// config parent follows it, so the local restack lands on live branches.
-/// Without an origin remote or forge credentials this is a plain restack.
+/// Without an origin remote this is a plain restack; when the forge cannot be
+/// reached (no credentials, network error) the retarget is skipped with a
+/// warning line and the restack still runs.
 pub fn sync(backend: &Arc<dyn GitBackend>) -> Result<String> {
     let parents: HashMap<String, String> = backend
         .stack_parents()?
@@ -77,11 +79,13 @@ pub fn sync(backend: &Arc<dyn GitBackend>) -> Result<String> {
         .filter_map(|(b, p)| p.map(|p| (b, p)))
         .collect();
     let mut retargeted = Vec::new();
+    let mut warning = None;
     if !parents.is_empty()
         && let Some(origin) = backend.config_get("remote.origin.url")?
         && let Ok(target) = forge_target(&origin)
+        && let Err(error) = retarget_merged_children(backend, &parents, &target, &mut retargeted)
     {
-        retarget_merged_children(backend, &parents, &target, &mut retargeted)?;
+        warning = Some(format!("warning: skipped PR retarget: {error}"));
     }
     let outcome = backend.restack()?;
     let mut out = String::new();
@@ -97,6 +101,10 @@ pub fn sync(backend: &Arc<dyn GitBackend>) -> Result<String> {
     }
     if out.is_empty() {
         out.push_str("nothing to restack");
+    }
+    if let Some(warning) = warning {
+        out.push('\n');
+        out.push_str(&warning);
     }
     Ok(out)
 }
