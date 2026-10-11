@@ -1204,12 +1204,10 @@ fn human_thread_entry(entry: &serde_json::Value) -> String {
     }
     if str_field(entry, "kind") == Some("inline") {
         let path = str_field(entry, "path").unwrap_or("");
-        let line = entry
-            .get("line")
-            .and_then(serde_json::Value::as_u64)
-            .map(|line| line.to_string())
-            .unwrap_or_default();
-        header.push_str(&format!("  {path}:{line}"));
+        match entry.get("line").and_then(serde_json::Value::as_u64) {
+            Some(line) => header.push_str(&format!("  {path}:{line}")),
+            None => header.push_str(&format!("  {path}")),
+        }
     }
     if let Some(state) = str_field(entry, "state") {
         header.push_str(&format!("  [{state}]"));

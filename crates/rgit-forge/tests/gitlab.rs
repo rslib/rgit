@@ -826,6 +826,13 @@ async fn pull_request_thread_reads_discussions_and_approvals() {
         "new_path": "src/main.rs",
         "new_line": 42
     });
+    let mut deleted = discussion_note(5, "Why drop this?", "2026-01-06T03:04:05Z");
+    deleted["position"] = serde_json::json!({
+        "new_path": null,
+        "new_line": null,
+        "old_path": "src/old.rs",
+        "old_line": 7
+    });
     let mut system = discussion_note(3, "added 1 commit", "2026-01-03T03:04:05Z");
     system["system"] = serde_json::json!(true);
     Mock::given(method("GET"))
@@ -841,7 +848,8 @@ async fn pull_request_thread_reads_discussions_and_approvals() {
                     discussion_note(4, "Agreed.", "2026-01-05T03:04:05Z")
                 ]
             },
-            {"id": "def", "individual_note": true, "notes": [inline, system]}
+            {"id": "def", "individual_note": true, "notes": [inline, system]},
+            {"id": "ghi", "individual_note": true, "notes": [deleted]}
         ])))
         .mount(&server)
         .await;
@@ -859,7 +867,7 @@ async fn pull_request_thread_reads_discussions_and_approvals() {
         .pull_request_thread(&repo(), 12)
         .await
         .expect("thread");
-    assert_eq!(thread.len(), 4);
+    assert_eq!(thread.len(), 5);
     assert_eq!(thread[0].kind, rgit_forge::ThreadKind::Inline);
     assert_eq!(thread[0].path.as_deref(), Some("src/main.rs"));
     assert_eq!(thread[0].line, Some(42));
@@ -868,6 +876,9 @@ async fn pull_request_thread_reads_discussions_and_approvals() {
     assert_eq!(thread[1].body, "Looks good.");
     assert_eq!(thread[2].kind, rgit_forge::ThreadKind::Comment);
     assert_eq!(thread[2].in_reply_to, Some(1));
+    assert_eq!(thread[3].kind, rgit_forge::ThreadKind::Inline);
+    assert_eq!(thread[3].path.as_deref(), Some("src/old.rs"));
+    assert_eq!(thread[3].line, Some(7));
     let approval = thread.last().expect("approval");
     assert_eq!(approval.kind, rgit_forge::ThreadKind::Review);
     assert_eq!(approval.state.as_deref(), Some("approved"));

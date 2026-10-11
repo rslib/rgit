@@ -79,11 +79,14 @@ struct ApiNote {
     position: Option<ApiPosition>,
 }
 
-/// Where an inline note points: the file and the new-side line.
+/// Where an inline note points: the file and the line, on the new side, or
+/// on the old side for a deleted line (GitLab leaves `new_line` null there).
 #[derive(Deserialize)]
 struct ApiPosition {
     new_path: Option<String>,
     new_line: Option<u64>,
+    old_path: Option<String>,
+    old_line: Option<u64>,
 }
 
 impl ApiMergeRequest {
@@ -875,10 +878,12 @@ impl GitlabClient {
                     continue;
                 }
                 let inline = note.position.as_ref().and_then(|position| {
+                    let line = position.new_line.or(position.old_line);
                     position
                         .new_path
                         .clone()
-                        .map(|path| (path, position.new_line))
+                        .or_else(|| position.old_path.clone())
+                        .map(|path| (path, line))
                 });
                 let (kind, path, line) = match inline {
                     Some((path, line)) => (ThreadKind::Inline, Some(path), line),

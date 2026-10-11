@@ -474,8 +474,12 @@ fn thread_sections(state: &ThreadState) -> Vec<Section> {
         if let Some(when) = entry.created_at.as_deref() {
             header.push(Span::new(format!("  {when}"), Style::Dim));
         }
-        if let (Some(path), Some(line)) = (entry.path.as_deref(), entry.line) {
-            header.push(Span::new(format!("  {path}:{line}"), Style::Branch));
+        match (entry.path.as_deref(), entry.line) {
+            (Some(path), Some(line)) => {
+                header.push(Span::new(format!("  {path}:{line}"), Style::Branch));
+            }
+            (Some(path), None) => header.push(Span::new(format!("  {path}"), Style::Branch)),
+            _ => {}
         }
         if let Some(state) = entry.state.as_deref() {
             let style = match state {
