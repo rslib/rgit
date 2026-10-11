@@ -932,3 +932,165 @@ async fn list_marks_a_pull_request_merged_from_merged_at() {
         .expect("found");
     assert!(found.merged);
 }
+
+fn thread_comment(id: u64, body: &str, when: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "body": body,
+        "user": {"login": AUTHOR.as_str()},
+        "html_url": format!("https://github.com/owner/repo/pull/12#issuecomment-{id}"),
+        "created_at": when
+    })
+}
+
+fn thread_inline(id: u64, body: &str, when: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "body": body,
+        "user": {"login": REVIEWER.as_str()},
+        "html_url": format!("https://github.com/owner/repo/pull/12#discussion_r{id}"),
+        "created_at": when,
+        "path": "src/main.rs",
+        "line": 42,
+        "original_line": 42,
+        "in_reply_to_id": null
+    })
+}
+
+fn thread_review(id: u64, state: &str, body: Option<&str>, when: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "state": state,
+        "body": body,
+        "user": {"login": REVIEWER.as_str()},
+        "html_url": format!("https://github.com/owner/repo/pull/12#pullrequestreview-{id}"),
+        "submitted_at": when
+    })
+}
+
+#[tokio::test]
+async fn pull_request_thread_reads_comments_inline_and_reviews() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues/12/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            thread_comment(1, "Looks good.", "2026-01-03T03:04:05Z")
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/12/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            thread_inline(2, "Rename this.", "2026-01-02T03:04:05Z")
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/12/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            thread_review(3, "APPROVED", Some("Ship it."), "2026-01-04T03:04:05Z")
+        ])))
+        .mount(&server)
+        .await;
+
+    let thread = forge(&server)
+        .pull_request_thread(&repo(), 12)
+        .await
+        .expect("thread");
+    assert_eq!(thread.len(), 3);
+    assert_eq!(thread[0].kind, rgit_forge::ThreadKind::Inline);
+    assert_eq!(thread[0].path.as_deref(), Some("src/main.rs"));
+    assert_eq!(thread[0].line, Some(42));
+    assert_eq!(thread[0].body, "Rename this.");
+    assert_eq!(thread[1].kind, rgit_forge::ThreadKind::Comment);
+    assert_eq!(thread[1].body, "Looks good.");
+    assert_eq!(thread[2].kind, rgit_forge::ThreadKind::Review);
+    assert_eq!(thread[2].state.as_deref(), Some("approved"));
+    assert_eq!(thread[2].body, "Ship it.");
+}
+
+#[tokio::test]
+async fn pull_request_thread_pages_and_skips_batch_reviews() {
+    let server = MockServer::start().await;
+    let page_one: Vec<_> = (0..100)
+        .map(|i| thread_comment(1000 + i, "note", "2026-01-02T03:04:05Z"))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues/12/comments"))
+        .and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page_one))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues/12/comments"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            thread_comment(2000, "last", "2026-01-05T03:04:05Z")
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/12/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/12/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            thread_review(3, "COMMENTED", Some(""), "2026-01-04T03:04:05Z"),
+            thread_review(4, "PENDING", Some("draft"), "2026-01-04T03:04:05Z"),
+            thread_review(5, "CHANGES_REQUESTED", Some("Fix it."), "2026-01-03T03:04:05Z")
+        ])))
+        .mount(&server)
+        .await;
+
+    let thread = forge(&server)
+        .pull_request_thread(&repo(), 12)
+        .await
+        .expect("thread");
+    assert_eq!(thread.len(), 102);
+    assert!(thread.iter().all(|entry| entry.kind != rgit_forge::ThreadKind::Review
+        || entry.state.as_deref() == Some("changes_requested")));
+    assert_eq!(thread.last().expect("last").body, "last");
+}
+
+#[tokio::test]
+async fn issue_thread_reads_its_comments() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            thread_comment(1, "Working on it.", "2026-01-04T03:04:05Z")
+        ])))
+        .mount(&server)
+        .await;
+
+    let thread = forge(&server).issue_thread(&repo(), 7).await.expect("thread");
+    assert_eq!(thread.len(), 1);
+    assert_eq!(thread[0].kind, rgit_forge::ThreadKind::Comment);
+    assert_eq!(thread[0].body, "Working on it.");
+    assert_eq!(thread[0].author.as_deref(), Some(AUTHOR.as_str()));
+}
+
+#[tokio::test]
+async fn issue_thread_refuses_a_pull_request_number() {
+    let server = MockServer::start().await;
+    let mut as_issue = pr_json(12, "feature", "main");
+    as_issue["pull_request"] = serde_json::json!({"url": "https://api.github.com/x"});
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues/12"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(as_issue))
+        .mount(&server)
+        .await;
+
+    let error = forge(&server)
+        .issue_thread(&repo(), 12)
+        .await
+        .expect_err("thread");
+    assert!(error.to_string().contains("pull request"), "{error}");
+}

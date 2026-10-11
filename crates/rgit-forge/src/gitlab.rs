@@ -6,9 +6,9 @@ use super::ForgeError;
 use super::auth::load_credential_for;
 use super::types::{
     Branch, CheckRun, CreateIssue, CreatePullRequest, CreateRepository, Issue, IssueState, Listing,
-    MergeMethod, Provider, PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview,
-    PullRequestState, RepoRef, Repository, ReviewAction, User, normalize_check_status, page_query,
-    rollup_from, total_from_last_page,
+    MergeMethod, Provider, PullRequest, PullRequestChecks, PullRequestComment,
+    PullRequestReview, PullRequestState, RepoRef, Repository, ReviewAction, ThreadEntry, ThreadKind,
+    User, normalize_check_status, page_query, rollup_from, sort_thread, total_from_last_page,
 };
 
 const DEFAULT_HOST: &str = "https://gitlab.com";
@@ -55,6 +55,35 @@ struct ApiMergeRequest {
 #[derive(Deserialize)]
 struct ApiAccount {
     username: String,
+}
+
+/// One GitLab discussion: its notes share a thread, the first note's id
+/// chaining the replies.
+#[derive(Deserialize)]
+struct ApiDiscussion {
+    #[serde(default)]
+    notes: Vec<ApiNote>,
+}
+
+/// One GitLab note: a discussion reply, an issue note, or (with `position`)
+/// an inline code comment.
+#[derive(Deserialize)]
+struct ApiNote {
+    id: u64,
+    body: Option<String>,
+    author: Option<ApiAccount>,
+    created_at: Option<String>,
+    #[serde(default)]
+    system: bool,
+    resolved: Option<bool>,
+    position: Option<ApiPosition>,
+}
+
+/// Where an inline note points: the file and the new-side line.
+#[derive(Deserialize)]
+struct ApiPosition {
+    new_path: Option<String>,
+    new_line: Option<u64>,
 }
 
 impl ApiMergeRequest {
@@ -815,6 +844,161 @@ impl GitlabClient {
             author: comment.author,
             url: None,
         })
+    }
+
+    /// The whole conversation on merge request `number`: discussion notes
+    /// (inline where they carry a position) plus one approval review per
+    /// approver, oldest first. System notes ("added 1 commit" and the like)
+    /// are skipped.
+    pub async fn pull_request_thread(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Vec<ThreadEntry>, ForgeError> {
+        let mut entries = Vec::new();
+        for discussion in self
+            .all_pages::<ApiDiscussion>(&format!(
+                "{}/projects/{}/merge_requests/{}/discussions",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .await?
+        {
+            let parent = discussion
+                .notes
+                .iter()
+                .find(|note| !note.system)
+                .map(|note| note.id);
+            for note in discussion.notes {
+                if note.system {
+                    continue;
+                }
+                let inline = note.position.as_ref().and_then(|position| {
+                    position
+                        .new_path
+                        .clone()
+                        .map(|path| (path, position.new_line))
+                });
+                let (kind, path, line) = match inline {
+                    Some((path, line)) => (ThreadKind::Inline, Some(path), line),
+                    None => (ThreadKind::Comment, None, None),
+                };
+                entries.push(ThreadEntry {
+                    kind,
+                    id: Some(note.id),
+                    author: note.author.map(|author| author.username),
+                    body: note.body.unwrap_or_default(),
+                    created_at: note.created_at,
+                    url: None,
+                    path,
+                    line,
+                    state: None,
+                    in_reply_to: match parent {
+                        Some(parent) if parent != note.id => Some(parent),
+                        _ => None,
+                    },
+                    resolved: note.resolved,
+                });
+            }
+        }
+        #[derive(Deserialize)]
+        struct ApiApprovals {
+            #[serde(default)]
+            approved_by: Vec<ApiApproval>,
+        }
+        #[derive(Deserialize)]
+        struct ApiApproval {
+            #[serde(default)]
+            user: Option<ApiAccount>,
+        }
+        let approvals: ApiApprovals = self
+            .http
+            .get(format!(
+                "{}/projects/{}/merge_requests/{}/approvals",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?
+            .json()
+            .await
+            .map_err(response_error)?;
+        for approval in approvals.approved_by {
+            entries.push(ThreadEntry {
+                kind: ThreadKind::Review,
+                id: None,
+                author: approval.user.map(|user| user.username),
+                body: String::new(),
+                created_at: None,
+                url: None,
+                path: None,
+                line: None,
+                state: Some("approved".to_owned()),
+                in_reply_to: None,
+                resolved: None,
+            });
+        }
+        sort_thread(&mut entries);
+        Ok(entries)
+    }
+
+    /// The notes on issue `number`, oldest first, skipping system notes.
+    pub async fn issue_thread(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Vec<ThreadEntry>, ForgeError> {
+        let mut entries: Vec<ThreadEntry> = self
+            .all_pages::<ApiNote>(&format!(
+                "{}/projects/{}/issues/{}/notes",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .await?
+            .into_iter()
+            .filter(|note| !note.system)
+            .map(|note| ThreadEntry {
+                kind: ThreadKind::Comment,
+                id: Some(note.id),
+                author: note.author.map(|author| author.username),
+                body: note.body.unwrap_or_default(),
+                created_at: note.created_at,
+                url: None,
+                path: None,
+                line: None,
+                state: None,
+                in_reply_to: None,
+                resolved: note.resolved,
+            })
+            .collect();
+        sort_thread(&mut entries);
+        Ok(entries)
+    }
+
+    /// Every item of a list endpoint, following `x-next-page` until it runs
+    /// out.
+    async fn all_pages<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<Vec<T>, ForgeError> {
+        let mut items = Vec::new();
+        let mut page = 1;
+        loop {
+            let listing: Listing<T> = self.list_page(url, page).await?;
+            items.extend(listing.items);
+            if !listing.more {
+                break;
+            }
+            page += 1;
+        }
+        Ok(items)
     }
 
     /// Change the title, description and target branch merge request `number`

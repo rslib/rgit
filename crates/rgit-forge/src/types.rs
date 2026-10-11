@@ -365,6 +365,55 @@ pub struct PullRequestReview {
     pub url: Option<String>,
 }
 
+/// What one entry of a pull request or issue thread is: a plain comment, an
+/// inline code comment, or a review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThreadKind {
+    Comment,
+    Inline,
+    Review,
+}
+
+impl fmt::Display for ThreadKind {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Comment => out.write_str("comment"),
+            Self::Inline => out.write_str("inline"),
+            Self::Review => out.write_str("review"),
+        }
+    }
+}
+
+/// One entry of a pull request or issue thread, oldest first. `path` and
+/// `line` are set only on inline code comments (`path:line` on the new
+/// side); `state` only on reviews (`approved`, `changes_requested`,
+/// `commented`, `dismissed`); `resolved` only where the forge tracks it
+/// (GitLab discussions; GitHub's REST API reports none).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadEntry {
+    pub kind: ThreadKind,
+    pub id: Option<u64>,
+    pub author: Option<String>,
+    pub body: String,
+    pub created_at: Option<String>,
+    pub url: Option<String>,
+    pub path: Option<String>,
+    pub line: Option<u64>,
+    pub state: Option<String>,
+    pub in_reply_to: Option<u64>,
+    pub resolved: Option<bool>,
+}
+
+/// Order a thread oldest first, keeping the fetch order on ties; entries
+/// with no time (GitLab approvals) sort last.
+pub(crate) fn sort_thread(entries: &mut Vec<ThreadEntry>) {
+    entries.sort_by(|a, b| {
+        (a.created_at.is_none(), a.created_at.clone())
+            .cmp(&(b.created_at.is_none(), b.created_at.clone()))
+    });
+}
+
 /// What `Forge::ensure_pull_request` did: opened a new pull request, or worked
 /// on the existing one (`retargeted` when it moved its base branch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -737,6 +786,42 @@ mod tests {
         assert_eq!(
             page_query("/r/p?state=open", 0),
             "/r/p?state=open&per_page=100&page=1"
+        );
+    }
+
+    #[test]
+    fn thread_sorts_oldest_first_with_timeless_last() {
+        use super::{ThreadEntry, ThreadKind};
+        let entry = |when: Option<&str>| ThreadEntry {
+            kind: ThreadKind::Comment,
+            id: None,
+            author: None,
+            body: when.unwrap_or("timeless").to_owned(),
+            created_at: when.map(str::to_owned),
+            url: None,
+            path: None,
+            line: None,
+            state: None,
+            in_reply_to: None,
+            resolved: None,
+        };
+        let mut entries = vec![
+            entry(None),
+            entry(Some("2026-01-03T00:00:00Z")),
+            entry(Some("2026-01-02T00:00:00Z")),
+        ];
+        super::sort_thread(&mut entries);
+        let order: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.created_at.as_deref().unwrap_or("timeless"))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "2026-01-02T00:00:00Z",
+                "2026-01-03T00:00:00Z",
+                "timeless"
+            ]
         );
     }
 }

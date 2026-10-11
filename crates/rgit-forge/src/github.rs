@@ -5,9 +5,9 @@ use super::ForgeError;
 use super::auth::{load_credential_for, refresh_if_needed};
 use super::types::{
     Branch, CheckRun, CreateIssue, CreatePullRequest, CreateRepository, Issue, IssueState, Listing,
-    MergeMethod, Provider, PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview,
-    PullRequestState, RepoRef, Repository, ReviewAction, User, normalize_check_status, page_query,
-    rollup_from, total_from_last_page,
+    MergeMethod, PAGE_SIZE, Provider, PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview,
+    PullRequestState, RepoRef, Repository, ReviewAction, ThreadEntry, ThreadKind, User,
+    normalize_check_status, page_query, rollup_from, sort_thread, total_from_last_page,
 };
 
 fn api_error(error: octocrab::Error) -> ForgeError {
@@ -604,6 +604,187 @@ impl GithubClient {
             author: review.user.map(|user| user.login),
             url: review.html_url,
         })
+    }
+
+    /// The whole conversation on pull request `number`: plain comments,
+    /// inline code comments (with file and line) and reviews, oldest first.
+    /// GitHub files one empty COMMENTED review per inline batch, so those
+    /// are skipped; the inline entries already carry the text. Pending
+    /// reviews are other users' drafts and never visible here.
+    pub async fn pull_request_thread(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Vec<ThreadEntry>, ForgeError> {
+        #[derive(Deserialize)]
+        struct ApiComment {
+            id: u64,
+            #[serde(default)]
+            body: String,
+            user: Option<ApiAccount>,
+            html_url: Option<String>,
+            created_at: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct ApiInline {
+            id: u64,
+            #[serde(default)]
+            body: String,
+            user: Option<ApiAccount>,
+            html_url: Option<String>,
+            created_at: Option<String>,
+            path: Option<String>,
+            line: Option<u64>,
+            original_line: Option<u64>,
+            in_reply_to_id: Option<u64>,
+        }
+        #[derive(Deserialize)]
+        struct ApiReview {
+            id: u64,
+            state: String,
+            body: Option<String>,
+            user: Option<ApiAccount>,
+            html_url: Option<String>,
+            submitted_at: Option<String>,
+        }
+        let mut entries = Vec::new();
+        for comment in self
+            .all_pages::<ApiComment>(&format!(
+                "/repos/{}/{}/issues/{number}/comments",
+                repo.owner, repo.name
+            ))
+            .await?
+        {
+            entries.push(ThreadEntry {
+                kind: ThreadKind::Comment,
+                id: Some(comment.id),
+                author: comment.user.map(|user| user.login),
+                body: comment.body,
+                created_at: comment.created_at,
+                url: comment.html_url,
+                path: None,
+                line: None,
+                state: None,
+                in_reply_to: None,
+                resolved: None,
+            });
+        }
+        for inline in self
+            .all_pages::<ApiInline>(&format!(
+                "/repos/{}/{}/pulls/{number}/comments",
+                repo.owner, repo.name
+            ))
+            .await?
+        {
+            entries.push(ThreadEntry {
+                kind: ThreadKind::Inline,
+                id: Some(inline.id),
+                author: inline.user.map(|user| user.login),
+                body: inline.body,
+                created_at: inline.created_at,
+                url: inline.html_url,
+                path: inline.path,
+                line: inline.line.or(inline.original_line),
+                state: None,
+                in_reply_to: inline.in_reply_to_id,
+                resolved: None,
+            });
+        }
+        for review in self
+            .all_pages::<ApiReview>(&format!(
+                "/repos/{}/{}/pulls/{number}/reviews",
+                repo.owner, repo.name
+            ))
+            .await?
+        {
+            if review.state.eq_ignore_ascii_case("pending") {
+                continue;
+            }
+            let body = review.body.unwrap_or_default();
+            if review.state.eq_ignore_ascii_case("commented") && body.trim().is_empty() {
+                continue;
+            }
+            entries.push(ThreadEntry {
+                kind: ThreadKind::Review,
+                id: Some(review.id),
+                author: review.user.map(|user| user.login),
+                body,
+                created_at: review.submitted_at,
+                url: review.html_url,
+                path: None,
+                line: None,
+                state: Some(review.state.to_lowercase()),
+                in_reply_to: None,
+                resolved: None,
+            });
+        }
+        sort_thread(&mut entries);
+        Ok(entries)
+    }
+
+    /// The comments on issue `number`, oldest first; a pull request number is
+    /// refused, since pull requests have their own calls.
+    pub async fn issue_thread(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Vec<ThreadEntry>, ForgeError> {
+        self.issue(repo, number).await?;
+        #[derive(Deserialize)]
+        struct ApiComment {
+            id: u64,
+            #[serde(default)]
+            body: String,
+            user: Option<ApiAccount>,
+            html_url: Option<String>,
+            created_at: Option<String>,
+        }
+        let mut entries: Vec<ThreadEntry> = self
+            .all_pages::<ApiComment>(&format!(
+                "/repos/{}/{}/issues/{number}/comments",
+                repo.owner, repo.name
+            ))
+            .await?
+            .into_iter()
+            .map(|comment| ThreadEntry {
+                kind: ThreadKind::Comment,
+                id: Some(comment.id),
+                author: comment.user.map(|user| user.login),
+                body: comment.body,
+                created_at: comment.created_at,
+                url: comment.html_url,
+                path: None,
+                line: None,
+                state: None,
+                in_reply_to: None,
+                resolved: None,
+            })
+            .collect();
+        sort_thread(&mut entries);
+        Ok(entries)
+    }
+
+    /// Every item of a list endpoint, following pages until a short one.
+    async fn all_pages<T: serde::de::DeserializeOwned>(
+        &self,
+        route: &str,
+    ) -> Result<Vec<T>, ForgeError> {
+        let mut items = Vec::new();
+        let mut page = 1;
+        loop {
+            let batch: Vec<T> = self
+                .api
+                .get(page_query(route, page), None::<&()>)
+                .await
+                .map_err(api_error)?;
+            let short = (batch.len() as u32) < PAGE_SIZE;
+            items.extend(batch);
+            if short {
+                break;
+            }
+            page += 1;
+        }
+        Ok(items)
     }
 
     /// Change the title, body and base branch pull request `number` carries;

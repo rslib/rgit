@@ -26,8 +26,8 @@ pub use types::{
     CredentialIdentity, EnsureOutcome, EnsuredPullRequest, Issue, IssueState, Listing, MergeMethod,
     PAGE_SIZE, Provider, PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview,
     PullRequestState, RepoRef, Repository, ReviewAction, STACK_END, STACK_START, StackEntry,
-    StoredCredential, User, branches_above, fill_from_commit, render_stack_block,
-    upsert_stack_block,
+    StoredCredential, ThreadEntry, ThreadKind, User, branches_above, fill_from_commit,
+    render_stack_block, upsert_stack_block,
 };
 
 /// An error from a forge operation. Every variant names the forge it came from
@@ -480,6 +480,19 @@ impl Forge {
         }
     }
 
+    /// The whole conversation on pull request `number`: plain comments,
+    /// inline code comments and reviews, oldest first.
+    pub async fn pull_request_thread(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Vec<ThreadEntry>, ForgeError> {
+        match self {
+            Self::Github(client) => client.pull_request_thread(repo, number).await,
+            Self::Gitlab(client) => client.pull_request_thread(repo, number).await,
+        }
+    }
+
     /// One page of issues, by `state`, author login, label and assignee
     /// login; each filter is skipped when unset.
     pub async fn issues(
@@ -551,6 +564,18 @@ impl Forge {
         match self {
             Self::Github(client) => client.comment_issue(repo, number, body).await,
             Self::Gitlab(client) => client.comment_issue(repo, number, body).await,
+        }
+    }
+
+    /// The whole conversation on issue `number`: its comments, oldest first.
+    pub async fn issue_thread(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+    ) -> Result<Vec<ThreadEntry>, ForgeError> {
+        match self {
+            Self::Github(client) => client.issue_thread(repo, number).await,
+            Self::Gitlab(client) => client.issue_thread(repo, number).await,
         }
     }
 

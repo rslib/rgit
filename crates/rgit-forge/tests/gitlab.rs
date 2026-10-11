@@ -805,3 +805,148 @@ async fn edits_the_title_and_labels_of_an_issue() {
     assert_eq!(issue.title, "Fix login faster");
     assert_eq!(issue.labels, vec!["bug"]);
 }
+
+fn discussion_note(id: u64, body: &str, when: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "body": body,
+        "author": {"username": AUTHOR.as_str()},
+        "created_at": when,
+        "system": false,
+        "resolvable": true,
+        "resolved": false
+    })
+}
+
+#[tokio::test]
+async fn pull_request_thread_reads_discussions_and_approvals() {
+    let server = MockServer::start().await;
+    let mut inline = discussion_note(2, "Rename this.", "2026-01-02T03:04:05Z");
+    inline["position"] = serde_json::json!({
+        "new_path": "src/main.rs",
+        "new_line": 42
+    });
+    let mut system = discussion_note(3, "added 1 commit", "2026-01-03T03:04:05Z");
+    system["system"] = serde_json::json!(true);
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12/discussions$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "id": "abc",
+                "individual_note": false,
+                "notes": [
+                    discussion_note(1, "Looks good.", "2026-01-04T03:04:05Z"),
+                    discussion_note(4, "Agreed.", "2026-01-05T03:04:05Z")
+                ]
+            },
+            {"id": "def", "individual_note": true, "notes": [inline, system]}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12/approvals$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "approved_by": [{"user": {"username": REVIEWER.as_str()}}]
+        })))
+        .mount(&server)
+        .await;
+
+    let thread = forge(&server)
+        .pull_request_thread(&repo(), 12)
+        .await
+        .expect("thread");
+    assert_eq!(thread.len(), 4);
+    assert_eq!(thread[0].kind, rgit_forge::ThreadKind::Inline);
+    assert_eq!(thread[0].path.as_deref(), Some("src/main.rs"));
+    assert_eq!(thread[0].line, Some(42));
+    assert_eq!(thread[0].resolved, Some(false));
+    assert_eq!(thread[1].kind, rgit_forge::ThreadKind::Comment);
+    assert_eq!(thread[1].body, "Looks good.");
+    assert_eq!(thread[2].kind, rgit_forge::ThreadKind::Comment);
+    assert_eq!(thread[2].in_reply_to, Some(1));
+    let approval = thread.last().expect("approval");
+    assert_eq!(approval.kind, rgit_forge::ThreadKind::Review);
+    assert_eq!(approval.state.as_deref(), Some("approved"));
+    assert_eq!(approval.author.as_deref(), Some(REVIEWER.as_str()));
+    assert!(approval.created_at.is_none());
+}
+
+#[tokio::test]
+async fn pull_request_thread_pages_discussions() {
+    let server = MockServer::start().await;
+    let page_one: Vec<_> = (0..100)
+        .map(|i| serde_json::json!({
+            "id": format!("d{i}"),
+            "individual_note": true,
+            "notes": [discussion_note(1000 + i, "note", "2026-01-02T03:04:05Z")]
+        }))
+        .collect();
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12/discussions$",
+        ))
+        .and(query_param("page", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(page_one)
+                .insert_header("x-next-page", "2"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12/discussions$",
+        ))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "id": "last",
+                "individual_note": true,
+                "notes": [discussion_note(2000, "last", "2026-01-05T03:04:05Z")]
+            }
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/merge_requests/12/approvals$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "approved_by": []
+        })))
+        .mount(&server)
+        .await;
+
+    let thread = forge(&server)
+        .pull_request_thread(&repo(), 12)
+        .await
+        .expect("thread");
+    assert_eq!(thread.len(), 101);
+    assert_eq!(thread.last().expect("last").body, "last");
+}
+
+#[tokio::test]
+async fn issue_thread_reads_notes_without_system_ones() {
+    let server = MockServer::start().await;
+    let mut system = discussion_note(2, "changed labels", "2026-01-03T03:04:05Z");
+    system["system"] = serde_json::json!(true);
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/issues/7/notes$",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            discussion_note(1, "Working on it.", "2026-01-04T03:04:05Z"),
+            system
+        ])))
+        .mount(&server)
+        .await;
+
+    let thread = forge(&server).issue_thread(&repo(), 7).await.expect("thread");
+    assert_eq!(thread.len(), 1);
+    assert_eq!(thread[0].kind, rgit_forge::ThreadKind::Comment);
+    assert_eq!(thread[0].body, "Working on it.");
+}
