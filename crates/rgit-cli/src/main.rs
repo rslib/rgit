@@ -1093,6 +1093,58 @@ fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> (Vec<String>, Option<String>)
                 )
             }
         },
+        ForgeCmd::Issue { cmd } => match cmd {
+            cli::IssueCmd::View { target, repo, .. } => {
+                let at = repo_args(target, repo);
+                (
+                    vec![format!(
+                        "Run `{base} issue comment <number>{at} --body \"<text>\"` to comment"
+                    )],
+                    None,
+                )
+            }
+            cli::IssueCmd::List { target, repo, .. } => {
+                let at = repo_args(target, repo);
+                (
+                    vec![
+                        format!(
+                            "Run `{base} issue create{at} --title \"<title>\"` to open one"
+                        ),
+                        format!("Run `{base} issue close <number>{at} --yes` to close one"),
+                    ],
+                    Some(format!("{base} issue list{at}")),
+                )
+            }
+            cli::IssueCmd::Create { target, repo, .. } => {
+                let at = repo_args(target, repo);
+                (
+                    vec![
+                        format!("Run `{base} issue list{at}` to see open issues"),
+                        format!("Run `{base} issue close <number>{at} --yes` to close it"),
+                    ],
+                    None,
+                )
+            }
+            cli::IssueCmd::Close { target, repo, .. } => (
+                vec![format!(
+                    "Run `{base} issue list{}` to see the remaining issues",
+                    repo_args(target, repo)
+                )],
+                None,
+            ),
+            cli::IssueCmd::Edit { target, repo, .. }
+            | cli::IssueCmd::Reopen { target, repo, .. }
+            | cli::IssueCmd::Comment { target, repo, .. }
+            | cli::IssueCmd::Browse { target, repo, .. } => {
+                let at = repo_args(target, repo);
+                (
+                    vec![format!(
+                        "Run `{base} issue view <number>{at}` to see the issue"
+                    )],
+                    None,
+                )
+            }
+        },
         ForgeCmd::Browse { .. } => (Vec::new(), None),
     }
 }
@@ -1107,6 +1159,9 @@ fn forge_output(text: String, list_cmd: Option<&str>) -> Output {
                 Some(items) if list_cmd.is_some_and(|cmd| cmd.contains(" pr list")) => {
                     Some(crate::forge::human_pull_request_list(items))
                 }
+                Some(items) if list_cmd.is_some_and(|cmd| cmd.contains(" issue list")) => {
+                    Some(crate::forge::human_issue_list(items))
+                }
                 _ => None,
             };
             let Some(Value::Array(items)) = map.remove("items") else {
@@ -1117,12 +1172,15 @@ fn forge_output(text: String, list_cmd: Option<&str>) -> Output {
             let total = map.get("total").and_then(Value::as_u64);
             let rows = objects(items);
             let is_pr = list_cmd.is_some_and(|c| c.contains(" pr list"));
+            let is_issue = list_cmd.is_some_and(|c| c.contains(" issue list"));
             let (key, defaults, noun): (&str, &'static [&'static str], &str) = if is_pr {
                 (
                     "pull_requests",
                     &["number", "title", "state", "head_branch"],
                     "open pull requests",
                 )
+            } else if is_issue {
+                ("issues", &["number", "title", "state"], "open issues")
             } else {
                 ("branches", &["name", "sha", "protected"], "remote branches")
             };
@@ -1810,6 +1868,7 @@ mod tests {
                 body: None,
                 body_file: None,
                 draft: false,
+                fixes: None,
             },
             cli::PrCmd::Checkout {
                 number: 1,

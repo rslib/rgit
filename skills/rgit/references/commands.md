@@ -95,6 +95,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `stack new`: Create a new branch stacked on the current one. e.g. `rgit stack new <branch>`
   - `stack list`: List the stack containing the current branch. e.g. `rgit stack list`
   - `stack restack`: Rebase every descendant onto its parent's new tip. e.g. `rgit stack restack`
+  - `stack sync`: Retarget the children of merged parents onto the grandparent branch, then restack. e.g. `rgit stack sync`
 - `next`: Check out the branch stacked on this one (move up the stack). e.g. `rgit next`
 - `prev`: Check out this branch's stack parent (move down the stack). e.g. `rgit prev`
 - `sync`: Fetch, fast-forward branches to their upstreams, and restack the stack. e.g. `rgit sync`
@@ -168,7 +169,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
     - `forge pr view`: Show one pull request or merge request by NUMBER or head BRANCH. e.g. `rgit forge pr view`, `rgit forge pr view 42`, `rgit forge pr view feature owner/repo`
     - `forge pr checks`: Show the CI checks on a pull request's head commit (its jobs for GitLab). e.g. `rgit forge pr checks`, `rgit forge pr checks 42`, `rgit forge pr checks 42 owner/repo`
     - `forge pr list`: List pull requests or merge requests, 100 per page. e.g. `rgit forge pr list`, `rgit forge pr list owner/repo`, `rgit forge pr list --page 2`, `rgit forge pr list --state merged --author <login> --head <branch>`
-    - `forge pr create`: Create a pull request or merge request. e.g. `rgit forge pr create`, `rgit forge pr create --title "<title>" --head <branch> --base main`
+    - `forge pr create`: Create a pull request or merge request. e.g. `rgit forge pr create`, `rgit forge pr create --title "<title>" --head <branch> --base main`, `rgit forge pr create --fixes 7`
     - `forge pr checkout`: Check out a pull request's head branch, fetching its head commit. e.g. `rgit forge pr checkout 42`, `rgit forge pr checkout 42 owner/repo`
     - `forge pr close`: Close a pull request or merge request. e.g. `rgit forge pr close 42 --yes`, `rgit forge pr close 42 owner/repo --yes`
     - `forge pr edit`: Change a pull request's title, body or base branch. e.g. `rgit forge pr edit 42 --title "<title>"`, `rgit forge pr edit 42 --base main`
@@ -178,6 +179,15 @@ Every command with what it does and example invocations. Run `rgit <command> --h
     - `forge pr comment`: Comment on a pull request or merge request. e.g. `rgit forge pr comment 42 --body "<text>"`
     - `forge pr review`: Review a pull request or merge request. e.g. `rgit forge pr review 42 --approve`, `rgit forge pr review 42 --request-changes --body "<text>"`
     - `forge pr merge`: Merge a pull request or merge request. e.g. `rgit forge pr merge 42 --yes`, `rgit forge pr merge 42 --method squash --delete-branch --yes`
+  - `forge issue`: Work with issues: list, view, create, edit, close, reopen and comment. e.g. `rgit forge issue list`
+    - `forge issue list`: List issues, 100 per page. e.g. `rgit forge issue list`, `rgit forge issue list owner/repo`, `rgit forge issue list --page 2`, `rgit forge issue list --state closed --author <login> --label <label> --assignee <login>`
+    - `forge issue view`: Show one issue by NUMBER. e.g. `rgit forge issue view 7`, `rgit forge issue view 7 owner/repo`
+    - `forge issue create`: Open an issue. e.g. `rgit forge issue create --title "<title>"`, `rgit forge issue create --title "<title>" --body "<text>" --label <label> --assignee <login>`
+    - `forge issue edit`: Change an issue's title, body, labels or assignees. e.g. `rgit forge issue edit 7 --title "<title>"`, `rgit forge issue edit 7 --label <label> --assignee <login>`
+    - `forge issue close`: Close an issue after explicit confirmation. e.g. `rgit forge issue close 7 --yes`, `rgit forge issue close 7 owner/repo --yes`
+    - `forge issue reopen`: Reopen an issue. e.g. `rgit forge issue reopen 7`
+    - `forge issue comment`: Comment on an issue. e.g. `rgit forge issue comment 7 --body "<text>"`
+    - `forge issue browse`: Open an issue in the browser. e.g. `rgit forge issue browse 7`, `rgit forge issue browse 7 owner/repo --print`
   - `forge browse`: Open the forge repository or one pull request in the browser. e.g. `rgit forge browse`, `rgit forge browse 42`, `rgit forge browse 42 owner/repo --print`
 
 ## Patches, notes, config and maintenance

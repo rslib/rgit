@@ -6562,6 +6562,11 @@ pub enum ForgeCmd {
         #[command(subcommand)]
         cmd: PrCmd,
     },
+    /// Work with issues: list, view, create, edit, close, reopen and comment.
+    Issue {
+        #[command(subcommand)]
+        cmd: IssueCmd,
+    },
     /// Open the forge repository or one pull request in the browser.
     Browse {
         /// A PR number; opens the repository page when omitted.
@@ -6711,6 +6716,9 @@ pub enum PrCmd {
         body_file: Option<String>,
         #[arg(long)]
         draft: bool,
+        /// An issue number this pull request fixes (`Fixes #N`, `Closes #N` on GitLab).
+        #[arg(long)]
+        fixes: Option<u64>,
     },
     /// Check out a pull request's head branch, fetching its head commit.
     Checkout {
@@ -6814,6 +6822,143 @@ pub enum PrCmd {
         delete_branch: bool,
         #[arg(long)]
         yes: bool,
+    },
+}
+
+/// The state filter of `forge issue list`.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum IssueListState {
+    /// Open issues (the default).
+    Open,
+    /// Closed issues.
+    Closed,
+    /// Every state.
+    All,
+}
+
+impl From<IssueListState> for rgit_forge::IssueState {
+    fn from(state: IssueListState) -> Self {
+        match state {
+            IssueListState::Open => Self::Open,
+            IssueListState::Closed => Self::Closed,
+            IssueListState::All => Self::All,
+        }
+    }
+}
+
+#[derive(clap::Subcommand)]
+pub enum IssueCmd {
+    /// List issues, 100 per page.
+    List {
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        /// Which state to list; open by default.
+        #[arg(long, value_enum, default_value = "open")]
+        state: IssueListState,
+        /// Only issues opened by this login.
+        #[arg(long)]
+        author: Option<String>,
+        /// Only issues carrying this label.
+        #[arg(long)]
+        label: Option<String>,
+        /// Only issues assigned to this login.
+        #[arg(long)]
+        assignee: Option<String>,
+        /// Which page of 100 to show.
+        #[arg(long, default_value_t = 1)]
+        page: u32,
+    },
+    /// Show one issue by NUMBER.
+    View {
+        /// An issue number.
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+    },
+    /// Open an issue.
+    Create {
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        /// The issue title.
+        #[arg(long)]
+        title: String,
+        /// The issue body.
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the body from this file (`-` for stdin).
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<String>,
+        /// A label per flag.
+        #[arg(long)]
+        label: Vec<String>,
+        /// An assignee login per flag.
+        #[arg(long)]
+        assignee: Vec<String>,
+    },
+    /// Change an issue's title, body, labels or assignees.
+    Edit {
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        /// A new title.
+        #[arg(long)]
+        title: Option<String>,
+        /// A new body.
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the new body from this file (`-` for stdin).
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<String>,
+        /// Replace the labels (one per flag).
+        #[arg(long)]
+        label: Vec<String>,
+        /// Replace the assignees (one login per flag).
+        #[arg(long)]
+        assignee: Vec<String>,
+    },
+    /// Close an issue after explicit confirmation.
+    Close {
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Reopen an issue.
+    Reopen {
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+    },
+    /// Comment on an issue.
+    Comment {
+        number: u64,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        /// The comment text.
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read the comment text from this file (`-` for stdin).
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<String>,
+    },
+    /// Open an issue in the browser.
+    Browse {
+        /// An issue number; opens the repository page when omitted.
+        number: Option<u64>,
+        /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
+        target: Option<String>,
+        repo: Option<String>,
+        /// Print the URL instead of opening it.
+        #[arg(long)]
+        print: bool,
     },
 }
 /// Subcommands for CoW workspaces.

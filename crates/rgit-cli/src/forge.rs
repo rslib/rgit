@@ -1,10 +1,10 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::cli::{AuthCmd, ForgeBranchCmd, ForgeCmd, PrCmd, RepoCmd};
+use crate::cli::{AuthCmd, ForgeBranchCmd, ForgeCmd, IssueCmd, PrCmd, RepoCmd};
 use anyhow::{Result, ensure};
 use rgit_forge::{
-    CreatePullRequest, CreateRepository, Forge, ForgeError, ForgeTarget, MergeMethod, Provider,
-    ReviewAction, StackEntry,
+    CreateIssue, CreatePullRequest, CreateRepository, Forge, ForgeError, ForgeTarget, MergeMethod,
+    Provider, ReviewAction, StackEntry,
 };
 use rgit_git::GitBackend;
 use serde::Serialize;
@@ -279,6 +279,7 @@ pub fn run_in(
                 body,
                 body_file,
                 draft,
+                fixes,
             } => {
                 let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
@@ -293,6 +294,17 @@ pub fn run_in(
                             .default_branch
                             .unwrap_or_else(|| "main".to_owned()),
                     };
+                    let mut body = create.body;
+                    if let Some(number) = fixes {
+                        let trailer = match forge.provider() {
+                            Provider::Github => format!("Fixes #{number}"),
+                            Provider::Gitlab => format!("Closes #{number}"),
+                        };
+                        body = Some(match body.filter(|body| !body.trim().is_empty()) {
+                            Some(body) => format!("{body}\n\n{trailer}"),
+                            None => trailer,
+                        });
+                    }
                     print_json(
                         forge
                             .create_pull_request(
@@ -301,7 +313,7 @@ pub fn run_in(
                                     title: create.title,
                                     head: create.head,
                                     base,
-                                    body: create.body,
+                                    body,
                                     draft,
                                 },
                             )
@@ -464,6 +476,175 @@ pub fn run_in(
                             .review_pull_request(&repo, number, action, body.as_deref())
                             .await?,
                     )
+                })
+            }
+        },
+        ForgeCmd::Issue { cmd } => match cmd {
+            IssueCmd::List {
+                target,
+                repo,
+                state,
+                author,
+                label,
+                assignee,
+                page,
+            } => {
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                let state = state.into();
+                with_forge(target, move |forge| async move {
+                    print_json(
+                        forge
+                            .issues(
+                                &repo,
+                                page,
+                                state,
+                                author.as_deref(),
+                                label.as_deref(),
+                                assignee.as_deref(),
+                            )
+                            .await?,
+                    )
+                })
+            }
+            IssueCmd::View {
+                number,
+                target,
+                repo,
+            } => {
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                with_forge(target, move |forge| async move {
+                    print_json(forge.issue(&repo, number).await?)
+                })
+            }
+            IssueCmd::Create {
+                target,
+                repo,
+                title,
+                body,
+                body_file,
+                label,
+                assignee,
+            } => {
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                let body = read_body(body, body_file)?;
+                with_forge(target, move |forge| async move {
+                    print_json(
+                        forge
+                            .create_issue(
+                                &repo,
+                                &CreateIssue {
+                                    title,
+                                    body,
+                                    labels: label,
+                                    assignees: assignee,
+                                },
+                            )
+                            .await?,
+                    )
+                })
+            }
+            IssueCmd::Edit {
+                number,
+                target,
+                repo,
+                title,
+                body,
+                body_file,
+                label,
+                assignee,
+            } => {
+                if title.is_none()
+                    && body.is_none()
+                    && body_file.is_none()
+                    && label.is_empty()
+                    && assignee.is_empty()
+                {
+                    return Err(crate::cli::CliError::usage(
+                        "issue edit needs one of --title, --body, --body-file, --label or --assignee",
+                    ));
+                }
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                let body = read_body(body, body_file)?;
+                with_forge(target, move |forge| async move {
+                    print_json(
+                        forge
+                            .edit_issue(
+                                &repo,
+                                number,
+                                title.as_deref(),
+                                body.as_deref(),
+                                (!label.is_empty()).then_some(label.as_slice()),
+                                (!assignee.is_empty()).then_some(assignee.as_slice()),
+                            )
+                            .await?,
+                    )
+                })
+            }
+            IssueCmd::Close {
+                target,
+                repo,
+                number,
+                yes,
+            } => destructive(yes, "issue", || {
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                with_forge(target, |forge| async move {
+                    print_json(forge.close_issue(&repo, number).await?)
+                })
+            }),
+            IssueCmd::Reopen {
+                number,
+                target,
+                repo,
+            } => {
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                with_forge(target, |forge| async move {
+                    print_json(forge.reopen_issue(&repo, number).await?)
+                })
+            }
+            IssueCmd::Comment {
+                number,
+                target,
+                repo,
+                body,
+                body_file,
+            } => {
+                let body = read_body(body, body_file)?.ok_or_else(|| {
+                    crate::cli::CliError::usage("issue comment needs --body or --body-file")
+                })?;
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                with_forge(target, move |forge| async move {
+                    print_json(forge.comment_issue(&repo, number, &body).await?)
+                })
+            }
+            IssueCmd::Browse {
+                number,
+                target,
+                repo,
+                print: show_url,
+            } => {
+                let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
+                let repo = target.repo()?.clone();
+                with_forge(target, move |forge| async move {
+                    let url = match number {
+                        Some(number) => forge.issue(&repo, number).await?.url,
+                        None => forge.repository(&repo).await?.html_url,
+                    };
+                    if show_url {
+                        Ok(url)
+                    } else {
+                        open::that_detached(&url).map_err(|error| ForgeError::Api {
+                            provider: forge.provider(),
+                            message: error.to_string(),
+                        })?;
+                        Ok(format!("opened {url}"))
+                    }
                 })
             }
         },
@@ -978,9 +1159,66 @@ pub fn human_pull_request_list(items: &serde_json::Value) -> String {
         .join("\n")
 }
 
-/// Compact human text for a forge result: one pull request, its checks, or a
-/// pull request listing (`list_cmd` names the listing command when the result
-/// is paged). `None` keeps the JSON text, for results with no compact form.
+/// Compact human text for one issue object, as `issue view` prints it on a
+/// terminal. The structured TOON and JSON keep the full value.
+pub fn human_issue(value: &serde_json::Value) -> String {
+    let number = value
+        .get("number")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let title = str_field(value, "title").unwrap_or("");
+    let state = str_field(value, "state").unwrap_or("");
+    let mut out = format!("#{number} {title} [{state}]");
+    if let Some(author) = str_field(value, "author") {
+        out.push_str(&format!(" by {author}"));
+    }
+    if let Some(url) = str_field(value, "url") {
+        out.push('\n');
+        out.push_str(url);
+    }
+    if let Some(body) = str_field(value, "body")
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+    {
+        out.push_str("\n\n");
+        out.push_str(body);
+    }
+    let labels = string_list(value, "labels");
+    if !labels.is_empty() {
+        out.push_str(&format!("\nlabels: {}", labels.join(", ")));
+    }
+    let assignees = string_list(value, "assignees");
+    if !assignees.is_empty() {
+        out.push_str(&format!("\nassignees: {}", assignees.join(", ")));
+    }
+    out
+}
+
+/// Compact human text for an issue listing: one line per issue.
+pub fn human_issue_list(items: &serde_json::Value) -> String {
+    let items = items.as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        return "0 open issues".to_owned();
+    }
+    items
+        .iter()
+        .map(|item| {
+            let number = item
+                .get("number")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let title = str_field(item, "title").unwrap_or("");
+            let state = str_field(item, "state").unwrap_or("");
+            format!("#{number} {title} [{state}]")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Compact human text for a forge result: one pull request, its checks, one
+/// issue, or a pull request or issue listing (`list_cmd` names the listing
+/// command when the result is paged). `None` keeps the JSON text, for results
+/// with no compact form.
 pub fn human_forge_text(value: &serde_json::Value, list_cmd: Option<&str>) -> Option<String> {
     match value {
         serde_json::Value::Object(map)
@@ -988,6 +1226,8 @@ pub fn human_forge_text(value: &serde_json::Value, list_cmd: Option<&str>) -> Op
         {
             if list_cmd.is_some_and(|cmd| cmd.contains(" pr list")) {
                 Some(human_pull_request_list(&map["items"]))
+            } else if list_cmd.is_some_and(|cmd| cmd.contains(" issue list")) {
+                Some(human_issue_list(&map["items"]))
             } else {
                 None
             }
@@ -999,6 +1239,11 @@ pub fn human_forge_text(value: &serde_json::Value, list_cmd: Option<&str>) -> Op
             if map.contains_key("number") && map.contains_key("head_branch") =>
         {
             Some(human_pull_request(value))
+        }
+        serde_json::Value::Object(map)
+            if map.contains_key("number") && map.contains_key("assignees") =>
+        {
+            Some(human_issue(value))
         }
         _ => None,
     }
@@ -1285,5 +1530,67 @@ mod tests {
         assert!(super::human_forge_text(&listing, Some("rgit forge branch list")).is_none());
         let repo = serde_json::json!({"name": "repo"});
         assert!(super::human_forge_text(&repo, None).is_none());
+    }
+
+    fn issue_value() -> serde_json::Value {
+        serde_json::json!({
+            "number": 7,
+            "title": "Fix login",
+            "state": "open",
+            "author": random_name("author"),
+            "body": "Details.",
+            "url": "https://github.com/owner/repo/issues/7",
+            "labels": ["bug"],
+            "assignees": [random_name("assignee")]
+        })
+    }
+
+    #[test]
+    fn human_issue_shows_the_issue_at_a_glance() {
+        let issue = issue_value();
+        let author = issue
+            .get("author")
+            .and_then(serde_json::Value::as_str)
+            .expect("author")
+            .to_owned();
+        let text = super::human_issue(&issue);
+        assert!(text.starts_with("#7 Fix login [open]"), "{text}");
+        assert!(text.contains(&format!("by {author}")), "{text}");
+        assert!(
+            text.contains("https://github.com/owner/repo/issues/7"),
+            "{text}"
+        );
+        assert!(text.contains("Details."), "{text}");
+        assert!(text.contains("labels: bug"), "{text}");
+        assert!(text.contains("assignees: "), "{text}");
+    }
+
+    #[test]
+    fn human_issue_list_shows_one_line_per_issue() {
+        let items = serde_json::json!([
+            {"number": 7, "title": "First", "state": "open"},
+            {"number": 8, "title": "Second", "state": "closed"}
+        ]);
+        assert_eq!(
+            super::human_issue_list(&items),
+            "#7 First [open]\n#8 Second [closed]"
+        );
+        let empty = serde_json::json!([]);
+        assert_eq!(super::human_issue_list(&empty), "0 open issues");
+    }
+
+    #[test]
+    fn human_forge_text_picks_the_issue_form_by_shape() {
+        let issue = issue_value();
+        assert!(
+            super::human_forge_text(&issue, None)
+                .expect("issue form")
+                .starts_with("#7 Fix login [open]")
+        );
+        let listing = serde_json::json!({"items": [], "page": 1});
+        assert_eq!(
+            super::human_forge_text(&listing, Some("rgit forge issue list o/r")).as_deref(),
+            Some("0 open issues")
+        );
     }
 }

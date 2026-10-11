@@ -1588,13 +1588,14 @@ fn tools() -> Vec<Tool> {
             "git_forge_pr_create",
             "Open a pull request from `head` (default the current branch) onto `base` (default \
              the trunk). `title` defaults to the head's tip commit subject, `body` to the rest \
-             of its message; `draft` opens it as a draft.",
+             of its message; `draft` opens it as a draft, `fixes` names an issue it closes.",
             &[
                 ("title", "string", false),
                 ("head", "string", false),
                 ("base", "string", false),
                 ("body", "string", false),
                 ("draft", "boolean", false),
+                ("fixes", "integer", false),
                 ("target", "string", false),
             ],
         ),
@@ -5196,6 +5197,7 @@ fn forge_pr_tool(backend: &Arc<dyn GitBackend>, a: &Args) -> anyhow::Result<Outp
                 body: a.str("body"),
                 body_file: None,
                 draft: a.flag("draft"),
+                fixes: a.num("fixes")?,
             },
             "git_forge_pr_comment" => PrCmd::Comment {
                 number: number()?,

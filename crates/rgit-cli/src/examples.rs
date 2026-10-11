@@ -1453,6 +1453,7 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit forge pr create",
             "rgit forge pr create --title \"<title>\" --head <branch> --base main",
+            "rgit forge pr create --fixes 7",
         ],
     ),
     (
@@ -1488,6 +1489,53 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit forge pr review 42 --approve",
             "rgit forge pr review 42 --request-changes --body \"<text>\"",
+        ],
+    ),
+    ("forge issue", &["rgit forge issue list"]),
+    (
+        "forge issue list",
+        &[
+            "rgit forge issue list",
+            "rgit forge issue list owner/repo",
+            "rgit forge issue list --page 2",
+            "rgit forge issue list --state closed --author <login> --label <label> --assignee <login>",
+        ],
+    ),
+    (
+        "forge issue view",
+        &["rgit forge issue view 7", "rgit forge issue view 7 owner/repo"],
+    ),
+    (
+        "forge issue create",
+        &[
+            "rgit forge issue create --title \"<title>\"",
+            "rgit forge issue create --title \"<title>\" --body \"<text>\" --label <label> --assignee <login>",
+        ],
+    ),
+    (
+        "forge issue edit",
+        &[
+            "rgit forge issue edit 7 --title \"<title>\"",
+            "rgit forge issue edit 7 --label <label> --assignee <login>",
+        ],
+    ),
+    (
+        "forge issue close",
+        &[
+            "rgit forge issue close 7 --yes",
+            "rgit forge issue close 7 owner/repo --yes",
+        ],
+    ),
+    ("forge issue reopen", &["rgit forge issue reopen 7"]),
+    (
+        "forge issue comment",
+        &["rgit forge issue comment 7 --body \"<text>\""],
+    ),
+    (
+        "forge issue browse",
+        &[
+            "rgit forge issue browse 7",
+            "rgit forge issue browse 7 owner/repo --print",
         ],
     ),
     ("stack", &["rgit stack"]),
