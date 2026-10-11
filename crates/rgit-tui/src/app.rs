@@ -634,6 +634,7 @@ pub enum Msg {
     Forge,
     ForgeLoaded(Result<ForgeSnapshot, String>),
     ForgeProfileNext,
+    ForgeTabToggle,
     ForgeOpen,
     ForgeClose,
     ForgeMutationDone(Result<String, String>),
@@ -1487,6 +1488,7 @@ pub enum PromptAction {
     /// Rename `pending_move_from` to the path named by the prompt value.
     MoveFile,
     ForgeCreate,
+    ForgeIssueCreate,
     /// Merge with the method the prompt value names.
     ForgeMerge,
 }
@@ -2041,6 +2043,19 @@ pub enum Effect {
         number: u64,
         body: String,
     },
+    ForgeIssueCreate {
+        target: rgit_forge::ForgeTarget,
+        title: String,
+    },
+    ForgeIssueClose {
+        target: rgit_forge::ForgeTarget,
+        number: u64,
+    },
+    ForgeIssueComment {
+        target: rgit_forge::ForgeTarget,
+        number: u64,
+        body: String,
+    },
     ForgeChecks {
         target: rgit_forge::ForgeTarget,
         numbers: Vec<u64>,
@@ -2237,6 +2252,11 @@ pub struct App {
     /// The pull request a pending comment editor writes to, set when `a`
     /// opens the commit editor from the forge view.
     pending_forge_comment: Option<u64>,
+    /// The issue a pending comment editor writes to, set when `a` opens the
+    /// commit editor from the forge issue list.
+    pending_forge_issue_comment: Option<u64>,
+    /// Which list the forge view shows; `i` switches it.
+    forge_tab: crate::forge::ForgeTab,
     forge_open_requested: bool,
     /// When the background forge snapshot was last requested.
     last_remote_fetch: Option<std::time::Instant>,
@@ -2376,6 +2396,8 @@ impl App {
             forge_close_armed: None,
             forge_merge_armed: None,
             pending_forge_comment: None,
+            pending_forge_issue_comment: None,
+            forge_tab: crate::forge::ForgeTab::Requests,
             last_remote_fetch: None,
             forge_open_requested: false,
             snapshot: None,
@@ -2477,10 +2499,11 @@ impl App {
         if matches!(self.cursor_preview_key(), Some(PreviewKey::Forge)) {
             if self.preview_key != Some(PreviewKey::Forge) {
                 self.preview_buf = Buffer::default();
+                let tab = self.forge_tab;
                 let sections = self
                     .forge_snapshot
                     .as_ref()
-                    .map(forge::build_view)
+                    .map(|snapshot| forge::build_view(snapshot, tab))
                     .unwrap_or_else(forge::build_placeholder);
                 self.preview_buf.set_content(sections);
                 self.preview_key = Some(PreviewKey::Forge);
@@ -2921,6 +2944,23 @@ impl App {
             return None;
         };
         Some((snapshot.target.clone(), request.clone()))
+    }
+
+    /// The issue under the cursor with its target, toasting why there is
+    /// none: the forge is not loaded, or the cursor is not on an issue.
+    pub fn forge_issue_at_cursor(
+        &mut self,
+    ) -> Option<(rgit_forge::ForgeTarget, crate::forge::ForgeIssue)> {
+        let Some(snapshot) = self.forge_snapshot.as_ref() else {
+            self.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
+            return None;
+        };
+        let index = self.buffer().cursor().saturating_sub(1);
+        let Some(issue) = snapshot.issues.get(index) else {
+            self.push_toast(ToastKind::Error, "move onto an issue first".to_owned());
+            return None;
+        };
+        Some((snapshot.target.clone(), issue.clone()))
     }
 
     /// Pop the active screen; returns false if already at the status root.
@@ -3501,9 +3541,36 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.push_toast(ToastKind::Success, format!("forge profile: {name}"));
             return vec![Effect::LoadForge];
         }
+        Msg::ForgeTabToggle => {
+            if app.forge_snapshot.is_none() {
+                app.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
+                return vec![];
+            }
+            app.forge_tab = app.forge_tab.toggle();
+            if app.active_kind() == ViewKind::Forge
+                && let Some(snapshot) = app.forge_snapshot.as_ref()
+            {
+                let sections = forge::build_view(snapshot, app.forge_tab);
+                app.buffer_mut().set_content(sections);
+            }
+            return vec![];
+        }
         Msg::ForgeCreate => {
             if app.forge_snapshot.is_none() {
                 app.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
+                return vec![];
+            }
+            if app.forge_tab == crate::forge::ForgeTab::Issues {
+                app.prompt = Some(Prompt {
+                    label: "Create issue (title)".to_owned(),
+                    input: String::new(),
+                    cursor: 0,
+                    candidates: Vec::new(),
+                    values: Vec::new(),
+                    selected: 0,
+                    action: PromptAction::ForgeIssueCreate,
+                    masked: false,
+                });
                 return vec![];
             }
             app.prompt = Some(Prompt {
@@ -3520,6 +3587,26 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::WorktreeMenu => app.transient = Some(Transient::worktree()),
         Msg::ForgeClose => {
+            if app.forge_tab == crate::forge::ForgeTab::Issues {
+                let Some((target, issue)) = app.forge_issue_at_cursor() else {
+                    return vec![];
+                };
+                let confirmed = app.forge_close_armed.take().is_some_and(|(number, armed)| {
+                    number == issue.number && armed.elapsed() <= std::time::Duration::from_secs(10)
+                });
+                if !confirmed {
+                    app.forge_close_armed = Some((issue.number, std::time::Instant::now()));
+                    app.push_toast(
+                        ToastKind::Error,
+                        format!("press x again within 10s to close issue #{}", issue.number),
+                    );
+                    return vec![];
+                }
+                return vec![Effect::ForgeIssueClose {
+                    target,
+                    number: issue.number,
+                }];
+            }
             let Some(snapshot) = app.forge_snapshot.as_ref() else {
                 app.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
                 return vec![];
@@ -3600,6 +3687,14 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }];
         }
         Msg::ForgeComment => {
+            if app.forge_tab == crate::forge::ForgeTab::Issues {
+                let Some((_, issue)) = app.forge_issue_at_cursor() else {
+                    return vec![];
+                };
+                app.pending_forge_issue_comment = Some(issue.number);
+                app.commit_editor = Some(CommitEditor::new(false, ""));
+                return vec![];
+            }
             let Some((_, request)) = app.forge_at_cursor() else {
                 return vec![];
             };
@@ -3623,7 +3718,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             if app.active_kind() == ViewKind::Forge
                 && let Some(snapshot) = app.forge_snapshot.as_ref()
             {
-                let sections = forge::build_view(snapshot);
+                let sections = forge::build_view(snapshot, app.forge_tab);
                 app.buffer_mut().set_content(sections);
             }
             return vec![];
@@ -3656,7 +3751,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::ForgeLoaded(Ok(snapshot)) => {
             let mut buffer = Buffer::default();
-            buffer.set_content(forge::build_view(&snapshot));
+            buffer.set_content(forge::build_view(&snapshot, app.forge_tab));
             let open_view = app.forge_open_requested;
             app.forge_open_requested = false;
             app.forge_snapshot = Some(snapshot);
@@ -3665,8 +3760,11 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             if open_view {
                 app.push_view(ViewKind::Forge, buffer);
             } else if app.active_kind() == ViewKind::Forge {
-                let sections =
-                    forge::build_view(app.forge_snapshot.as_ref().expect("forge snapshot"));
+                let tab = app.forge_tab;
+                let sections = forge::build_view(
+                    app.forge_snapshot.as_ref().expect("forge snapshot"),
+                    tab,
+                );
                 app.buffer_mut().set_content(sections);
             }
             // CI loads lazily after the list: every row on screen when the
@@ -3692,6 +3790,21 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::ForgeDetails => {
+            if app.forge_tab == crate::forge::ForgeTab::Issues {
+                let Some(snapshot) = app.forge_snapshot.as_ref() else {
+                    app.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
+                    return Vec::new();
+                };
+                let index = app.buffer().cursor().saturating_sub(1);
+                let Some(issue) = snapshot.issues.get(index) else {
+                    app.push_toast(ToastKind::Error, "move onto an issue first".to_owned());
+                    return Vec::new();
+                };
+                let mut buffer = Buffer::default();
+                buffer.set_content(forge::build_issue_detail(snapshot, issue));
+                app.push_view(ViewKind::Review, buffer);
+                return Vec::new();
+            }
             let Some(snapshot) = app.forge_snapshot.as_ref() else {
                 app.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
                 return Vec::new();
@@ -3710,6 +3823,20 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             return Vec::new();
         }
         Msg::ForgeOpen => {
+            if app.forge_tab == crate::forge::ForgeTab::Issues {
+                let Some((_, issue)) = app.forge_issue_at_cursor() else {
+                    return Vec::new();
+                };
+                if issue.url.is_empty() {
+                    app.push_toast(
+                        ToastKind::Error,
+                        "this forge did not provide an issue URL".to_owned(),
+                    );
+                } else if let Err(error) = open::that_detached(&issue.url) {
+                    app.push_toast(ToastKind::Error, format!("could not open issue: {error}"));
+                }
+                return Vec::new();
+            }
             let Some(snapshot) = app.forge_snapshot.as_ref() else {
                 app.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
                 return Vec::new();
@@ -4096,11 +4223,33 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::CommitEditorCancel => {
             app.commit_editor = None;
             app.pending_forge_comment = None;
+            app.pending_forge_issue_comment = None;
         }
         Msg::CommitEditorSubmit => {
-            // A comment editor writes to its pull request instead of
-            // committing.
-            if app.pending_forge_comment.is_some() {
+            // A comment editor writes to its pull request or issue instead
+            // of committing.
+            if app.pending_forge_issue_comment.is_some() {
+                let body = app
+                    .commit_editor
+                    .as_ref()
+                    .map(|editor| editor.message())
+                    .unwrap_or_default();
+                if body.is_empty() {
+                    app.push_toast(ToastKind::Error, "empty comment".into());
+                } else if let Some(number) = app.pending_forge_issue_comment.take() {
+                    app.commit_editor = None;
+                    match app.forge_snapshot.as_ref() {
+                        Some(snapshot) => {
+                            return vec![Effect::ForgeIssueComment {
+                                target: snapshot.target.clone(),
+                                number,
+                                body,
+                            }];
+                        }
+                        None => app.push_toast(ToastKind::Error, "forge data is not loaded".into()),
+                    }
+                }
+            } else if app.pending_forge_comment.is_some() {
                 let body = app
                     .commit_editor
                     .as_ref()
@@ -4576,6 +4725,21 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             base: base.to_owned(),
         }];
     }
+    if let PromptAction::ForgeIssueCreate = prompt.action {
+        let title = value.trim();
+        if title.is_empty() {
+            app.error = Some("expected an issue title".into());
+            return Vec::new();
+        }
+        let Some(snapshot) = app.forge_snapshot.as_ref() else {
+            app.error = Some("forge data is not loaded".into());
+            return Vec::new();
+        };
+        return vec![Effect::ForgeIssueCreate {
+            target: snapshot.target.clone(),
+            title: title.to_owned(),
+        }];
+    }
     if let PromptAction::ForgeMerge = prompt.action {
         let method = match value.trim().to_lowercase().as_str() {
             "merge" => rgit_forge::MergeMethod::Merge,
@@ -4831,6 +4995,7 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         | PromptAction::SplitRev
         | PromptAction::Credential
         | PromptAction::ForgeCreate
+        | PromptAction::ForgeIssueCreate
         | PromptAction::ForgeMerge => {
             return Vec::new();
         }
@@ -5930,6 +6095,19 @@ mod tests {
                 forge_request(12, "feature", false),
                 forge_request(13, "other", true),
             ],
+            issues: vec![forge_issue(7)],
+        }
+    }
+
+    fn forge_issue(number: u64) -> crate::forge::ForgeIssue {
+        crate::forge::ForgeIssue {
+            number,
+            title: "Fix login".to_owned(),
+            state: "open".to_owned(),
+            url: format!("https://github.com/o/r/issues/{number}"),
+            body: Some("Details.".to_owned()),
+            labels: vec!["bug".to_owned()],
+            assignees: vec!["dev-2".to_owned()],
         }
     }
 
@@ -6042,6 +6220,7 @@ mod tests {
         let mut buffer = Buffer::default();
         buffer.set_content(crate::forge::build_view(
             app.forge_snapshot.as_ref().expect("snapshot"),
+            crate::forge::ForgeTab::Requests,
         ));
         app.push_view(ViewKind::Forge, buffer);
         app.buffer_mut().set_cursor(2);
@@ -6136,7 +6315,7 @@ mod tests {
             name: "build".to_owned(),
             status: "passing".to_owned(),
         }];
-        let list = section_text(&crate::forge::build_view(&snapshot));
+        let list = section_text(&crate::forge::build_view(&snapshot, crate::forge::ForgeTab::Requests));
         assert!(list.contains("#12"), "{list}");
         assert!(list.contains("passing"), "{list}");
         let detail =
@@ -6144,6 +6323,87 @@ mod tests {
         assert!(detail.contains("Longer story."), "{detail}");
         assert!(detail.contains("dev-2"), "{detail}");
         assert!(detail.contains("build"), "{detail}");
+    }
+
+    #[test]
+    fn forge_tab_toggle_switches_between_requests_and_issues() {
+        let mut app = forge_app();
+        assert_eq!(app.forge_tab, crate::forge::ForgeTab::Requests);
+        let fx = update(&mut app, Msg::ForgeTabToggle);
+        assert!(fx.is_empty());
+        assert_eq!(app.forge_tab, crate::forge::ForgeTab::Issues);
+        let list = section_text(
+            &crate::forge::build_view(
+                app.forge_snapshot.as_ref().expect("snapshot"),
+                app.forge_tab,
+            ),
+        );
+        assert!(list.contains("#7"), "{list}");
+        assert!(!list.contains("#12"), "{list}");
+    }
+
+    #[test]
+    fn forge_issue_close_needs_a_second_press() {
+        let mut app = forge_app();
+        update(&mut app, Msg::ForgeTabToggle);
+        let mut buffer = Buffer::default();
+        buffer.set_content(crate::forge::build_view(
+            app.forge_snapshot.as_ref().expect("snapshot"),
+            app.forge_tab,
+        ));
+        app.push_view(ViewKind::Forge, buffer);
+        app.buffer_mut().set_cursor(1);
+        let fx = update(&mut app, Msg::ForgeClose);
+        assert!(fx.is_empty(), "first press only arms");
+        let fx = update(&mut app, Msg::ForgeClose);
+        assert!(
+            matches!(fx.as_slice(), [Effect::ForgeIssueClose { number: 7, .. }]),
+            "{fx:?}"
+        );
+    }
+
+    #[test]
+    fn forge_issue_comment_uses_the_commit_editor() {
+        let mut app = forge_app();
+        update(&mut app, Msg::ForgeTabToggle);
+        let fx = update(&mut app, Msg::ForgeComment);
+        assert!(fx.is_empty());
+        assert!(app.commit_editor.is_some());
+        assert_eq!(app.pending_forge_issue_comment, Some(7));
+        app.commit_editor
+            .as_mut()
+            .expect("editor")
+            .set_text("working on it");
+        let fx = update(&mut app, Msg::CommitEditorSubmit);
+        assert!(
+            matches!(
+                fx.as_slice(),
+                [Effect::ForgeIssueComment { number: 7, body, .. }] if body == "working on it"
+            ),
+            "{fx:?}"
+        );
+        assert_eq!(app.pending_forge_issue_comment, None);
+    }
+
+    #[test]
+    fn forge_issue_create_prompts_for_a_title() {
+        let mut app = forge_app();
+        update(&mut app, Msg::ForgeTabToggle);
+        update(&mut app, Msg::ForgeCreate);
+        let prompt = app.prompt.as_ref().expect("issue prompt");
+        assert_eq!(prompt.action, PromptAction::ForgeIssueCreate);
+    }
+
+    #[test]
+    fn forge_issue_detail_shows_body_and_labels() {
+        let snapshot = forge_snapshot();
+        let detail = section_text(
+            crate::forge::build_issue_detail(&snapshot, &snapshot.issues[0]).as_slice(),
+        );
+        assert!(detail.contains("Fix login"), "{detail}");
+        assert!(detail.contains("Details."), "{detail}");
+        assert!(detail.contains("bug"), "{detail}");
+        assert!(detail.contains("dev-2"), "{detail}");
     }
 
     #[test]

@@ -32,6 +32,7 @@ fn resolve_forge_key(key: crossterm::event::KeyEvent) -> Option<Msg> {
         KeyCode::Char('g') => Some(Msg::ForgeRefresh),
         KeyCode::Char('R') => Some(Msg::ForgeReadyToggle),
         KeyCode::Char('a') => Some(Msg::ForgeComment),
+        KeyCode::Char('i') => Some(Msg::ForgeTabToggle),
         _ if keymap::profile() == keymap::Profile::Vim => keymap::resolve_vim_key(key),
         _ => resolve_key(key),
     }
@@ -1418,6 +1419,70 @@ async fn run_msg(
                     let _ = msg_tx.send(Msg::ForgeMutationDone(result));
                 });
             }
+            Effect::ForgeIssueCreate { target, title } => {
+                let msg_tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let repo = target.repo().map_err(|error| error.to_string())?.clone();
+                        let provider = target.provider;
+                        let request = rgit_forge::CreateIssue {
+                            title,
+                            body: None,
+                            labels: Vec::new(),
+                            assignees: Vec::new(),
+                        };
+                        rgit_forge::Forge::connect(&target)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .create_issue(&repo, &request)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("created {provider} issue"))
+                    }
+                    .await;
+                    let _ = msg_tx.send(Msg::ForgeMutationDone(result));
+                });
+            }
+            Effect::ForgeIssueClose { target, number } => {
+                let msg_tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let repo = target.repo().map_err(|error| error.to_string())?.clone();
+                        let provider = target.provider;
+                        rgit_forge::Forge::connect(&target)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .close_issue(&repo, number)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("closed {provider} issue #{number}"))
+                    }
+                    .await;
+                    let _ = msg_tx.send(Msg::ForgeMutationDone(result));
+                });
+            }
+            Effect::ForgeIssueComment {
+                target,
+                number,
+                body,
+            } => {
+                let msg_tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let repo = target.repo().map_err(|error| error.to_string())?.clone();
+                        let provider = target.provider;
+                        rgit_forge::Forge::connect(&target)
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .comment_issue(&repo, number, &body)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        Ok(format!("commented on {provider} issue #{number}"))
+                    }
+                    .await;
+                    let _ = msg_tx.send(Msg::ForgeMutationDone(result));
+                });
+            }
             Effect::LoadDiff { from, to } => {
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
@@ -2620,6 +2685,11 @@ mod tests {
         assert!(matches!(
             super::resolve_forge_key(key('x')),
             Some(crate::app::Msg::ForgeClose)
+        ));
+        let tab = KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE);
+        assert!(matches!(
+            super::resolve_forge_key(tab),
+            Some(crate::app::Msg::ForgeTabToggle)
         ));
     }
 

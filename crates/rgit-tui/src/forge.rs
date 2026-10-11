@@ -45,11 +45,50 @@ pub struct PullRequestCi {
     pub checks: Vec<ForgeCheck>,
 }
 
-/// The loaded forge state: the account and repository, plus its open requests.
+/// One issue on the forge, normalized across providers.
+#[derive(Debug, Clone)]
+pub struct ForgeIssue {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    pub url: String,
+    pub body: Option<String>,
+    pub labels: Vec<String>,
+    pub assignees: Vec<String>,
+}
+
+/// Which list the forge view shows: pull requests or issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ForgeTab {
+    #[default]
+    Requests,
+    Issues,
+}
+
+impl ForgeTab {
+    /// The other list.
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Requests => Self::Issues,
+            Self::Issues => Self::Requests,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Requests => "pull requests",
+            Self::Issues => "issues",
+        }
+    }
+}
+
+/// The loaded forge state: the account and repository, plus its open requests
+/// and issues.
 #[derive(Debug, Clone)]
 pub struct ForgeSnapshot {
     pub target: ForgeTarget,
     pub requests: Vec<PullRequest>,
+    pub issues: Vec<ForgeIssue>,
 }
 
 pub async fn load(
@@ -95,7 +134,37 @@ pub async fn load(
             check_list: Vec::new(),
         })
         .collect();
-    Ok(ForgeSnapshot { target, requests })
+    let issues = forge
+        .issues(
+            target.repo().expect("remote names a repository"),
+            1,
+            rgit_forge::IssueState::Open,
+            None,
+            None,
+            None,
+        )
+        .await
+        .map(|listing| {
+            listing
+                .items
+                .into_iter()
+                .map(|issue| ForgeIssue {
+                    number: issue.number,
+                    title: issue.title,
+                    state: issue.state,
+                    url: issue.url,
+                    body: issue.body,
+                    labels: issue.labels,
+                    assignees: issue.assignees,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(ForgeSnapshot {
+        target,
+        requests,
+        issues,
+    })
 }
 
 /// Ensure a pull request per pushed `(branch, base)` pair against the origin
@@ -221,49 +290,84 @@ fn repository(target: &ForgeTarget) -> String {
         .unwrap_or_default()
 }
 
-/// Render the forge context and pull-request list as view content.
-pub fn build_view(snapshot: &ForgeSnapshot) -> Vec<Section> {
+/// Render the forge context and the active list as view content: pull
+/// requests or issues, one row per item (`i` switches the list).
+pub fn build_view(snapshot: &ForgeSnapshot, tab: ForgeTab) -> Vec<Section> {
     let mut sections = vec![Section::leaf(
         "forge/context",
         NodeKind::DiffLine,
         vec![Span::new(
             format!(
-                "{} {} ({}) \u{b7} account {}",
+                "{} {} ({}) \u{b7} account {} \u{b7} {} (i to switch)",
                 snapshot.target.provider,
                 repository(&snapshot.target),
                 snapshot.target.host,
-                snapshot.target.account
+                snapshot.target.account,
+                tab.name(),
             ),
             Style::Dim,
         )],
     )];
-    if snapshot.requests.is_empty() {
-        sections.push(Section::leaf(
-            "forge/empty",
-            NodeKind::DiffLine,
-            vec![Span::new("no open pull requests".to_owned(), Style::Dim)],
-        ));
-        return sections;
-    }
-    sections.extend(snapshot.requests.iter().map(|pr| {
-        let state_style = if pr.state.eq_ignore_ascii_case("open") {
-            Style::Added
-        } else {
-            Style::Dim
-        };
-        let mut spans = vec![
-            Span::new(format!("#{:<5}", pr.number), Style::Hash),
-            Span::new(format!(" {} ", pr.state), state_style),
-        ];
-        if let Some(checks) = &pr.checks {
-            let (sym, style) = check_mark(checks);
-            spans.push(Span::new(format!(" {sym} {checks} "), style));
+    match tab {
+        ForgeTab::Requests => {
+            if snapshot.requests.is_empty() {
+                sections.push(Section::leaf(
+                    "forge/empty",
+                    NodeKind::DiffLine,
+                    vec![Span::new("no open pull requests".to_owned(), Style::Dim)],
+                ));
+                return sections;
+            }
+            sections.extend(snapshot.requests.iter().map(|pr| {
+                let state_style = if pr.state.eq_ignore_ascii_case("open") {
+                    Style::Added
+                } else {
+                    Style::Dim
+                };
+                let mut spans = vec![
+                    Span::new(format!("#{:<5}", pr.number), Style::Hash),
+                    Span::new(format!(" {} ", pr.state), state_style),
+                ];
+                if let Some(checks) = &pr.checks {
+                    let (sym, style) = check_mark(checks);
+                    spans.push(Span::new(format!(" {sym} {checks} "), style));
+                }
+                spans.push(Span::plain(format!(" {}", pr.title)));
+                spans.push(Span::new(format!("  {}", pr.branch), Style::Branch));
+                Section::leaf(format!("forge/{}", pr.number), NodeKind::Commit, spans)
+            }));
+            sections
         }
-        spans.push(Span::plain(format!(" {}", pr.title)));
-        spans.push(Span::new(format!("  {}", pr.branch), Style::Branch));
-        Section::leaf(format!("forge/{}", pr.number), NodeKind::Commit, spans)
-    }));
-    sections
+        ForgeTab::Issues => {
+            if snapshot.issues.is_empty() {
+                sections.push(Section::leaf(
+                    "forge/empty",
+                    NodeKind::DiffLine,
+                    vec![Span::new("no open issues".to_owned(), Style::Dim)],
+                ));
+                return sections;
+            }
+            sections.extend(snapshot.issues.iter().map(|issue| {
+                let state_style = if issue.state.eq_ignore_ascii_case("open")
+                    || issue.state.eq_ignore_ascii_case("opened")
+                {
+                    Style::Added
+                } else {
+                    Style::Dim
+                };
+                Section::leaf(
+                    format!("forge/issue/{}", issue.number),
+                    NodeKind::Commit,
+                    vec![
+                        Span::new(format!("#{:<5}", issue.number), Style::Hash),
+                        Span::new(format!(" {} ", issue.state), state_style),
+                        Span::plain(format!(" {}", issue.title)),
+                    ],
+                )
+            }));
+            sections
+        }
+    }
 }
 
 pub fn build_placeholder() -> Vec<Section> {
@@ -358,6 +462,74 @@ pub fn build_detail(snapshot: &ForgeSnapshot, request: &PullRequest) -> Vec<Sect
                     Span::new(format!("{sym} "), style),
                     Span::plain(check.name.clone()),
                 ],
+            ));
+        }
+    }
+    sections
+}
+
+/// Render the selected issue for inspection: its metadata, body and labels.
+pub fn build_issue_detail(snapshot: &ForgeSnapshot, issue: &ForgeIssue) -> Vec<Section> {
+    let row = |id: &str, label: &str, value: String| {
+        Section::leaf(
+            id,
+            NodeKind::Info,
+            vec![
+                Span::new(format!("{label}: "), Style::Dim),
+                Span::plain(value),
+            ],
+        )
+    };
+    let mut sections = vec![
+        Section::leaf(
+            "forge/detail/title",
+            NodeKind::Section,
+            vec![Span::new(issue.title.clone(), Style::SectionHeader)],
+        ),
+        row(
+            "forge/detail/context",
+            "Forge",
+            format!(
+                "{} \u{b7} {} \u{b7} account {}",
+                snapshot.target.provider, snapshot.target.host, snapshot.target.account
+            ),
+        ),
+        row(
+            "forge/detail/repository",
+            "Repository",
+            repository(&snapshot.target),
+        ),
+        row("forge/detail/state", "State", issue.state.clone()),
+        row("forge/detail/url", "URL", issue.url.clone()),
+    ];
+    let labels = if issue.labels.is_empty() {
+        "none".to_owned()
+    } else {
+        issue.labels.join(", ")
+    };
+    sections.push(row("forge/detail/labels", "Labels", labels));
+    let assignees = if issue.assignees.is_empty() {
+        "none".to_owned()
+    } else {
+        issue.assignees.join(", ")
+    };
+    sections.push(row("forge/detail/assignees", "Assignees", assignees));
+    if let Some(body) = issue
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+    {
+        sections.push(Section::leaf(
+            "forge/detail/body",
+            NodeKind::Info,
+            vec![Span::new("Body:", Style::Dim)],
+        ));
+        for (i, line) in body.lines().enumerate() {
+            sections.push(Section::leaf(
+                format!("forge/detail/body/{i}"),
+                NodeKind::Info,
+                vec![Span::plain(line)],
             ));
         }
     }
