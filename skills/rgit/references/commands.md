@@ -337,14 +337,14 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `submodule set-url`: Change a submodule's URL in .gitmodules and sync it. e.g. `rgit submodule set-url vendor/lib https://github.com/fork/lib.git`
   - `submodule set-branch`: Set (or with -d, clear) the branch `update --remote` follows. e.g. `rgit submodule set-branch -b main vendor/lib`, `rgit submodule set-branch -d vendor/lib`
   - `submodule absorbgitdirs`: Move submodules' repositories into the superproject's .git/modules. e.g. `rgit submodule absorbgitdirs`
-- `git`: Escape hatch: run any `git` subcommand and print its output. e.g. `rgit git status`, `rgit git log --oneline -5`
+- `git`: Run a git subcommand that rgit does not have, such as `lfs` or `filter-repo`. rgit takes git's own commands and flags directly. e.g. `rgit git lfs pull`, `rgit git filter-repo --path src`
 
 ## Agent integration and servers
 
 - `agent`: Set agent apps (Claude Code, Codex, OpenCode, pi, omp) up for rgit. e.g. `rgit agent install`, `rgit agent status`
-  - `agent install`: Install or repair the rgit skill and session hook in agent apps (the ones found on this machine by default); with --mcp also rgit's MCP tools (for pi and omp, as native tools). e.g. `rgit agent install`, `rgit agent install claude codex --mcp`, `rgit agent install --project codex opencode`
-  - `agent status`: Show each app's plugin or extension, skill, hook and MCP state. e.g. `rgit agent status`
-  - `agent uninstall`: Remove what `rgit agent install` added (from every app by default). e.g. `rgit agent uninstall codex`, `rgit agent uninstall --mcp-only`
+  - `agent install`: Install or repair the rgit skill, session hook and tools in agent apps (the ones found on this machine by default). e.g. `rgit agent install`, `rgit agent install --all-tools codex`, `rgit agent install --project codex opencode`
+  - `agent status`: Show each app's plugin or extension, skill, hook and tools state. e.g. `rgit agent status`
+  - `agent uninstall`: Remove what `rgit agent install` added (from every app by default). e.g. `rgit agent uninstall codex`, `rgit agent uninstall --tools-only`
   - `agent skill`: Print the rgit SKILL.md, or its command reference. e.g. `rgit agent skill`, `rgit agent skill --reference`
 - `mcp`: Run the Model Context Protocol server over stdio. e.g. `rgit mcp`
 - `tool`: Run one MCP tool with its arguments as a JSON object on stdin and print its TOON result, as the pi and omp extension does. e.g. `echo '{}' | rgit tool git_status`, `echo '{"limit": 5}' | rgit tool git_log`

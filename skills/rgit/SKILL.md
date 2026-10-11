@@ -1,11 +1,11 @@
 ---
 name: rgit
-description: Use for any git work in this repository - inspecting changes, committing, rewriting or undoing history, branches and stacks, and GitHub/GitLab PRs.
+description: Load before you run any git command or answer a git question in this repository, even a quick status, diff, log, add or commit. rgit replaces git for inspecting changes, staging, committing, rewriting or undoing history, branches and stacks, and GitHub/GitLab PRs.
 ---
 
 # rgit
 
-Inspect and change the git repository in the current directory. Prefer `rgit` over raw `git`. Always pass `--toon` (alias `--axi`) or `--json`: without them rgit prints git's human text. Run `rgit --toon` with no other arguments first: it prints the repo's current state and the next useful commands.
+Inspect and change the git repository in the current directory. Type `rgit` wherever you would type `git`. rgit takes git's commands and flags and prints git's text, so `git status --short` becomes `rgit status --short` and `git rev-parse HEAD` becomes `rgit rev-parse HEAD`. Do not run `git` or `rgit git` for a command rgit has. Always pass `--toon` (alias `--axi`) or `--json`: without them rgit prints git's human text. Run `rgit --toon` with no other arguments first: it prints the repo's current state and the next useful commands.
 
 If `rgit` is not on PATH, install it with `cargo install --locked --git https://github.com/rslib/rgit rgit-cli`.
 
@@ -31,7 +31,7 @@ If `rgit` is not on PATH, install it with `cargo install --locked --git https://
 - Almost every change is recorded in the op-log. `rgit undo` restores HEAD and the working tree (including uncommitted work) from before the last operation; `rgit redo` reverses it; `rgit oplog` lists it.
 - Repeating a change whose result already holds is a no-op (exit 0), for example creating an existing branch or deleting a missing tag.
 - Destructive forge operations require `--yes`.
-- For git plumbing rgit does not wrap, use `rgit git <args>`.
+- rgit runs git's plumbing too (`rgit rev-parse`, `rgit ls-files`, `rgit cat-file`, `rgit for-each-ref`). Use `rgit git <args>` only for a git tool that rgit does not have, such as `git lfs`.
 
 ## Git spellings
 

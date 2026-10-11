@@ -249,10 +249,7 @@ fn install_sets_up_detected_apps_once() {
     );
     assert!(ext.contains("const TOOLS_JSON: string = \"[{"));
     assert!(ext.contains("git_status"));
-    assert!(
-        !ext.contains("git_push"),
-        "the core set only"
-    );
+    assert!(!ext.contains("git_push"), "the core set only");
     for absent in [".omp", ".claude/skills", ".claude/settings.json"] {
         assert!(!env.exists(absent), "{absent} written");
     }
@@ -316,9 +313,10 @@ fn install_tools_everywhere_and_keep_them() {
         "{register}"
     );
     assert!(register.contains("git_status"), "all tools registered");
-    let hooks: Value =
-        serde_json::from_str(&std::fs::read_to_string(env.plugin().join("hooks/hooks.json")).unwrap())
-            .unwrap();
+    let hooks: Value = serde_json::from_str(
+        &std::fs::read_to_string(env.plugin().join("hooks/hooks.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(hooks["modules"], json!(["./register.tsx"]));
     assert_eq!(
         hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"],
@@ -488,9 +486,7 @@ fn install_migrates_old_files_repairs_and_keeps_the_rest() {
     );
     assert_eq!(status["pi user"][0], "stale");
 
-    let out = env.ok(&[
-        "agent", "install", "claude", "codex", "opencode", "pi",
-    ]);
+    let out = env.ok(&["agent", "install", "claude", "codex", "opencode", "pi"]);
     assert!(out.contains("written"), "{out}");
 
     assert!(
@@ -762,9 +758,10 @@ fn extension_drives_rgit() {
     // Inside the package, so `import "typebox"` resolves as pi and omp resolve it.
     let generated = package.join(".test");
     std::fs::create_dir_all(&generated).unwrap();
-    for (harness, flags, mode) in
-        [("pi", &[][..] as &[&str], "mcp"), ("omp", &[][..], "native")]
-    {
+    for (harness, flags, mode) in [
+        ("pi", &[][..] as &[&str], "mcp"),
+        ("omp", &[][..], "native"),
+    ] {
         let env = Env::new(&format!("ext-{harness}"), &[]);
         let mut args = vec!["agent", "install", harness];
         args.extend(flags);

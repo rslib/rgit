@@ -27,8 +27,8 @@ OpenCode, pi, omp) with both:
 
 1. **Session hook.** Each session starts with the repo's live state.
 2. **Agent Skill.** rgit's usage guide, loaded when a task needs it.
+3. **Tools.** rgit's operations as the agent's own tools.
 
-Add `--mcp` for rgit's MCP tools too. `rgit agent status` shows what each app
-has.
+`rgit agent status` shows what each app has.
 
 See [docs/agent-integration.md](docs/agent-integration.md) for details.

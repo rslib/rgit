@@ -5826,10 +5826,7 @@ mod tests {
             assert!(names.contains(name), "{name} is listed");
         }
         for t in tools() {
-            let hint = t
-                .annotations
-                .as_ref()
-                .and_then(|a| a.read_only_hint);
+            let hint = t.annotations.as_ref().and_then(|a| a.read_only_hint);
             assert_eq!(hint, Some(is_read_only(&t.name)), "{}", t.name);
         }
         let core = core_definitions();

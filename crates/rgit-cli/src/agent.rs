@@ -623,7 +623,8 @@ fn uninstall(apps: &[App], project: bool, only: Option<Parts>) -> Result<Output>
             None => Parts::NONE,
             Some(drop) => {
                 let have = current_parts(&place, &bin);
-                if !(have.skill && drop.skill || have.hook && drop.hook || have.tools && drop.tools) {
+                if !(have.skill && drop.skill || have.hook && drop.hook || have.tools && drop.tools)
+                {
                     continue;
                 }
                 Parts {
@@ -755,9 +756,8 @@ fn part_states(place: &Place, bin: &str) -> [&'static str; 3] {
             // it belongs to the tools part.
             let hook = match std::fs::read_to_string(dir.join("hooks/hooks.json")) {
                 Ok(text) => {
-                    let command: Option<String> = serde_json::from_str(&text)
-                        .ok()
-                        .and_then(|v: Value| {
+                    let command: Option<String> =
+                        serde_json::from_str(&text).ok().and_then(|v: Value| {
                             v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
                                 .as_str()
                                 .map(str::to_owned)
@@ -1086,7 +1086,10 @@ fn plugin_files(bin: &str, parts: Parts) -> (Vec<(String, String)>, String) {
         ));
     }
     if parts.tools {
-        files.push(("plugins/rgit/hooks/register.tsx".into(), claude_register(bin)));
+        files.push((
+            "plugins/rgit/hooks/register.tsx".into(),
+            claude_register(bin),
+        ));
     }
     let mut h = Sha256::new();
     for (path, text) in &files {
@@ -1502,7 +1505,9 @@ fn add_mcp_toml(path: &Path, bin: &str, all_tools: bool) -> Result<bool> {
     server.insert("command", toml_edit::value(bin));
     server.insert(
         "args",
-        toml_edit::value(toml_edit::Array::from_iter(mcp_args(all_tools).iter().copied())),
+        toml_edit::value(toml_edit::Array::from_iter(
+            mcp_args(all_tools).iter().copied(),
+        )),
     );
     write_toml(path, &doc)?;
     Ok(true)
