@@ -26,7 +26,8 @@ pub use types::{
     CredentialIdentity, EnsureOutcome, EnsuredPullRequest, Issue, IssueState, Listing, MergeMethod,
     PAGE_SIZE, Provider, PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview,
     PullRequestState, RepoRef, Repository, ReviewAction, STACK_END, STACK_START, StackEntry,
-    StoredCredential, User, fill_from_commit, render_stack_block, upsert_stack_block,
+    StoredCredential, User, branches_above, fill_from_commit, render_stack_block,
+    upsert_stack_block,
 };
 
 /// An error from a forge operation. Every variant names the forge it came from
@@ -278,12 +279,16 @@ impl Forge {
 
     /// Ensure a pull request per stack entry, filling each title and body from
     /// the entry's tip commit message the way `gh pr create --fill` does,
-    /// then write the stack table into each body. Returns one `opened` or
-    /// `updated` line per entry, for submit reports.
+    /// then write the stack table into each body. `above` names the stack
+    /// branches above the entries: their open pull requests join the table
+    /// and get it too, so a submit from the middle of a stack keeps the whole
+    /// stack listed. Returns one `opened` or `updated` line per entry, for
+    /// submit reports.
     pub async fn ensure_pull_requests(
         &self,
         repo: &RepoRef,
         entries: &[StackEntry],
+        above: &[String],
     ) -> Result<Vec<String>, ForgeError> {
         let mut ensured = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -300,23 +305,31 @@ impl Forge {
                 .await?;
             ensured.push(one);
         }
-        let table: Vec<(u64, String)> = ensured
+        let mut stacked: Vec<&PullRequest> = ensured.iter().map(|one| &one.pull_request).collect();
+        let mut upper = Vec::new();
+        for branch in above {
+            if let Some(pr) = self.pull_request_for_branch(repo, branch).await?
+                && !pr.merged
+                && matches!(pr.state.as_str(), "open" | "opened")
+            {
+                upper.push(pr);
+            }
+        }
+        stacked.extend(upper.iter());
+        let table: Vec<(u64, String)> = stacked
             .iter()
-            .map(|one| {
-                (
-                    one.pull_request.number,
-                    one.pull_request.head_branch.clone(),
-                )
-            })
+            .map(|pr| (pr.number, pr.head_branch.clone()))
             .collect();
-        let mut lines = Vec::with_capacity(entries.len());
-        for (entry, one) in entries.iter().zip(ensured.iter()) {
-            if table.len() >= 2 {
-                let block = render_stack_block(&table, one.pull_request.number);
-                let body = upsert_stack_block(one.pull_request.body.as_deref(), &block);
-                self.edit_pull_request(repo, one.pull_request.number, None, Some(&body), None)
+        if table.len() >= 2 {
+            for pr in &stacked {
+                let block = render_stack_block(&table, pr.number);
+                let body = upsert_stack_block(pr.body.as_deref(), &block);
+                self.edit_pull_request(repo, pr.number, None, Some(&body), None)
                     .await?;
             }
+        }
+        let mut lines = Vec::with_capacity(entries.len());
+        for (entry, one) in entries.iter().zip(ensured.iter()) {
             let word = match one.outcome {
                 EnsureOutcome::Created => "opened",
                 EnsureOutcome::Updated { .. } => "updated",

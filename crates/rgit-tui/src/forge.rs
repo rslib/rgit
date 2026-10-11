@@ -189,6 +189,13 @@ pub fn submit_pull_requests(
         .flatten()
         .ok_or_else(|| "no origin remote is configured".to_owned())?;
     let selection = selection.resolve().map_err(|error| error.to_string())?;
+    let above = match pairs.last() {
+        Some((top, _)) => rgit_forge::branches_above(
+            &backend.stack_parents().map_err(|error| error.to_string())?,
+            top,
+        ),
+        None => Vec::new(),
+    };
     let mut entries = Vec::with_capacity(pairs.len());
     for (branch, base) in pairs {
         let message = backend
@@ -208,7 +215,7 @@ pub fn submit_pull_requests(
             .await
             .map_err(|error| forge_error(&target, error))?;
         forge
-            .ensure_pull_requests(&repo, &entries)
+            .ensure_pull_requests(&repo, &entries, &above)
             .await
             .map_err(|error| forge_error(&target, error))
     })

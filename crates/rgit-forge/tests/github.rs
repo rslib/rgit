@@ -171,6 +171,7 @@ async fn ensure_pull_requests_reports_one_word_per_branch() {
                 base: "main".to_owned(),
                 message: "Add a thing\n\nIn detail.".to_owned(),
             }],
+            &[],
         )
         .await
         .expect("lines");
@@ -236,10 +237,61 @@ async fn ensure_pull_requests_marks_each_body_with_its_own_row() {
                     message: "Second\n".to_owned(),
                 },
             ],
+            &[],
         )
         .await
         .expect("lines");
     assert_eq!(lines.len(), 2);
+}
+
+#[tokio::test]
+async fn ensure_pull_requests_lists_open_pull_requests_above_the_entries() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls"))
+        .and(query_param("head", "owner:feat-b"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([pr_json(13, "feat-b", "feat-a")])),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(pr_json(12, "feat-a", "main")))
+        .mount(&server)
+        .await;
+    for (number, other) in [(12, "- #13 feat-b"), (13, "- #12 feat-a")] {
+        Mock::given(method("PATCH"))
+            .and(path(format!("/repos/owner/repo/pulls/{number}")))
+            .and(body_string_contains(other))
+            .respond_with(ResponseTemplate::new(200).set_body_json(pr_json(number, "x", "main")))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let lines = forge(&server)
+        .ensure_pull_requests(
+            &repo(),
+            &[rgit_forge::StackEntry {
+                branch: "feat-a".to_owned(),
+                base: "main".to_owned(),
+                message: "First\n".to_owned(),
+            }],
+            &["feat-b".to_owned()],
+        )
+        .await
+        .expect("lines");
+    assert_eq!(
+        lines,
+        vec!["opened https://github.com/owner/repo/pull/12 (feat-a)"]
+    );
 }
 
 #[tokio::test]

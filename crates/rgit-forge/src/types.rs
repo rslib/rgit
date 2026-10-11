@@ -399,6 +399,22 @@ pub fn render_stack_block(entries: &[(u64, String)], current: u64) -> String {
     out
 }
 
+/// The stack branches above `branch`, nearest first, from `(branch, parent)`
+/// pairs.
+pub fn branches_above(parents: &[(String, Option<String>)], branch: &str) -> Vec<String> {
+    let mut above: Vec<String> = Vec::new();
+    let mut queue = std::collections::VecDeque::from([branch.to_owned()]);
+    while let Some(cur) = queue.pop_front() {
+        for (child, parent) in parents {
+            if parent.as_deref() == Some(cur.as_str()) && !above.contains(child) {
+                above.push(child.clone());
+                queue.push_back(child.clone());
+            }
+        }
+    }
+    above
+}
+
 /// The body `body` carries with the stack `block` in it: a well-formed marked
 /// section (the first end marker and the last start marker before it) is
 /// replaced, else the block is appended after a blank line. Without such a
@@ -597,6 +613,19 @@ mod tests {
         let body = format!("A\n{STACK_END}\nB\n{STACK_START}\nC");
         let out = upsert_stack_block(Some(&body), &block);
         assert_eq!(out, format!("A\nB\nC\n\n{block}"));
+    }
+
+    #[test]
+    fn lists_stack_branches_above_nearest_first() {
+        let pair = |b: &str, p: Option<&str>| (b.to_owned(), p.map(str::to_owned));
+        let parents = [
+            pair("c", Some("b")),
+            pair("a", Some("main")),
+            pair("b", Some("a")),
+            pair("other", None),
+        ];
+        assert_eq!(branches_above(&parents, "a"), ["b", "c"]);
+        assert!(branches_above(&parents, "c").is_empty());
     }
 
     #[test]

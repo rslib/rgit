@@ -688,6 +688,10 @@ pub fn ensure_pull_requests(
     let selection = ForgeSelection::default().resolve()?;
     let target = ForgeTarget::from_remote(&selection, &origin)?;
     let repo = target.repo()?.clone();
+    let above = match pairs.last() {
+        Some((top, _)) => rgit_forge::branches_above(&backend.stack_parents()?, top),
+        None => Vec::new(),
+    };
     let mut entries = Vec::with_capacity(pairs.len());
     for (branch, base) in pairs {
         entries.push(StackEntry {
@@ -701,7 +705,7 @@ pub fn ensure_pull_requests(
         .build()?;
     runtime.block_on(async {
         let forge = Forge::connect(&target).await?;
-        let lines = forge.ensure_pull_requests(&repo, &entries).await?;
+        let lines = forge.ensure_pull_requests(&repo, &entries, &above).await?;
         Ok(lines.join("\n"))
     })
 }
