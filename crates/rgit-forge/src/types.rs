@@ -371,6 +371,46 @@ pub struct EnsuredPullRequest {
     pub outcome: EnsureOutcome,
 }
 
+/// Markers around the stack table `rgit submit` writes into each pull
+/// request body. Text outside the markers is never touched.
+pub const STACK_START: &str = "<!-- rgit-stack -->";
+pub const STACK_END: &str = "<!-- /rgit-stack -->";
+
+/// The stack table for pull request `current`: one `- #number branch` row
+/// per stacked request, in stack order, with the current row marked.
+pub fn render_stack_block(entries: &[(u64, String)], current: u64) -> String {
+    let mut out = String::from(STACK_START);
+    for (number, branch) in entries {
+        out.push_str(&format!("\n- #{number} {branch}"));
+        if *number == current {
+            out.push_str("  <- this PR");
+        }
+    }
+    out.push_str(&format!("\n{STACK_END}"));
+    out
+}
+
+/// The body `body` carries with the stack `block` in it: the marked section
+/// is replaced when present, else the block is appended after a blank line.
+/// Text outside the markers is left alone.
+pub fn upsert_stack_block(body: Option<&str>, block: &str) -> String {
+    let body = body.unwrap_or("");
+    match (body.find(STACK_START), body.find(STACK_END)) {
+        (Some(start), Some(end)) if start < end => {
+            let end = end + STACK_END.len();
+            format!("{}{block}{}", &body[..start], &body[end..])
+        }
+        _ => {
+            let trimmed = body.trim_end();
+            if trimmed.is_empty() {
+                block.to_owned()
+            } else {
+                format!("{trimmed}\n\n{block}")
+            }
+        }
+    }
+}
+
 /// One branch to ensure a pull request for: its head branch, base branch and
 /// the tip commit message that fills the title and body.
 #[derive(Debug, Clone)]
@@ -451,6 +491,42 @@ pub struct CredentialIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stack_block_marks_the_current_request() {
+        let entries = vec![
+            (12, "feat-a".to_owned()),
+            (13, "feat-b".to_owned()),
+        ];
+        assert_eq!(
+            render_stack_block(&entries, 13),
+            "<!-- rgit-stack -->\n- #12 feat-a\n- #13 feat-b  <- this PR\n<!-- /rgit-stack -->"
+        );
+    }
+
+    #[test]
+    fn stack_block_appends_when_missing() {
+        let block = render_stack_block(&[(12, "feat-a".to_owned())], 12);
+        assert_eq!(upsert_stack_block(None, &block), block);
+        assert_eq!(
+            upsert_stack_block(Some("Longer story."), &block),
+            format!("Longer story.\n\n{block}")
+        );
+    }
+
+    #[test]
+    fn stack_block_replaces_without_touching_outside_text() {
+        let old = render_stack_block(&[(12, "feat-a".to_owned())], 12);
+        let new = render_stack_block(
+            &[(12, "feat-a".to_owned()), (13, "feat-b".to_owned())],
+            12,
+        );
+        let body = format!("Intro.\n\n{old}\n\nOutro.");
+        assert_eq!(
+            upsert_stack_block(Some(&body), &new),
+            format!("Intro.\n\n{new}\n\nOutro.")
+        );
+    }
 
     #[test]
     fn parses_repository_reference() {

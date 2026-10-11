@@ -26,6 +26,7 @@ pub use types::{
     EnsureOutcome, EnsuredPullRequest, Listing, MergeMethod, PAGE_SIZE, Provider, PullRequest,
     PullRequestChecks, PullRequestComment, PullRequestReview, PullRequestState, RepoRef,
     Repository, ReviewAction, StackEntry, StoredCredential, User, fill_from_commit,
+    render_stack_block, upsert_stack_block, STACK_END, STACK_START,
 };
 
 /// An error from a forge operation. Every variant names the forge it came from
@@ -276,17 +277,18 @@ impl Forge {
     }
 
     /// Ensure a pull request per stack entry, filling each title and body from
-    /// the entry's tip commit message the way `gh pr create --fill` does.
-    /// Returns one `opened` or `updated` line per entry, for submit reports.
+    /// the entry's tip commit message the way `gh pr create --fill` does,
+    /// then write the stack table into each body. Returns one `opened` or
+    /// `updated` line per entry, for submit reports.
     pub async fn ensure_pull_requests(
         &self,
         repo: &RepoRef,
         entries: &[StackEntry],
     ) -> Result<Vec<String>, ForgeError> {
-        let mut lines = Vec::with_capacity(entries.len());
+        let mut ensured = Vec::with_capacity(entries.len());
         for entry in entries {
             let (title, body) = fill_from_commit(&entry.message);
-            let ensured = self
+            let one = self
                 .ensure_pull_request(
                     repo,
                     &entry.branch,
@@ -296,13 +298,30 @@ impl Forge {
                     false,
                 )
                 .await?;
-            let word = match ensured.outcome {
+            ensured.push(one);
+        }
+        let table: Vec<(u64, String)> = ensured
+            .iter()
+            .map(|one| {
+                (
+                    one.pull_request.number,
+                    one.pull_request.head_branch.clone(),
+                )
+            })
+            .collect();
+        let mut lines = Vec::with_capacity(entries.len());
+        for (entry, one) in entries.iter().zip(ensured.iter()) {
+            let block = render_stack_block(&table, one.pull_request.number);
+            let body = upsert_stack_block(one.pull_request.body.as_deref(), &block);
+            self.edit_pull_request(repo, one.pull_request.number, None, Some(&body), None)
+                .await?;
+            let word = match one.outcome {
                 EnsureOutcome::Created => "opened",
                 EnsureOutcome::Updated { .. } => "updated",
             };
             lines.push(format!(
                 "{word} {} ({})",
-                ensured.pull_request.html_url, entry.branch
+                one.pull_request.html_url, entry.branch
             ));
         }
         Ok(lines)

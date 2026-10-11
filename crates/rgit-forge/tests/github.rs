@@ -162,6 +162,12 @@ async fn ensure_pull_requests_reports_one_word_per_branch() {
         .respond_with(ResponseTemplate::new(201).set_body_json(pr_json(12, "feat-a", "main")))
         .mount(&server)
         .await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/pulls/12"))
+        .and(body_string_contains("rgit-stack"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pr_json(12, "feat-a", "main")))
+        .mount(&server)
+        .await;
 
     let lines = forge(&server)
         .ensure_pull_requests(
@@ -178,6 +184,60 @@ async fn ensure_pull_requests_reports_one_word_per_branch() {
         lines,
         vec!["opened https://github.com/owner/repo/pull/12 (feat-a)"]
     );
+}
+
+#[tokio::test]
+async fn ensure_pull_requests_marks_each_body_with_its_own_row() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls"))
+        .and(body_string_contains("\"head\":\"feat-a\""))
+        .respond_with(ResponseTemplate::new(201).set_body_json(pr_json(12, "feat-a", "main")))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls"))
+        .and(body_string_contains("\"head\":\"feat-b\""))
+        .respond_with(ResponseTemplate::new(201).set_body_json(pr_json(13, "feat-b", "main")))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/pulls/12"))
+        .and(body_string_contains("- #13 feat-b"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pr_json(12, "feat-a", "main")))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/pulls/13"))
+        .and(body_string_contains("- #12 feat-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(pr_json(13, "feat-b", "main")))
+        .mount(&server)
+        .await;
+
+    let lines = forge(&server)
+        .ensure_pull_requests(
+            &repo(),
+            &[
+                rgit_forge::StackEntry {
+                    branch: "feat-a".to_owned(),
+                    base: "main".to_owned(),
+                    message: "First\n".to_owned(),
+                },
+                rgit_forge::StackEntry {
+                    branch: "feat-b".to_owned(),
+                    base: "feat-a".to_owned(),
+                    message: "Second\n".to_owned(),
+                },
+            ],
+        )
+        .await
+        .expect("lines");
+    assert_eq!(lines.len(), 2);
 }
 
 #[tokio::test]
