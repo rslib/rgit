@@ -5,9 +5,10 @@ use super::ForgeError;
 use super::auth::{load_credential_for, refresh_if_needed};
 use super::types::{
     Branch, CheckRun, CreateIssue, CreatePullRequest, CreateRepository, Issue, IssueState, Listing,
-    MergeMethod, PAGE_SIZE, Provider, PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview,
-    PullRequestState, RepoRef, Repository, ReviewAction, ThreadEntry, ThreadKind, User,
-    normalize_check_status, page_query, rollup_from, sort_thread, total_from_last_page,
+    MergeMethod, PAGE_SIZE, Provider, PullRequest, PullRequestChecks, PullRequestComment,
+    PullRequestReview, PullRequestState, RepoRef, Repository, ReviewAction, ThreadEntry,
+    ThreadKind, User, normalize_check_status, page_query, rollup_from, sort_thread,
+    total_from_last_page,
 };
 
 fn api_error(error: octocrab::Error) -> ForgeError {

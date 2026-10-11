@@ -5231,11 +5231,7 @@ fn need_confirm(a: &Args, verb: &str, object: &str) -> anyhow::Result<()> {
 
 /// A forge pull request tool: build the CLI command it mirrors and run it
 /// against the bound repository, so MCP and the CLI share one forge path.
-fn forge_pr_tool(
-    backend: &Arc<dyn GitBackend>,
-    a: &Args,
-    full: bool,
-) -> anyhow::Result<Output> {
+fn forge_pr_tool(backend: &Arc<dyn GitBackend>, a: &Args, full: bool) -> anyhow::Result<Output> {
     let number = || a.num("number")?.ok_or_else(|| a.missing("number"));
     let cmd = ForgeCmd::Pr {
         cmd: match a.tool {
@@ -5345,11 +5341,7 @@ fn forge_pr_tool(
 
 /// A forge issue tool: build the CLI command it mirrors and run it against
 /// the bound repository, so MCP and the CLI share one forge path.
-fn forge_issue_tool(
-    backend: &Arc<dyn GitBackend>,
-    a: &Args,
-    full: bool,
-) -> anyhow::Result<Output> {
+fn forge_issue_tool(backend: &Arc<dyn GitBackend>, a: &Args, full: bool) -> anyhow::Result<Output> {
     let number = || a.num("number")?.ok_or_else(|| a.missing("number"));
     let cmd = ForgeCmd::Issue {
         cmd: match a.tool {
@@ -6003,10 +5995,7 @@ mod tests {
         for name in ["git_forge_pr_comments", "git_forge_issue_comments"] {
             assert!(tools().iter().any(|t| t.name == *name), "{name} is listed");
             assert!(is_read_only(name), "{name} is read-only");
-            assert!(
-                !CORE_TOOLS.contains(&name),
-                "{name} is not a core tool"
-            );
+            assert!(!CORE_TOOLS.contains(&name), "{name} is not a core tool");
             let all = tools();
             let tool = all.iter().find(|t| t.name == *name).expect("tool");
             assert_eq!(

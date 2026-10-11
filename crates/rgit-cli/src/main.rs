@@ -998,8 +998,7 @@ fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> (Vec<String>, Option<String>)
                 if *comments {
                     let number = match what.as_deref() {
                         Some(number)
-                            if !number.is_empty()
-                                && number.chars().all(char::is_numeric) =>
+                            if !number.is_empty() && number.chars().all(char::is_numeric) =>
                         {
                             number.to_owned()
                         }
@@ -1265,8 +1264,7 @@ fn forge_output(text: String, list_cmd: Option<&str>, full: bool) -> Output {
                             if total > crate::output::TRUNCATE_AT {
                                 let kept: String =
                                     body.chars().take(crate::output::TRUNCATE_AT).collect();
-                                *body =
-                                    format!("{kept}\n... (truncated, {total} chars total)");
+                                *body = format!("{kept}\n... (truncated, {total} chars total)");
                                 cut = true;
                             }
                         }
@@ -1897,7 +1895,12 @@ mod tests {
     fn forge_output_shows_a_view_thread_as_table_and_text() {
         let view = r#"{"number":12,"title":"t","state":"open","html_url":"u","head_branch":"h","base_branch":"main","draft":false,"thread":[{"kind":"inline","id":2,"author":"bob","body":"Rename this.","created_at":"2026-01-03T03:04:05Z","path":"src/main.rs","line":42},{"kind":"review","id":4,"author":"bob","body":"Ship it.","created_at":"2026-01-05T03:04:05Z","state":"approved"}]}"#;
         let out = forge_output(view.to_owned(), None, false);
-        assert!(out.text.contains("bob  2026-01-03T03:04:05Z  src/main.rs:42"), "{}", out.text);
+        assert!(
+            out.text
+                .contains("bob  2026-01-03T03:04:05Z  src/main.rs:42"),
+            "{}",
+            out.text
+        );
         assert!(out.text.contains("[approved]"), "{}", out.text);
         let rendered = render(out);
         assert!(

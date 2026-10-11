@@ -28,6 +28,9 @@ pub struct PullRequest {
     /// One row per CI check on the head commit, filled lazily after the list.
     #[serde(default)]
     pub check_list: Vec<ForgeCheck>,
+    /// The comment thread, loaded with one extra call when the detail opens.
+    #[serde(default)]
+    pub thread: ThreadState,
 }
 
 /// One CI check on a pull request's head commit.
@@ -35,6 +38,17 @@ pub struct PullRequest {
 pub struct ForgeCheck {
     pub name: String,
     pub status: String,
+}
+
+/// The comment thread a detail view carries: unloaded until the detail
+/// opens, then loaded with one extra call.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub enum ThreadState {
+    #[default]
+    Unloaded,
+    Loading,
+    Loaded(Vec<rgit_forge::ThreadEntry>),
+    Failed(String),
 }
 
 /// One pull request's CI: the rollup plus one row per check.
@@ -55,6 +69,8 @@ pub struct ForgeIssue {
     pub body: Option<String>,
     pub labels: Vec<String>,
     pub assignees: Vec<String>,
+    /// The comment thread, loaded with one extra call when the detail opens.
+    pub thread: ThreadState,
 }
 
 /// Which list the forge view shows: pull requests or issues.
@@ -134,6 +150,7 @@ pub async fn load(
             reviewers: pr.reviewers,
             draft: pr.draft,
             check_list: Vec::new(),
+            thread: ThreadState::Unloaded,
         })
         .collect();
     let (issues, issues_error) = match forge
@@ -159,6 +176,7 @@ pub async fn load(
                     body: issue.body,
                     labels: issue.labels,
                     assignees: issue.assignees,
+                    thread: ThreadState::Unloaded,
                 })
                 .collect(),
             None,
@@ -250,6 +268,25 @@ pub async fn load_checks(target: &ForgeTarget, numbers: Vec<u64>) -> Vec<PullReq
         });
     }
     out
+}
+
+/// The comment thread of one pull request or issue, oldest first;
+/// `is_issue` picks the issue thread.
+pub async fn load_thread(
+    target: &ForgeTarget,
+    number: u64,
+    is_issue: bool,
+) -> Result<Vec<rgit_forge::ThreadEntry>, String> {
+    let repo = target.repo().map_err(|error| error.to_string())?.clone();
+    let forge = rgit_forge::Forge::connect(target)
+        .await
+        .map_err(|error| forge_error(target, error))?;
+    if is_issue {
+        forge.issue_thread(&repo, number).await
+    } else {
+        forge.pull_request_thread(&repo, number).await
+    }
+    .map_err(|error| forge_error(target, error))
 }
 
 /// A check rollup as the list and detail rows print it.
@@ -402,6 +439,73 @@ pub fn build_placeholder() -> Vec<Section> {
     )]
 }
 
+/// The comment thread under a detail view: one header per entry (author,
+/// time, `path:line` for inline entries, review state) with its body below,
+/// or the load error when the thread failed. Nothing shows until the thread
+/// loads.
+fn thread_sections(state: &ThreadState) -> Vec<Section> {
+    let entries = match state {
+        ThreadState::Loaded(entries) => entries,
+        ThreadState::Failed(error) => {
+            return vec![Section::leaf(
+                "forge/detail/thread/error",
+                NodeKind::Info,
+                vec![Span::new(
+                    format!("could not load comments: {error}"),
+                    Style::Deleted,
+                )],
+            )];
+        }
+        ThreadState::Unloaded | ThreadState::Loading => return Vec::new(),
+    };
+    let mut sections = vec![Section::leaf(
+        "forge/detail/thread",
+        NodeKind::Info,
+        vec![Span::new("Comments:", Style::Dim)],
+    )];
+    for (i, entry) in entries.iter().enumerate() {
+        let mut header = Vec::new();
+        if entry.in_reply_to.is_some() {
+            header.push(Span::plain("  "));
+        }
+        header.push(Span::plain(
+            entry.author.as_deref().unwrap_or("").to_owned(),
+        ));
+        if let Some(when) = entry.created_at.as_deref() {
+            header.push(Span::new(format!("  {when}"), Style::Dim));
+        }
+        if let (Some(path), Some(line)) = (entry.path.as_deref(), entry.line) {
+            header.push(Span::new(format!("  {path}:{line}"), Style::Branch));
+        }
+        if let Some(state) = entry.state.as_deref() {
+            let style = match state {
+                "approved" => Style::Added,
+                "changes_requested" => Style::Deleted,
+                _ => Style::Dim,
+            };
+            header.push(Span::new(format!("  [{state}]"), style));
+        }
+        sections.push(Section::leaf(
+            format!("forge/detail/thread/{i}"),
+            NodeKind::Info,
+            header,
+        ));
+        let indent = if entry.in_reply_to.is_some() {
+            "    "
+        } else {
+            "  "
+        };
+        for (j, line) in entry.body.lines().enumerate() {
+            sections.push(Section::leaf(
+                format!("forge/detail/thread/{i}/{j}"),
+                NodeKind::Info,
+                vec![Span::plain(format!("{indent}{line}"))],
+            ));
+        }
+    }
+    sections
+}
+
 /// Render the selected request for inspection before mutation: its metadata,
 /// body, reviewers and check list.
 pub fn build_detail(snapshot: &ForgeSnapshot, request: &PullRequest) -> Vec<Section> {
@@ -486,6 +590,7 @@ pub fn build_detail(snapshot: &ForgeSnapshot, request: &PullRequest) -> Vec<Sect
             ));
         }
     }
+    sections.extend(thread_sections(&request.thread));
     sections
 }
 
@@ -554,6 +659,7 @@ pub fn build_issue_detail(snapshot: &ForgeSnapshot, issue: &ForgeIssue) -> Vec<S
             ));
         }
     }
+    sections.extend(thread_sections(&issue.thread));
     sections
 }
 

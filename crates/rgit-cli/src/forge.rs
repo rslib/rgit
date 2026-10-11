@@ -1773,7 +1773,10 @@ mod tests {
     #[test]
     fn human_thread_shows_one_block_per_entry() {
         let text = super::human_thread(&thread_value());
-        assert!(text.contains("alice  2026-01-02T03:04:05Z\n  Looks good."), "{text}");
+        assert!(
+            text.contains("alice  2026-01-02T03:04:05Z\n  Looks good."),
+            "{text}"
+        );
         assert!(
             text.contains("bob  2026-01-03T03:04:05Z  src/main.rs:42\n  Rename this."),
             "{text}"

@@ -1389,6 +1389,21 @@ async fn run_msg(
                     let _ = msg_tx.send(Msg::ForgeChecksLoaded(results));
                 });
             }
+            Effect::ForgeThread {
+                target,
+                number,
+                is_issue,
+            } => {
+                let msg_tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    let result = crate::forge::load_thread(&target, number, is_issue).await;
+                    let _ = msg_tx.send(Msg::ForgeThreadLoaded {
+                        number,
+                        is_issue,
+                        result,
+                    });
+                });
+            }
             Effect::ForgeCreate {
                 target,
                 title,

@@ -879,11 +879,13 @@ async fn pull_request_thread_reads_discussions_and_approvals() {
 async fn pull_request_thread_pages_discussions() {
     let server = MockServer::start().await;
     let page_one: Vec<_> = (0..100)
-        .map(|i| serde_json::json!({
-            "id": format!("d{i}"),
-            "individual_note": true,
-            "notes": [discussion_note(1000 + i, "note", "2026-01-02T03:04:05Z")]
-        }))
+        .map(|i| {
+            serde_json::json!({
+                "id": format!("d{i}"),
+                "individual_note": true,
+                "notes": [discussion_note(1000 + i, "note", "2026-01-02T03:04:05Z")]
+            })
+        })
         .collect();
     Mock::given(method("GET"))
         .and(path_regex(
@@ -945,7 +947,10 @@ async fn issue_thread_reads_notes_without_system_ones() {
         .mount(&server)
         .await;
 
-    let thread = forge(&server).issue_thread(&repo(), 7).await.expect("thread");
+    let thread = forge(&server)
+        .issue_thread(&repo(), 7)
+        .await
+        .expect("thread");
     assert_eq!(thread.len(), 1);
     assert_eq!(thread[0].kind, rgit_forge::ThreadKind::Comment);
     assert_eq!(thread[0].body, "Working on it.");

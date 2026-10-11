@@ -980,16 +980,25 @@ async fn pull_request_thread_reads_comments_inline_and_reviews() {
         .await;
     Mock::given(method("GET"))
         .and(path("/repos/owner/repo/pulls/12/comments"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            thread_inline(2, "Rename this.", "2026-01-02T03:04:05Z")
-        ])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([thread_inline(
+                2,
+                "Rename this.",
+                "2026-01-02T03:04:05Z"
+            )])),
+        )
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(path("/repos/owner/repo/pulls/12/reviews"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            thread_review(3, "APPROVED", Some("Ship it."), "2026-01-04T03:04:05Z")
-        ])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([thread_review(
+                3,
+                "APPROVED",
+                Some("Ship it."),
+                "2026-01-04T03:04:05Z"
+            )])),
+        )
         .mount(&server)
         .await;
 
@@ -1039,7 +1048,12 @@ async fn pull_request_thread_pages_and_skips_batch_reviews() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
             thread_review(3, "COMMENTED", Some(""), "2026-01-04T03:04:05Z"),
             thread_review(4, "PENDING", Some("draft"), "2026-01-04T03:04:05Z"),
-            thread_review(5, "CHANGES_REQUESTED", Some("Fix it."), "2026-01-03T03:04:05Z")
+            thread_review(
+                5,
+                "CHANGES_REQUESTED",
+                Some("Fix it."),
+                "2026-01-03T03:04:05Z"
+            )
         ])))
         .mount(&server)
         .await;
@@ -1049,8 +1063,12 @@ async fn pull_request_thread_pages_and_skips_batch_reviews() {
         .await
         .expect("thread");
     assert_eq!(thread.len(), 102);
-    assert!(thread.iter().all(|entry| entry.kind != rgit_forge::ThreadKind::Review
-        || entry.state.as_deref() == Some("changes_requested")));
+    assert!(
+        thread
+            .iter()
+            .all(|entry| entry.kind != rgit_forge::ThreadKind::Review
+                || entry.state.as_deref() == Some("changes_requested"))
+    );
     assert_eq!(thread.last().expect("last").body, "last");
 }
 
@@ -1070,7 +1088,10 @@ async fn issue_thread_reads_its_comments() {
         .mount(&server)
         .await;
 
-    let thread = forge(&server).issue_thread(&repo(), 7).await.expect("thread");
+    let thread = forge(&server)
+        .issue_thread(&repo(), 7)
+        .await
+        .expect("thread");
     assert_eq!(thread.len(), 1);
     assert_eq!(thread[0].kind, rgit_forge::ThreadKind::Comment);
     assert_eq!(thread[0].body, "Working on it.");

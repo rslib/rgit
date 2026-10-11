@@ -6,9 +6,9 @@ use super::ForgeError;
 use super::auth::load_credential_for;
 use super::types::{
     Branch, CheckRun, CreateIssue, CreatePullRequest, CreateRepository, Issue, IssueState, Listing,
-    MergeMethod, Provider, PullRequest, PullRequestChecks, PullRequestComment,
-    PullRequestReview, PullRequestState, RepoRef, Repository, ReviewAction, ThreadEntry, ThreadKind,
-    User, normalize_check_status, page_query, rollup_from, sort_thread, total_from_last_page,
+    MergeMethod, Provider, PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview,
+    PullRequestState, RepoRef, Repository, ReviewAction, ThreadEntry, ThreadKind, User,
+    normalize_check_status, page_query, rollup_from, sort_thread, total_from_last_page,
 };
 
 const DEFAULT_HOST: &str = "https://gitlab.com";

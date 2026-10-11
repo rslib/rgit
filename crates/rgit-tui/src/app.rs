@@ -646,6 +646,11 @@ pub enum Msg {
     ForgeReadyToggle,
     ForgeComment,
     ForgeChecksLoaded(Vec<crate::forge::PullRequestCi>),
+    ForgeThreadLoaded {
+        number: u64,
+        is_issue: bool,
+        result: Result<Vec<rgit_forge::ThreadEntry>, String>,
+    },
     DiffPrompt,
     DiffLoaded {
         title: String,
@@ -2060,6 +2065,12 @@ pub enum Effect {
         target: rgit_forge::ForgeTarget,
         numbers: Vec<u64>,
     },
+    /// Load one pull request or issue thread, then refresh its detail view.
+    ForgeThread {
+        target: rgit_forge::ForgeTarget,
+        number: u64,
+        is_issue: bool,
+    },
     /// Open the in-app commit editor (loading the HEAD message when amending).
     OpenCommitEditor {
         amend: bool,
@@ -2258,6 +2269,9 @@ pub struct App {
     /// Which list the forge view shows; `i` switches it.
     forge_tab: crate::forge::ForgeTab,
     forge_open_requested: bool,
+    /// The open forge detail (`is_issue`, number), so a loaded thread
+    /// refreshes it.
+    forge_detail: Option<(bool, u64)>,
     /// When the background forge snapshot was last requested.
     last_remote_fetch: Option<std::time::Instant>,
     /// Last status snapshot, for the adaptive preview pane.
@@ -2400,6 +2414,7 @@ impl App {
             forge_tab: crate::forge::ForgeTab::Requests,
             last_remote_fetch: None,
             forge_open_requested: false,
+            forge_detail: None,
             snapshot: None,
             preview_key: None,
             preview_buf: Buffer::default(),
@@ -3793,36 +3808,116 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::ForgeDetails => {
-            if app.forge_tab == crate::forge::ForgeTab::Issues {
-                let Some(snapshot) = app.forge_snapshot.as_ref() else {
-                    app.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
-                    return Vec::new();
-                };
-                let index = app.buffer().cursor().saturating_sub(1);
-                let Some(issue) = snapshot.issues.get(index) else {
-                    app.push_toast(ToastKind::Error, "move onto an issue first".to_owned());
-                    return Vec::new();
-                };
-                let mut buffer = Buffer::default();
-                buffer.set_content(forge::build_issue_detail(snapshot, issue));
-                app.push_view(ViewKind::Review, buffer);
-                return Vec::new();
-            }
+            let is_issue = app.forge_tab == crate::forge::ForgeTab::Issues;
             let Some(snapshot) = app.forge_snapshot.as_ref() else {
                 app.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
                 return Vec::new();
             };
             let index = app.buffer().cursor().saturating_sub(1);
-            let Some(request) = snapshot.requests.get(index) else {
-                app.push_toast(
-                    ToastKind::Error,
-                    "move onto a pull request first".to_owned(),
-                );
-                return Vec::new();
+            let (number, load) = if is_issue {
+                let Some(issue) = snapshot.issues.get(index) else {
+                    app.push_toast(ToastKind::Error, "move onto an issue first".to_owned());
+                    return Vec::new();
+                };
+                (
+                    issue.number,
+                    matches!(
+                        issue.thread,
+                        crate::forge::ThreadState::Unloaded | crate::forge::ThreadState::Failed(_)
+                    ),
+                )
+            } else {
+                let Some(request) = snapshot.requests.get(index) else {
+                    app.push_toast(
+                        ToastKind::Error,
+                        "move onto a pull request first".to_owned(),
+                    );
+                    return Vec::new();
+                };
+                (
+                    request.number,
+                    matches!(
+                        request.thread,
+                        crate::forge::ThreadState::Unloaded | crate::forge::ThreadState::Failed(_)
+                    ),
+                )
             };
+            if load {
+                let snapshot = app.forge_snapshot.as_mut().expect("forge snapshot");
+                let thread = if is_issue {
+                    &mut snapshot.issues[index].thread
+                } else {
+                    &mut snapshot.requests[index].thread
+                };
+                *thread = crate::forge::ThreadState::Loading;
+            }
+            let snapshot = app.forge_snapshot.as_ref().expect("forge snapshot");
+            let detail = if is_issue {
+                forge::build_issue_detail(snapshot, &snapshot.issues[index])
+            } else {
+                forge::build_detail(snapshot, &snapshot.requests[index])
+            };
+            let target = snapshot.target.clone();
             let mut buffer = Buffer::default();
-            buffer.set_content(forge::build_detail(snapshot, request));
+            buffer.set_content(detail);
+            app.forge_detail = Some((is_issue, number));
             app.push_view(ViewKind::Review, buffer);
+            if load {
+                return vec![Effect::ForgeThread {
+                    target,
+                    number,
+                    is_issue,
+                }];
+            }
+            return Vec::new();
+        }
+        Msg::ForgeThreadLoaded {
+            number,
+            is_issue,
+            result,
+        } => {
+            if let Some(snapshot) = app.forge_snapshot.as_mut() {
+                let thread = if is_issue {
+                    snapshot
+                        .issues
+                        .iter_mut()
+                        .find(|issue| issue.number == number)
+                        .map(|issue| &mut issue.thread)
+                } else {
+                    snapshot
+                        .requests
+                        .iter_mut()
+                        .find(|request| request.number == number)
+                        .map(|request| &mut request.thread)
+                };
+                if let Some(thread) = thread {
+                    *thread = match result {
+                        Ok(entries) => crate::forge::ThreadState::Loaded(entries),
+                        Err(error) => crate::forge::ThreadState::Failed(error),
+                    };
+                }
+            }
+            if app.forge_detail == Some((is_issue, number)) && app.active_kind() == ViewKind::Review
+            {
+                let detail = app.forge_snapshot.as_ref().and_then(|snapshot| {
+                    if is_issue {
+                        snapshot
+                            .issues
+                            .iter()
+                            .find(|issue| issue.number == number)
+                            .map(|issue| forge::build_issue_detail(snapshot, issue))
+                    } else {
+                        snapshot
+                            .requests
+                            .iter()
+                            .find(|request| request.number == number)
+                            .map(|request| forge::build_detail(snapshot, request))
+                    }
+                });
+                if let Some(detail) = detail {
+                    app.buffer_mut().set_content(detail);
+                }
+            }
             return Vec::new();
         }
         Msg::ForgeOpen => {
@@ -4075,6 +4170,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::AiReviewLoaded(text) => {
             app.busy = None;
+            app.forge_detail = None;
             let mut buffer = Buffer::default();
             let sections: Vec<_> = text
                 .lines()
@@ -6088,6 +6184,7 @@ mod tests {
             reviewers: vec!["dev-2".to_owned()],
             draft,
             check_list: Vec::new(),
+            thread: crate::forge::ThreadState::Unloaded,
         }
     }
 
@@ -6112,6 +6209,7 @@ mod tests {
             body: Some("Details.".to_owned()),
             labels: vec!["bug".to_owned()],
             assignees: vec!["dev-2".to_owned()],
+            thread: crate::forge::ThreadState::Unloaded,
         }
     }
 
@@ -6330,6 +6428,113 @@ mod tests {
         assert!(detail.contains("Longer story."), "{detail}");
         assert!(detail.contains("dev-2"), "{detail}");
         assert!(detail.contains("build"), "{detail}");
+    }
+
+    fn thread_entry(
+        kind: rgit_forge::ThreadKind,
+        author: &str,
+        body: &str,
+    ) -> rgit_forge::ThreadEntry {
+        let (path, line, state) = match kind {
+            rgit_forge::ThreadKind::Inline => (Some("src/main.rs".to_owned()), Some(42), None),
+            rgit_forge::ThreadKind::Review => (None, None, Some("approved".to_owned())),
+            rgit_forge::ThreadKind::Comment => (None, None, None),
+        };
+        rgit_forge::ThreadEntry {
+            kind,
+            id: Some(1),
+            author: Some(author.to_owned()),
+            body: body.to_owned(),
+            created_at: Some("2026-01-02T03:04:05Z".to_owned()),
+            url: None,
+            path,
+            line,
+            state,
+            in_reply_to: None,
+            resolved: None,
+        }
+    }
+
+    #[test]
+    fn forge_detail_shows_the_thread_with_inline_place_and_review_state() {
+        let mut snapshot = forge_snapshot();
+        snapshot.requests[0].thread = crate::forge::ThreadState::Loaded(vec![
+            thread_entry(rgit_forge::ThreadKind::Comment, "alice", "Looks good."),
+            thread_entry(rgit_forge::ThreadKind::Inline, "bob", "Rename this."),
+            thread_entry(rgit_forge::ThreadKind::Review, "bob", "Ship it."),
+        ]);
+        let detail =
+            section_text(crate::forge::build_detail(&snapshot, &snapshot.requests[0]).as_slice());
+        assert!(detail.contains("Comments:"), "{detail}");
+        assert!(detail.contains("Looks good."), "{detail}");
+        assert!(detail.contains("src/main.rs:42"), "{detail}");
+        assert!(detail.contains("Rename this."), "{detail}");
+        assert!(detail.contains("[approved]"), "{detail}");
+        snapshot.issues[0].thread = crate::forge::ThreadState::Loaded(vec![thread_entry(
+            rgit_forge::ThreadKind::Comment,
+            "alice",
+            "Working on it.",
+        )]);
+        let issue = section_text(
+            crate::forge::build_issue_detail(&snapshot, &snapshot.issues[0]).as_slice(),
+        );
+        assert!(issue.contains("Working on it."), "{issue}");
+    }
+
+    #[test]
+    fn forge_detail_shows_an_error_line_when_the_thread_fails() {
+        let mut snapshot = forge_snapshot();
+        snapshot.requests[0].thread = crate::forge::ThreadState::Failed("gone".to_owned());
+        let detail =
+            section_text(crate::forge::build_detail(&snapshot, &snapshot.requests[0]).as_slice());
+        assert!(detail.contains("could not load comments: gone"), "{detail}");
+        assert!(!detail.contains("Comments:"), "{detail}");
+    }
+
+    #[test]
+    fn forge_details_loads_the_thread_once_with_the_detail() {
+        let mut app = forge_app();
+        let mut buffer = Buffer::default();
+        buffer.set_content(crate::forge::build_view(
+            app.forge_snapshot.as_ref().expect("snapshot"),
+            app.forge_tab,
+        ));
+        app.push_view(ViewKind::Forge, buffer);
+        app.buffer_mut().set_cursor(1);
+        let fx = update(&mut app, Msg::ForgeDetails);
+        assert!(matches!(
+            fx.as_slice(),
+            [Effect::ForgeThread {
+                number: 12,
+                is_issue: false,
+                ..
+            }]
+        ));
+        let snapshot = app.forge_snapshot.as_ref().expect("snapshot");
+        assert!(matches!(
+            snapshot.requests[0].thread,
+            crate::forge::ThreadState::Loading
+        ));
+        update(
+            &mut app,
+            Msg::ForgeThreadLoaded {
+                number: 12,
+                is_issue: false,
+                result: Ok(vec![thread_entry(
+                    rgit_forge::ThreadKind::Comment,
+                    "alice",
+                    "Looks good.",
+                )]),
+            },
+        );
+        let snapshot = app.forge_snapshot.as_ref().expect("snapshot");
+        assert!(matches!(
+            snapshot.requests[0].thread,
+            crate::forge::ThreadState::Loaded(_)
+        ));
+        let detail =
+            section_text(crate::forge::build_detail(snapshot, &snapshot.requests[0]).as_slice());
+        assert!(detail.contains("Looks good."), "{detail}");
     }
 
     #[test]

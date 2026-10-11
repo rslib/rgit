@@ -407,7 +407,7 @@ pub struct ThreadEntry {
 
 /// Order a thread oldest first, keeping the fetch order on ties; entries
 /// with no time (GitLab approvals) sort last.
-pub(crate) fn sort_thread(entries: &mut Vec<ThreadEntry>) {
+pub(crate) fn sort_thread(entries: &mut [ThreadEntry]) {
     entries.sort_by(|a, b| {
         (a.created_at.is_none(), a.created_at.clone())
             .cmp(&(b.created_at.is_none(), b.created_at.clone()))
@@ -817,11 +817,7 @@ mod tests {
             .collect();
         assert_eq!(
             order,
-            [
-                "2026-01-02T00:00:00Z",
-                "2026-01-03T00:00:00Z",
-                "timeless"
-            ]
+            ["2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z", "timeless"]
         );
     }
 }
