@@ -17,7 +17,7 @@ use serde_json::{Map, Value, json};
 use crate::cli::{
     AmArgs, ApplyArgs, ArchiveArgs, BisectCmd, BlameArgs, BlameFormat, BranchCmd, BranchOpts,
     BundleCmd, CliError, Command, CommitGraphCmd, ConfigArgs, DiffFormat, FlowCmd, ForgeCmd,
-    FormatPatchArgs, HashObjectArgs, HookCmd, IndexCmd, LanesCmd, MaintenanceCmd, MergeDiffArgs,
+    FormatPatchArgs, HashObjectArgs, HookCmd, IndexCmd, IssueCmd, IssueListState, LanesCmd, MaintenanceCmd, MergeDiffArgs,
     MidxCmd, NoteMessage, NotesCmd, PickFlags, Plumbing, PrCmd, PrListState, PrettyArgs,
     RawDiffArgs, RebaseFlags, RemoteCmd, StackCmd, StashCmd, StashPush, SubmoduleCmd, TagOpts,
     WalkArgs, WordDiffArgs, WorkspaceCmd, WorktreeCmd,
@@ -78,6 +78,8 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "git_forge_pr_list",
     "git_forge_pr_view",
     "git_forge_pr_checks",
+    "git_forge_issue_list",
+    "git_forge_issue_view",
     "git_branches",
     "git_lanes_list",
     "git_stack_list",
@@ -1624,6 +1626,61 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_forge_pr_close",
             "Close a pull request. Needs confirm=true, the MCP form of --yes.",
+            &[
+                ("number", "integer", true),
+                ("confirm", "boolean", false),
+                ("target", "string", false),
+            ],
+        ),
+        tool(
+            "git_forge_issue_list",
+            "Issues against the origin remote's forge (GitHub or GitLab): number, title, \
+             state. `state` is open (default), closed or all; `author`, `label` and \
+             `assignee` filter; `target` names another forge repository (`OWNER/REPO`).",
+            &[
+                ("state", "string", false),
+                ("author", "string", false),
+                ("label", "string", false),
+                ("assignee", "string", false),
+                ("target", "string", false),
+                ("page", "integer", false),
+                FIELDS,
+            ],
+        ),
+        tool(
+            "git_forge_issue_view",
+            "One issue: title, body, labels, assignees. `number` names it. `target` names \
+             another forge repository (`OWNER/REPO`).",
+            &[
+                ("number", "integer", true),
+                ("target", "string", false),
+                FIELDS,
+            ],
+        ),
+        tool(
+            "git_forge_issue_create",
+            "Open an issue: `title` names it, `body` is its text, `labels` and `assignees` \
+             take logins.",
+            &[
+                ("title", "string", true),
+                ("body", "string", false),
+                ("labels", "string[]", false),
+                ("assignees", "string[]", false),
+                ("target", "string", false),
+            ],
+        ),
+        tool(
+            "git_forge_issue_comment",
+            "Comment on an issue: `number` names it, `body` is the comment text.",
+            &[
+                ("number", "integer", true),
+                ("body", "string", true),
+                ("target", "string", false),
+            ],
+        ),
+        tool(
+            "git_forge_issue_close",
+            "Close an issue. Needs confirm=true, the MCP form of --yes.",
             &[
                 ("number", "integer", true),
                 ("confirm", "boolean", false),
@@ -5137,12 +5194,12 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
 /// Tools that read the object store directly and have no CLI command.
 /// Merge and close reach outward: without confirm=true they refuse, as --yes does
 /// on the CLI.
-fn need_confirm(a: &Args, verb: &str) -> anyhow::Result<()> {
+fn need_confirm(a: &Args, verb: &str, object: &str) -> anyhow::Result<()> {
     if a.flag("confirm") {
         Ok(())
     } else {
         Err(anyhow::Error::new(CliError {
-            message: format!("refusing to {verb} a pull request without confirm=true"),
+            message: format!("refusing to {verb} {object} without confirm=true"),
             help: Some(format!("Call {} with confirm=true", a.tool)),
             code: 2,
         }))
@@ -5207,7 +5264,7 @@ fn forge_pr_tool(backend: &Arc<dyn GitBackend>, a: &Args) -> anyhow::Result<Outp
                 body_file: None,
             },
             "git_forge_pr_merge" => {
-                need_confirm(a, "merge")?;
+                need_confirm(a, "merge", "a pull request")?;
                 let method = a.str("method").unwrap_or_else(|| "merge".to_owned());
                 if !matches!(method.as_str(), "merge" | "squash" | "rebase") {
                     return Err(a.invalid("method", "one of merge, squash or rebase"));
@@ -5222,7 +5279,7 @@ fn forge_pr_tool(backend: &Arc<dyn GitBackend>, a: &Args) -> anyhow::Result<Outp
                 }
             }
             "git_forge_pr_close" => {
-                need_confirm(a, "close")?;
+                need_confirm(a, "close", "a pull request")?;
                 PrCmd::Close {
                     number: number()?,
                     target: a.str("target"),
@@ -5252,6 +5309,80 @@ fn forge_pr_tool(backend: &Arc<dyn GitBackend>, a: &Args) -> anyhow::Result<Outp
     Ok(crate::forge_output(text, list_cmd))
 }
 
+/// A forge issue tool: build the CLI command it mirrors and run it against
+/// the bound repository, so MCP and the CLI share one forge path.
+fn forge_issue_tool(backend: &Arc<dyn GitBackend>, a: &Args) -> anyhow::Result<Output> {
+    let number = || a.num("number")?.ok_or_else(|| a.missing("number"));
+    let cmd = ForgeCmd::Issue {
+        cmd: match a.tool {
+            "git_forge_issue_list" => IssueCmd::List {
+                target: a.str("target"),
+                repo: None,
+                state: match a.str("state").as_deref() {
+                    None | Some("open") => IssueListState::Open,
+                    Some("closed") => IssueListState::Closed,
+                    Some("all") => IssueListState::All,
+                    Some(_) => {
+                        return Err(a.invalid("state", "one of open, closed or all"));
+                    }
+                },
+                author: a.str("author"),
+                label: a.str("label"),
+                assignee: a.str("assignee"),
+                page: a.num("page")?.map(|n| n as u32).unwrap_or(1),
+            },
+            "git_forge_issue_view" => IssueCmd::View {
+                number: number()?,
+                target: a.str("target"),
+                repo: None,
+            },
+            "git_forge_issue_create" => IssueCmd::Create {
+                target: a.str("target"),
+                repo: None,
+                title: a.str("title").ok_or_else(|| a.missing("title"))?,
+                body: a.str("body"),
+                body_file: None,
+                label: a.strings("labels")?,
+                assignee: a.strings("assignees")?,
+            },
+            "git_forge_issue_comment" => IssueCmd::Comment {
+                number: number()?,
+                target: a.str("target"),
+                repo: None,
+                body: Some(a.str("body").ok_or_else(|| a.missing("body"))?),
+                body_file: None,
+            },
+            "git_forge_issue_close" => {
+                need_confirm(a, "close", "an issue")?;
+                IssueCmd::Close {
+                    number: number()?,
+                    target: a.str("target"),
+                    repo: None,
+                    yes: true,
+                }
+            }
+            other => {
+                return Err(anyhow::Error::new(CliError {
+                    message: format!("unknown tool: {other}"),
+                    help: Some("Call tools/list to see the available tools".to_owned()),
+                    code: 2,
+                }));
+            }
+        },
+    };
+    let list_cmd = if a.tool == "git_forge_issue_list" {
+        Some("rgit forge issue list")
+    } else {
+        None
+    };
+    let text = crate::forge::run_in(
+        backend.workdir(),
+        cmd,
+        crate::forge::ForgeSelection::default(),
+    )?;
+    Ok(crate::forge_output(text, list_cmd))
+}
+
 fn local(backend: &Arc<dyn GitBackend>, a: &Args, full: bool) -> anyhow::Result<Output> {
     Ok(match a.tool {
         "git_forge_pr_list"
@@ -5261,6 +5392,11 @@ fn local(backend: &Arc<dyn GitBackend>, a: &Args, full: bool) -> anyhow::Result<
         | "git_forge_pr_comment"
         | "git_forge_pr_merge"
         | "git_forge_pr_close" => forge_pr_tool(backend, a)?,
+        "git_forge_issue_list"
+        | "git_forge_issue_view"
+        | "git_forge_issue_create"
+        | "git_forge_issue_comment"
+        | "git_forge_issue_close" => forge_issue_tool(backend, a)?,
         "git_tree" => {
             let rev = a.or("rev", "HEAD");
             let path = a.or("path", "");
@@ -5740,7 +5876,7 @@ mod tests {
         let backend = open(&dir);
         let run = |name: &str, args: Value| call(&backend, name, args);
 
-        for tool in ["git_forge_pr_merge", "git_forge_pr_close"] {
+        for tool in ["git_forge_pr_merge", "git_forge_pr_close", "git_forge_issue_close"] {
             let refused = run(tool, json!({ "number": 1 })).unwrap_err();
             assert!(refused.contains("confirm=true"), "{refused}");
             // With confirm the gate passes: the call reaches target resolution
@@ -5789,6 +5925,29 @@ mod tests {
     }
 
     #[test]
+    fn forge_issue_tools_validate_their_args() {
+        let dir = init_repo("forge-issue-args");
+        let backend = open(&dir);
+        let run = |name: &str, args: Value| call(&backend, name, args);
+
+        let bad_state = run("git_forge_issue_list", json!({ "state": "bogus" })).unwrap_err();
+        assert!(
+            bad_state.contains("one of open, closed or all"),
+            "{bad_state}"
+        );
+
+        let no_title = run("git_forge_issue_create", json!({})).unwrap_err();
+        assert!(no_title.contains("title required"), "{no_title}");
+
+        let no_body = run("git_forge_issue_comment", json!({ "number": 1 })).unwrap_err();
+        assert!(no_body.contains("body required"), "{no_body}");
+
+        let no_number = run("git_forge_issue_comment", json!({ "body": "hi" })).unwrap_err();
+        assert!(no_number.contains("number required"), "{no_number}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn every_tool_is_wired() {
         const LOCAL: &[&str] = &[
             "git_tree",
@@ -5802,6 +5961,11 @@ mod tests {
             "git_forge_pr_comment",
             "git_forge_pr_merge",
             "git_forge_pr_close",
+            "git_forge_issue_list",
+            "git_forge_issue_view",
+            "git_forge_issue_create",
+            "git_forge_issue_comment",
+            "git_forge_issue_close",
         ];
         for t in tools() {
             let args = json!({});
