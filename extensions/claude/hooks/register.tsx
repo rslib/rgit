@@ -43,13 +43,15 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     cwd = e.cwd
-    for (const t of TOOLS) {
-      const ok = await $.tool.register({ name: t.name, description: t.description, inputSchema: t.inputSchema }).then(
-        () => true,
-        () => false,
-      )
-      if (ok) tools.add(TOOL_PREFIX + t.name)
-    }
+    // In parallel: one at a time, 200 registrations hold up the session start.
+    await Promise.all(
+      TOOLS.map(t =>
+        $.tool.register({ name: t.name, description: t.description, inputSchema: t.inputSchema }).then(
+          () => tools.add(TOOL_PREFIX + t.name),
+          () => undefined,
+        ),
+      ),
+    )
     return next(e)
   })
 
