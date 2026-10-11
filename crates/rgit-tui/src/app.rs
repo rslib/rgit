@@ -3761,10 +3761,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 app.push_view(ViewKind::Forge, buffer);
             } else if app.active_kind() == ViewKind::Forge {
                 let tab = app.forge_tab;
-                let sections = forge::build_view(
-                    app.forge_snapshot.as_ref().expect("forge snapshot"),
-                    tab,
-                );
+                let sections =
+                    forge::build_view(app.forge_snapshot.as_ref().expect("forge snapshot"), tab);
                 app.buffer_mut().set_content(sections);
             }
             // CI loads lazily after the list: every row on screen when the
@@ -6315,7 +6313,10 @@ mod tests {
             name: "build".to_owned(),
             status: "passing".to_owned(),
         }];
-        let list = section_text(&crate::forge::build_view(&snapshot, crate::forge::ForgeTab::Requests));
+        let list = section_text(&crate::forge::build_view(
+            &snapshot,
+            crate::forge::ForgeTab::Requests,
+        ));
         assert!(list.contains("#12"), "{list}");
         assert!(list.contains("passing"), "{list}");
         let detail =
@@ -6332,12 +6333,10 @@ mod tests {
         let fx = update(&mut app, Msg::ForgeTabToggle);
         assert!(fx.is_empty());
         assert_eq!(app.forge_tab, crate::forge::ForgeTab::Issues);
-        let list = section_text(
-            &crate::forge::build_view(
-                app.forge_snapshot.as_ref().expect("snapshot"),
-                app.forge_tab,
-            ),
-        );
+        let list = section_text(&crate::forge::build_view(
+            app.forge_snapshot.as_ref().expect("snapshot"),
+            app.forge_tab,
+        ));
         assert!(list.contains("#7"), "{list}");
         assert!(!list.contains("#12"), "{list}");
     }

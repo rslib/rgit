@@ -6,10 +6,9 @@ use super::ForgeError;
 use super::auth::load_credential_for;
 use super::types::{
     Branch, CheckRun, CreateIssue, CreatePullRequest, CreateRepository, Issue, IssueState, Listing,
-    MergeMethod, Provider,
-    PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview, PullRequestState,
-    RepoRef, Repository, ReviewAction, User, normalize_check_status, page_query, rollup_from,
-    total_from_last_page,
+    MergeMethod, Provider, PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview,
+    PullRequestState, RepoRef, Repository, ReviewAction, User, normalize_check_status, page_query,
+    rollup_from, total_from_last_page,
 };
 
 const DEFAULT_HOST: &str = "https://gitlab.com";
@@ -897,7 +896,11 @@ impl GitlabClient {
         label: Option<&str>,
         assignee: Option<&str>,
     ) -> Result<Listing<Issue>, ForgeError> {
-        let mut url = format!("{}/projects/{}/issues", self.base_url, self.project_path(repo));
+        let mut url = format!(
+            "{}/projects/{}/issues",
+            self.base_url,
+            self.project_path(repo)
+        );
         let state = match state {
             IssueState::Open => "opened",
             IssueState::Closed => "closed",
@@ -911,7 +914,10 @@ impl GitlabClient {
             url.push_str(&format!("&labels={}", urlencoding::encode(label)));
         }
         if let Some(assignee) = assignee {
-            url.push_str(&format!("&assignee_username={}", urlencoding::encode(assignee)));
+            url.push_str(&format!(
+                "&assignee_username={}",
+                urlencoding::encode(assignee)
+            ));
         }
         let listing: Listing<ApiIssue> = self.list_page(&url, page).await?;
         Ok(listing.map(|issue| issue.into_issue()))

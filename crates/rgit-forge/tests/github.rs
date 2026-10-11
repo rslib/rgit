@@ -657,10 +657,9 @@ async fn issue_list_drops_pull_requests() {
     Mock::given(method("GET"))
         .and(path("/repos/owner/repo/issues"))
         .and(query_param("state", "open"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            issue_json(7),
-            as_issue
-        ])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!([issue_json(7), as_issue])),
+        )
         .mount(&server)
         .await;
 
@@ -736,9 +735,15 @@ async fn closes_and_reopens_an_issue() {
         .mount(&server)
         .await;
 
-    let issue = forge(&server).close_issue(&repo(), 7).await.expect("closed");
+    let issue = forge(&server)
+        .close_issue(&repo(), 7)
+        .await
+        .expect("closed");
     assert_eq!(issue.state, "closed");
-    let issue = forge(&server).reopen_issue(&repo(), 8).await.expect("reopened");
+    let issue = forge(&server)
+        .reopen_issue(&repo(), 8)
+        .await
+        .expect("reopened");
     assert_eq!(issue.state, "open");
 }
 
@@ -747,7 +752,9 @@ async fn comments_on_an_issue() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/repos/owner/repo/issues/7/comments"))
-        .and(body_partial_json(serde_json::json!({"body": "Working on it."})))
+        .and(body_partial_json(
+            serde_json::json!({"body": "Working on it."}),
+        ))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
             "id": 99,
             "body": "Working on it.",

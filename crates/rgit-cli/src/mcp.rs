@@ -17,10 +17,10 @@ use serde_json::{Map, Value, json};
 use crate::cli::{
     AmArgs, ApplyArgs, ArchiveArgs, BisectCmd, BlameArgs, BlameFormat, BranchCmd, BranchOpts,
     BundleCmd, CliError, Command, CommitGraphCmd, ConfigArgs, DiffFormat, FlowCmd, ForgeCmd,
-    FormatPatchArgs, HashObjectArgs, HookCmd, IndexCmd, IssueCmd, IssueListState, LanesCmd, MaintenanceCmd, MergeDiffArgs,
-    MidxCmd, NoteMessage, NotesCmd, PickFlags, Plumbing, PrCmd, PrListState, PrettyArgs,
-    RawDiffArgs, RebaseFlags, RemoteCmd, StackCmd, StashCmd, StashPush, SubmoduleCmd, TagOpts,
-    WalkArgs, WordDiffArgs, WorkspaceCmd, WorktreeCmd,
+    FormatPatchArgs, HashObjectArgs, HookCmd, IndexCmd, IssueCmd, IssueListState, LanesCmd,
+    MaintenanceCmd, MergeDiffArgs, MidxCmd, NoteMessage, NotesCmd, PickFlags, Plumbing, PrCmd,
+    PrListState, PrettyArgs, RawDiffArgs, RebaseFlags, RemoteCmd, StackCmd, StashCmd, StashPush,
+    SubmoduleCmd, TagOpts, WalkArgs, WordDiffArgs, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::toon::{Node, Obj};
@@ -5876,7 +5876,11 @@ mod tests {
         let backend = open(&dir);
         let run = |name: &str, args: Value| call(&backend, name, args);
 
-        for tool in ["git_forge_pr_merge", "git_forge_pr_close", "git_forge_issue_close"] {
+        for tool in [
+            "git_forge_pr_merge",
+            "git_forge_pr_close",
+            "git_forge_issue_close",
+        ] {
             let refused = run(tool, json!({ "number": 1 })).unwrap_err();
             assert!(refused.contains("confirm=true"), "{refused}");
             // With confirm the gate passes: the call reaches target resolution

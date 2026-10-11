@@ -5,10 +5,9 @@ use super::ForgeError;
 use super::auth::{load_credential_for, refresh_if_needed};
 use super::types::{
     Branch, CheckRun, CreateIssue, CreatePullRequest, CreateRepository, Issue, IssueState, Listing,
-    MergeMethod, Provider,
-    PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview, PullRequestState,
-    RepoRef, Repository, ReviewAction, User, normalize_check_status, page_query, rollup_from,
-    total_from_last_page,
+    MergeMethod, Provider, PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview,
+    PullRequestState, RepoRef, Repository, ReviewAction, User, normalize_check_status, page_query,
+    rollup_from, total_from_last_page,
 };
 
 fn api_error(error: octocrab::Error) -> ForgeError {
@@ -882,11 +881,7 @@ impl From<ApiIssue> for Issue {
             author: issue.user.map(|user| user.login),
             body: issue.body,
             labels: issue.labels.into_iter().map(|label| label.name).collect(),
-            assignees: issue
-                .assignees
-                .into_iter()
-                .map(|user| user.login)
-                .collect(),
+            assignees: issue.assignees.into_iter().map(|user| user.login).collect(),
             url: issue.html_url,
             created_at: issue.created_at,
             updated_at: issue.updated_at,

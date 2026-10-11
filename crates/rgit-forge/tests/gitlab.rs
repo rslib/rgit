@@ -599,7 +599,10 @@ fn assert_issue_mapped(issue: &rgit_forge::Issue) {
     assert_eq!(issue.assignees, vec![REVIEWER.clone()]);
     assert_eq!(
         issue.url,
-        format!("https://gitlab.example/group/project/-/issues/{}", issue.number)
+        format!(
+            "https://gitlab.example/group/project/-/issues/{}",
+            issue.number
+        )
     );
 }
 
@@ -636,7 +639,9 @@ async fn issue_list_requests_the_filters() {
 async fn pulls_one_issue_by_iid() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path_regex(r"^/api/v4/projects/group(%2F|/)project/issues/7$"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/issues/7$",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7)))
         .mount(&server)
         .await;
@@ -689,21 +694,31 @@ async fn closes_and_reopens_an_issue() {
     let mut closed = issue_json(7);
     closed["state"] = serde_json::json!("closed");
     Mock::given(method("PUT"))
-        .and(path_regex(r"^/api/v4/projects/group(%2F|/)project/issues/7$"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/issues/7$",
+        ))
         .and(body_string("state_event=close"))
         .respond_with(ResponseTemplate::new(200).set_body_json(closed))
         .mount(&server)
         .await;
     Mock::given(method("PUT"))
-        .and(path_regex(r"^/api/v4/projects/group(%2F|/)project/issues/8$"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/issues/8$",
+        ))
         .and(body_string("state_event=reopen"))
         .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(8)))
         .mount(&server)
         .await;
 
-    let issue = forge(&server).close_issue(&repo(), 7).await.expect("closed");
+    let issue = forge(&server)
+        .close_issue(&repo(), 7)
+        .await
+        .expect("closed");
     assert_eq!(issue.state, "closed");
-    let issue = forge(&server).reopen_issue(&repo(), 8).await.expect("reopened");
+    let issue = forge(&server)
+        .reopen_issue(&repo(), 8)
+        .await
+        .expect("reopened");
     assert_eq!(issue.state, "opened");
 }
 
@@ -711,8 +726,12 @@ async fn closes_and_reopens_an_issue() {
 async fn comments_on_an_issue() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path_regex(r"^/api/v4/projects/group(%2F|/)project/issues/7/notes$"))
-        .and(body_partial_json(serde_json::json!({"body": "Working on it."})))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/issues/7/notes$",
+        ))
+        .and(body_partial_json(
+            serde_json::json!({"body": "Working on it."}),
+        ))
         .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
             "id": 99,
             "body": "Working on it.",
@@ -737,7 +756,9 @@ async fn edits_the_title_and_labels_of_an_issue() {
     let mut edited = issue_json(7);
     edited["title"] = serde_json::json!("Fix login faster");
     Mock::given(method("PUT"))
-        .and(path_regex(r"^/api/v4/projects/group(%2F|/)project/issues/7$"))
+        .and(path_regex(
+            r"^/api/v4/projects/group(%2F|/)project/issues/7$",
+        ))
         .and(body_partial_json(serde_json::json!({
             "title": "Fix login faster",
             "labels": "bug"

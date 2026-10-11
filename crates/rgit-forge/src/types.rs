@@ -539,10 +539,7 @@ mod tests {
 
     #[test]
     fn stack_block_marks_the_current_request() {
-        let entries = vec![
-            (12, "feat-a".to_owned()),
-            (13, "feat-b".to_owned()),
-        ];
+        let entries = vec![(12, "feat-a".to_owned()), (13, "feat-b".to_owned())];
         assert_eq!(
             render_stack_block(&entries, 13),
             "<!-- rgit-stack -->\n- #12 feat-a\n- #13 feat-b  <- this PR\n<!-- /rgit-stack -->"
@@ -562,10 +559,7 @@ mod tests {
     #[test]
     fn stack_block_replaces_without_touching_outside_text() {
         let old = render_stack_block(&[(12, "feat-a".to_owned())], 12);
-        let new = render_stack_block(
-            &[(12, "feat-a".to_owned()), (13, "feat-b".to_owned())],
-            12,
-        );
+        let new = render_stack_block(&[(12, "feat-a".to_owned()), (13, "feat-b".to_owned())], 12);
         let body = format!("Intro.\n\n{old}\n\nOutro.");
         assert_eq!(
             upsert_stack_block(Some(&body), &new),

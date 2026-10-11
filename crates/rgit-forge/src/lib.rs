@@ -22,11 +22,11 @@ pub use gitlab::GitlabClient;
 pub use profile::{ForgeConfig, ForgeProfile, ForgeSelection, ForgeTarget};
 pub use remote::RemoteTarget;
 pub use types::{
-    Branch, CheckRollup, CheckRun, CreateIssue, CreatePullRequest, CreateRepository, CredentialIdentity,
-    EnsureOutcome, EnsuredPullRequest, Issue, IssueState, Listing, MergeMethod, PAGE_SIZE, Provider, PullRequest,
-    PullRequestChecks, PullRequestComment, PullRequestReview, PullRequestState, RepoRef,
-    Repository, ReviewAction, StackEntry, StoredCredential, User, fill_from_commit,
-    render_stack_block, upsert_stack_block, STACK_END, STACK_START,
+    Branch, CheckRollup, CheckRun, CreateIssue, CreatePullRequest, CreateRepository,
+    CredentialIdentity, EnsureOutcome, EnsuredPullRequest, Issue, IssueState, Listing, MergeMethod,
+    PAGE_SIZE, Provider, PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview,
+    PullRequestState, RepoRef, Repository, ReviewAction, STACK_END, STACK_START, StackEntry,
+    StoredCredential, User, fill_from_commit, render_stack_block, upsert_stack_block,
 };
 
 /// An error from a forge operation. Every variant names the forge it came from

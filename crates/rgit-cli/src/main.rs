@@ -1107,9 +1107,7 @@ fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> (Vec<String>, Option<String>)
                 let at = repo_args(target, repo);
                 (
                     vec![
-                        format!(
-                            "Run `{base} issue create{at} --title \"<title>\"` to open one"
-                        ),
+                        format!("Run `{base} issue create{at} --title \"<title>\"` to open one"),
                         format!("Run `{base} issue close <number>{at} --yes` to close one"),
                     ],
                     Some(format!("{base} issue list{at}")),

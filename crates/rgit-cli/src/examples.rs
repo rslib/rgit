@@ -1503,7 +1503,10 @@ const EXAMPLES: &[Entry] = &[
     ),
     (
         "forge issue view",
-        &["rgit forge issue view 7", "rgit forge issue view 7 owner/repo"],
+        &[
+            "rgit forge issue view 7",
+            "rgit forge issue view 7 owner/repo",
+        ],
     ),
     (
         "forge issue create",
