@@ -6391,6 +6391,9 @@ pub enum StackCmd {
     List,
     /// Rebase every descendant onto its parent's new tip.
     Restack,
+    /// Retarget the children of merged parents onto the grandparent branch,
+    /// then restack.
+    Sync,
 }
 
 /// Subcommands for lanes.
@@ -9724,6 +9727,7 @@ fn run_command(
             StackCmd::New { name } => crate::stack::new(backend, &name)?,
             StackCmd::List => crate::stack::list(backend)?,
             StackCmd::Restack => crate::stack::restack(backend)?,
+            StackCmd::Sync => crate::stack::sync(backend)?,
         },
         Command::Absorb => backend.absorb()?,
         Command::Workspace { cmd } => match cmd.unwrap_or(WorkspaceCmd::List) {

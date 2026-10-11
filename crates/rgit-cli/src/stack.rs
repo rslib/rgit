@@ -65,6 +65,91 @@ pub fn restack(backend: &Arc<dyn GitBackend>) -> Result<String> {
     Ok(render_restack(&backend.restack()?))
 }
 
+/// Retarget the children of merged parents onto the grandparent branch,
+/// record the new parent and restack: when a parent pull request is merged,
+/// each child's pull request base moves to the parent's base and the stack
+/// config parent follows it, so the local restack lands on live branches.
+/// Without an origin remote or forge credentials this is a plain restack.
+pub fn sync(backend: &Arc<dyn GitBackend>) -> Result<String> {
+    let parents: HashMap<String, String> = backend
+        .stack_parents()?
+        .into_iter()
+        .filter_map(|(b, p)| p.map(|p| (b, p)))
+        .collect();
+    let mut retargeted = Vec::new();
+    if !parents.is_empty()
+        && let Some(origin) = backend.config_get("remote.origin.url")?
+        && let Ok(target) = forge_target(&origin)
+    {
+        retarget_merged_children(backend, &parents, &target, &mut retargeted)?;
+    }
+    let outcome = backend.restack()?;
+    let mut out = String::new();
+    if !retargeted.is_empty() {
+        out.push_str(&format!("retargeted:\n{}", retargeted.join("\n")));
+    }
+    let restacked = render_restack(&outcome);
+    if restacked != "nothing to restack" {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&restacked);
+    }
+    if out.is_empty() {
+        out.push_str("nothing to restack");
+    }
+    Ok(out)
+}
+
+/// The forge target of the origin remote, when it names a forge repository.
+fn forge_target(origin: &str) -> Result<rgit_forge::ForgeTarget> {
+    let selection = rgit_forge::ForgeSelection::default().resolve()?;
+    Ok(rgit_forge::ForgeTarget::from_remote(&selection, origin)?)
+}
+
+/// Every stacked child whose parent pull request is merged: point the child
+/// pull request at the parent's base and record that base as the new stack
+/// parent, collecting one `child -> base` line per move.
+fn retarget_merged_children(
+    backend: &Arc<dyn GitBackend>,
+    parents: &HashMap<String, String>,
+    target: &rgit_forge::ForgeTarget,
+    retargeted: &mut Vec<String>,
+) -> Result<()> {
+    let repo = target.repo()?.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let forge = rgit_forge::Forge::connect(target).await?;
+        for (child, parent) in parents {
+            let Some(parent_pr) = forge.pull_request_for_branch(&repo, parent).await? else {
+                continue;
+            };
+            if !parent_pr.merged && parent_pr.state != "merged" {
+                continue;
+            }
+            let base = parent_pr.base_branch.clone();
+            if base == *parent {
+                continue;
+            }
+            if let Some(child_pr) = forge.pull_request_for_branch(&repo, child).await?
+                && child_pr.base_branch != base
+            {
+                forge
+                    .retarget_pull_request(&repo, child_pr.number, &base)
+                    .await?;
+            }
+            backend
+                .config_set(&format!("branch.{child}.rgit-stack-parent"), &base)
+                .map_err(|error| anyhow!("{error}"))?;
+            retargeted.push(format!("{child} -> {base}"));
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
 /// Human summary of a restack: what moved, and what conflicted and needs a
 /// manual resolve.
 pub fn render_restack(outcome: &rgit_git::RestackOutcome) -> String {

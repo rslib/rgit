@@ -77,3 +77,19 @@ fn restack_after_editing_the_parent() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn sync_without_a_stack_restacks_nothing() {
+    let dir = std::env::temp_dir().join(format!("rgit-stack-sync-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    git(&dir, &["config", "user.email", "t@t"]);
+    git(&dir, &["config", "user.name", "t"]);
+    git(&dir, &["commit", "-q", "--allow-empty", "-m", "base"]);
+
+    let (out, ok) = rgit(&dir, &["stack", "sync"]);
+    assert!(ok && out.contains("nothing to restack"), "sync: {out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
