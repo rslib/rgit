@@ -737,10 +737,28 @@ fn part_states(place: &Place, bin: &str) -> [&'static str; 3] {
                 Ok(_) => "stale",
                 Err(_) => "missing",
             };
+            // The hook is the SessionStart command; the modules line next to
+            // it belongs to the tools part.
+            let hook = match std::fs::read_to_string(dir.join("hooks/hooks.json")) {
+                Ok(text) => {
+                    let command: Option<String> = serde_json::from_str(&text)
+                        .ok()
+                        .and_then(|v: Value| {
+                            v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+                                .as_str()
+                                .map(str::to_owned)
+                        });
+                    match command.as_deref() {
+                        Some(c) if c == hook_command(bin) => "current",
+                        _ => "stale",
+                    }
+                }
+                Err(_) => "missing",
+            };
             [
                 skill_state(&place.skill_dir()),
-                file_state("hooks/hooks.json", &claude_hooks(bin)),
-                file_state(".mcp.json", &claude_mcp(bin)),
+                hook,
+                file_state("hooks/register.tsx", &claude_register(bin)),
             ]
         }
         App::Pi | App::Omp => {
@@ -1003,15 +1021,27 @@ fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).expect("json serializes") + "\n"
 }
 
-fn claude_hooks(bin: &str) -> String {
-    pretty(&json!({ "hooks": { "SessionStart": [{
+fn claude_hooks(bin: &str, tools: bool) -> String {
+    let mut root = json!({ "hooks": { "SessionStart": [{
         "matcher": CLAUDE_MATCHER,
         "hooks": [{ "type": "command", "command": hook_command(bin), "timeout": 10 }],
-    }] } }))
+    }] } });
+    if tools {
+        root["modules"] = json!(["./register.tsx"]);
+    }
+    pretty(&root)
 }
 
-fn claude_mcp(bin: &str) -> String {
-    pretty(&json!({ "mcpServers": { "rgit": { "command": bin, "args": ["mcp"] } } }))
+/// The Claude Code mod template.
+const REGISTER_TSX: &str = include_str!("../../../extensions/claude/hooks/register.tsx");
+
+/// The Claude Code mod: rgit's tools as native tools running `rgit tool`.
+fn claude_register(bin: &str) -> String {
+    let string = |s: &str| serde_json::to_string(s).expect("a string serializes");
+    let tools = serde_json::to_string(&crate::mcp::definitions()).expect("definitions serialize");
+    REGISTER_TSX
+        .replace("\"__RGIT__\"", &string(bin))
+        .replace("\"__TOOLS__\"", &string(&tools))
 }
 
 /// The optional plugin files and the part each carries, relative to the
@@ -1020,7 +1050,7 @@ const PLUGIN_PART_FILES: [&str; 4] = [
     "skills/rgit/SKILL.md",
     "skills/rgit/references/commands.md",
     "hooks/hooks.json",
-    ".mcp.json",
+    "hooks/register.tsx",
 ];
 
 /// The marketplace files, relative to `plugin_dir`, and the plugin version,
@@ -1035,10 +1065,13 @@ fn plugin_files(bin: &str, parts: Parts) -> (Vec<(String, String)>, String) {
         }
     }
     if parts.hook {
-        files.push(("plugins/rgit/hooks/hooks.json".into(), claude_hooks(bin)));
+        files.push((
+            "plugins/rgit/hooks/hooks.json".into(),
+            claude_hooks(bin, parts.mcp),
+        ));
     }
     if parts.mcp {
-        files.push(("plugins/rgit/.mcp.json".into(), claude_mcp(bin)));
+        files.push(("plugins/rgit/hooks/register.tsx".into(), claude_register(bin)));
     }
     let mut h = Sha256::new();
     for (path, text) in &files {
@@ -1077,7 +1110,7 @@ fn plugin_parts(dir: &Path) -> Parts {
     Parts {
         skill: dir.join("skills/rgit/SKILL.md").exists(),
         hook: dir.join("hooks/hooks.json").exists(),
-        mcp: dir.join(".mcp.json").exists(),
+        mcp: dir.join("hooks/register.tsx").exists(),
     }
 }
 
@@ -1691,20 +1724,40 @@ mod tests {
         let (files, version) = plugin_files("rgit", all);
         assert!(version.starts_with(env!("CARGO_PKG_VERSION")));
         assert_eq!(version.len(), env!("CARGO_PKG_VERSION").len() + 7);
-        assert!(files.iter().any(|(p, _)| p == "plugins/rgit/.mcp.json"));
+        assert!(
+            files
+                .iter()
+                .any(|(p, _)| p == "plugins/rgit/hooks/register.tsx")
+        );
         assert!(
             !plugin_files("rgit", no_mcp)
                 .0
                 .iter()
-                .any(|(p, _)| p.ends_with(".mcp.json"))
+                .any(|(p, _)| p.ends_with("register.tsx"))
         );
         assert_ne!(plugin_files("rgit", no_mcp).1, version);
         assert_ne!(plugin_files("/new/rgit", all).1, version);
-        let hooks: Value = serde_json::from_str(&claude_hooks("rgit")).unwrap();
+        let hooks: Value = serde_json::from_str(&claude_hooks("rgit", true)).unwrap();
         assert_eq!(
             hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"],
             "rgit hook session-start"
         );
+        assert_eq!(hooks["modules"], json!(["./register.tsx"]));
+        let bare: Value = serde_json::from_str(&claude_hooks("rgit", false)).unwrap();
+        assert!(bare.get("modules").is_none());
+    }
+
+    #[test]
+    fn claude_register_fills_every_placeholder() {
+        let text = claude_register("/x/rgit");
+        assert!(text.starts_with("// Generated by rgit agent install;"));
+        assert!(
+            !text.contains("__RGIT__") && !text.contains("__TOOLS__"),
+            "a placeholder is left"
+        );
+        assert!(text.contains("const RGIT: string = \"/x/rgit\";"));
+        assert!(text.contains("git_status"));
+        assert!(text.contains("readOnlyHint"));
     }
 
     #[test]
