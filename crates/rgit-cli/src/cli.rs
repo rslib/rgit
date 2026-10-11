@@ -15507,7 +15507,7 @@ fn pretty_log(
         let mut c = c.clone();
         c.from = from.clone();
         out.push_str(&pretty.show(&c));
-        if pretty.terminator {
+        if pretty.terminator && !pretty.is_empty() {
             out.push('\n');
         }
         if let Some(changes) = changes {
@@ -15607,7 +15607,7 @@ fn graph_log(
             }
             out.push_str(&graph.commit_msg(&msg));
             missing_newline = !msg.ends_with('\n');
-            if pretty.terminator {
+            if pretty.terminator && !pretty.is_empty() {
                 if !missing_newline {
                     out.push_str(&graph.padding_line());
                 }

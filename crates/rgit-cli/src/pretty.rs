@@ -148,7 +148,12 @@ impl Pretty {
         let (fmt, terminator) = match spec {
             "oneline" => (Fmt::Oneline, true),
             "short" => (Fmt::Short, false),
-            "medium" | "" => (Fmt::Medium, false),
+            "medium" => (Fmt::Medium, false),
+            // git reads an empty --format= or --pretty= as an empty tformat.
+            "" => {
+                crate::cli::print_as_is();
+                (Fmt::User(String::new()), true)
+            }
             "full" => (Fmt::Full, false),
             "fuller" => (Fmt::Fuller, false),
             "raw" => (Fmt::Raw, false),
@@ -161,7 +166,12 @@ impl Pretty {
                     crate::cli::print_as_is();
                     (Fmt::User(f.to_owned()), false)
                 }
-                (_, Some(f)) => (Fmt::User(f.to_owned()), true),
+                (_, Some(f)) => {
+                    if f.is_empty() {
+                        crate::cli::print_as_is();
+                    }
+                    (Fmt::User(f.to_owned()), true)
+                }
                 _ if s.contains('%') => (Fmt::User(s.to_owned()), true),
                 _ => return Err(CliError::usage(format!("invalid --pretty format: {s}"))),
             },
@@ -223,6 +233,12 @@ impl Pretty {
 
     /// Whether a blank line goes between the message and the diff. A merge's
     /// combined diff gets one even after a oneline.
+    /// An empty user format prints nothing for a commit, not even its
+    /// terminator, as git's `--format=` lists only the changes.
+    pub fn is_empty(&self) -> bool {
+        matches!(&self.fmt, Fmt::User(f) if f.is_empty())
+    }
+
     pub fn blank_before_diff(&self, merge: bool) -> bool {
         match &self.fmt {
             Fmt::Oneline => merge,

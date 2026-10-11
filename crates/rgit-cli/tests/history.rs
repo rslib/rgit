@@ -379,6 +379,25 @@ fn log_simplifies_history_and_draws_graphs_like_git() {
         &["log", "--oneline", "--graph", "--", "f"],
         &["log", "--oneline", "--graph", "--first-parent"],
         &["log", "--oneline", "--graph", "--reverse"],
+        &["log", "--graph", "--format=", "--name-only"],
+        &["log", "--graph", "--format=tformat:"],
+    ];
+    for args in cases {
+        same(&dir, args);
+    }
+}
+
+#[test]
+fn empty_format_lists_only_changes_like_git() {
+    let dir = side_repo("empty-format");
+    let cases: &[&[&str]] = &[
+        &["show", "--name-only", "--format="],
+        &["show", "--format=", "--stat"],
+        &["show", "--pretty=", "--name-status"],
+        &["log", "--format=", "--name-only", "-3"],
+        &["log", "--format=tformat:", "--name-only", "-3"],
+        &["log", "--format=", "-2"],
+        &["log", "--pretty=format:", "--name-only", "-3"],
     ];
     for args in cases {
         same(&dir, args);
