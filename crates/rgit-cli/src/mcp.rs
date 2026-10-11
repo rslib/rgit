@@ -77,9 +77,11 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "git_stash_show",
     "git_forge_pr_list",
     "git_forge_pr_view",
+    "git_forge_pr_comments",
     "git_forge_pr_checks",
     "git_forge_issue_list",
     "git_forge_issue_view",
+    "git_forge_issue_comments",
     "git_branches",
     "git_lanes_list",
     "git_stack_list",
@@ -1581,6 +1583,17 @@ fn tools() -> Vec<Tool> {
             ],
         ),
         tool(
+            "git_forge_pr_comments",
+            "The comment thread of a pull request: plain comments, inline code comments \
+             (path:line) and reviews, oldest first. `number` names it. `target` names \
+             another forge repository (`OWNER/REPO`).",
+            &[
+                ("number", "integer", true),
+                ("target", "string", false),
+                FIELDS,
+            ],
+        ),
+        tool(
             "git_forge_pr_checks",
             "CI checks on a pull request's head commit (its jobs for GitLab): the rollup plus \
              one row per check. `number` names the request, defaulting to the current branch's.",
@@ -1651,6 +1664,16 @@ fn tools() -> Vec<Tool> {
             "git_forge_issue_view",
             "One issue: title, body, labels, assignees. `number` names it. `target` names \
              another forge repository (`OWNER/REPO`).",
+            &[
+                ("number", "integer", true),
+                ("target", "string", false),
+                FIELDS,
+            ],
+        ),
+        tool(
+            "git_forge_issue_comments",
+            "The comment thread of an issue, oldest first. `number` names it. `target` \
+             names another forge repository (`OWNER/REPO`).",
             &[
                 ("number", "integer", true),
                 ("target", "string", false),
@@ -5250,6 +5273,12 @@ fn forge_pr_tool(
                 target: a.str("target"),
                 repo: None,
             },
+            "git_forge_pr_comments" => PrCmd::View {
+                what: Some(number()?.to_string()),
+                target: a.str("target"),
+                repo: None,
+                comments: true,
+            },
             "git_forge_pr_create" => PrCmd::Create {
                 target: a.str("target"),
                 repo: None,
@@ -5346,6 +5375,12 @@ fn forge_issue_tool(
                 repo: None,
                 comments: false,
             },
+            "git_forge_issue_comments" => IssueCmd::View {
+                number: number()?,
+                target: a.str("target"),
+                repo: None,
+                comments: true,
+            },
             "git_forge_issue_create" => IssueCmd::Create {
                 target: a.str("target"),
                 repo: None,
@@ -5397,6 +5432,7 @@ fn local(backend: &Arc<dyn GitBackend>, a: &Args, full: bool) -> anyhow::Result<
     Ok(match a.tool {
         "git_forge_pr_list"
         | "git_forge_pr_view"
+        | "git_forge_pr_comments"
         | "git_forge_pr_checks"
         | "git_forge_pr_create"
         | "git_forge_pr_comment"
@@ -5404,6 +5440,7 @@ fn local(backend: &Arc<dyn GitBackend>, a: &Args, full: bool) -> anyhow::Result<
         | "git_forge_pr_close" => forge_pr_tool(backend, a, full)?,
         "git_forge_issue_list"
         | "git_forge_issue_view"
+        | "git_forge_issue_comments"
         | "git_forge_issue_create"
         | "git_forge_issue_comment"
         | "git_forge_issue_close" => forge_issue_tool(backend, a, full)?,
@@ -5962,6 +5999,33 @@ mod tests {
     }
 
     #[test]
+    fn forge_comment_tools_are_listed_and_read_only() {
+        for name in ["git_forge_pr_comments", "git_forge_issue_comments"] {
+            assert!(tools().iter().any(|t| t.name == *name), "{name} is listed");
+            assert!(is_read_only(name), "{name} is read-only");
+            assert!(
+                !CORE_TOOLS.contains(&name),
+                "{name} is not a core tool"
+            );
+            let all = tools();
+            let tool = all.iter().find(|t| t.name == *name).expect("tool");
+            assert_eq!(
+                tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+                Some(true),
+                "{name}"
+            );
+        }
+        let dir = init_repo("forge-comments-args");
+        let backend = open(&dir);
+        let run = |name: &str, args: Value| call(&backend, name, args);
+        let no_number = run("git_forge_pr_comments", json!({})).unwrap_err();
+        assert!(no_number.contains("number required"), "{no_number}");
+        let no_number = run("git_forge_issue_comments", json!({})).unwrap_err();
+        assert!(no_number.contains("number required"), "{no_number}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn every_tool_is_wired() {
         const LOCAL: &[&str] = &[
             "git_tree",
@@ -5970,6 +6034,7 @@ mod tests {
             "git_grep",
             "git_forge_pr_list",
             "git_forge_pr_view",
+            "git_forge_pr_comments",
             "git_forge_pr_checks",
             "git_forge_pr_create",
             "git_forge_pr_comment",
@@ -5977,6 +6042,7 @@ mod tests {
             "git_forge_pr_close",
             "git_forge_issue_list",
             "git_forge_issue_view",
+            "git_forge_issue_comments",
             "git_forge_issue_create",
             "git_forge_issue_comment",
             "git_forge_issue_close",
