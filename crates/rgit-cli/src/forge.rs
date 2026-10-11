@@ -4,7 +4,7 @@ use crate::cli::{AuthCmd, ForgeBranchCmd, ForgeCmd, IssueCmd, PrCmd, RepoCmd};
 use anyhow::{Result, ensure};
 use rgit_forge::{
     CreateIssue, CreatePullRequest, CreateRepository, Forge, ForgeError, ForgeTarget, MergeMethod,
-    Provider, ReviewAction, StackEntry,
+    Provider, ReviewAction, StackEntry, ThreadEntry,
 };
 use rgit_git::GitBackend;
 use serde::Serialize;
@@ -201,7 +201,12 @@ pub fn run_in(
             }),
         },
         ForgeCmd::Pr { cmd } => match cmd {
-            PrCmd::View { what, target, repo } => {
+            PrCmd::View {
+                what,
+                target,
+                repo,
+                comments,
+            } => {
                 let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 let what = pr_what(what, dir)?;
@@ -217,7 +222,11 @@ pub fn run_in(
                                 ))
                             })?,
                     };
-                    print_json(pr)
+                    if !comments {
+                        return print_json(pr);
+                    }
+                    let thread = forge.pull_request_thread(&repo, pr.number).await?;
+                    print_json_with_thread(pr, thread)
                 })
             }
             PrCmd::Checks {
@@ -511,11 +520,17 @@ pub fn run_in(
                 number,
                 target,
                 repo,
+                comments,
             } => {
                 let target = resolve_target(dir, &selection, target.as_deref(), repo.as_deref())?;
                 let repo = target.repo()?.clone();
                 with_forge(target, move |forge| async move {
-                    print_json(forge.issue(&repo, number).await?)
+                    let issue = forge.issue(&repo, number).await?;
+                    if !comments {
+                        return print_json(issue);
+                    }
+                    let thread = forge.issue_thread(&repo, number).await?;
+                    print_json_with_thread(issue, thread)
                 })
             }
             IssueCmd::Create {
@@ -1043,6 +1058,23 @@ fn print_json<T: Serialize>(value: T) -> Result<String, ForgeError> {
     serde_json::to_string_pretty(&value).map_err(|error| ForgeError::Response(error.to_string()))
 }
 
+/// A pull request or issue with its `thread` entries under one `thread` key.
+fn print_json_with_thread<T: Serialize>(
+    value: T,
+    thread: Vec<ThreadEntry>,
+) -> Result<String, ForgeError> {
+    let mut value =
+        serde_json::to_value(value).map_err(|error| ForgeError::Response(error.to_string()))?;
+    if let serde_json::Value::Object(ref mut map) = value {
+        map.insert(
+            "thread".to_owned(),
+            serde_json::to_value(thread)
+                .map_err(|error| ForgeError::Response(error.to_string()))?,
+        );
+    }
+    serde_json::to_string_pretty(&value).map_err(|error| ForgeError::Response(error.to_string()))
+}
+
 fn str_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(serde_json::Value::as_str)
 }
@@ -1138,6 +1170,104 @@ pub fn human_pull_request_checks(value: &serde_json::Value) -> String {
         }
     }
     out
+}
+
+/// Compact human text for a comment thread: one block per entry, oldest
+/// first. Inline entries show `path:line` in the header; replies indent one
+/// more level under their parent.
+pub fn human_thread(thread: &serde_json::Value) -> String {
+    let entries = thread.as_array().cloned().unwrap_or_default();
+    if entries.is_empty() {
+        return "no comments".to_owned();
+    }
+    entries
+        .iter()
+        .map(human_thread_entry)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn human_thread_entry(entry: &serde_json::Value) -> String {
+    let reply = entry
+        .get("in_reply_to")
+        .is_some_and(|value| !value.is_null());
+    let indent = if reply { "  " } else { "" };
+    let mut header = match str_field(entry, "author") {
+        Some(author) => author.to_owned(),
+        None => str_field(entry, "kind").unwrap_or("").to_owned(),
+    };
+    if let Some(when) = str_field(entry, "created_at") {
+        if !header.is_empty() {
+            header.push_str("  ");
+        }
+        header.push_str(when);
+    }
+    if str_field(entry, "kind") == Some("inline") {
+        let path = str_field(entry, "path").unwrap_or("");
+        let line = entry
+            .get("line")
+            .and_then(serde_json::Value::as_u64)
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        header.push_str(&format!("  {path}:{line}"));
+    }
+    if let Some(state) = str_field(entry, "state") {
+        header.push_str(&format!("  [{state}]"));
+    }
+    let mut out = format!("{indent}{header}");
+    if let Some(body) = str_field(entry, "body")
+        .map(str::trim)
+        .filter(|body| !body.is_empty())
+    {
+        for line in body.lines() {
+            out.push('\n');
+            out.push_str(indent);
+            out.push_str("  ");
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// One TOON row per thread entry: a fixed schema with `created_at` renamed
+/// to `when`, plus `where` (`path:line` for inline entries); missing values
+/// stay null so every row has the same columns.
+pub fn thread_rows(thread: &serde_json::Value) -> Vec<serde_json::Value> {
+    thread
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| {
+            let field = |key: &str| entry.get(key).cloned().unwrap_or(serde_json::Value::Null);
+            let when = entry
+                .get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let whereabouts = match (
+                entry.get("path").and_then(serde_json::Value::as_str),
+                entry.get("line").and_then(serde_json::Value::as_u64),
+            ) {
+                (Some(path), Some(line)) => format!("{path}:{line}"),
+                (Some(path), None) => path.to_owned(),
+                _ => String::new(),
+            };
+            serde_json::json!({
+                "kind": field("kind"),
+                "id": field("id"),
+                "author": field("author"),
+                "body": field("body"),
+                "when": when,
+                "url": field("url"),
+                "path": field("path"),
+                "line": field("line"),
+                "where": whereabouts,
+                "state": field("state"),
+                "in_reply_to": field("in_reply_to"),
+                "resolved": field("resolved"),
+            })
+        })
+        .collect()
 }
 
 /// Compact human text for a pull request listing: one line per request.
@@ -1581,6 +1711,94 @@ mod tests {
         );
         let empty = serde_json::json!([]);
         assert_eq!(super::human_issue_list(&empty), "0 open issues");
+    }
+
+    fn thread_value() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "kind": "comment",
+                "id": 1,
+                "author": "alice",
+                "body": "Looks good.",
+                "created_at": "2026-01-02T03:04:05Z",
+                "url": "https://h/1",
+                "path": null,
+                "line": null,
+                "state": null,
+                "in_reply_to": null,
+                "resolved": null
+            },
+            {
+                "kind": "inline",
+                "id": 2,
+                "author": "bob",
+                "body": "Rename this.",
+                "created_at": "2026-01-03T03:04:05Z",
+                "url": "https://h/2",
+                "path": "src/main.rs",
+                "line": 42,
+                "state": null,
+                "in_reply_to": null,
+                "resolved": null
+            },
+            {
+                "kind": "inline",
+                "id": 3,
+                "author": "alice",
+                "body": "Done.",
+                "created_at": "2026-01-04T03:04:05Z",
+                "url": "https://h/3",
+                "path": "src/main.rs",
+                "line": 42,
+                "state": null,
+                "in_reply_to": 2,
+                "resolved": true
+            },
+            {
+                "kind": "review",
+                "id": 4,
+                "author": "bob",
+                "body": "Ship it.",
+                "created_at": "2026-01-05T03:04:05Z",
+                "url": "https://h/4",
+                "path": null,
+                "line": null,
+                "state": "approved",
+                "in_reply_to": null,
+                "resolved": null
+            }
+        ])
+    }
+
+    #[test]
+    fn human_thread_shows_one_block_per_entry() {
+        let text = super::human_thread(&thread_value());
+        assert!(text.contains("alice  2026-01-02T03:04:05Z\n  Looks good."), "{text}");
+        assert!(
+            text.contains("bob  2026-01-03T03:04:05Z  src/main.rs:42\n  Rename this."),
+            "{text}"
+        );
+        assert!(
+            text.contains("  alice  2026-01-04T03:04:05Z  src/main.rs:42\n    Done."),
+            "{text}"
+        );
+        assert!(
+            text.contains("bob  2026-01-05T03:04:05Z  [approved]\n  Ship it."),
+            "{text}"
+        );
+        assert_eq!(super::human_thread(&serde_json::json!([])), "no comments");
+    }
+
+    #[test]
+    fn thread_rows_carry_when_and_where() {
+        let rows = super::thread_rows(&thread_value());
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["when"], "2026-01-02T03:04:05Z");
+        assert_eq!(rows[0]["where"], "");
+        assert_eq!(rows[1]["where"], "src/main.rs:42");
+        assert_eq!(rows[3]["state"], "approved");
+        assert!(rows[0]["path"].is_null(), "{rows:?}");
+        assert!(rows[0].get("created_at").is_none(), "{rows:?}");
     }
 
     #[test]

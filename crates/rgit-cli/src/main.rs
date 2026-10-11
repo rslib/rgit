@@ -467,6 +467,7 @@ fn main() -> ! {
                 }
             }
             let (hints, list_cmd) = forge_hints(&cmd, &base);
+            let full = emit.full;
             finish(
                 forge::run(
                     cmd,
@@ -478,7 +479,7 @@ fn main() -> ! {
                     },
                 )
                 .map(|text| {
-                    let mut out = forge_output(text, list_cmd.as_deref());
+                    let mut out = forge_output(text, list_cmd.as_deref(), full);
                     out.help.extend(hints);
                     out
                 }),
@@ -984,14 +985,31 @@ fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> (Vec<String>, Option<String>)
             ),
         },
         ForgeCmd::Pr { cmd } => match cmd {
-            PrCmd::View { target, repo, .. } => {
+            PrCmd::View {
+                what,
+                target,
+                repo,
+                comments,
+            } => {
                 let at = repo_args(target, repo);
-                (
-                    vec![format!(
-                        "Run `{base} pr checks <number>{at}` to see its checks"
-                    )],
-                    None,
-                )
+                let mut hints = vec![format!(
+                    "Run `{base} pr checks <number>{at}` to see its checks"
+                )];
+                if *comments {
+                    let number = match what.as_deref() {
+                        Some(number)
+                            if !number.is_empty()
+                                && number.chars().all(char::is_numeric) =>
+                        {
+                            number.to_owned()
+                        }
+                        _ => "<number>".to_owned(),
+                    };
+                    hints.push(format!(
+                        "Run `{base} pr comment {number}{at} --body \"<text>\"` to reply"
+                    ));
+                }
+                (hints, None)
             }
             PrCmd::Checks { target, repo, .. } => {
                 let at = repo_args(target, repo);
@@ -1150,7 +1168,9 @@ fn forge_hints(cmd: &cli::ForgeCmd, base: &str) -> (Vec<String>, Option<String>)
 /// Forge results arrive as JSON; tables get a small default schema. A paged
 /// listing (`items`, `page`, `more`, `total`) gets a count and, when more
 /// pages follow, a hint that re-runs `list_cmd` with the next `--page`.
-fn forge_output(text: String, list_cmd: Option<&str>) -> Output {
+/// A pull request or issue viewed with `--comments` carries its `thread`
+/// entries, shown as a table (bodies cut unless `full`) after the human text.
+fn forge_output(text: String, list_cmd: Option<&str>, full: bool) -> Output {
     match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(mut map)) if map.get("items").is_some_and(Value::is_array) => {
             let human = match map.get("items") {
@@ -1210,9 +1230,14 @@ fn forge_output(text: String, list_cmd: Option<&str>) -> Output {
         }
         Ok(Value::Object(mut map)) => {
             map.retain(|_, v| !v.is_null());
+            let thread = map.remove("thread").filter(Value::is_array);
             let human = crate::forge::human_forge_text(&Value::Object(map.clone()), list_cmd);
-            let text = human.unwrap_or(text);
-            match map.remove("accounts") {
+            let mut text = human.unwrap_or(text);
+            if let Some(thread) = thread.as_ref() {
+                text.push_str("\n\n");
+                text.push_str(&crate::forge::human_thread(thread));
+            }
+            let mut out = match map.remove("accounts") {
                 Some(Value::Array(items)) => {
                     let rows = objects(items);
                     Output::from_json(text, map).list(
@@ -1227,7 +1252,37 @@ fn forge_output(text: String, list_cmd: Option<&str>) -> Output {
                     Output::from_json(text, map)
                 }
                 None => Output::from_json(text, map),
+            };
+            if let Some(thread) = thread.as_ref() {
+                let mut rows = objects(crate::forge::thread_rows(thread));
+                let mut cut = false;
+                if !full {
+                    for row in &mut rows {
+                        if let Some((_, Node::Str(body))) =
+                            row.iter_mut().find(|(key, _)| key == "body")
+                        {
+                            let total = body.chars().count();
+                            if total > crate::output::TRUNCATE_AT {
+                                let kept: String =
+                                    body.chars().take(crate::output::TRUNCATE_AT).collect();
+                                *body =
+                                    format!("{kept}\n... (truncated, {total} chars total)");
+                                cut = true;
+                            }
+                        }
+                    }
+                }
+                out = out.list(
+                    "thread",
+                    rows,
+                    &["kind", "author", "when", "where", "state", "body"],
+                    "no comments",
+                );
+                if cut {
+                    out = out.help("Re-run with --full to see the complete bodies");
+                }
             }
+            out
         }
         _ => Output::message(text),
     }
@@ -1774,6 +1829,7 @@ mod tests {
         let out = render(forge_output(
             text.to_owned(),
             Some("rgit forge pr list o/r"),
+            false,
         ));
         assert!(out.contains("count: 101-101 of 150 total"), "{out}");
         assert!(
@@ -1789,6 +1845,7 @@ mod tests {
         let out = render(forge_output(
             text.to_owned(),
             Some("rgit forge branch list"),
+            false,
         ));
         assert_eq!(out, "branches: 0 remote branches on page 3");
     }
@@ -1814,7 +1871,7 @@ mod tests {
     #[test]
     fn forge_output_prints_human_text_for_pr_results() {
         let pr = r#"{"number":12,"title":"Add forge PRs","state":"open","html_url":"https://h/12","head_branch":"feature","base_branch":"main","draft":false,"author":"dev-1","body":null,"labels":[],"reviewers":[]}"#;
-        let out = forge_output(pr.to_owned(), None);
+        let out = forge_output(pr.to_owned(), None, false);
         assert!(
             out.text.starts_with("#12 Add forge PRs [open]"),
             "{}",
@@ -1828,12 +1885,39 @@ mod tests {
 
         let checks =
             r#"{"rollup":"passing","checks":[{"name":"build","status":"passing","url":null}]}"#;
-        let out = forge_output(checks.to_owned(), None);
+        let out = forge_output(checks.to_owned(), None, false);
         assert!(out.text.starts_with("passing (1 check)"), "{}", out.text);
 
         let listing = r#"{"items":[{"number":12,"title":"t","state":"open","html_url":"u","head_branch":"h","base_branch":"main","draft":false}],"page":1,"more":false,"total":1}"#;
-        let out = forge_output(listing.to_owned(), Some("rgit forge pr list o/r"));
+        let out = forge_output(listing.to_owned(), Some("rgit forge pr list o/r"), false);
         assert_eq!(out.text, "#12 t [open] h -> main");
+    }
+
+    #[test]
+    fn forge_output_shows_a_view_thread_as_table_and_text() {
+        let view = r#"{"number":12,"title":"t","state":"open","html_url":"u","head_branch":"h","base_branch":"main","draft":false,"thread":[{"kind":"inline","id":2,"author":"bob","body":"Rename this.","created_at":"2026-01-03T03:04:05Z","path":"src/main.rs","line":42},{"kind":"review","id":4,"author":"bob","body":"Ship it.","created_at":"2026-01-05T03:04:05Z","state":"approved"}]}"#;
+        let out = forge_output(view.to_owned(), None, false);
+        assert!(out.text.contains("bob  2026-01-03T03:04:05Z  src/main.rs:42"), "{}", out.text);
+        assert!(out.text.contains("[approved]"), "{}", out.text);
+        let rendered = render(out);
+        assert!(
+            rendered.contains("thread[2]{kind,author,when,where,state,body}:"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("src/main.rs:42"), "{rendered}");
+    }
+
+    #[test]
+    fn forge_output_cuts_thread_bodies_unless_full() {
+        let body = "x".repeat(1600);
+        let view = format!(
+            "{{\"number\":12,\"title\":\"t\",\"state\":\"open\",\"thread\":[{{\"kind\":\"comment\",\"author\":\"a\",\"body\":\"{body}\",\"created_at\":\"2026-01-02T03:04:05Z\"}}]}}"
+        );
+        let cut = render(forge_output(view.clone(), None, false));
+        assert!(cut.contains("truncated, 1600 chars total"), "{cut}");
+        let whole = render(forge_output(view, None, true));
+        assert!(!whole.contains("truncated"), "{whole}");
+        assert!(whole.contains(&"x".repeat(1600)));
     }
 
     #[test]
@@ -1843,6 +1927,7 @@ mod tests {
                 what: None,
                 target: None,
                 repo: None,
+                comments: false,
             },
             cli::PrCmd::Checks {
                 number: None,

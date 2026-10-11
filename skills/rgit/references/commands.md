@@ -166,7 +166,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
     - `forge branch list`: List remote branches, 100 per page. e.g. `rgit forge branch list`, `rgit forge branch list owner/repo`
     - `forge branch delete`: Delete a remote branch after explicit confirmation. e.g. `rgit forge branch delete <branch> --yes`, `rgit forge branch delete <branch> owner/repo --yes`
   - `forge pr`: Work with pull requests: view, create, edit, merge, review and comment (merge requests on GitLab). e.g. `rgit forge pr list`
-    - `forge pr view`: Show one pull request or merge request by NUMBER or head BRANCH. e.g. `rgit forge pr view`, `rgit forge pr view 42`, `rgit forge pr view feature owner/repo`
+    - `forge pr view`: Show one pull request or merge request by NUMBER or head BRANCH. e.g. `rgit forge pr view`, `rgit forge pr view 42`, `rgit forge pr view feature owner/repo`, `rgit forge pr view 42 --comments`
     - `forge pr checks`: Show the CI checks on a pull request's head commit (its jobs for GitLab). e.g. `rgit forge pr checks`, `rgit forge pr checks 42`, `rgit forge pr checks 42 owner/repo`
     - `forge pr list`: List pull requests or merge requests, 100 per page. e.g. `rgit forge pr list`, `rgit forge pr list owner/repo`, `rgit forge pr list --page 2`, `rgit forge pr list --state merged --author <login> --head <branch>`
     - `forge pr create`: Create a pull request or merge request. e.g. `rgit forge pr create`, `rgit forge pr create --title "<title>" --head <branch> --base main`, `rgit forge pr create --fixes 7`
@@ -181,7 +181,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
     - `forge pr merge`: Merge a pull request or merge request. e.g. `rgit forge pr merge 42 --yes`, `rgit forge pr merge 42 --method squash --delete-branch --yes`
   - `forge issue`: Work with issues: list, view, create, edit, close, reopen and comment. e.g. `rgit forge issue list`
     - `forge issue list`: List issues, 100 per page. e.g. `rgit forge issue list`, `rgit forge issue list owner/repo`, `rgit forge issue list --page 2`, `rgit forge issue list --state closed --author <login> --label <label> --assignee <login>`
-    - `forge issue view`: Show one issue by NUMBER. e.g. `rgit forge issue view 7`, `rgit forge issue view 7 owner/repo`
+    - `forge issue view`: Show one issue by NUMBER. e.g. `rgit forge issue view 7`, `rgit forge issue view 7 owner/repo`, `rgit forge issue view 7 --comments`
     - `forge issue create`: Open an issue. e.g. `rgit forge issue create --title "<title>"`, `rgit forge issue create --title "<title>" --body "<text>" --label <label> --assignee <login>`
     - `forge issue edit`: Change an issue's title, body, labels or assignees. e.g. `rgit forge issue edit 7 --title "<title>"`, `rgit forge issue edit 7 --label <label> --assignee <login>`
     - `forge issue close`: Close an issue after explicit confirmation. e.g. `rgit forge issue close 7 --yes`, `rgit forge issue close 7 owner/repo --yes`

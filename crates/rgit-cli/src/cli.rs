@@ -6667,6 +6667,9 @@ pub enum PrCmd {
         /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
         target: Option<String>,
         repo: Option<String>,
+        /// Also show the thread: plain comments, inline code comments and reviews, oldest first.
+        #[arg(long)]
+        comments: bool,
     },
     /// Show the CI checks on a pull request's head commit (its jobs for GitLab).
     Checks {
@@ -6876,6 +6879,9 @@ pub enum IssueCmd {
         /// Optional `OWNER/REPO`, `github:OWNER/REPO`, or `gitlab:GROUP/PROJECT`; defaults to the Git remote.
         target: Option<String>,
         repo: Option<String>,
+        /// Also show the comment thread, oldest first.
+        #[arg(long)]
+        comments: bool,
     },
     /// Open an issue.
     Create {

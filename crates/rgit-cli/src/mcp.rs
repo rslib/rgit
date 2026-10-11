@@ -5208,7 +5208,11 @@ fn need_confirm(a: &Args, verb: &str, object: &str) -> anyhow::Result<()> {
 
 /// A forge pull request tool: build the CLI command it mirrors and run it
 /// against the bound repository, so MCP and the CLI share one forge path.
-fn forge_pr_tool(backend: &Arc<dyn GitBackend>, a: &Args) -> anyhow::Result<Output> {
+fn forge_pr_tool(
+    backend: &Arc<dyn GitBackend>,
+    a: &Args,
+    full: bool,
+) -> anyhow::Result<Output> {
     let number = || a.num("number")?.ok_or_else(|| a.missing("number"));
     let cmd = ForgeCmd::Pr {
         cmd: match a.tool {
@@ -5238,6 +5242,7 @@ fn forge_pr_tool(backend: &Arc<dyn GitBackend>, a: &Args) -> anyhow::Result<Outp
                     what: digits.map(|n| n.to_string()).or(branch),
                     target: a.str("target"),
                     repo: None,
+                    comments: false,
                 }
             }
             "git_forge_pr_checks" => PrCmd::Checks {
@@ -5306,12 +5311,16 @@ fn forge_pr_tool(backend: &Arc<dyn GitBackend>, a: &Args) -> anyhow::Result<Outp
         cmd,
         crate::forge::ForgeSelection::default(),
     )?;
-    Ok(crate::forge_output(text, list_cmd))
+    Ok(crate::forge_output(text, list_cmd, full))
 }
 
 /// A forge issue tool: build the CLI command it mirrors and run it against
 /// the bound repository, so MCP and the CLI share one forge path.
-fn forge_issue_tool(backend: &Arc<dyn GitBackend>, a: &Args) -> anyhow::Result<Output> {
+fn forge_issue_tool(
+    backend: &Arc<dyn GitBackend>,
+    a: &Args,
+    full: bool,
+) -> anyhow::Result<Output> {
     let number = || a.num("number")?.ok_or_else(|| a.missing("number"));
     let cmd = ForgeCmd::Issue {
         cmd: match a.tool {
@@ -5335,6 +5344,7 @@ fn forge_issue_tool(backend: &Arc<dyn GitBackend>, a: &Args) -> anyhow::Result<O
                 number: number()?,
                 target: a.str("target"),
                 repo: None,
+                comments: false,
             },
             "git_forge_issue_create" => IssueCmd::Create {
                 target: a.str("target"),
@@ -5380,7 +5390,7 @@ fn forge_issue_tool(backend: &Arc<dyn GitBackend>, a: &Args) -> anyhow::Result<O
         cmd,
         crate::forge::ForgeSelection::default(),
     )?;
-    Ok(crate::forge_output(text, list_cmd))
+    Ok(crate::forge_output(text, list_cmd, full))
 }
 
 fn local(backend: &Arc<dyn GitBackend>, a: &Args, full: bool) -> anyhow::Result<Output> {
@@ -5391,12 +5401,12 @@ fn local(backend: &Arc<dyn GitBackend>, a: &Args, full: bool) -> anyhow::Result<
         | "git_forge_pr_create"
         | "git_forge_pr_comment"
         | "git_forge_pr_merge"
-        | "git_forge_pr_close" => forge_pr_tool(backend, a)?,
+        | "git_forge_pr_close" => forge_pr_tool(backend, a, full)?,
         "git_forge_issue_list"
         | "git_forge_issue_view"
         | "git_forge_issue_create"
         | "git_forge_issue_comment"
-        | "git_forge_issue_close" => forge_issue_tool(backend, a)?,
+        | "git_forge_issue_close" => forge_issue_tool(backend, a, full)?,
         "git_tree" => {
             let rev = a.or("rev", "HEAD");
             let path = a.or("path", "");

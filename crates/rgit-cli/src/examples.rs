@@ -1414,6 +1414,7 @@ const EXAMPLES: &[Entry] = &[
             "rgit forge pr view",
             "rgit forge pr view 42",
             "rgit forge pr view feature owner/repo",
+            "rgit forge pr view 42 --comments",
         ],
     ),
     (
@@ -1506,6 +1507,7 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit forge issue view 7",
             "rgit forge issue view 7 owner/repo",
+            "rgit forge issue view 7 --comments",
         ],
     ),
     (

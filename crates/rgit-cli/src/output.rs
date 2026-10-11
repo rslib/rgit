@@ -7,7 +7,7 @@ use crate::cli::CliError;
 use crate::toon::{Node, Obj};
 
 /// Long text fields are cut to this many chars unless `--full` is given.
-const TRUNCATE_AT: usize = 1500;
+pub(crate) const TRUNCATE_AT: usize = 1500;
 /// Plain multi-line output is cut to this many lines unless `--full` is given.
 const MAX_LINES: usize = 200;
 
