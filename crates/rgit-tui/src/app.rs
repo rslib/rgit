@@ -640,6 +640,9 @@ pub enum Msg {
     ForgeMutationDone(Result<String, String>),
     ForgeCreate,
     ForgeDetails,
+    /// Open the detail of the current branch's pull request from the status
+    /// view's `PR #N` row.
+    ForgeBranchDetails,
     ForgeMerge,
     ForgeCheckout,
     ForgeRefresh,
@@ -3807,6 +3810,31 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 }
             }
         }
+        Msg::ForgeBranchDetails => {
+            let number = app
+                .remote_status
+                .as_ref()
+                .and_then(|remote| remote.pr.as_ref())
+                .map(|(number, _)| *number);
+            let Some((snapshot, number)) = app.forge_snapshot.as_ref().zip(number) else {
+                app.push_toast(ToastKind::Error, "no open pull request".to_owned());
+                return Vec::new();
+            };
+            let Some(index) = snapshot
+                .requests
+                .iter()
+                .position(|request| request.number == number)
+            else {
+                app.push_toast(ToastKind::Error, "no open pull request".to_owned());
+                return Vec::new();
+            };
+            app.forge_tab = crate::forge::ForgeTab::Requests;
+            let mut buffer = Buffer::default();
+            buffer.set_content(forge::build_view(snapshot, app.forge_tab));
+            app.push_view(ViewKind::Forge, buffer);
+            app.buffer_mut().set_cursor(index + 1);
+            return update(app, Msg::ForgeDetails);
+        }
         Msg::ForgeDetails => {
             let is_issue = app.forge_tab == crate::forge::ForgeTab::Issues;
             let Some(snapshot) = app.forge_snapshot.as_ref() else {
@@ -6489,6 +6517,27 @@ mod tests {
             section_text(crate::forge::build_detail(&snapshot, &snapshot.requests[0]).as_slice());
         assert!(detail.contains("could not load comments: gone"), "{detail}");
         assert!(!detail.contains("Comments:"), "{detail}");
+    }
+
+    #[test]
+    fn status_pr_row_opens_the_branch_pull_request_detail() {
+        let mut app = forge_app();
+        app.forge_tab = crate::forge::ForgeTab::Issues;
+        app.remote_status.as_mut().expect("remote").pr = Some((13, "open".to_owned()));
+        let fx = update(&mut app, Msg::ForgeBranchDetails);
+        assert!(matches!(
+            fx.as_slice(),
+            [Effect::ForgeThread {
+                number: 13,
+                is_issue: false,
+                ..
+            }]
+        ));
+        assert_eq!(app.active_kind(), ViewKind::Review);
+        assert_eq!(app.forge_tab, crate::forge::ForgeTab::Requests);
+
+        app.remote_status.as_mut().expect("remote").pr = None;
+        assert!(update(&mut app, Msg::ForgeBranchDetails).is_empty());
     }
 
     #[test]

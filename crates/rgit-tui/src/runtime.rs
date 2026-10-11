@@ -462,6 +462,11 @@ async fn event_loop(
                     resolve_confirm_key(key)
                 } else if app.leader.is_some() {
                     resolve_leader(&mut app, key)
+                } else if app.active_kind() == crate::app::ViewKind::Status
+                    && app.buffer().cursor_id().as_deref() == Some("remote/pr")
+                    && key.code == crossterm::event::KeyCode::Enter
+                {
+                    Some(Msg::ForgeBranchDetails)
                 } else if (app.active_kind() == crate::app::ViewKind::Status
                     && app.buffer().cursor_id().as_deref() == Some("remote/forge")
                     && key.code == crossterm::event::KeyCode::Enter)
