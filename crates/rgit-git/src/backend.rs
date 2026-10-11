@@ -82,11 +82,15 @@ pub trait GitBackend: Send + Sync {
     /// Unstage everything back to HEAD.
     fn unstage_all(&self) -> Result<(), GitError>;
 
-    /// Stage a whole path, folder or glob (add what exists, record deletions).
-    fn stage_file(&self, path: &str) -> Result<(), GitError>;
+    /// Stage whole paths, folders or globs (add what exists, record deletions)
+    /// with one index read and write. Fails, changing nothing, when a path
+    /// matches nothing.
+    fn stage_paths(&self, paths: &[String]) -> Result<(), GitError>;
 
-    /// Unstage a whole path, folder or glob (reset its index entries to HEAD).
-    fn unstage_file(&self, path: &str) -> Result<(), GitError>;
+    /// Unstage whole paths, folders or globs (reset their index entries to
+    /// HEAD) with one index write. Fails, changing nothing, when a path matches
+    /// nothing.
+    fn unstage_paths(&self, paths: &[String]) -> Result<(), GitError>;
 
     /// git's `add`: stage new, changed and deleted files under `paths` (every
     /// path when empty), or with `update` only tracked ones. `force` adds

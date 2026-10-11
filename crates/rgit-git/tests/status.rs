@@ -132,7 +132,7 @@ fn stage_and_unstage_a_whole_file() {
     std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    backend.stage_file("a.txt").unwrap();
+    backend.stage_paths(&["a.txt".to_owned()]).unwrap();
     let st = backend.status().unwrap();
     assert!(
         st.entries
@@ -142,7 +142,7 @@ fn stage_and_unstage_a_whole_file() {
             .is_staged()
     );
 
-    backend.unstage_file("a.txt").unwrap();
+    backend.unstage_paths(&["a.txt".to_owned()]).unwrap();
     let st = backend.status().unwrap();
     let e = st.entries.iter().find(|e| e.path == "a.txt").unwrap();
     assert!(!e.is_staged() && e.is_unstaged());

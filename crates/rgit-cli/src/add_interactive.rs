@@ -440,16 +440,19 @@ impl Ui<'_> {
         if count > 0 {
             let picked = selected(&items);
             let head = self.backend.rev_parse("HEAD").is_ok();
-            let mut notes = String::new();
-            for p in &picked {
-                let in_head = head && self.backend.read_blob("HEAD", p).is_ok();
-                if in_head {
-                    self.backend.reset_paths("HEAD", std::slice::from_ref(p))?;
-                } else {
-                    self.backend.unstage_file(p)?;
-                    notes.push_str(&format!("note: {p} is untracked now.\n"));
-                }
+            let (tracked, fresh): (Vec<String>, Vec<String>) = picked
+                .into_iter()
+                .partition(|p| head && self.backend.read_blob("HEAD", p).is_ok());
+            if !tracked.is_empty() {
+                self.backend.reset_paths("HEAD", &tracked)?;
             }
+            if !fresh.is_empty() {
+                self.backend.unstage_paths(&fresh)?;
+            }
+            let notes: String = fresh
+                .iter()
+                .map(|p| format!("note: {p} is untracked now.\n"))
+                .collect();
             let s = if count == 1 { "" } else { "s" };
             self.print(&format!("{notes}reverted {count} path{s}\n"));
         }

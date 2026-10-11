@@ -1057,42 +1057,63 @@ impl GitBackend for Git2Backend {
         Ok(())
     }
 
-    fn stage_file(&self, path: &str) -> Result<(), GitError> {
-        let path = root_dot(path);
+    fn stage_paths(&self, paths: &[String]) -> Result<(), GitError> {
+        let paths = root_dots(paths);
         let repo = self.repo();
         sync_index(&repo)?;
-        no_match(&repo, path)?;
         let mut index = repo.index()?;
-        if self.workdir.join(path).is_file() {
-            index.add_path(Path::new(path))?;
-        } else {
-            // A folder, glob or deleted path: add what is there, drop what is gone.
-            let specs = [path.to_owned()];
+        let head = repo.head().and_then(|h| h.peel_to_tree()).ok();
+        for p in &paths {
+            no_match_in(&repo, &index, head.as_ref(), p)?;
+        }
+        let mut skip = crate::sparse::keep_sparse(&repo, &index);
+        let mut walk = Vec::new();
+        for p in paths {
+            let path = Path::new(&p);
+            if self.workdir.join(path).is_file() {
+                index.add_path(path)?;
+            } else if Pathspec::new([&p])?.is_plain()
+                && index.get_path(path, 0).is_some()
+                && skip(path, &[]) == 0
+            {
+                index.remove_path(path)?;
+            } else {
+                walk.push(p);
+            }
+        }
+        if !walk.is_empty() {
+            // Folders, globs and paths already gone from the index: add what is
+            // there, drop what is gone.
             let skip = crate::sparse::keep_sparse(&repo, &index);
-            crate::pathspec::index_walk(&specs, skip, |s, cb| {
+            crate::pathspec::index_walk(&walk, skip, |s, cb| {
                 index.add_all(s, git2::IndexAddOption::DEFAULT, cb)
             })?;
             let skip = crate::sparse::keep_sparse(&repo, &index);
-            crate::pathspec::index_walk(&specs, skip, |s, cb| index.update_all(s, cb))?;
+            crate::pathspec::index_walk(&walk, skip, |s, cb| index.update_all(s, cb))?;
         }
         index.write()?;
         Ok(())
     }
 
-    fn unstage_file(&self, path: &str) -> Result<(), GitError> {
-        let path = root_dot(path);
+    fn unstage_paths(&self, paths: &[String]) -> Result<(), GitError> {
+        let paths = root_dots(paths);
         let repo = self.repo();
         sync_index(&repo)?;
-        no_match(&repo, path)?;
+        let mut index = repo.index()?;
+        let head = repo.head().and_then(|h| h.peel_to_tree()).ok();
+        for p in &paths {
+            no_match_in(&repo, &index, head.as_ref(), p)?;
+        }
         match repo.head() {
             Ok(head_ref) => {
                 let target = head_ref.peel(ObjectType::Commit)?;
-                crate::pathspec::reset_default(&repo, Some(&target), &[path.to_owned()])?;
+                crate::pathspec::reset_default(&repo, Some(&target), &paths)?;
             }
             Err(_) => {
-                // Unborn branch: nothing is committed, so drop the index entry.
-                let mut index = repo.index()?;
-                index.remove_path(Path::new(path))?;
+                // Unborn branch: nothing is committed, so drop the index entries.
+                for p in &paths {
+                    index.remove_path(Path::new(p))?;
+                }
                 index.write()?;
             }
         }
@@ -9604,12 +9625,19 @@ fn index_matches(index: &git2::Index, path: &str) -> Result<Vec<String>, GitErro
 /// Fail like git when a pathspec names nothing in the working tree, the index
 /// or HEAD.
 fn no_match(repo: &Repository, path: &str) -> Result<(), GitError> {
+    let head = repo.head().and_then(|h| h.peel_to_tree()).ok();
+    no_match_in(repo, &repo.index()?, head.as_ref(), path)
+}
+
+fn no_match_in(
+    repo: &Repository,
+    index: &git2::Index,
+    head: Option<&git2::Tree>,
+    path: &str,
+) -> Result<(), GitError> {
     let spec = Pathspec::new([path])?;
-    let hit = !spec.match_index(&repo.index()?).is_empty()
-        || repo
-            .head()
-            .and_then(|h| h.peel_to_tree())
-            .is_ok_and(|t| !spec.match_tree(&t).is_empty())
+    let hit = !spec.match_index(index).is_empty()
+        || head.is_some_and(|t| !spec.match_tree(t).is_empty())
         || repo.workdir().is_some_and(|w| spec.any_in_workdir(w));
     if hit {
         Ok(())

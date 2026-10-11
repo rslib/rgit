@@ -1879,10 +1879,10 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
     let result = match mutation {
         Mutation::StageAll => backend.stage_all(),
         Mutation::UnstageAll => backend.unstage_all(),
-        Mutation::StageFile(path) => backend.stage_file(path),
-        Mutation::UnstageFile(path) => backend.unstage_file(path),
-        Mutation::StageFiles(paths) => paths.iter().try_for_each(|p| backend.stage_file(p)),
-        Mutation::UnstageFiles(paths) => paths.iter().try_for_each(|p| backend.unstage_file(p)),
+        Mutation::StageFile(path) => backend.stage_paths(std::slice::from_ref(path)),
+        Mutation::UnstageFile(path) => backend.unstage_paths(std::slice::from_ref(path)),
+        Mutation::StageFiles(paths) => backend.stage_paths(paths),
+        Mutation::UnstageFiles(paths) => backend.unstage_paths(paths),
         Mutation::StageHunk { path, new_start } => backend.stage_hunk(path, *new_start),
         Mutation::UnstageHunk { path, new_start } => backend.unstage_hunk(path, *new_start),
         Mutation::StageLines {

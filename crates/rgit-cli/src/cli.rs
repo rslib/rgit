@@ -8047,7 +8047,7 @@ fn run_command(
             &paths,
             hunk,
             &lines,
-            |p| backend.stage_file(p),
+            |ps| backend.stage_paths(ps),
             |p, h| backend.stage_hunk(p, h),
             |p, h, l| backend.stage_lines(p, h, l),
         )?,
@@ -8055,7 +8055,7 @@ fn run_command(
             &paths,
             hunk,
             &lines,
-            |p| backend.unstage_file(p),
+            |ps| backend.unstage_paths(ps),
             |p, h| backend.unstage_hunk(p, h),
             |p, h, l| backend.unstage_lines(p, h, l),
         )?,
@@ -8202,7 +8202,7 @@ fn run_command(
                 &paths,
                 hunk,
                 &lines,
-                |p| backend.discard_file(p),
+                |ps| ps.iter().try_for_each(|p| backend.discard_file(p)),
                 |p, h| backend.discard_hunk(p, h),
                 |p, h, l| backend.discard_lines(p, h, l),
             )?
@@ -9117,9 +9117,7 @@ fn run_command(
             if !paths.is_empty() {
                 let msg = match rev {
                     None => {
-                        for p in &paths {
-                            backend.unstage_file(p)?;
-                        }
+                        backend.unstage_paths(&paths)?;
                         format!("unstaged {}", paths.join(", "))
                     }
                     Some(rev) => {
@@ -14727,14 +14725,12 @@ fn partial(
     paths: &[String],
     mut hunks: Vec<u32>,
     lines: &[usize],
-    file: impl Fn(&str) -> Result<(), GitError>,
+    file: impl Fn(&[String]) -> Result<(), GitError>,
     hunk: impl Fn(&str, u32) -> Result<(), GitError>,
     some: impl Fn(&str, u32, &[usize]) -> Result<(), GitError>,
 ) -> anyhow::Result<String> {
     if hunks.is_empty() {
-        for p in paths {
-            file(p)?;
-        }
+        file(paths)?;
         return Ok("ok".to_owned());
     }
     let [path] = paths else {
