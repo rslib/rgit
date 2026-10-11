@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use super::ForgeError;
 use super::auth::{load_credential_for, refresh_if_needed};
 use super::types::{
-    Branch, CheckRun, CreatePullRequest, CreateRepository, Listing, MergeMethod, Provider,
+    Branch, CheckRun, CreateIssue, CreatePullRequest, CreateRepository, Issue, IssueState, Listing,
+    MergeMethod, Provider,
     PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview, PullRequestState,
     RepoRef, Repository, ReviewAction, User, normalize_check_status, page_query, rollup_from,
     total_from_last_page,
@@ -677,6 +678,219 @@ impl GithubClient {
             self.delete_branch(repo, &merged.head_branch).await?;
         }
         Ok(merged)
+    }
+
+    /// One page of issues. GitHub lists pull requests as issues, so entries
+    /// carrying a `pull_request` field are dropped before mapping.
+    pub async fn issues(
+        &self,
+        repo: &RepoRef,
+        page: u32,
+        state: IssueState,
+        author: Option<&str>,
+        label: Option<&str>,
+        assignee: Option<&str>,
+    ) -> Result<Listing<Issue>, ForgeError> {
+        let state = match state {
+            IssueState::Open => "open",
+            IssueState::Closed => "closed",
+            IssueState::All => "all",
+        };
+        let mut route = format!("/repos/{}/{}/issues?state={state}", repo.owner, repo.name);
+        if let Some(author) = author {
+            route.push_str(&format!("&creator={}", urlencoding::encode(author)));
+        }
+        if let Some(label) = label {
+            route.push_str(&format!("&labels={}", urlencoding::encode(label)));
+        }
+        if let Some(assignee) = assignee {
+            route.push_str(&format!("&assignee={}", urlencoding::encode(assignee)));
+        }
+        let listing: Listing<ApiIssue> = self.list_page(&route, page).await?;
+        let dropped = listing
+            .items
+            .iter()
+            .filter(|issue| issue.is_pull_request())
+            .count();
+        let mut listing: Listing<Issue> =
+            listing.map_filter(|issue| (!issue.is_pull_request()).then(|| issue.into()));
+        if dropped > 0 && (listing.more || listing.page != 1) {
+            listing.total = None;
+        } else if dropped > 0 {
+            listing.total = Some(listing.items.len() as u64);
+        }
+        Ok(listing)
+    }
+
+    /// One issue by its number; a pull request number is refused, since pull
+    /// requests have their own calls.
+    pub async fn issue(&self, repo: &RepoRef, number: u64) -> Result<Issue, ForgeError> {
+        let issue: ApiIssue = self
+            .api
+            .get(
+                format!("/repos/{}/{}/issues/{number}", repo.owner, repo.name),
+                None::<&()>,
+            )
+            .await
+            .map_err(api_error)?;
+        if issue.is_pull_request() {
+            return Err(ForgeError::Response(format!(
+                "{repo} #{number} is a pull request, not an issue"
+            )));
+        }
+        Ok(issue.into())
+    }
+
+    /// Open an issue from `request`.
+    pub async fn create_issue(
+        &self,
+        repo: &RepoRef,
+        request: &CreateIssue,
+    ) -> Result<Issue, ForgeError> {
+        #[derive(Serialize)]
+        struct NewIssue<'a> {
+            title: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            body: &'a Option<String>,
+            labels: &'a [String],
+            assignees: &'a [String],
+        }
+        let issue: ApiIssue = self
+            .api
+            .post(
+                format!("/repos/{}/{}/issues", repo.owner, repo.name),
+                Some(&NewIssue {
+                    title: &request.title,
+                    body: &request.body,
+                    labels: &request.labels,
+                    assignees: &request.assignees,
+                }),
+            )
+            .await
+            .map_err(api_error)?;
+        Ok(issue.into())
+    }
+
+    /// Close issue `number`.
+    pub async fn close_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue, ForgeError> {
+        self.set_issue_state(repo, number, "closed").await
+    }
+
+    /// Reopen issue `number`.
+    pub async fn reopen_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue, ForgeError> {
+        self.set_issue_state(repo, number, "open").await
+    }
+
+    async fn set_issue_state(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        state: &'static str,
+    ) -> Result<Issue, ForgeError> {
+        #[derive(Serialize)]
+        struct Update {
+            state: &'static str,
+        }
+        let issue: ApiIssue = self
+            .api
+            .patch(
+                format!("/repos/{}/{}/issues/{number}", repo.owner, repo.name),
+                Some(&Update { state }),
+            )
+            .await
+            .map_err(api_error)?;
+        Ok(issue.into())
+    }
+
+    /// Comment `body` on issue `number`.
+    pub async fn comment_issue(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        body: &str,
+    ) -> Result<PullRequestComment, ForgeError> {
+        self.comment_pull_request(repo, number, body).await
+    }
+
+    /// Change the title, body, labels and assignees issue `number` carries;
+    /// each `None` (or empty list) leaves that field alone.
+    pub async fn edit_issue(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        title: Option<&str>,
+        body: Option<&str>,
+        labels: Option<&[String]>,
+        assignees: Option<&[String]>,
+    ) -> Result<Issue, ForgeError> {
+        let mut patch = serde_json::Map::new();
+        if let Some(title) = title {
+            patch.insert("title".to_owned(), serde_json::json!(title));
+        }
+        if let Some(body) = body {
+            patch.insert("body".to_owned(), serde_json::json!(body));
+        }
+        if let Some(labels) = labels {
+            patch.insert("labels".to_owned(), serde_json::json!(labels));
+        }
+        if let Some(assignees) = assignees {
+            patch.insert("assignees".to_owned(), serde_json::json!(assignees));
+        }
+        let issue: ApiIssue = self
+            .api
+            .patch(
+                format!("/repos/{}/{}/issues/{number}", repo.owner, repo.name),
+                Some(&serde_json::Value::Object(patch)),
+            )
+            .await
+            .map_err(api_error)?;
+        Ok(issue.into())
+    }
+}
+
+/// The issue shape of GitHub's API. `pull_request` is present on pull
+/// requests listed as issues and absent on real ones.
+#[derive(serde::Deserialize)]
+struct ApiIssue {
+    number: u64,
+    title: String,
+    state: String,
+    user: Option<ApiAccount>,
+    body: Option<String>,
+    #[serde(default)]
+    labels: Vec<ApiLabel>,
+    #[serde(default)]
+    assignees: Vec<ApiAccount>,
+    html_url: String,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    pull_request: Option<serde_json::Value>,
+}
+
+impl ApiIssue {
+    fn is_pull_request(&self) -> bool {
+        self.pull_request.is_some()
+    }
+}
+
+impl From<ApiIssue> for Issue {
+    fn from(issue: ApiIssue) -> Self {
+        Self {
+            number: issue.number,
+            title: issue.title,
+            state: issue.state,
+            author: issue.user.map(|user| user.login),
+            body: issue.body,
+            labels: issue.labels.into_iter().map(|label| label.name).collect(),
+            assignees: issue
+                .assignees
+                .into_iter()
+                .map(|user| user.login)
+                .collect(),
+            url: issue.html_url,
+            created_at: issue.created_at,
+            updated_at: issue.updated_at,
+        }
     }
 }
 

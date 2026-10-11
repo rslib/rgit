@@ -148,6 +148,15 @@ impl<T> Listing<T> {
             total: self.total,
         }
     }
+
+    pub(crate) fn map_filter<U>(self, f: impl FnMut(T) -> Option<U>) -> Listing<U> {
+        Listing {
+            items: self.items.into_iter().filter_map(f).collect(),
+            page: self.page,
+            more: self.more,
+            total: self.total,
+        }
+    }
 }
 
 /// The item count implied by the last page: every earlier page is full.
@@ -409,6 +418,42 @@ pub fn upsert_stack_block(body: Option<&str>, block: &str) -> String {
             }
         }
     }
+}
+
+/// The state filter of an issue list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IssueState {
+    #[default]
+    Open,
+    Closed,
+    All,
+}
+
+/// One issue: a pull request never appears here (GitHub lists pull requests
+/// as issues, so that filter drops them before mapping).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Issue {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    pub author: Option<String>,
+    pub body: Option<String>,
+    pub labels: Vec<String>,
+    pub assignees: Vec<String>,
+    pub url: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// A new issue: labels and assignees are logins or usernames.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateIssue {
+    pub title: String,
+    pub body: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub assignees: Vec<String>,
 }
 
 /// One branch to ensure a pull request for: its head branch, base branch and

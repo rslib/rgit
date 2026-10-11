@@ -574,3 +574,189 @@ async fn requests_changes_on_a_merge_request_with_a_note() {
     assert_eq!(review.body.as_deref(), Some("Fix the tests."));
     assert_eq!(review.author.as_deref(), Some(REVIEWER.as_str()));
 }
+
+fn issue_json(iid: u64) -> serde_json::Value {
+    serde_json::json!({
+        "iid": iid,
+        "title": "Fix login",
+        "state": "opened",
+        "author": {"username": AUTHOR.as_str()},
+        "description": "Details.",
+        "labels": ["bug"],
+        "assignees": [{"username": REVIEWER.as_str()}],
+        "web_url": format!("https://gitlab.example/group/project/-/issues/{iid}"),
+        "created_at": "2026-01-02T03:04:05Z",
+        "updated_at": "2026-01-03T03:04:05Z"
+    })
+}
+
+fn assert_issue_mapped(issue: &rgit_forge::Issue) {
+    assert_eq!(issue.title, "Fix login");
+    assert_eq!(issue.state, "opened");
+    assert_eq!(issue.author.as_deref(), Some(AUTHOR.as_str()));
+    assert_eq!(issue.body.as_deref(), Some("Details."));
+    assert_eq!(issue.labels, vec!["bug"]);
+    assert_eq!(issue.assignees, vec![REVIEWER.clone()]);
+    assert_eq!(
+        issue.url,
+        format!("https://gitlab.example/group/project/-/issues/{}", issue.number)
+    );
+}
+
+#[tokio::test]
+async fn issue_list_requests_the_filters() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v4/projects/group(%2F|/)project/issues$"))
+        .and(query_param("state", "opened"))
+        .and(query_param("author_username", AUTHOR.as_str()))
+        .and(query_param("labels", "bug"))
+        .and(query_param("assignee_username", REVIEWER.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([issue_json(7)])))
+        .mount(&server)
+        .await;
+
+    let listing = forge(&server)
+        .issues(
+            &repo(),
+            1,
+            rgit_forge::IssueState::Open,
+            Some(AUTHOR.as_str()),
+            Some("bug"),
+            Some(REVIEWER.as_str()),
+        )
+        .await
+        .expect("issues");
+    assert_eq!(listing.items.len(), 1);
+    assert_eq!(listing.items[0].number, 7);
+    assert_issue_mapped(&listing.items[0]);
+}
+
+#[tokio::test]
+async fn pulls_one_issue_by_iid() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/v4/projects/group(%2F|/)project/issues/7$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7)))
+        .mount(&server)
+        .await;
+
+    let issue = forge(&server).issue(&repo(), 7).await.expect("issue");
+    assert_eq!(issue.number, 7);
+    assert_issue_mapped(&issue);
+}
+
+#[tokio::test]
+async fn creates_an_issue_resolving_assignees() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path("/api/v4/users"))
+        .and(query_param("username", REVIEWER.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{"id": 5}])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/api/v4/projects/group(%2F|/)project/issues$"))
+        .and(body_partial_json(serde_json::json!({
+            "title": "Fix login",
+            "description": "Details.",
+            "labels": "bug",
+            "assignee_ids": [5]
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(7)))
+        .mount(&server)
+        .await;
+
+    let issue = forge(&server)
+        .create_issue(
+            &repo(),
+            &rgit_forge::CreateIssue {
+                title: "Fix login".to_owned(),
+                body: Some("Details.".to_owned()),
+                labels: vec!["bug".to_owned()],
+                assignees: vec![REVIEWER.clone()],
+            },
+        )
+        .await
+        .expect("created");
+    assert_eq!(issue.number, 7);
+    assert_issue_mapped(&issue);
+}
+
+#[tokio::test]
+async fn closes_and_reopens_an_issue() {
+    let server = MockServer::start().await;
+    let mut closed = issue_json(7);
+    closed["state"] = serde_json::json!("closed");
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/api/v4/projects/group(%2F|/)project/issues/7$"))
+        .and(body_string("state_event=close"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(closed))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/api/v4/projects/group(%2F|/)project/issues/8$"))
+        .and(body_string("state_event=reopen"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(8)))
+        .mount(&server)
+        .await;
+
+    let issue = forge(&server).close_issue(&repo(), 7).await.expect("closed");
+    assert_eq!(issue.state, "closed");
+    let issue = forge(&server).reopen_issue(&repo(), 8).await.expect("reopened");
+    assert_eq!(issue.state, "opened");
+}
+
+#[tokio::test]
+async fn comments_on_an_issue() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"^/api/v4/projects/group(%2F|/)project/issues/7/notes$"))
+        .and(body_partial_json(serde_json::json!({"body": "Working on it."})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": 99,
+            "body": "Working on it.",
+            "author": {"username": AUTHOR.as_str()},
+            "created_at": "2026-01-04T03:04:05Z"
+        })))
+        .mount(&server)
+        .await;
+
+    let comment = forge(&server)
+        .comment_issue(&repo(), 7, "Working on it.")
+        .await
+        .expect("comment");
+    assert_eq!(comment.id, 99);
+    assert_eq!(comment.body, "Working on it.");
+    assert_eq!(comment.author.as_deref(), Some(AUTHOR.as_str()));
+}
+
+#[tokio::test]
+async fn edits_the_title_and_labels_of_an_issue() {
+    let server = MockServer::start().await;
+    let mut edited = issue_json(7);
+    edited["title"] = serde_json::json!("Fix login faster");
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/api/v4/projects/group(%2F|/)project/issues/7$"))
+        .and(body_partial_json(serde_json::json!({
+            "title": "Fix login faster",
+            "labels": "bug"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(edited))
+        .mount(&server)
+        .await;
+
+    let issue = forge(&server)
+        .edit_issue(
+            &repo(),
+            7,
+            Some("Fix login faster"),
+            None,
+            Some(&["bug".to_owned()]),
+            None,
+        )
+        .await
+        .expect("edited");
+    assert_eq!(issue.title, "Fix login faster");
+    assert_eq!(issue.labels, vec!["bug"]);
+}

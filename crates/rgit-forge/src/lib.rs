@@ -22,8 +22,8 @@ pub use gitlab::GitlabClient;
 pub use profile::{ForgeConfig, ForgeProfile, ForgeSelection, ForgeTarget};
 pub use remote::RemoteTarget;
 pub use types::{
-    Branch, CheckRollup, CheckRun, CreatePullRequest, CreateRepository, CredentialIdentity,
-    EnsureOutcome, EnsuredPullRequest, Listing, MergeMethod, PAGE_SIZE, Provider, PullRequest,
+    Branch, CheckRollup, CheckRun, CreateIssue, CreatePullRequest, CreateRepository, CredentialIdentity,
+    EnsureOutcome, EnsuredPullRequest, Issue, IssueState, Listing, MergeMethod, PAGE_SIZE, Provider, PullRequest,
     PullRequestChecks, PullRequestComment, PullRequestReview, PullRequestState, RepoRef,
     Repository, ReviewAction, StackEntry, StoredCredential, User, fill_from_commit,
     render_stack_block, upsert_stack_block, STACK_END, STACK_START,
@@ -460,6 +460,105 @@ impl Forge {
             Self::Gitlab(client) => {
                 client
                     .review_merge_request(repo, number, action, body)
+                    .await
+            }
+        }
+    }
+
+    /// One page of issues, by `state`, author login, label and assignee
+    /// login; each filter is skipped when unset.
+    pub async fn issues(
+        &self,
+        repo: &RepoRef,
+        page: u32,
+        state: IssueState,
+        author: Option<&str>,
+        label: Option<&str>,
+        assignee: Option<&str>,
+    ) -> Result<Listing<Issue>, ForgeError> {
+        match self {
+            Self::Github(client) => {
+                client
+                    .issues(repo, page, state, author, label, assignee)
+                    .await
+            }
+            Self::Gitlab(client) => {
+                client
+                    .issues(repo, page, state, author, label, assignee)
+                    .await
+            }
+        }
+    }
+
+    /// One issue by its number (a GitLab issue's `iid`).
+    pub async fn issue(&self, repo: &RepoRef, number: u64) -> Result<Issue, ForgeError> {
+        match self {
+            Self::Github(client) => client.issue(repo, number).await,
+            Self::Gitlab(client) => client.issue(repo, number).await,
+        }
+    }
+
+    /// Open an issue from `request`.
+    pub async fn create_issue(
+        &self,
+        repo: &RepoRef,
+        request: &CreateIssue,
+    ) -> Result<Issue, ForgeError> {
+        match self {
+            Self::Github(client) => client.create_issue(repo, request).await,
+            Self::Gitlab(client) => client.create_issue(repo, request).await,
+        }
+    }
+
+    /// Close issue `number`.
+    pub async fn close_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue, ForgeError> {
+        match self {
+            Self::Github(client) => client.close_issue(repo, number).await,
+            Self::Gitlab(client) => client.close_issue(repo, number).await,
+        }
+    }
+
+    /// Reopen issue `number`.
+    pub async fn reopen_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue, ForgeError> {
+        match self {
+            Self::Github(client) => client.reopen_issue(repo, number).await,
+            Self::Gitlab(client) => client.reopen_issue(repo, number).await,
+        }
+    }
+
+    /// Comment `body` on issue `number`.
+    pub async fn comment_issue(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        body: &str,
+    ) -> Result<PullRequestComment, ForgeError> {
+        match self {
+            Self::Github(client) => client.comment_issue(repo, number, body).await,
+            Self::Gitlab(client) => client.comment_issue(repo, number, body).await,
+        }
+    }
+
+    /// Change the title, body, labels and assignees issue `number` carries;
+    /// each `None` (or empty list) leaves that field alone.
+    pub async fn edit_issue(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        title: Option<&str>,
+        body: Option<&str>,
+        labels: Option<&[String]>,
+        assignees: Option<&[String]>,
+    ) -> Result<Issue, ForgeError> {
+        match self {
+            Self::Github(client) => {
+                client
+                    .edit_issue(repo, number, title, body, labels, assignees)
+                    .await
+            }
+            Self::Gitlab(client) => {
+                client
+                    .edit_issue(repo, number, title, body, labels, assignees)
                     .await
             }
         }

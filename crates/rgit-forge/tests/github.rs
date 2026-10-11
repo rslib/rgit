@@ -620,3 +620,180 @@ async fn approves_a_pull_request_with_a_review() {
         Some("https://github.com/owner/repo/pull/12#pullrequestreview-80")
     );
 }
+
+fn issue_json(number: u64) -> serde_json::Value {
+    serde_json::json!({
+        "number": number,
+        "title": "Fix login",
+        "state": "open",
+        "user": {"login": AUTHOR.as_str()},
+        "body": "Details.",
+        "labels": [{"name": "bug"}],
+        "assignees": [{"login": REVIEWER.as_str()}],
+        "html_url": format!("https://github.com/owner/repo/issues/{number}"),
+        "created_at": "2026-01-02T03:04:05Z",
+        "updated_at": "2026-01-03T03:04:05Z"
+    })
+}
+
+fn assert_issue_mapped(issue: &rgit_forge::Issue) {
+    assert_eq!(issue.title, "Fix login");
+    assert_eq!(issue.state, "open");
+    assert_eq!(issue.author.as_deref(), Some(AUTHOR.as_str()));
+    assert_eq!(issue.body.as_deref(), Some("Details."));
+    assert_eq!(issue.labels, vec!["bug"]);
+    assert_eq!(issue.assignees, vec![REVIEWER.clone()]);
+    assert_eq!(
+        issue.url,
+        format!("https://github.com/owner/repo/issues/{}", issue.number)
+    );
+}
+
+#[tokio::test]
+async fn issue_list_drops_pull_requests() {
+    let server = MockServer::start().await;
+    let mut as_issue = pr_json(12, "feature", "main");
+    as_issue["pull_request"] = serde_json::json!({"url": "https://api.github.com/x"});
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            issue_json(7),
+            as_issue
+        ])))
+        .mount(&server)
+        .await;
+
+    let listing = forge(&server)
+        .issues(&repo(), 1, rgit_forge::IssueState::Open, None, None, None)
+        .await
+        .expect("issues");
+    assert_eq!(listing.items.len(), 1);
+    assert_eq!(listing.items[0].number, 7);
+    assert_issue_mapped(&listing.items[0]);
+}
+
+#[tokio::test]
+async fn pulls_one_issue_by_number() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/issues/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(7)))
+        .mount(&server)
+        .await;
+
+    let issue = forge(&server).issue(&repo(), 7).await.expect("issue");
+    assert_eq!(issue.number, 7);
+    assert_issue_mapped(&issue);
+}
+
+#[tokio::test]
+async fn creates_an_issue() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/issues"))
+        .and(body_partial_json(serde_json::json!({
+            "title": "Fix login",
+            "body": "Details.",
+            "labels": ["bug"],
+            "assignees": [REVIEWER.as_str()]
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(issue_json(7)))
+        .mount(&server)
+        .await;
+
+    let issue = forge(&server)
+        .create_issue(
+            &repo(),
+            &rgit_forge::CreateIssue {
+                title: "Fix login".to_owned(),
+                body: Some("Details.".to_owned()),
+                labels: vec!["bug".to_owned()],
+                assignees: vec![REVIEWER.clone()],
+            },
+        )
+        .await
+        .expect("created");
+    assert_eq!(issue.number, 7);
+    assert_issue_mapped(&issue);
+}
+
+#[tokio::test]
+async fn closes_and_reopens_an_issue() {
+    let server = MockServer::start().await;
+    let mut closed = issue_json(7);
+    closed["state"] = serde_json::json!("closed");
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/issues/7"))
+        .and(body_partial_json(serde_json::json!({"state": "closed"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(closed))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/issues/8"))
+        .and(body_partial_json(serde_json::json!({"state": "open"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(issue_json(8)))
+        .mount(&server)
+        .await;
+
+    let issue = forge(&server).close_issue(&repo(), 7).await.expect("closed");
+    assert_eq!(issue.state, "closed");
+    let issue = forge(&server).reopen_issue(&repo(), 8).await.expect("reopened");
+    assert_eq!(issue.state, "open");
+}
+
+#[tokio::test]
+async fn comments_on_an_issue() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/issues/7/comments"))
+        .and(body_partial_json(serde_json::json!({"body": "Working on it."})))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": 99,
+            "body": "Working on it.",
+            "user": {"login": AUTHOR.as_str()},
+            "html_url": "https://github.com/owner/repo/issues/7#issuecomment-99",
+            "created_at": "2026-01-04T03:04:05Z"
+        })))
+        .mount(&server)
+        .await;
+
+    let comment = forge(&server)
+        .comment_issue(&repo(), 7, "Working on it.")
+        .await
+        .expect("comment");
+    assert_eq!(comment.id, 99);
+    assert_eq!(comment.body, "Working on it.");
+    assert_eq!(comment.author.as_deref(), Some(AUTHOR.as_str()));
+}
+
+#[tokio::test]
+async fn edits_an_issue() {
+    let server = MockServer::start().await;
+    let mut edited = issue_json(7);
+    edited["title"] = serde_json::json!("Fix login faster");
+    Mock::given(method("PATCH"))
+        .and(path("/repos/owner/repo/issues/7"))
+        .and(body_partial_json(serde_json::json!({
+            "title": "Fix login faster",
+            "labels": ["bug"],
+            "assignees": [REVIEWER.as_str()]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(edited))
+        .mount(&server)
+        .await;
+
+    let issue = forge(&server)
+        .edit_issue(
+            &repo(),
+            7,
+            Some("Fix login faster"),
+            None,
+            Some(&["bug".to_owned()]),
+            Some(std::slice::from_ref(&REVIEWER)),
+        )
+        .await
+        .expect("edited");
+    assert_eq!(issue.title, "Fix login faster");
+    assert_eq!(issue.labels, vec!["bug"]);
+}

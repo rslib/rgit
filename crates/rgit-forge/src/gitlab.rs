@@ -5,7 +5,8 @@ use serde::Deserialize;
 use super::ForgeError;
 use super::auth::load_credential_for;
 use super::types::{
-    Branch, CheckRun, CreatePullRequest, CreateRepository, Listing, MergeMethod, Provider,
+    Branch, CheckRun, CreateIssue, CreatePullRequest, CreateRepository, Issue, IssueState, Listing,
+    MergeMethod, Provider,
     PullRequest, PullRequestChecks, PullRequestComment, PullRequestReview, PullRequestState,
     RepoRef, Repository, ReviewAction, User, normalize_check_status, page_query, rollup_from,
     total_from_last_page,
@@ -107,6 +108,43 @@ fn labels_from_value(value: Option<serde_json::Value>) -> Vec<String> {
             })
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// The issue shape of GitLab's API.
+#[derive(Deserialize)]
+struct ApiIssue {
+    iid: u64,
+    title: String,
+    state: String,
+    author: Option<ApiAccount>,
+    description: Option<String>,
+    labels: Option<serde_json::Value>,
+    #[serde(default)]
+    assignees: Vec<ApiAccount>,
+    web_url: String,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+}
+
+impl ApiIssue {
+    fn into_issue(self) -> Issue {
+        Issue {
+            number: self.iid,
+            title: self.title,
+            state: self.state,
+            author: self.author.map(|user| user.username),
+            body: self.description,
+            labels: labels_from_value(self.labels),
+            assignees: self
+                .assignees
+                .into_iter()
+                .map(|user| user.username)
+                .collect(),
+            url: self.web_url,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
     }
 }
 
@@ -846,6 +884,255 @@ impl GitlabClient {
         };
         self.edit_merge_request(repo, number, Some(&title), None, None)
             .await
+    }
+
+    /// One page of issues, by `state`, author username, label and assignee
+    /// username; each filter is skipped when unset.
+    pub async fn issues(
+        &self,
+        repo: &RepoRef,
+        page: u32,
+        state: IssueState,
+        author: Option<&str>,
+        label: Option<&str>,
+        assignee: Option<&str>,
+    ) -> Result<Listing<Issue>, ForgeError> {
+        let mut url = format!("{}/projects/{}/issues", self.base_url, self.project_path(repo));
+        let state = match state {
+            IssueState::Open => "opened",
+            IssueState::Closed => "closed",
+            IssueState::All => "all",
+        };
+        url.push_str(&format!("?state={state}"));
+        if let Some(author) = author {
+            url.push_str(&format!("&author_username={}", urlencoding::encode(author)));
+        }
+        if let Some(label) = label {
+            url.push_str(&format!("&labels={}", urlencoding::encode(label)));
+        }
+        if let Some(assignee) = assignee {
+            url.push_str(&format!("&assignee_username={}", urlencoding::encode(assignee)));
+        }
+        let listing: Listing<ApiIssue> = self.list_page(&url, page).await?;
+        Ok(listing.map(|issue| issue.into_issue()))
+    }
+
+    /// One issue by its `iid`.
+    pub async fn issue(&self, repo: &RepoRef, number: u64) -> Result<Issue, ForgeError> {
+        let value: serde_json::Value = self
+            .http
+            .get(format!(
+                "{}/projects/{}/issues/{}",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?
+            .json()
+            .await
+            .map_err(response_error)?;
+        self.issue_from_value(value)
+    }
+
+    fn issue_from_value(&self, value: serde_json::Value) -> Result<Issue, ForgeError> {
+        let issue: ApiIssue = serde_json::from_value(value).map_err(response_error)?;
+        Ok(issue.into_issue())
+    }
+
+    /// Open an issue from `request`, resolving assignee usernames to ids.
+    pub async fn create_issue(
+        &self,
+        repo: &RepoRef,
+        request: &CreateIssue,
+    ) -> Result<Issue, ForgeError> {
+        let mut payload = serde_json::json!({
+            "title": request.title,
+            "description": request.body,
+        });
+        if !request.labels.is_empty() {
+            payload["labels"] = serde_json::json!(request.labels.join(","));
+        }
+        let ids = self.user_ids(&request.assignees).await?;
+        if !ids.is_empty() {
+            payload["assignee_ids"] = serde_json::json!(ids);
+        }
+        let value: serde_json::Value = self
+            .http
+            .post(format!(
+                "{}/projects/{}/issues",
+                self.base_url,
+                self.project_path(repo)
+            ))
+            .bearer_auth(&self.token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?
+            .json()
+            .await
+            .map_err(response_error)?;
+        self.issue_from_value(value)
+    }
+
+    /// The user ids of `usernames`, looked up one by one; unknown names are
+    /// skipped so one typo cannot block the issue.
+    async fn user_ids(&self, usernames: &[String]) -> Result<Vec<u64>, ForgeError> {
+        #[derive(Deserialize)]
+        struct ApiUser {
+            id: u64,
+        }
+        let mut ids = Vec::with_capacity(usernames.len());
+        for username in usernames {
+            let users: Vec<ApiUser> = self
+                .http
+                .get(format!(
+                    "{}/users?username={}",
+                    self.base_url,
+                    urlencoding::encode(username)
+                ))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .map_err(api_error)?
+                .error_for_status()
+                .map_err(api_error)?
+                .json()
+                .await
+                .map_err(response_error)?;
+            ids.extend(users.into_iter().map(|user| user.id));
+        }
+        Ok(ids)
+    }
+
+    /// Close issue `number`.
+    pub async fn close_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue, ForgeError> {
+        self.set_issue_state(repo, number, "close").await
+    }
+
+    /// Reopen issue `number`.
+    pub async fn reopen_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue, ForgeError> {
+        self.set_issue_state(repo, number, "reopen").await
+    }
+
+    async fn set_issue_state(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        event: &'static str,
+    ) -> Result<Issue, ForgeError> {
+        let value: serde_json::Value = self
+            .http
+            .put(format!(
+                "{}/projects/{}/issues/{}",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .bearer_auth(&self.token)
+            .form(&[("state_event", event)])
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?
+            .json()
+            .await
+            .map_err(response_error)?;
+        self.issue_from_value(value)
+    }
+
+    /// Comment `body` on issue `number`.
+    pub async fn comment_issue(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        body: &str,
+    ) -> Result<PullRequestComment, ForgeError> {
+        #[derive(Deserialize)]
+        struct ApiNote {
+            id: u64,
+            body: String,
+            author: Option<ApiAccount>,
+            created_at: Option<String>,
+        }
+        let note: ApiNote = self
+            .http
+            .post(format!(
+                "{}/projects/{}/issues/{}/notes",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "body": body }))
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?
+            .json()
+            .await
+            .map_err(response_error)?;
+        Ok(PullRequestComment {
+            id: note.id,
+            body: note.body,
+            author: note.author.map(|user| user.username),
+            url: None,
+            created_at: note.created_at,
+        })
+    }
+
+    /// Change the title, description, labels and assignees issue `number`
+    /// carries; each `None` (or empty list) leaves that field alone.
+    pub async fn edit_issue(
+        &self,
+        repo: &RepoRef,
+        number: u64,
+        title: Option<&str>,
+        body: Option<&str>,
+        labels: Option<&[String]>,
+        assignees: Option<&[String]>,
+    ) -> Result<Issue, ForgeError> {
+        let mut payload = serde_json::Map::new();
+        if let Some(title) = title {
+            payload.insert("title".to_owned(), serde_json::json!(title));
+        }
+        if let Some(body) = body {
+            payload.insert("description".to_owned(), serde_json::json!(body));
+        }
+        if let Some(labels) = labels {
+            payload.insert("labels".to_owned(), serde_json::json!(labels.join(",")));
+        }
+        if let Some(assignees) = assignees {
+            let ids = self.user_ids(assignees).await?;
+            payload.insert("assignee_ids".to_owned(), serde_json::json!(ids));
+        }
+        let value: serde_json::Value = self
+            .http
+            .put(format!(
+                "{}/projects/{}/issues/{}",
+                self.base_url,
+                self.project_path(repo),
+                number
+            ))
+            .bearer_auth(&self.token)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(api_error)?
+            .error_for_status()
+            .map_err(api_error)?
+            .json()
+            .await
+            .map_err(response_error)?;
+        self.issue_from_value(value)
     }
 }
 
