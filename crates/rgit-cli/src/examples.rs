@@ -1153,7 +1153,10 @@ const EXAMPLES: &[Entry] = &[
         ],
     ),
     ("submodule absorbgitdirs", &["rgit submodule absorbgitdirs"]),
-    ("git", &["rgit git status", "rgit git log --oneline -5"]),
+    (
+        "git",
+        &["rgit git lfs pull", "rgit git filter-repo --path src"],
+    ),
     ("mcp", &["rgit mcp"]),
     (
         "tool",
@@ -1522,7 +1525,7 @@ const EXAMPLES: &[Entry] = &[
         "agent install",
         &[
             "rgit agent install",
-            "rgit agent install claude codex --mcp",
+            "rgit agent install --all-tools codex",
             "rgit agent install --project codex opencode",
         ],
     ),
@@ -1531,7 +1534,7 @@ const EXAMPLES: &[Entry] = &[
         "agent uninstall",
         &[
             "rgit agent uninstall codex",
-            "rgit agent uninstall --mcp-only",
+            "rgit agent uninstall --tools-only",
         ],
     ),
     (

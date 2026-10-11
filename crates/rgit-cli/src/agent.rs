@@ -1,11 +1,13 @@
 //! `rgit agent`: set agent apps (harnesses) up for rgit. Each gets what it
 //! supports of three parts: the rgit Agent Skill, a session-start hook that
-//! runs `rgit hook session-start`, and, with `--mcp`, rgit's MCP tools.
+//! runs `rgit hook session-start`, and rgit's tools.
 //!
 //! Claude Code gets a plugin in a local marketplace that rgit writes and
-//! installs with `claude plugin`. Pi and omp get the skill and a generated
-//! TypeScript extension. Codex and OpenCode get their config files edited
-//! in place, keeping the user's other entries.
+//! installs with `claude plugin`: the skill, the hook and a mod registering
+//! the tools. Pi gets the skill and a generated TypeScript extension that
+//! registers the tools over MCP; omp's extension registers the core tools
+//! natively. Codex and OpenCode get their config files edited in place,
+//! keeping the user's other entries.
 //!
 //! `plan` turns a request into steps without touching anything; `apply`
 //! checks every step can run, then runs them.
@@ -61,18 +63,18 @@ impl std::fmt::Display for App {
 pub struct Parts {
     skill: bool,
     hook: bool,
-    mcp: bool,
+    tools: bool,
 }
 
 impl Parts {
     const NONE: Parts = Parts {
         skill: false,
         hook: false,
-        mcp: false,
+        tools: false,
     };
 
     fn any(self) -> bool {
-        self.skill || self.hook || self.mcp
+        self.skill || self.hook || self.tools
     }
 }
 
@@ -81,21 +83,21 @@ pub fn run(cmd: AgentCmd) -> Result<Output> {
         AgentCmd::Install {
             apps,
             project,
-            mcp,
-            no_mcp: _,
-        } => install(&apps, project, mcp),
+            no_tools,
+            all_tools,
+        } => install(&apps, project, no_tools, all_tools),
         AgentCmd::Status => status(),
         AgentCmd::Uninstall {
             apps,
             project,
             skill_only,
             hook_only,
-            mcp_only,
+            tools_only,
         } => {
-            let only = (skill_only || hook_only || mcp_only).then_some(Parts {
+            let only = (skill_only || hook_only || tools_only).then_some(Parts {
                 skill: skill_only,
                 hook: hook_only,
-                mcp: mcp_only,
+                tools: tools_only,
             });
             uninstall(&apps, project, only)
         }
@@ -388,6 +390,7 @@ enum Step {
     AddMcpToml {
         file: PathBuf,
         bin: String,
+        all_tools: bool,
     },
     RemoveMcpToml {
         file: PathBuf,
@@ -427,9 +430,10 @@ impl Step {
 }
 
 /// The steps that leave `place` with `want` of its parts. Reads only what
-/// the harness has now (to keep an MCP part the request does not name) and
-/// writes nothing.
-fn plan(place: &Place, want: Parts, bin: &str) -> Vec<Step> {
+/// the harness has now (to keep a tools part the request does not name) and
+/// writes nothing. With `all_tools`, Codex and OpenCode get the full `rgit
+/// mcp`; otherwise they get the core set.
+fn plan(place: &Place, want: Parts, bin: &str, all_tools: bool) -> Vec<Step> {
     let mut steps = Vec::new();
     let skill = |steps: &mut Vec<Step>, dir: PathBuf| {
         steps.push(if want.skill {
@@ -473,7 +477,7 @@ fn plan(place: &Place, want: Parts, bin: &str) -> Vec<Step> {
         App::Pi | App::Omp => {
             skill(&mut steps, place.skill_dir());
             let file = place.extension();
-            steps.push(if want.hook || want.mcp {
+            steps.push(if want.hook || want.tools {
                 Step::WriteFile {
                     file,
                     text: extension(place.app, bin, want),
@@ -497,10 +501,11 @@ fn plan(place: &Place, want: Parts, bin: &str) -> Vec<Step> {
                 steps.push(Step::RemoveHook { file });
             }
             let file = place.codex_config();
-            steps.push(if want.mcp {
+            steps.push(if want.tools {
                 Step::AddMcpToml {
                     file,
                     bin: bin.to_owned(),
+                    all_tools,
                 }
             } else {
                 Step::RemoveMcpToml { file }
@@ -518,11 +523,11 @@ fn plan(place: &Place, want: Parts, bin: &str) -> Vec<Step> {
                 Step::RemoveFile { file }
             });
             let file = place.opencode_config();
-            steps.push(if want.mcp {
+            steps.push(if want.tools {
                 Step::AddMcpJson {
                     file,
                     key: "mcp",
-                    entry: json!({ "type": "local", "command": [bin, "mcp"], "enabled": true }),
+                    entry: opencode_mcp(bin, all_tools),
                 }
             } else {
                 Step::RemoveMcpJson { file, key: "mcp" }
@@ -536,11 +541,11 @@ fn plan(place: &Place, want: Parts, bin: &str) -> Vec<Step> {
 /// The parts `place` has now, from the files rgit wrote.
 fn current_parts(place: &Place, bin: &str) -> Parts {
     let has = |s: &str| s != "missing" && s != "unsupported";
-    let [skill, hook, mcp] = part_states(place, bin);
+    let [skill, hook, tools] = part_states(place, bin);
     Parts {
         skill: has(skill),
         hook: has(hook),
-        mcp: has(mcp),
+        tools: has(tools),
     }
 }
 
@@ -568,21 +573,26 @@ fn places(apps: &[App], project: bool, home: &Path) -> Result<Vec<Place>> {
         .collect())
 }
 
-/// Install or repair the skill and hook for `apps` (the installed ones by
-/// default), and with `mcp` the MCP tools. An MCP part already there stays.
-fn install(apps: &[App], project: bool, mcp: bool) -> Result<Output> {
+/// Install or repair the skill, hook and tools for `apps` (the installed
+/// ones by default); with `no_tools` no new tools are added, but a tools
+/// part already there stays.
+fn install(apps: &[App], project: bool, no_tools: bool, all_tools: bool) -> Result<Output> {
     let home = home()?;
     let apps = resolve(apps, project, &home, false)?;
     let bin = hook_bin();
     let mut steps = Vec::new();
     for place in places(&apps, project, &home)? {
-        let mcp = mcp || current_parts(&place, &bin).mcp;
+        let tools = !no_tools || current_parts(&place, &bin).tools;
         let want = Parts {
             skill: true,
             hook: true,
-            mcp,
+            tools,
         };
-        steps.extend(plan(&place, want, &bin).into_iter().map(|s| (place.app, s)));
+        steps.extend(
+            plan(&place, want, &bin, all_tools)
+                .into_iter()
+                .map(|s| (place.app, s)),
+        );
     }
     let changes = apply(&steps)?;
     let mut notes = Vec::new();
@@ -613,17 +623,21 @@ fn uninstall(apps: &[App], project: bool, only: Option<Parts>) -> Result<Output>
             None => Parts::NONE,
             Some(drop) => {
                 let have = current_parts(&place, &bin);
-                if !(have.skill && drop.skill || have.hook && drop.hook || have.mcp && drop.mcp) {
+                if !(have.skill && drop.skill || have.hook && drop.hook || have.tools && drop.tools) {
                     continue;
                 }
                 Parts {
                     skill: have.skill && !drop.skill,
                     hook: have.hook && !drop.hook,
-                    mcp: have.mcp && !drop.mcp,
+                    tools: have.tools && !drop.tools,
                 }
             }
         };
-        steps.extend(plan(&place, want, &bin).into_iter().map(|s| (place.app, s)));
+        steps.extend(
+            plan(&place, want, &bin, false)
+                .into_iter()
+                .map(|s| (place.app, s)),
+        );
     }
     let changes = apply(&steps)?;
     Ok(report(&steps, &changes, Vec::new()))
@@ -667,7 +681,7 @@ fn report(steps: &[(App, Step)], changes: &[Change], notes: Vec<String>) -> Outp
     out
 }
 
-const STATUS_COLUMNS: [&str; 6] = ["app", "scope", "plugin", "skill", "hook", "mcp"];
+const STATUS_COLUMNS: [&str; 6] = ["app", "scope", "plugin", "skill", "hook", "tools"];
 
 /// Each harness's plugin (or extension), skill, hook and MCP state, per user
 /// and, for Codex and OpenCode, in this project.
@@ -679,14 +693,14 @@ fn status() -> Result<Output> {
     let rows: Vec<[&'static str; 6]> = all
         .iter()
         .map(|p| {
-            let [skill, hook, mcp] = part_states(p, &bin);
+            let [skill, hook, tools] = part_states(p, &bin);
             [
                 p.app.name(),
                 p.scope(),
                 package_state(p, &bin),
                 skill,
                 hook,
-                mcp,
+                tools,
             ]
         })
         .collect();
@@ -704,7 +718,7 @@ fn status() -> Result<Output> {
         .map(|r| {
             obj! {
                 "app" => r[0], "scope" => r[1], "plugin" => r[2],
-                "skill" => r[3], "hook" => r[4], "mcp" => r[5],
+                "skill" => r[3], "hook" => r[4], "tools" => r[5],
             }
         })
         .collect();
@@ -778,7 +792,7 @@ fn part_states(place: &Place, bin: &str) -> [&'static str; 3] {
             [
                 skill_state(&place.skill_dir()),
                 part(parts.hook),
-                part(parts.mcp),
+                part(parts.tools),
             ]
         }
         App::Codex => {
@@ -794,17 +808,14 @@ fn part_states(place: &Place, bin: &str) -> [&'static str; 3] {
             [
                 skill_state(&place.skill_dir()),
                 hook,
-                or_stale(mcp_toml_state(&place.codex_config(), bin)),
+                or_stale(mcp_toml_state(&place.codex_config(), bin, None)),
             ]
         }
-        App::Opencode => {
-            let want = json!({ "type": "local", "command": [bin, "mcp"], "enabled": true });
-            [
-                skill_state(&place.skill_dir()),
-                managed_state(&place.opencode_plugin(), &opencode_plugin(bin)),
-                or_stale(mcp_json_state(&place.opencode_config(), "mcp", &want)),
-            ]
-        }
+        App::Opencode => [
+            skill_state(&place.skill_dir()),
+            managed_state(&place.opencode_plugin(), &opencode_plugin(bin)),
+            or_stale(opencode_tools_state(&place.opencode_config(), bin)),
+        ],
         App::All => ["unsupported"; 3],
     }
 }
@@ -909,7 +920,11 @@ fn run_step(step: &Step) -> Result<&'static str> {
         Step::RemoveFile { file } => effect(remove_managed(file)?, "removed"),
         Step::AddMcpJson { file, key, entry } => effect(add_mcp_json(file, key, entry)?, "written"),
         Step::RemoveMcpJson { file, key } => effect(remove_mcp_json(file, key)?, "written"),
-        Step::AddMcpToml { file, bin } => effect(add_mcp_toml(file, bin)?, "written"),
+        Step::AddMcpToml {
+            file,
+            bin,
+            all_tools,
+        } => effect(add_mcp_toml(file, bin, *all_tools)?, "written"),
         Step::RemoveMcpToml { file } => effect(remove_mcp_toml(file)?, "written"),
     })
 }
@@ -1067,10 +1082,10 @@ fn plugin_files(bin: &str, parts: Parts) -> (Vec<(String, String)>, String) {
     if parts.hook {
         files.push((
             "plugins/rgit/hooks/hooks.json".into(),
-            claude_hooks(bin, parts.mcp),
+            claude_hooks(bin, parts.tools),
         ));
     }
-    if parts.mcp {
+    if parts.tools {
         files.push(("plugins/rgit/hooks/register.tsx".into(), claude_register(bin)));
     }
     let mut h = Sha256::new();
@@ -1110,7 +1125,7 @@ fn plugin_parts(dir: &Path) -> Parts {
     Parts {
         skill: dir.join("skills/rgit/SKILL.md").exists(),
         hook: dir.join("hooks/hooks.json").exists(),
-        mcp: dir.join("hooks/register.tsx").exists(),
+        tools: dir.join("hooks/register.tsx").exists(),
     }
 }
 
@@ -1433,7 +1448,21 @@ fn enable_codex_hooks(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn mcp_toml_state(path: &Path, bin: &str) -> Result<&'static str> {
+/// The `rgit mcp` arguments install writes for Codex and OpenCode: only the
+/// core tools, for harnesses that load every tool into the prompt, or all of
+/// them with `--all-tools`.
+fn mcp_args(all_tools: bool) -> &'static [&'static str] {
+    if all_tools {
+        &["mcp"]
+    } else {
+        &["mcp", "--core"]
+    }
+}
+
+/// The Codex tools state: with `want` the state against that argument list,
+/// else current for the core set (the default) or the full set
+/// (`--all-tools`).
+fn mcp_toml_state(path: &Path, bin: &str, want: Option<&[&str]>) -> Result<&'static str> {
     let doc = read_toml(path)?;
     let Some(server) = doc.get("mcp_servers").and_then(|s| s.get("rgit")) else {
         return Ok("missing");
@@ -1443,17 +1472,16 @@ fn mcp_toml_state(path: &Path, bin: &str) -> Result<&'static str> {
         .get("args")
         .and_then(|a| a.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_str()).collect());
-    Ok(
-        if command == Some(bin) && args.as_deref() == Some(&["mcp"]) {
-            "current"
-        } else {
-            "stale"
-        },
-    )
+    let current = match (command, args.as_deref(), want) {
+        (Some(c), Some(a), None) if c == bin => a == ["mcp"] || a == ["mcp", "--core"],
+        (Some(c), Some(a), Some(w)) => c == bin && a == w,
+        _ => false,
+    };
+    Ok(if current { "current" } else { "stale" })
 }
 
-fn add_mcp_toml(path: &Path, bin: &str) -> Result<bool> {
-    if mcp_toml_state(path, bin)? == "current" {
+fn add_mcp_toml(path: &Path, bin: &str, all_tools: bool) -> Result<bool> {
+    if mcp_toml_state(path, bin, Some(mcp_args(all_tools)))? == "current" {
         return Ok(false);
     }
     let mut doc = read_toml(path)?;
@@ -1474,7 +1502,7 @@ fn add_mcp_toml(path: &Path, bin: &str) -> Result<bool> {
     server.insert("command", toml_edit::value(bin));
     server.insert(
         "args",
-        toml_edit::value(toml_edit::Array::from_iter(["mcp"])),
+        toml_edit::value(toml_edit::Array::from_iter(mcp_args(all_tools).iter().copied())),
     );
     write_toml(path, &doc)?;
     Ok(true)
@@ -1515,6 +1543,28 @@ fn mcp_json_state(path: &Path, key: &str, want: &Value) -> Result<&'static str> 
             Some(_) => "stale",
         },
     )
+}
+
+/// The OpenCode `mcp.rgit` entry: `rgit mcp --core` by default, plain
+/// `rgit mcp` with `--all-tools`.
+fn opencode_mcp(bin: &str, all_tools: bool) -> Value {
+    let mut command = vec![Value::from(bin)];
+    command.extend(mcp_args(all_tools).iter().map(|a| Value::from(*a)));
+    json!({ "type": "local", "command": command, "enabled": true })
+}
+
+/// The OpenCode tools state: current for the core set (the default) or the
+/// full set (`--all-tools`).
+fn opencode_tools_state(path: &Path, bin: &str) -> Result<&'static str> {
+    for all_tools in [false, true] {
+        match mcp_json_state(path, "mcp", &opencode_mcp(bin, all_tools)) {
+            Ok("current") => return Ok("current"),
+            Ok("missing") => return Ok("missing"),
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok("stale")
 }
 
 fn add_mcp_json(path: &Path, key: &str, want: &Value) -> Result<bool> {
@@ -1631,11 +1681,11 @@ export const RgitContext = async ({{ $, client, directory }}) => {{
 const EXTENSION: &str = include_str!("../../../extensions/rgit/src/rgit.ts");
 
 /// The extension for `app` running `bin`: the session-start hook when
-/// `parts.hook`, and rgit's core tools when `parts.mcp`, over MCP where the
+/// `parts.hook`, and rgit's core tools when `parts.tools`, over MCP where the
 /// harness takes an MCP server (pi) and as native tools elsewhere (omp).
 fn extension(app: App, bin: &str, parts: Parts) -> String {
     let string = |s: &str| serde_json::to_string(s).expect("a string serializes");
-    let tools = if parts.mcp {
+    let tools = if parts.tools {
         serde_json::to_string(&crate::mcp::core_definitions()).expect("definitions serialize")
     } else {
         String::new()
@@ -1655,7 +1705,7 @@ fn extension_parts(text: &str) -> Parts {
     Parts {
         skill: false,
         hook: text.contains("const SESSION_START: string = \"yes\""),
-        mcp: text.contains("const TOOLS_JSON: string = \"["),
+        tools: text.contains("const TOOLS_JSON: string = \"["),
     }
 }
 
@@ -1719,9 +1769,12 @@ mod tests {
         let all = Parts {
             skill: true,
             hook: true,
-            mcp: true,
+            tools: true,
         };
-        let no_mcp = Parts { mcp: false, ..all };
+        let no_tools = Parts {
+            tools: false,
+            ..all
+        };
         let (files, version) = plugin_files("rgit", all);
         assert!(version.starts_with(env!("CARGO_PKG_VERSION")));
         assert_eq!(version.len(), env!("CARGO_PKG_VERSION").len() + 7);
@@ -1731,12 +1784,12 @@ mod tests {
                 .any(|(p, _)| p == "plugins/rgit/hooks/register.tsx")
         );
         assert!(
-            !plugin_files("rgit", no_mcp)
+            !plugin_files("rgit", no_tools)
                 .0
                 .iter()
                 .any(|(p, _)| p.ends_with("register.tsx"))
         );
-        assert_ne!(plugin_files("rgit", no_mcp).1, version);
+        assert_ne!(plugin_files("rgit", no_tools).1, version);
         assert_ne!(plugin_files("/new/rgit", all).1, version);
         let hooks: Value = serde_json::from_str(&claude_hooks("rgit", true)).unwrap();
         assert_eq!(
@@ -1766,7 +1819,7 @@ mod tests {
         let parts = Parts {
             skill: true,
             hook: true,
-            mcp: true,
+            tools: true,
         };
         let text = extension(App::Omp, "/x/rgit", parts);
         assert!(text.starts_with(MARKER));
@@ -1783,12 +1836,12 @@ mod tests {
             App::Pi,
             "rgit",
             Parts {
-                mcp: false,
+                tools: false,
                 ..parts
             },
         );
         assert!(bare.contains("const TOOLS_JSON: string = \"\";"));
-        assert!(!extension_parts(&bare).mcp);
+        assert!(!extension_parts(&bare).tools);
         assert!(opencode_plugin("rgit").starts_with(MARKER));
     }
 
@@ -1802,7 +1855,7 @@ mod tests {
         let all = Parts {
             skill: true,
             hook: true,
-            mcp: true,
+            tools: true,
         };
         write_plugin(&dir, "rgit", all).unwrap();
         for target in [dir.clone(), dir.join("plugins/rgit")] {

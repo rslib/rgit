@@ -4219,9 +4219,8 @@ pub enum HookCmd {
 
 #[derive(Subcommand)]
 pub enum AgentCmd {
-    /// Install or repair the rgit skill and session hook in agent apps (the
-    /// ones found on this machine by default); with --mcp also rgit's MCP
-    /// tools (for pi and omp, as native tools).
+    /// Install or repair the rgit skill, session hook and tools in agent apps
+    /// (the ones found on this machine by default).
     Install {
         /// Apps to set up; by default every one found on PATH or by its config folder.
         #[arg(value_enum)]
@@ -4229,15 +4228,15 @@ pub enum AgentCmd {
         /// This project's config instead of your user config (codex and opencode only).
         #[arg(long)]
         project: bool,
-        /// Also add rgit's MCP tools: `rgit mcp` for Claude Code, Codex and
-        /// OpenCode, native tools running `rgit tool` for pi and omp.
-        #[arg(long, overrides_with = "no_mcp")]
-        mcp: bool,
-        /// Add no MCP tools (the default); tools already installed stay.
-        #[arg(long, overrides_with = "mcp")]
-        no_mcp: bool,
+        /// Add no tools; tools already installed stay.
+        #[arg(long)]
+        no_tools: bool,
+        /// Install all 200 tools for Codex and OpenCode instead of the 10
+        /// core tools they get by default.
+        #[arg(long)]
+        all_tools: bool,
     },
-    /// Show each app's plugin or extension, skill, hook and MCP state.
+    /// Show each app's plugin or extension, skill, hook and tools state.
     Status,
     /// Remove what `rgit agent install` added (from every app by default).
     Uninstall {
@@ -4253,9 +4252,9 @@ pub enum AgentCmd {
         /// Remove only the session hook.
         #[arg(long, group = "only")]
         hook_only: bool,
-        /// Remove only the MCP tools.
+        /// Remove only the tools.
         #[arg(long, group = "only")]
-        mcp_only: bool,
+        tools_only: bool,
     },
     /// Print the rgit SKILL.md, or its command reference.
     Skill {
