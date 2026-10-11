@@ -254,7 +254,11 @@ fn fetch_short_non_branch_source_into_a_short_branch() {
     let (_, up, clone) = fetch_setup("fetch-pull");
     git(&up, &["push", "-q", "origin", "main:refs/pull/1/head"]);
 
-    ok(&clone, &["fetch", "origin", "pull/1/head:feat/x"]);
+    let (out, _, _) = human(&clone, &["fetch", "origin", "pull/1/head:feat/x"]);
+    assert!(
+        out.contains("[new ref]         refs/pull/1/head -> feat/x"),
+        "{out}"
+    );
     let refs = git(&clone, &["for-each-ref", "--format=%(refname)"]);
     assert!(refs.contains("refs/heads/feat/x\n"), "{refs}");
     assert!(!refs.contains("headrefs"), "{refs}");
@@ -262,6 +266,57 @@ fn fetch_short_non_branch_source_into_a_short_branch() {
         git(&clone, &["rev-parse", "feat/x"]),
         git(&up, &["rev-parse", "main"])
     );
+}
+
+/// `up` with an annotated tag `rel` and a light tag `lone` on main, pushed
+/// after `clone` was made, so the clone has neither.
+fn tag_setup(name: &str) -> (PathBuf, PathBuf) {
+    let (_, up, clone) = fetch_setup(name);
+    git(&up, &["tag", "-a", "-m", "rel", "rel"]);
+    git(&up, &["tag", "lone"]);
+    git(&up, &["push", "-q", "origin", "rel", "lone"]);
+    (up, clone)
+}
+
+#[test]
+fn fetch_into_a_local_ref_follows_tags() {
+    let (_, clone) = tag_setup("fetch-follow");
+    ok(&clone, &["fetch", "origin", "main:x"]);
+    let tags = git(&clone, &["tag"]);
+    assert_eq!(tags, "lone\nrel\n");
+}
+
+#[test]
+fn fetch_short_tag_source_into_a_renamed_tag() {
+    for tag_opt in [None, Some("--tags")] {
+        let (up, clone) = tag_setup(&format!("fetch-tag-{}", tag_opt.is_some()));
+        if let Some(opt) = tag_opt {
+            git(&clone, &["config", "remote.origin.tagOpt", opt]);
+        }
+        let (out, _, _) = human(&clone, &["fetch", "origin", "tags/rel:tags/z"]);
+        assert!(out.contains("[new tag]         rel        -> z"), "{out}");
+        let refs = git(
+            &clone,
+            &["for-each-ref", "--format=%(refname)", "refs/tags"],
+        );
+        assert_eq!(refs, "refs/tags/lone\nrefs/tags/rel\nrefs/tags/z\n");
+        assert_eq!(
+            git(&clone, &["rev-parse", "z"]),
+            git(&up, &["rev-parse", "rel"])
+        );
+    }
+}
+
+#[test]
+fn fetch_refuses_an_annotated_tag_into_a_branch() {
+    let (_, clone) = tag_setup("fetch-tag-branch");
+    let out = fails(&clone, &["--human", "fetch", "origin", "rel:v2"]);
+    assert!(
+        out.contains("! [new tag]         rel        -> v2  (unable to update local ref)"),
+        "{out}"
+    );
+    let refs = git(&clone, &["for-each-ref", "--format=%(refname)"]);
+    assert!(!refs.contains("refs/heads/v2"), "{refs}");
 }
 
 #[test]

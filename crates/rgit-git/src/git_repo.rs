@@ -5970,8 +5970,112 @@ fn do_fetch(
         }
         specs.push("refs/tags/*:refs/tags/*".to_owned());
     }
-    let tracking = tracking_specs(&remote, &specs)?;
     let updates: Mutex<Vec<FetchUpdate>> = Mutex::new(Vec::new());
+    let tag_opt = repo
+        .config()?
+        .get_string(&format!("remote.{name}.tagOpt"))
+        .unwrap_or_default();
+    let mut tags = if args.no_tags || tag_opt == "--no-tags" {
+        git2::AutotagOption::None
+    } else if args.tags || tag_opt == "--tags" {
+        git2::AutotagOption::All
+    } else if !refspecs.is_empty() {
+        // Named refs follow tags only when one of them is stored locally.
+        match refspecs
+            .iter()
+            .any(|s| s.split_once(':').is_some_and(|(_, dst)| !dst.is_empty()))
+        {
+            true => git2::AutotagOption::Auto,
+            false => git2::AutotagOption::None,
+        }
+    } else {
+        git2::AutotagOption::Unspecified
+    };
+    let ignored = std::sync::atomic::AtomicBool::new(false);
+    let mut opts = FetchOptions::new();
+    opts.remote_callbacks(remote_callbacks(report, &ignored, cred));
+    if args.unshallow {
+        // libgit2's GIT_FETCH_DEPTH_UNSHALLOW.
+        opts.depth(i32::MAX);
+    } else if args.depth > 0 {
+        opts.depth(args.depth);
+    }
+    // git_remote_fetch's steps, with the ref updates one fetch at a time so
+    // fetches running at once can share FETCH_HEAD. The connection comes
+    // first: libgit2 mangles a short source that is not a branch
+    // (`v1:refs/tags/z` makes `refs/tags/v1refs/tags/z`), so each source is
+    // spelled out from the refs the remote advertises.
+    let mut conn = remote.connect_auth(
+        git2::Direction::Fetch,
+        Some(remote_callbacks(report, &ignored, cred)),
+        None,
+    )?;
+    let heads: Vec<(String, Oid)> = conn
+        .list()?
+        .iter()
+        .map(|head| (head.name().to_owned(), head.oid()))
+        .collect();
+    let advertised: Vec<String> = heads.iter().map(|(name, _)| name.clone()).collect();
+    let given = !specs.is_empty();
+    // Like git, an annotated tag never becomes a branch tip.
+    let (refused, mut specs): (Vec<String>, Vec<String>) = specs
+        .iter()
+        .map(|spec| full_fetch_src_spec(spec, &advertised))
+        .partition(|spec| {
+            spec.trim_start_matches('+')
+                .split_once(':')
+                .is_some_and(|(src, dst)| {
+                    dst.starts_with("refs/heads/") && advertised.contains(&format!("{src}^{{}}"))
+                })
+        });
+    // libgit2 names a tag it also follows wrongly (`refs/tags/v1:refs/tags/z`
+    // writes `refs/tags/v1refs/tags/z` with every tag on), so a named tag
+    // turns its tag handling off; `--tags` becomes an explicit spec.
+    let named_tag = specs
+        .iter()
+        .any(|spec| spec.trim_start_matches('+').starts_with("refs/tags/"));
+    let mut follow = false;
+    if given && named_tag && tags != git2::AutotagOption::None {
+        match tags {
+            git2::AutotagOption::All => specs.push("refs/tags/*:refs/tags/*".to_owned()),
+            _ => follow = true,
+        }
+        tags = git2::AutotagOption::None;
+    }
+    opts.download_tags(tags);
+    if !given || !specs.is_empty() {
+        conn.remote().download(&specs, Some(&mut opts))?;
+    }
+    let their_head = conn
+        .default_branch()
+        .ok()
+        .and_then(|b| b.as_str().ok().map(str::to_owned));
+    drop(conn);
+    if follow && !specs.is_empty() {
+        // git's tag following: a remote tag whose object is here now, and
+        // that is not here yet, comes along.
+        let odb = repo.odb()?;
+        let extra: Vec<String> = heads
+            .iter()
+            .filter(|(name, _)| name.starts_with("refs/tags/") && !name.ends_with("^{}"))
+            .filter(|(name, oid)| {
+                let peeled = heads
+                    .iter()
+                    .find(|(n, _)| *n == format!("{name}^{{}}"))
+                    .map_or(*oid, |(_, o)| *o);
+                odb.exists(peeled) && repo.find_reference(name).is_err()
+            })
+            .map(|(name, _)| format!("{name}:{name}"))
+            .collect();
+        if !extra.is_empty() {
+            // A fresh connection: over ssh and git:// upload-pack serves one
+            // pack per connection.
+            specs.extend(extra);
+            remote.download(&specs, Some(&mut opts))?;
+            remote.disconnect()?;
+        }
+    }
+    let tracking = tracking_specs(&remote, &specs)?;
     let on_tip = |dst: &str, old: Oid, new: Oid| {
         let src = tracking
             .iter()
@@ -5983,38 +6087,6 @@ fn do_fetch(
             .push((src, dst.to_owned(), Some(old), new));
         true
     };
-    let tag_opt = repo
-        .config()?
-        .get_string(&format!("remote.{name}.tagOpt"))
-        .unwrap_or_default();
-    let tags = if args.no_tags || (anonymous && tag_opt == "--no-tags") {
-        git2::AutotagOption::None
-    } else if args.tags || (anonymous && tag_opt == "--tags") {
-        git2::AutotagOption::All
-    } else if !refspecs.is_empty() {
-        // git follows no tags when the refs to fetch are named.
-        git2::AutotagOption::None
-    } else {
-        git2::AutotagOption::Unspecified
-    };
-    let ignored = std::sync::atomic::AtomicBool::new(false);
-    let mut opts = FetchOptions::new();
-    opts.remote_callbacks(remote_callbacks(report, &ignored, cred));
-    opts.download_tags(tags);
-    if args.unshallow {
-        // libgit2's GIT_FETCH_DEPTH_UNSHALLOW.
-        opts.depth(i32::MAX);
-    } else if args.depth > 0 {
-        opts.depth(args.depth);
-    }
-    // git_remote_fetch's steps, with the ref updates one fetch at a time so
-    // fetches running at once can share FETCH_HEAD.
-    remote.download(&specs, Some(&mut opts))?;
-    let their_head = remote
-        .default_branch()
-        .ok()
-        .and_then(|b| b.as_str().ok().map(str::to_owned));
-    remote.disconnect()?;
     let fetch_head = repo.path().join("FETCH_HEAD");
     let fetched = {
         let _serial = FETCH_UPDATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -6058,11 +6130,31 @@ fn do_fetch(
     let updates = updates
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let rows = fetch_rows(repo, name, refspecs, &updates, &fetched, true);
+    let mut rows: Vec<crate::fetch_display::Row> = refused
+        .iter()
+        .filter_map(|spec| spec.trim_start_matches('+').split_once(':'))
+        .map(|(src, dst)| crate::fetch_display::Row {
+            code: '!',
+            summary: "[new tag]".to_owned(),
+            remote: short_ref(src).to_owned(),
+            local: short_ref(dst).to_owned(),
+            error: Some("unable to update local ref".to_owned()),
+            counted: true,
+        })
+        .collect();
+    rows.extend(fetch_rows(repo, name, refspecs, &updates, &fetched, true));
     for line in crate::fetch_display::render(&url, &rows, compact_fetch(repo)) {
         report(OpProgress::Line(line));
     }
-    Ok(())
+    match refused
+        .first()
+        .and_then(|spec| spec.trim_start_matches('+').split_once(':'))
+    {
+        Some((_, dst)) => Err(GitError::Other(format!(
+            "cannot update ref '{dst}': trying to write a tag object to branch '{dst}'"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Fetch `name`, making its history as shallow as `args` asks. From a local
@@ -6464,7 +6556,9 @@ fn fetch_rows(
         };
         keyed.push((key, row));
     }
-    for name in fetched {
+    // A ref named twice in FETCH_HEAD (`v1` and the `--tags` glob) is one row.
+    let mut seen = std::collections::HashSet::new();
+    for name in fetched.iter().filter(|name| seen.insert(name.as_str())) {
         let Some(i) = cli.iter().position(|(s, d)| d.is_none() && named(s, name)) else {
             continue;
         };
@@ -6524,9 +6618,45 @@ fn map_glob(from: &str, to: &str, name: &str) -> Option<String> {
     }
 }
 
-/// `src:dst` with a short `dst` spelled out as git does: `refs/tags/dst`
-/// for a tag, else `refs/heads/dst`. libgit2 joins a short `dst` onto a
-/// short non-branch `src` (`pull/1/head:x` makes `pull/1/headrefs/heads/x`).
+/// A short fetch source spelled out as the remote advertises it, in git's
+/// lookup order (`pull/1/head` is `refs/pull/1/head`); unchanged when it is
+/// already full, a glob, or not advertised.
+fn full_fetch_src(src: &str, advertised: &[String]) -> String {
+    if src.starts_with("refs/") || src == "HEAD" || src.contains('*') {
+        return src.to_owned();
+    }
+    [
+        format!("refs/{src}"),
+        format!("refs/tags/{src}"),
+        format!("refs/heads/{src}"),
+        format!("refs/remotes/{src}"),
+        format!("refs/remotes/{src}/HEAD"),
+    ]
+    .into_iter()
+    .find(|full| advertised.contains(full))
+    .unwrap_or_else(|| src.to_owned())
+}
+
+/// `src:dst` (or a bare `src`) with a short `src` spelled out by
+/// [`full_fetch_src`].
+fn full_fetch_src_spec(spec: &str, advertised: &[String]) -> String {
+    let (force, rest) = match spec.strip_prefix('+') {
+        Some(rest) => ("+", rest),
+        None => ("", spec),
+    };
+    match rest.split_once(':') {
+        Some((src, dst)) if !src.is_empty() => {
+            format!("{force}{}:{dst}", full_fetch_src(src, advertised))
+        }
+        Some(_) => spec.to_owned(),
+        None => format!("{force}{}", full_fetch_src(rest, advertised)),
+    }
+}
+
+/// `src:dst` with a short `dst` spelled out as git does: `refs/heads/dst`,
+/// or `refs/dst` when it starts with `heads/`, `tags/` or `remotes/`.
+/// libgit2 joins a short `dst` onto a short non-branch `src`
+/// (`pull/1/head:x` makes `pull/1/headrefs/heads/x`).
 fn full_fetch_dst(spec: &str) -> String {
     let Some((src, dst)) = spec.split_once(':') else {
         return spec.to_owned();
@@ -6534,11 +6664,13 @@ fn full_fetch_dst(spec: &str) -> String {
     if dst.is_empty() || dst.starts_with("refs/") {
         return spec.to_owned();
     }
-    let kind = match src.trim_start_matches('+').starts_with("refs/tags/") {
-        true => "tags",
-        false => "heads",
-    };
-    format!("{src}:refs/{kind}/{dst}")
+    match ["heads/", "tags/", "remotes/"]
+        .iter()
+        .any(|kind| dst.starts_with(kind))
+    {
+        true => format!("{src}:refs/{dst}"),
+        false => format!("{src}:refs/heads/{dst}"),
+    }
 }
 
 /// A command-line fetch refspec as `--refmap` maps it: a bare ref gets the
