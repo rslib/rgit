@@ -626,8 +626,8 @@ fn definition(tool: Tool) -> Value {
 }
 
 /// Every tool as `{name, description, inputSchema, annotations}`, the shape
-/// MCP lists, for harnesses that register rgit's tools natively (the omp
-/// extension) or rank them (pi reads them from the MCP server itself).
+/// MCP lists, for the Claude Code mod (pi reads them from the MCP server
+/// itself).
 pub fn definitions() -> Vec<Value> {
     tools().into_iter().map(definition).collect()
 }

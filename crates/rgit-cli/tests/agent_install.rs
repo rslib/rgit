@@ -701,7 +701,7 @@ fn extension_drives_rgit() {
     // Inside the package, so `import "typebox"` resolves as pi and omp resolve it.
     let generated = package.join(".test");
     std::fs::create_dir_all(&generated).unwrap();
-    for (harness, flags, mode) in [("pi", &["--mcp"][..], "tools"), ("omp", &[], "no-tools")] {
+    for (harness, flags, mode) in [("pi", &["--mcp"][..], "mcp"), ("omp", &["--mcp"][..], "native")] {
         let env = Env::new(&format!("ext-{harness}"), &[]);
         let mut args = vec!["agent", "install", harness];
         args.extend(flags);

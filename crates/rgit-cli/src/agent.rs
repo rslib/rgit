@@ -1631,11 +1631,12 @@ export const RgitContext = async ({{ $, client, directory }}) => {{
 const EXTENSION: &str = include_str!("../../../extensions/rgit/src/rgit.ts");
 
 /// The extension for `app` running `bin`: the session-start hook when
-/// `parts.hook`, and rgit's MCP tools as native tools when `parts.mcp`.
+/// `parts.hook`, and rgit's core tools when `parts.mcp`, over MCP where the
+/// harness takes an MCP server (pi) and as native tools elsewhere (omp).
 fn extension(app: App, bin: &str, parts: Parts) -> String {
     let string = |s: &str| serde_json::to_string(s).expect("a string serializes");
     let tools = if parts.mcp {
-        serde_json::to_string(&crate::mcp::definitions()).expect("definitions serialize")
+        serde_json::to_string(&crate::mcp::core_definitions()).expect("definitions serialize")
     } else {
         String::new()
     };
