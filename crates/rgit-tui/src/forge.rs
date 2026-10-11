@@ -89,6 +89,8 @@ pub struct ForgeSnapshot {
     pub target: ForgeTarget,
     pub requests: Vec<PullRequest>,
     pub issues: Vec<ForgeIssue>,
+    /// Why the issues could not load; the pull requests still show.
+    pub issues_error: Option<String>,
 }
 
 pub async fn load(
@@ -134,7 +136,7 @@ pub async fn load(
             check_list: Vec::new(),
         })
         .collect();
-    let issues = forge
+    let (issues, issues_error) = match forge
         .issues(
             target.repo().expect("remote names a repository"),
             1,
@@ -144,7 +146,8 @@ pub async fn load(
             None,
         )
         .await
-        .map(|listing| {
+    {
+        Ok(listing) => (
             listing
                 .items
                 .into_iter()
@@ -157,13 +160,16 @@ pub async fn load(
                     labels: issue.labels,
                     assignees: issue.assignees,
                 })
-                .collect()
-        })
-        .unwrap_or_default();
+                .collect(),
+            None,
+        ),
+        Err(error) => (Vec::new(), Some(forge_error(&target, error))),
+    };
     Ok(ForgeSnapshot {
         target,
         requests,
         issues,
+        issues_error,
     })
 }
 
@@ -339,6 +345,14 @@ pub fn build_view(snapshot: &ForgeSnapshot, tab: ForgeTab) -> Vec<Section> {
             sections
         }
         ForgeTab::Issues => {
+            if let Some(error) = &snapshot.issues_error {
+                sections.push(Section::leaf(
+                    "forge/empty",
+                    NodeKind::DiffLine,
+                    vec![Span::new(error.clone(), Style::Deleted)],
+                ));
+                return sections;
+            }
             if snapshot.issues.is_empty() {
                 sections.push(Section::leaf(
                     "forge/empty",

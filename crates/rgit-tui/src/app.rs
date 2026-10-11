@@ -2935,6 +2935,10 @@ impl App {
             self.push_toast(ToastKind::Error, "forge data is not loaded".to_owned());
             return None;
         };
+        if self.forge_tab == crate::forge::ForgeTab::Issues {
+            self.push_toast(ToastKind::Error, "switch to pull requests first".to_owned());
+            return None;
+        }
         let index = self.buffer().cursor().saturating_sub(1);
         let Some(request) = snapshot.requests.get(index) else {
             self.push_toast(
@@ -3547,6 +3551,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 return vec![];
             }
             app.forge_tab = app.forge_tab.toggle();
+            app.forge_close_armed = None;
             if app.active_kind() == ViewKind::Forge
                 && let Some(snapshot) = app.forge_snapshot.as_ref()
             {
@@ -6094,6 +6099,7 @@ mod tests {
                 forge_request(13, "other", true),
             ],
             issues: vec![forge_issue(7)],
+            issues_error: None,
         }
     }
 
@@ -6359,6 +6365,56 @@ mod tests {
             matches!(fx.as_slice(), [Effect::ForgeIssueClose { number: 7, .. }]),
             "{fx:?}"
         );
+    }
+
+    #[test]
+    fn forge_pull_request_actions_do_nothing_on_the_issues_tab() {
+        let mut app = forge_app();
+        update(&mut app, Msg::ForgeTabToggle);
+        let mut buffer = Buffer::default();
+        buffer.set_content(crate::forge::build_view(
+            app.forge_snapshot.as_ref().expect("snapshot"),
+            app.forge_tab,
+        ));
+        app.push_view(ViewKind::Forge, buffer);
+        app.buffer_mut().set_cursor(1);
+        for msg in [Msg::ForgeReadyToggle, Msg::ForgeMerge, Msg::ForgeCheckout] {
+            let fx = update(&mut app, msg);
+            assert!(fx.is_empty(), "{fx:?}");
+            assert!(app.prompt.is_none());
+        }
+    }
+
+    #[test]
+    fn forge_close_arming_does_not_cross_tabs() {
+        let mut app = forge_app();
+        app.forge_snapshot.as_mut().expect("snapshot").requests[0].number = 7;
+        let mut buffer = Buffer::default();
+        buffer.set_content(crate::forge::build_view(
+            app.forge_snapshot.as_ref().expect("snapshot"),
+            app.forge_tab,
+        ));
+        app.push_view(ViewKind::Forge, buffer);
+        app.buffer_mut().set_cursor(1);
+        let fx = update(&mut app, Msg::ForgeClose);
+        assert!(fx.is_empty(), "first press only arms");
+        update(&mut app, Msg::ForgeTabToggle);
+        app.buffer_mut().set_cursor(1);
+        let fx = update(&mut app, Msg::ForgeClose);
+        assert!(fx.is_empty(), "the issue asks again");
+    }
+
+    #[test]
+    fn forge_issue_load_error_shows_on_the_issues_tab() {
+        let mut snapshot = forge_snapshot();
+        snapshot.issues.clear();
+        snapshot.issues_error = Some("issues are disabled".to_owned());
+        let list = section_text(&crate::forge::build_view(
+            &snapshot,
+            crate::forge::ForgeTab::Issues,
+        ));
+        assert!(list.contains("issues are disabled"), "{list}");
+        assert!(!list.contains("no open issues"), "{list}");
     }
 
     #[test]
