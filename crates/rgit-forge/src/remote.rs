@@ -5,25 +5,34 @@ use super::types::{Provider, RepoRef};
 
 /// The provider, host and repository behind a Git remote URL.
 ///
-/// `gitlab_host` names a self-hosted GitLab to recognize: a profile host or
-/// `GITLAB_HOST`. `host` is the URL's own host, so a caller can connect to the
-/// GitLab the remote points at.
+/// `configured` pairs a provider with a host a profile or the environment
+/// names, so a self-hosted GitLab or Forgejo is recognized. `host` is the host
+/// to connect to: the configured one when the remote matched it, else
+/// `https://` and the URL's own host.
 pub struct RemoteTarget {
     pub provider: Provider,
     pub host: String,
     pub repo: RepoRef,
+    pub configured: bool,
 }
 
 impl RemoteTarget {
-    pub fn parse(url: &str, gitlab_host: Option<&str>) -> Result<Self, ForgeError> {
+    pub fn parse(url: &str, configured: &[(Provider, String)]) -> Result<Self, ForgeError> {
         let value = url.trim().trim_end_matches(".git");
         let (host, path) = split_authority(value)?;
-        let provider = Provider::from_host(host, gitlab_host)
+        let matched = Provider::configured_match(host, configured);
+        let provider = Provider::from_host(host, configured)
             .ok_or_else(|| ForgeError::UnsupportedHost(host.to_owned()))?;
+        let connect_host = match matched {
+            Some((_, value)) if value.contains("://") => value.trim_end_matches('/').to_owned(),
+            Some((_, value)) => format!("https://{}", value.trim().trim_end_matches('/')),
+            None => format!("https://{host}"),
+        };
         Ok(Self {
             provider,
-            host: format!("https://{host}"),
+            host: connect_host,
             repo: RepoRef::parse(path.trim_start_matches('/'))?,
+            configured: matched.is_some(),
         })
     }
 }
@@ -57,7 +66,7 @@ mod tests {
 
     #[test]
     fn parses_common_remote_urls() {
-        let target = RemoteTarget::parse("git@github.com:owner/repo.git", None).expect("github");
+        let target = RemoteTarget::parse("git@github.com:owner/repo.git", &[]).expect("github");
         assert_eq!(target.provider, Provider::Github);
         assert_eq!(target.host, "https://github.com");
         assert_eq!(target.repo.to_string(), "owner/repo");
@@ -65,7 +74,7 @@ mod tests {
 
     #[test]
     fn parses_nested_gitlab_groups() {
-        let target = RemoteTarget::parse("https://gitlab.com/group/subgroup/project.git", None)
+        let target = RemoteTarget::parse("https://gitlab.com/group/subgroup/project.git", &[])
             .expect("gitlab");
         assert_eq!(target.provider, Provider::Gitlab);
         assert_eq!(target.repo.owner, "group");
@@ -76,7 +85,7 @@ mod tests {
     fn parses_an_ssh_url_with_a_port() {
         let target = RemoteTarget::parse(
             "ssh://git@code.example.com:2222/group/project.git",
-            Some("https://code.example.com:2222"),
+            &[(Provider::Gitlab, "https://code.example.com:2222".to_owned())],
         )
         .expect("self hosted gitlab");
         assert_eq!(target.provider, Provider::Gitlab);
@@ -88,15 +97,34 @@ mod tests {
     fn recognizes_a_self_hosted_gitlab_by_configuration() {
         let target = RemoteTarget::parse(
             "https://gitlab.internal.example/group/project",
-            Some("https://gitlab.internal.example"),
+            &[(
+                Provider::Gitlab,
+                "https://gitlab.internal.example".to_owned(),
+            )],
         )
         .expect("configured host");
         assert_eq!(target.provider, Provider::Gitlab);
-        assert!(RemoteTarget::parse("https://example.com/a/b", None).is_err());
+        assert!(RemoteTarget::parse("https://example.com/a/b", &[]).is_err());
+    }
+
+    #[test]
+    fn forgejo_provider_recognizes_an_ssh_remote_by_profile_host() {
+        let configured = [(Provider::Forgejo, "https://git.rs.ht".to_owned())];
+        let target = RemoteTarget::parse("forgejo@git.rs.ht:rayandrew/lab.git", &configured)
+            .expect("forgejo remote");
+        assert_eq!(target.provider, Provider::Forgejo);
+        assert_eq!(target.host, "https://git.rs.ht");
+        assert_eq!(target.repo.to_string(), "rayandrew/lab");
+        assert!(target.configured);
+    }
+
+    #[test]
+    fn forgejo_provider_leaves_an_unconfigured_host_unsupported() {
+        assert!(RemoteTarget::parse("forgejo@git.rs.ht:rayandrew/lab.git", &[]).is_err());
     }
 
     #[test]
     fn rejects_a_remote_with_no_path() {
-        assert!(RemoteTarget::parse("https://github.com", None).is_err());
+        assert!(RemoteTarget::parse("https://github.com", &[]).is_err());
     }
 }

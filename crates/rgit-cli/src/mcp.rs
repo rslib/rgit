@@ -1552,13 +1552,14 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_submit",
             "Push every branch in the current stack and open or update a pull request per branch, \
-             against the origin remote's forge (GitHub or GitLab; authenticated via `rgit forge \
-             login`).",
+             against the origin remote's forge (GitHub, GitLab or Forgejo; authenticated via \
+             `rgit forge login`).",
             none,
         ),
         tool(
             "git_forge_pr_list",
-            "Pull requests against the origin remote's forge (GitHub or GitLab): number, title, \
+            "Pull requests against the origin remote's forge (GitHub, GitLab or Forgejo): \
+             number, title, \
              state, head branch. `state` is open (default), closed, merged or all; `author` and \
              `head` filter; `target` names another forge repository (`OWNER/REPO`).",
             &[
@@ -1647,7 +1648,8 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_forge_issue_list",
-            "Issues against the origin remote's forge (GitHub or GitLab): number, title, \
+            "Issues against the origin remote's forge (GitHub, GitLab or Forgejo): number, \
+             title, \
              state. `state` is open (default), closed or all; `author`, `label` and \
              `assignee` filter; `target` names another forge repository (`OWNER/REPO`).",
             &[
@@ -1830,7 +1832,8 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_lanes_pr",
             "Push a lane's branch and open or update its pull request against the trunk, via the \
-             origin remote's forge (GitHub or GitLab; authenticated via `rgit forge login`).",
+             origin remote's forge (GitHub, GitLab or Forgejo; authenticated via `rgit forge \
+             login`).",
             &[("lane", "string", true)],
         ),
         tool(

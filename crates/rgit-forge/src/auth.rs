@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use super::ForgeError;
-use super::types::{CredentialIdentity, StoredCredential};
+use super::types::{CredentialIdentity, Provider, StoredCredential};
 
 const KEYRING_SERVICE: &str = "rgit.forge";
 pub const GITHUB_OAUTH_CLIENT_ID: &str = "Ov23lizdJOnx6whPL9rw";
@@ -379,10 +379,11 @@ pub fn credential_identities(provider: &str) -> Result<Vec<CredentialIdentity>, 
     if identities.is_empty() && load_provider_token(provider)?.is_some() {
         identities.push(CredentialIdentity {
             provider: provider.to_ascii_lowercase(),
-            host: if provider.eq_ignore_ascii_case("github") {
-                "https://github.com".to_owned()
-            } else {
-                "https://gitlab.com".to_owned()
+            host: match Provider::parse(provider) {
+                Ok(provider) => provider
+                    .env_host()
+                    .unwrap_or_else(|| provider.default_host().to_owned()),
+                Err(_) => "https://gitlab.com".to_owned(),
             },
             account: "default".to_owned(),
         });

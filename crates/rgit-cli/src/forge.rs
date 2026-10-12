@@ -21,6 +21,25 @@ fn active() -> ForgeSelection {
         .clone()
 }
 
+/// The host a login stores the credential for: the flag, else the
+/// provider's environment host, else its default host.
+fn login_host(provider: Provider, host: Option<String>) -> String {
+    host.unwrap_or_else(|| {
+        provider
+            .env_host()
+            .unwrap_or_else(|| provider.default_host().to_owned())
+    })
+}
+
+/// The issue-close trailer a `fixes` number appends to a pull request body:
+/// `Fixes #N`, `Closes #N` on GitLab.
+fn issue_close_trailer(provider: Provider, number: u64) -> String {
+    match provider {
+        Provider::Github | Provider::Forgejo => format!("Fixes #{number}"),
+        Provider::Gitlab => format!("Closes #{number}"),
+    }
+}
+
 pub fn run(command: ForgeCmd, selection: ForgeSelection) -> Result<String> {
     let dir = std::env::current_dir()?;
     run_in(&dir, command, selection)
@@ -47,13 +66,7 @@ pub fn run_in(
             token_stdin,
         } => {
             let provider = Provider::parse(&provider)?;
-            let host = host.unwrap_or_else(|| {
-                if provider == Provider::Github {
-                    "https://github.com".to_owned()
-                } else {
-                    std::env::var("GITLAB_HOST").unwrap_or_else(|_| "https://gitlab.com".to_owned())
-                }
-            });
+            let host = login_host(provider, host);
             if provider == Provider::Github {
                 if token_stdin {
                     let token = rgit_forge::read_token_stdin()?;
@@ -88,7 +101,12 @@ pub fn run_in(
                     Ok("GitHub authentication completed".to_owned())
                 }
             } else {
-                ensure!(token_stdin, "GitLab login requires --token-stdin");
+                let name = if provider == Provider::Gitlab {
+                    "GitLab"
+                } else {
+                    "Forgejo"
+                };
+                ensure!(token_stdin, "{name} login requires --token-stdin");
                 let token = rgit_forge::read_token_stdin()?;
                 rgit_forge::save_credential_for(
                     provider.as_str(),
@@ -101,7 +119,7 @@ pub fn run_in(
                         refresh_expires_at: None,
                     },
                 )?;
-                Ok(format!("stored GitLab credential for account {account:?}"))
+                Ok(format!("stored {name} credential for account {account:?}"))
             }
         }
         ForgeCmd::Auth { cmd } => auth_command(cmd, active()),
@@ -305,10 +323,7 @@ pub fn run_in(
                     };
                     let mut body = create.body;
                     if let Some(number) = fixes {
-                        let trailer = match forge.provider() {
-                            Provider::Github => format!("Fixes #{number}"),
-                            Provider::Gitlab => format!("Closes #{number}"),
-                        };
+                        let trailer = issue_close_trailer(forge.provider(), number);
                         body = Some(match body.filter(|body| !body.trim().is_empty()) {
                             Some(body) => format!("{body}\n\n{trailer}"),
                             None => trailer,
@@ -1529,6 +1544,72 @@ mod tests {
         assert!(output.contains("\"profile\": \"work\""));
         assert!(output.contains("\"account\": \"work\""));
         assert!(output.contains("\"source\": \"not_checked\""));
+    }
+
+    #[test]
+    fn forgejo_login_host_prefers_flag_then_default() {
+        assert_eq!(
+            super::login_host(
+                rgit_forge::Provider::Forgejo,
+                Some("https://git.rs.ht".to_owned())
+            ),
+            "https://git.rs.ht"
+        );
+        unsafe { std::env::remove_var("FORGEJO_HOST") };
+        assert_eq!(
+            super::login_host(rgit_forge::Provider::Forgejo, None),
+            rgit_forge::Provider::Forgejo.default_host()
+        );
+    }
+
+    #[test]
+    fn forgejo_issue_close_uses_the_fixes_keyword() {
+        assert_eq!(
+            super::issue_close_trailer(rgit_forge::Provider::Forgejo, 7),
+            "Fixes #7"
+        );
+        assert_eq!(
+            super::issue_close_trailer(rgit_forge::Provider::Github, 7),
+            "Fixes #7"
+        );
+        assert_eq!(
+            super::issue_close_trailer(rgit_forge::Provider::Gitlab, 7),
+            "Closes #7"
+        );
+    }
+
+    #[test]
+    fn forgejo_target_prefix_resolves_provider_host_and_repo() {
+        let selection = ForgeSelection {
+            provider: Some("forgejo".to_owned()),
+            host: Some("https://git.rs.ht".to_owned()),
+            ..ForgeSelection::default()
+        };
+        let target = super::resolve_target(
+            &std::env::temp_dir(),
+            &selection,
+            Some("forgejo:rayandrew/lab"),
+            None,
+        )
+        .expect("forgejo target");
+        assert_eq!(target.provider, rgit_forge::Provider::Forgejo);
+        assert_eq!(target.host, "https://git.rs.ht");
+        assert_eq!(target.repo().expect("repo").to_string(), "rayandrew/lab");
+    }
+
+    #[test]
+    fn forgejo_auth_status_names_the_provider_and_host() {
+        let output = super::auth_command(
+            AuthCmd::Status,
+            ForgeSelection {
+                provider: Some("forgejo".to_owned()),
+                host: Some("https://git.rs.ht".to_owned()),
+                ..ForgeSelection::default()
+            },
+        )
+        .expect("auth status");
+        assert!(output.contains(r#""provider": "forgejo""#), "{output}");
+        assert!(output.contains("https://git.rs.ht"), "{output}");
     }
 
     fn random_name(prefix: &str) -> String {

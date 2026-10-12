@@ -1,7 +1,8 @@
-//! Native forge integration: GitHub and GitLab API clients, one remote parser
+//! Native forge integration: GitHub, GitLab and Forgejo API clients, one remote parser
 //! and one profile loader, behind a single [`Forge`] client.
 
 mod auth;
+mod forgejo;
 mod github;
 mod gitlab;
 mod profile;
@@ -17,6 +18,7 @@ pub use auth::{
     login_browser, login_device, read_token_stdin, save_credential, save_credential_for,
     save_provider_token,
 };
+pub use forgejo::ForgejoClient;
 pub use github::GithubClient;
 pub use gitlab::GitlabClient;
 pub use profile::{ForgeConfig, ForgeProfile, ForgeSelection, ForgeTarget};
@@ -78,6 +80,7 @@ impl ForgeError {
 pub enum Forge {
     Github(GithubClient),
     Gitlab(GitlabClient),
+    Forgejo(ForgejoClient),
 }
 
 impl Forge {
@@ -94,6 +97,10 @@ impl Forge {
                 &target.host,
                 &target.account,
             )?)),
+            Provider::Forgejo => Ok(Self::Forgejo(ForgejoClient::from_environment_for(
+                &target.host,
+                &target.account,
+            )?)),
         }
     }
 
@@ -101,6 +108,7 @@ impl Forge {
         match self {
             Self::Github(_) => Provider::Github,
             Self::Gitlab(_) => Provider::Gitlab,
+            Self::Forgejo(_) => Provider::Forgejo,
         }
     }
 
@@ -108,6 +116,7 @@ impl Forge {
         match self {
             Self::Github(client) => client.repository(repo).await,
             Self::Gitlab(client) => client.repository(repo).await,
+            Self::Forgejo(client) => client.repository(repo).await,
         }
     }
 
@@ -119,6 +128,7 @@ impl Forge {
         match self {
             Self::Github(client) => client.create_repository(request, organization).await,
             Self::Gitlab(client) => client.create_repository(request, organization).await,
+            Self::Forgejo(client) => client.create_repository(request, organization).await,
         }
     }
 
@@ -126,6 +136,7 @@ impl Forge {
         match self {
             Self::Github(client) => client.delete_repository(repo).await,
             Self::Gitlab(client) => client.delete_repository(repo).await,
+            Self::Forgejo(client) => client.delete_repository(repo).await,
         }
     }
 
@@ -133,6 +144,7 @@ impl Forge {
         match self {
             Self::Github(client) => client.branches(repo, page).await,
             Self::Gitlab(client) => client.branches(repo, page).await,
+            Self::Forgejo(client) => client.branches(repo, page).await,
         }
     }
 
@@ -140,6 +152,7 @@ impl Forge {
         match self {
             Self::Github(client) => client.delete_branch(repo, branch).await,
             Self::Gitlab(client) => client.delete_branch(repo, branch).await,
+            Self::Forgejo(client) => client.delete_branch(repo, branch).await,
         }
     }
 
@@ -155,6 +168,7 @@ impl Forge {
     ) -> Result<Listing<PullRequest>, ForgeError> {
         match self {
             Self::Github(client) => client.pull_requests(repo, page, state, head, author).await,
+            Self::Forgejo(client) => client.pull_requests(repo, page, state, head, author).await,
             Self::Gitlab(client) => client.merge_requests(repo, page, state, head, author).await,
         }
     }
@@ -167,6 +181,7 @@ impl Forge {
     ) -> Result<PullRequest, ForgeError> {
         match self {
             Self::Github(client) => client.pull_request(repo, number).await,
+            Self::Forgejo(client) => client.pull_request(repo, number).await,
             Self::Gitlab(client) => client.pull_merge_request(repo, number).await,
         }
     }
@@ -200,6 +215,7 @@ impl Forge {
         match self {
             Self::Github(_) => format!("refs/pull/{number}/head"),
             Self::Gitlab(_) => format!("refs/merge-requests/{number}/head"),
+            Self::Forgejo(_) => format!("refs/pull/{number}/head"),
         }
     }
 
@@ -211,6 +227,7 @@ impl Forge {
     ) -> Result<PullRequestChecks, ForgeError> {
         match self {
             Self::Github(client) => client.pull_request_checks(repo, number).await,
+            Self::Forgejo(client) => client.pull_request_checks(repo, number).await,
             Self::Gitlab(client) => client.pull_request_checks(repo, number).await,
         }
     }
@@ -222,6 +239,7 @@ impl Forge {
     ) -> Result<PullRequest, ForgeError> {
         match self {
             Self::Github(client) => client.create_pull_request(repo, request).await,
+            Self::Forgejo(client) => client.create_pull_request(repo, request).await,
             Self::Gitlab(client) => client.create_merge_request(repo, request).await,
         }
     }
@@ -350,6 +368,7 @@ impl Forge {
     ) -> Result<PullRequest, ForgeError> {
         match self {
             Self::Github(client) => client.retarget_pull_request(repo, number, base).await,
+            Self::Forgejo(client) => client.retarget_pull_request(repo, number, base).await,
             Self::Gitlab(client) => client.retarget_pull_request(repo, number, base).await,
         }
     }
@@ -361,6 +380,7 @@ impl Forge {
     ) -> Result<PullRequest, ForgeError> {
         match self {
             Self::Github(client) => client.close_pull_request(repo, number).await,
+            Self::Forgejo(client) => client.close_pull_request(repo, number).await,
             Self::Gitlab(client) => client.close_merge_request(repo, number).await,
         }
     }
@@ -376,6 +396,11 @@ impl Forge {
     ) -> Result<PullRequest, ForgeError> {
         match self {
             Self::Github(client) => {
+                client
+                    .merge_pull_request(repo, number, method, delete_branch)
+                    .await
+            }
+            Self::Forgejo(client) => {
                 client
                     .merge_pull_request(repo, number, method, delete_branch)
                     .await
@@ -404,6 +429,11 @@ impl Forge {
                     .edit_pull_request(repo, number, title, body, base)
                     .await
             }
+            Self::Forgejo(client) => {
+                client
+                    .edit_pull_request(repo, number, title, body, base)
+                    .await
+            }
             Self::Gitlab(client) => {
                 client
                     .edit_merge_request(repo, number, title, body, base)
@@ -420,6 +450,7 @@ impl Forge {
     ) -> Result<PullRequest, ForgeError> {
         match self {
             Self::Github(client) => client.set_pull_request_draft(repo, number, false).await,
+            Self::Forgejo(_) => Err(ForgeError::UnsupportedProvider("forgejo".to_owned())),
             Self::Gitlab(client) => client.set_merge_request_draft(repo, number, false).await,
         }
     }
@@ -432,6 +463,7 @@ impl Forge {
     ) -> Result<PullRequest, ForgeError> {
         match self {
             Self::Github(client) => client.set_pull_request_draft(repo, number, true).await,
+            Self::Forgejo(_) => Err(ForgeError::UnsupportedProvider("forgejo".to_owned())),
             Self::Gitlab(client) => client.set_merge_request_draft(repo, number, true).await,
         }
     }
@@ -444,6 +476,7 @@ impl Forge {
     ) -> Result<PullRequest, ForgeError> {
         match self {
             Self::Github(client) => client.reopen_pull_request(repo, number).await,
+            Self::Forgejo(client) => client.reopen_pull_request(repo, number).await,
             Self::Gitlab(client) => client.reopen_merge_request(repo, number).await,
         }
     }
@@ -457,6 +490,7 @@ impl Forge {
     ) -> Result<PullRequestComment, ForgeError> {
         match self {
             Self::Github(client) => client.comment_pull_request(repo, number, body).await,
+            Self::Forgejo(client) => client.comment_pull_request(repo, number, body).await,
             Self::Gitlab(client) => client.comment_merge_request(repo, number, body).await,
         }
     }
@@ -472,6 +506,7 @@ impl Forge {
     ) -> Result<PullRequestReview, ForgeError> {
         match self {
             Self::Github(client) => client.review_pull_request(repo, number, action, body).await,
+            Self::Forgejo(_) => Err(ForgeError::UnsupportedProvider("forgejo".to_owned())),
             Self::Gitlab(client) => {
                 client
                     .review_merge_request(repo, number, action, body)
@@ -489,6 +524,7 @@ impl Forge {
     ) -> Result<Vec<ThreadEntry>, ForgeError> {
         match self {
             Self::Github(client) => client.pull_request_thread(repo, number).await,
+            Self::Forgejo(_) => Err(ForgeError::UnsupportedProvider("forgejo".to_owned())),
             Self::Gitlab(client) => client.pull_request_thread(repo, number).await,
         }
     }
@@ -510,6 +546,11 @@ impl Forge {
                     .issues(repo, page, state, author, label, assignee)
                     .await
             }
+            Self::Forgejo(client) => {
+                client
+                    .issues(repo, page, state, author, label, assignee)
+                    .await
+            }
             Self::Gitlab(client) => {
                 client
                     .issues(repo, page, state, author, label, assignee)
@@ -522,6 +563,7 @@ impl Forge {
     pub async fn issue(&self, repo: &RepoRef, number: u64) -> Result<Issue, ForgeError> {
         match self {
             Self::Github(client) => client.issue(repo, number).await,
+            Self::Forgejo(client) => client.issue(repo, number).await,
             Self::Gitlab(client) => client.issue(repo, number).await,
         }
     }
@@ -534,6 +576,7 @@ impl Forge {
     ) -> Result<Issue, ForgeError> {
         match self {
             Self::Github(client) => client.create_issue(repo, request).await,
+            Self::Forgejo(client) => client.create_issue(repo, request).await,
             Self::Gitlab(client) => client.create_issue(repo, request).await,
         }
     }
@@ -542,6 +585,7 @@ impl Forge {
     pub async fn close_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue, ForgeError> {
         match self {
             Self::Github(client) => client.close_issue(repo, number).await,
+            Self::Forgejo(client) => client.close_issue(repo, number).await,
             Self::Gitlab(client) => client.close_issue(repo, number).await,
         }
     }
@@ -550,6 +594,7 @@ impl Forge {
     pub async fn reopen_issue(&self, repo: &RepoRef, number: u64) -> Result<Issue, ForgeError> {
         match self {
             Self::Github(client) => client.reopen_issue(repo, number).await,
+            Self::Forgejo(client) => client.reopen_issue(repo, number).await,
             Self::Gitlab(client) => client.reopen_issue(repo, number).await,
         }
     }
@@ -563,6 +608,7 @@ impl Forge {
     ) -> Result<PullRequestComment, ForgeError> {
         match self {
             Self::Github(client) => client.comment_issue(repo, number, body).await,
+            Self::Forgejo(client) => client.comment_issue(repo, number, body).await,
             Self::Gitlab(client) => client.comment_issue(repo, number, body).await,
         }
     }
@@ -575,6 +621,7 @@ impl Forge {
     ) -> Result<Vec<ThreadEntry>, ForgeError> {
         match self {
             Self::Github(client) => client.issue_thread(repo, number).await,
+            Self::Forgejo(client) => client.issue_thread(repo, number).await,
             Self::Gitlab(client) => client.issue_thread(repo, number).await,
         }
     }
@@ -596,6 +643,11 @@ impl Forge {
                     .edit_issue(repo, number, title, body, labels, assignees)
                     .await
             }
+            Self::Forgejo(client) => {
+                client
+                    .edit_issue(repo, number, title, body, labels, assignees)
+                    .await
+            }
             Self::Gitlab(client) => {
                 client
                     .edit_issue(repo, number, title, body, labels, assignees)
@@ -608,6 +660,7 @@ impl Forge {
         match self {
             Self::Github(client) => client.current_user().await,
             Self::Gitlab(client) => client.current_user().await,
+            Self::Forgejo(client) => client.current_user().await,
         }
     }
 }

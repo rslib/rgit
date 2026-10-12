@@ -9,22 +9,20 @@ use super::ForgeError;
 pub enum Provider {
     Github,
     Gitlab,
+    Forgejo,
 }
 
 impl Provider {
     /// Every provider rgit supports, in a stable order.
-    pub const ALL: [Self; 2] = [Self::Github, Self::Gitlab];
+    pub const ALL: [Self; 3] = [Self::Github, Self::Gitlab, Self::Forgejo];
 
     /// Parse a provider name as it appears in a target prefix, a config
     /// profile or a command argument.
     pub fn parse(value: &str) -> Result<Self, ForgeError> {
-        if value.eq_ignore_ascii_case("github") {
-            Ok(Self::Github)
-        } else if value.eq_ignore_ascii_case("gitlab") {
-            Ok(Self::Gitlab)
-        } else {
-            Err(ForgeError::UnsupportedProvider(value.to_owned()))
-        }
+        Self::ALL
+            .into_iter()
+            .find(|provider| value.eq_ignore_ascii_case(provider.as_str()))
+            .ok_or_else(|| ForgeError::UnsupportedProvider(value.to_owned()))
     }
 
     /// The name of this provider as config, a target prefix and output write it.
@@ -32,25 +30,34 @@ impl Provider {
         match self {
             Self::Github => "github",
             Self::Gitlab => "gitlab",
+            Self::Forgejo => "forgejo",
         }
     }
 
-    /// The provider behind a remote host. `gitlab_host` is a configured
-    /// self-hosted GitLab, such as the profile host or `GITLAB_HOST`.
-    pub fn from_host(host: &str, gitlab_host: Option<&str>) -> Option<Self> {
+    /// The provider behind a remote host. `configured` pairs a provider with a
+    /// host a profile or the environment names, such as a self-hosted GitLab
+    /// or Forgejo. A configured host matches the remote host exactly, or the
+    /// remote host without its port, because an SSH port is not the web port.
+    pub fn from_host(host: &str, configured: &[(Self, String)]) -> Option<Self> {
         if host.eq_ignore_ascii_case("github.com") {
             return Some(Self::Github);
         }
-        let is_gitlab = |configured: Option<&str>| {
-            configured.is_some_and(|value| value.trim_end_matches('/').contains(host))
-        };
-        if host.eq_ignore_ascii_case("gitlab.com")
-            || is_gitlab(gitlab_host)
-            || is_gitlab(std::env::var("GITLAB_HOST").ok().as_deref())
-        {
+        if host.eq_ignore_ascii_case("gitlab.com") {
             return Some(Self::Gitlab);
         }
-        None
+        Self::configured_match(host, configured).map(|(provider, _)| *provider)
+    }
+
+    /// The configured entry whose host matches the remote `host`, if any.
+    pub(crate) fn configured_match<'a>(
+        host: &str,
+        configured: &'a [(Self, String)],
+    ) -> Option<&'a (Self, String)> {
+        let bare = host.rsplit_once(':').map_or(host, |(name, _)| name);
+        configured.iter().find(|(_, value)| {
+            let authority = host_authority(value);
+            authority.eq_ignore_ascii_case(host) || authority.eq_ignore_ascii_case(bare)
+        })
     }
 
     /// The host this provider is reached at when nothing configures another.
@@ -58,15 +65,17 @@ impl Provider {
         match self {
             Self::Github => "https://github.com",
             Self::Gitlab => "https://gitlab.com",
+            Self::Forgejo => "https://codeberg.org",
         }
     }
 
     /// The host this provider reads from the environment, when it has one.
-    /// Only a self-hosted GitLab is placed in the environment.
+    /// Only a self-hosted GitLab or Forgejo is placed in the environment.
     pub fn env_host(self) -> Option<String> {
         let name = match self {
             Self::Github => return None,
             Self::Gitlab => "GITLAB_HOST",
+            Self::Forgejo => "FORGEJO_HOST",
         };
         std::env::var(name)
             .ok()
@@ -79,6 +88,7 @@ impl Provider {
         match self {
             Self::Github => &["GITHUB_TOKEN", "GH_TOKEN"],
             Self::Gitlab => &["GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN"],
+            Self::Forgejo => &["FORGEJO_TOKEN"],
         }
     }
 
@@ -88,6 +98,13 @@ impl Provider {
             .iter()
             .find_map(|name| std::env::var(name).ok())
     }
+}
+
+/// The `host[:port]` part of a configured host such as `https://git.rs.ht/`.
+fn host_authority(value: &str) -> &str {
+    let value = value.trim();
+    let value = value.split_once("://").map_or(value, |(_, rest)| rest);
+    value.split('/').next().unwrap_or(value)
 }
 
 impl fmt::Display for Provider {
@@ -707,25 +724,51 @@ mod tests {
     #[test]
     fn maps_hosts_to_providers() {
         assert_eq!(
-            Provider::from_host("github.com", None),
+            Provider::from_host("github.com", &[]),
             Some(Provider::Github)
         );
         assert_eq!(
-            Provider::from_host("gitlab.com", None),
+            Provider::from_host("gitlab.com", &[]),
             Some(Provider::Gitlab)
         );
         assert_eq!(
-            Provider::from_host("code.example.com", Some("https://code.example.com")),
+            Provider::from_host(
+                "code.example.com",
+                &[(Provider::Gitlab, "https://code.example.com".to_owned())]
+            ),
             Some(Provider::Gitlab)
         );
-        assert_eq!(Provider::from_host("code.example.com", None), None);
+        assert_eq!(Provider::from_host("code.example.com", &[]), None);
     }
 
     #[test]
     fn reads_a_provider_name_case_insensitively() {
         assert_eq!(Provider::parse("GitHub").unwrap(), Provider::Github);
         assert_eq!(Provider::parse("gitlab").unwrap(), Provider::Gitlab);
+        assert_eq!(Provider::parse("Forgejo").unwrap(), Provider::Forgejo);
         assert!(Provider::parse("gitea").is_err());
+    }
+
+    #[test]
+    fn forgejo_provider_matches_a_configured_host_exactly() {
+        let configured = [(Provider::Forgejo, "https://git.rs.ht/".to_owned())];
+        assert_eq!(
+            Provider::from_host("git.rs.ht", &configured),
+            Some(Provider::Forgejo)
+        );
+        assert_eq!(
+            Provider::from_host("git.rs.ht:2222", &configured),
+            Some(Provider::Forgejo)
+        );
+        assert_eq!(Provider::from_host("evil-git.rs.ht", &configured), None);
+        assert_eq!(Provider::from_host("rs.ht", &configured), None);
+    }
+
+    #[test]
+    fn forgejo_provider_reads_its_own_environment() {
+        assert_eq!(Provider::Forgejo.as_str(), "forgejo");
+        assert_eq!(Provider::Forgejo.token_env_vars(), &["FORGEJO_TOKEN"]);
+        assert_eq!(Provider::Forgejo.default_host(), "https://codeberg.org");
     }
 
     #[test]

@@ -714,4 +714,18 @@ mod tests {
             .is_ok()
         );
     }
+
+    #[test]
+    fn detects_a_forgejo_remote_by_profile_host() {
+        let selection = ForgeSelection {
+            provider: Some("forgejo".to_owned()),
+            host: Some("https://git.rs.ht".to_owned()),
+            ..ForgeSelection::default()
+        };
+        let target = ForgeTarget::from_remote(&selection, "forgejo@git.rs.ht:rayandrew/lab.git")
+            .expect("Forgejo remote");
+        assert_eq!(target.provider, rgit_forge::Provider::Forgejo);
+        assert_eq!(target.host, "https://git.rs.ht");
+        assert_eq!(target.repo().expect("repo").to_string(), "rayandrew/lab");
+    }
 }

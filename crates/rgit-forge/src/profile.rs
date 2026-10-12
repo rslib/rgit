@@ -37,14 +37,37 @@ impl ForgeConfig {
                 });
             }
         };
-        toml::from_str(&text).map_err(|error| ForgeError::ConfigParse {
+        Self::from_toml(&text).map_err(|error| ForgeError::ConfigParse {
             path,
             detail: error.to_string(),
         })
     }
 
+    fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct File {
+            forge: ForgeConfig,
+        }
+        toml::from_str::<File>(text).map(|file| file.forge)
+    }
+
     pub fn profile(&self, name: &str) -> Option<&ForgeProfile> {
         self.profiles.get(name)
+    }
+
+    /// The provider and host of every profile that names both, by profile name.
+    fn hosts(&self) -> Vec<(Provider, String)> {
+        let mut names: Vec<_> = self.profiles.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .filter_map(|name| {
+                let profile = &self.profiles[name];
+                let provider = Provider::parse(profile.provider.as_deref()?).ok()?;
+                Some((provider, profile.host.clone()?))
+            })
+            .collect()
     }
 }
 
@@ -112,6 +135,44 @@ impl ForgeSelection {
         Ok(self)
     }
 
+    /// The hosts that name a provider: the selection itself, every profile,
+    /// then the provider environment hosts. A selected host with no provider
+    /// is a self-hosted GitLab.
+    fn configured_hosts(&self) -> Result<Vec<(Provider, String)>, ForgeError> {
+        let mut hosts = Vec::new();
+        if let Some(host) = &self.host {
+            let provider = match self.provider.as_deref() {
+                Some(name) => Provider::parse(name)?,
+                None => Provider::Gitlab,
+            };
+            hosts.push((provider, host.clone()));
+        }
+        hosts.extend(ForgeConfig::load()?.hosts());
+        for provider in [Provider::Gitlab, Provider::Forgejo] {
+            if let Some(host) = provider.env_host() {
+                hosts.push((provider, host));
+            }
+        }
+        Ok(hosts)
+    }
+
+    /// The host this selection names for `provider`: the selected host when
+    /// its provider fits, else the host of the first profile of that provider.
+    fn host_for(&self, provider: Provider) -> Option<String> {
+        let selected = match self.provider.as_deref() {
+            Some(name) => Provider::parse(name).ok() == Some(provider),
+            None => true,
+        };
+        if selected && self.host.is_some() {
+            return self.host.clone();
+        }
+        ForgeConfig::load()
+            .ok()?
+            .hosts()
+            .into_iter()
+            .find_map(|(candidate, host)| (candidate == provider).then_some(host))
+    }
+
     /// The credential account label to connect with: the flag, the profile,
     /// then `RGIT_FORGE_ACCOUNT`.
     pub fn account(&self) -> String {
@@ -157,12 +218,15 @@ impl ForgeTarget {
     /// environment host, else the host the remote names, so a self-hosted
     /// GitLab remote connects without extra configuration.
     pub fn from_remote(selection: &ForgeSelection, remote: &str) -> Result<Self, ForgeError> {
-        let target = RemoteTarget::parse(remote, selection.host.as_deref())?;
-        let host = selection
-            .host
-            .clone()
-            .or_else(|| target.provider.env_host())
-            .unwrap_or(target.host);
+        let target = RemoteTarget::parse(remote, &selection.configured_hosts()?)?;
+        let host = if target.configured {
+            target.host
+        } else {
+            selection
+                .host_for(target.provider)
+                .or_else(|| target.provider.env_host())
+                .unwrap_or(target.host)
+        };
         Ok(Self {
             provider: target.provider,
             host,
@@ -185,8 +249,7 @@ impl ForgeTarget {
 
     fn new(selection: &ForgeSelection, provider: Provider, repo: Option<RepoRef>) -> Self {
         let host = selection
-            .host
-            .clone()
+            .host_for(provider)
             .or_else(|| provider.env_host())
             .unwrap_or_else(|| provider.default_host().to_owned());
         Self {
@@ -224,6 +287,25 @@ mod tests {
     }
 
     #[test]
+    fn profiles_are_read_from_the_forge_table() {
+        let config = ForgeConfig::from_toml(
+            r#"
+            [profiles.vim]
+            extends = "vim"
+            [forge.profiles.lab]
+            provider = "forgejo"
+            host = "https://git.rs.ht"
+            "#,
+        )
+        .expect("parsable config");
+        assert_eq!(config.profiles.len(), 1);
+        assert_eq!(
+            config.hosts(),
+            [(Provider::Forgejo, "https://git.rs.ht".to_owned())]
+        );
+    }
+
+    #[test]
     fn an_explicit_target_names_the_provider() {
         let selection = ForgeSelection::default();
         let target = ForgeTarget::from_argument(&selection, Some("owner/repo"), None)
@@ -237,6 +319,33 @@ mod tests {
             .expect("gitlab target");
         assert_eq!(target.provider, Provider::Gitlab);
         assert_eq!(target.host, "https://gitlab.com");
+    }
+
+    #[test]
+    fn forgejo_provider_target_ignores_a_gitlab_selection() {
+        let selection = ForgeSelection {
+            provider: Some("gitlab".to_owned()),
+            host: Some("https://gitlab.example.com".to_owned()),
+            ..ForgeSelection::default()
+        };
+        let target = ForgeTarget::from_argument(&selection, Some("forgejo:owner/repo"), None)
+            .expect("forgejo target");
+        assert_eq!(target.provider, Provider::Forgejo);
+        assert_ne!(target.host, "https://gitlab.example.com");
+    }
+
+    #[test]
+    fn forgejo_provider_remote_uses_a_selected_forgejo_host() {
+        let selection = ForgeSelection {
+            provider: Some("forgejo".to_owned()),
+            host: Some("https://git.rs.ht".to_owned()),
+            ..ForgeSelection::default()
+        };
+        let target = ForgeTarget::from_remote(&selection, "forgejo@git.rs.ht:rayandrew/lab.git")
+            .expect("forgejo remote");
+        assert_eq!(target.provider, Provider::Forgejo);
+        assert_eq!(target.host, "https://git.rs.ht");
+        assert_eq!(target.repo().expect("repo").to_string(), "rayandrew/lab");
     }
 
     #[test]

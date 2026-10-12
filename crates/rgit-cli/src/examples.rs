@@ -1369,6 +1369,7 @@ const EXAMPLES: &[Entry] = &[
         &[
             "rgit forge login github --token-stdin",
             "rgit forge login gitlab --host https://gitlab.example.com --token-stdin",
+            "rgit forge login forgejo --host https://git.rs.ht --token-stdin",
         ],
     ),
     ("forge auth", &["rgit forge auth list"]),
