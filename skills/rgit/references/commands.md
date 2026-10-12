@@ -152,7 +152,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `remote set-head`: Set `<name>/HEAD`: to a branch, from the remote (-a), or delete it (-d). e.g. `rgit remote set-head origin -a`, `rgit remote set-head origin main`
   - `remote set-branches`: Fetch only these branches from a remote (with --add, these too). e.g. `rgit remote set-branches --add origin <branch>`
 - `forge`: Manage GitHub repositories, branches, and pull requests with the native API. e.g. `rgit forge --profile work whoami`, `rgit forge pr list`
-  - `forge login`: Store a forge credential in the OS credential store. e.g. `rgit forge login github --token-stdin`, `rgit forge login gitlab --host https://gitlab.example.com --token-stdin`
+  - `forge login`: Store a forge credential in the OS credential store. e.g. `rgit forge login github --token-stdin`, `rgit forge login gitlab --host https://gitlab.example.com --token-stdin`, `rgit forge login forgejo --host https://git.rs.ht --token-stdin`
   - `forge auth`: Show authentication status for configured forge providers. e.g. `rgit forge auth list`
     - `forge auth list`: List known forge providers and whether credentials are stored. e.g. `rgit forge auth list`
     - `forge auth status`: Show detailed authentication status. e.g. `rgit forge auth status`

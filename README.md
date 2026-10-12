@@ -8,6 +8,12 @@ rgit            # open the TUI (without a terminal, print git's usage)
 rgit status     # subcommands print git's human text; agents add --toon
 ```
 
+## Forge support
+
+rgit works with GitHub, GitLab and Forgejo.
+Set up a profile once, then use `OWNER/REPO` or `forgejo:OWNER/REPO` targets with any `forge` command.
+See [docs/forgejo.md](docs/forgejo.md) for Forgejo setup.
+
 ## Change-Id trailers
 
 rgit does not add trailers to commit messages by default. For Gerrit-style
