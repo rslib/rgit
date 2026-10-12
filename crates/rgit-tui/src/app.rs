@@ -452,7 +452,20 @@ pub struct RemoteSummary {
     pub title: Option<String>,
     /// The PR's CI rollup: `passing` / `failing` / `pending`.
     pub checks: Option<String>,
+    /// Open PRs from other branches that merge into the current branch.
+    pub incoming: Vec<IncomingPr>,
 }
+
+/// An open PR that targets the current branch.
+#[derive(Debug, Clone)]
+pub struct IncomingPr {
+    pub number: u64,
+    pub branch: String,
+    pub title: String,
+}
+
+/// How many incoming PRs the REMOTE section lists before it counts the rest.
+const INCOMING_SHOWN: usize = 3;
 
 /// A lane mutation run from the lanes view, reported and then reloaded.
 #[derive(Debug, Clone)]
@@ -5780,6 +5793,21 @@ fn sync_remote_summary(app: &mut App) {
         pr: request.map(|request| (request.number, request.state.clone())),
         title: request.map(|request| request.title.clone()),
         checks: request.and_then(|request| request.checks.clone()),
+        incoming: branch
+            .zip(app.forge_snapshot.as_ref())
+            .map(|(branch, snapshot)| {
+                snapshot
+                    .requests
+                    .iter()
+                    .filter(|request| request.base == branch && request.branch != branch)
+                    .map(|request| IncomingPr {
+                        number: request.number,
+                        branch: request.branch.clone(),
+                        title: request.title.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     });
 }
 
@@ -5837,6 +5865,27 @@ fn build_remote_section(
             spans.push(Span::plain(format!("  {title}")));
         }
         children.push(Section::leaf("remote/pr", NodeKind::Info, spans));
+        for (index, incoming) in remote.incoming.iter().take(INCOMING_SHOWN).enumerate() {
+            children.push(Section::leaf(
+                format!("remote/incoming/{index}"),
+                NodeKind::Info,
+                vec![
+                    Span::new(format!("PR #{} ", incoming.number), Style::Hash),
+                    Span::new(format!("{} \u{2192} ", incoming.branch), Style::Branch),
+                    Span::plain(incoming.title.clone()),
+                ],
+            ));
+        }
+        if remote.incoming.len() > INCOMING_SHOWN {
+            children.push(Section::leaf(
+                "remote/incoming/more",
+                NodeKind::Info,
+                vec![Span::new(
+                    format!("+{} more open PRs", remote.incoming.len() - INCOMING_SHOWN),
+                    Style::Dim,
+                )],
+            ));
+        }
     }
 
     let forge_spans = if let Some(forge) = forge {
@@ -5943,6 +5992,11 @@ mod tests {
             pr: Some((7, "open".into())),
             title: Some("Improve forge".into()),
             checks: Some("passing".into()),
+            incoming: vec![IncomingPr {
+                number: 9,
+                branch: "llm-sync-routes".into(),
+                title: "chore: llm-sync routes".into(),
+            }],
         };
         let mut buffer = Buffer::default();
         buffer.set_content(vec![
@@ -5951,6 +6005,30 @@ mod tests {
         let ids: Vec<String> = buffer.rows().map(|r| r.id.clone()).collect();
         assert!(ids.contains(&"remote".to_owned()));
         assert!(ids.contains(&"remote/pr".to_owned()));
+        assert!(ids.contains(&"remote/incoming/0".to_owned()));
+    }
+
+    #[test]
+    fn remote_summary_lists_open_pull_requests_into_the_current_branch() {
+        let mut app = forge_app();
+        app.head = Some(Head {
+            branch: Some("main".to_owned()),
+            ..Head::default()
+        });
+        sync_remote_summary(&mut app);
+        let summary = app.remote_status.as_ref().expect("remote");
+        assert_eq!(summary.pr, None);
+        let numbers: Vec<u64> = summary.incoming.iter().map(|pr| pr.number).collect();
+        assert_eq!(numbers, vec![12, 13]);
+
+        app.head = Some(Head {
+            branch: Some("feature".to_owned()),
+            ..Head::default()
+        });
+        sync_remote_summary(&mut app);
+        let summary = app.remote_status.as_ref().expect("remote");
+        assert_eq!(summary.pr.as_ref().map(|pr| pr.0), Some(12));
+        assert!(summary.incoming.is_empty());
     }
 
     #[test]
@@ -6206,6 +6284,7 @@ mod tests {
             title: format!("Request {number}"),
             state: "open".to_owned(),
             branch: branch.to_owned(),
+            base: "main".to_owned(),
             checks: None,
             url: format!("https://h/{number}"),
             body: Some("Longer story.".to_owned()),

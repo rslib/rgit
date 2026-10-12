@@ -12,6 +12,9 @@ pub struct PullRequest {
     pub state: String,
     #[serde(rename = "headRefName")]
     pub branch: String,
+    /// The branch the request merges into.
+    #[serde(default, rename = "baseRefName")]
+    pub base: String,
     /// CI rollup: `passing`, `failing`, or `pending`; `None` when unknown (no
     /// checks, or a source that does not report them).
     #[serde(default)]
@@ -144,6 +147,7 @@ pub async fn load(
             title: pr.title,
             state: pr.state,
             branch: pr.head_branch,
+            base: pr.base_branch,
             checks: None,
             url: pr.html_url,
             body: pr.body,
