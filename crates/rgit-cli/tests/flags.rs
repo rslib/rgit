@@ -737,7 +737,7 @@ fn version_fast_path_is_near_process_floor() {
 }
 
 #[test]
-fn status_porcelain_matches_git_in_every_mode() {
+fn status_porcelain_bytes_in_human_mode() {
     let dir = repo("status-porcelain");
     commit(&dir, "f", "x\n", "init");
     write(&dir, "f", "y\n");
