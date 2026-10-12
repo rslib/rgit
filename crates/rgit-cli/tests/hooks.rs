@@ -11,6 +11,7 @@ fn run(bin: &str, dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_AUTHOR_DATE", DATE)
         .env("GIT_COMMITTER_DATE", DATE)

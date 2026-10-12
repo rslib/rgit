@@ -55,6 +55,7 @@ fn run_dumb(dir: &Path, args: &[&str], input: &str) -> (String, bool) {
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_rgit"));
     cmd.args(args);
     cmd.env("TERM", "dumb");
+    cmd.env("RGIT_OUTPUT", "human");
     cmd.cwd(dir);
     let mut child = pair.slave.spawn_command(cmd).expect("spawn");
     drop(pair.slave);
@@ -145,6 +146,7 @@ fn patch_mode_picks_hunks() {
     let piped = Command::new(env!("CARGO_BIN_EXE_rgit"))
         .args(["add", "-p"])
         .current_dir(&dir)
+        .env("RGIT_OUTPUT", "human")
         .output()
         .expect("run rgit");
     let _ = std::fs::remove_dir_all(&dir);
@@ -206,6 +208,7 @@ fn drive(dir: &Path, argv: &[&str], keys: &[&str], editor: &Path) -> String {
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
     cmd.env("GIT_PAGER", "cat");
     cmd.env("RGIT_OPLOG", "0");
+    cmd.env("RGIT_OUTPUT", "human");
     cmd.env("GIT_EDITOR", editor);
     cmd.cwd(dir);
     let mut child = pair.slave.spawn_command(cmd).expect("spawn");

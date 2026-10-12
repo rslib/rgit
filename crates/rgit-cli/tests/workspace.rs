@@ -28,6 +28,7 @@ fn rgit(cwd: &Path, ws_dir: &Path, args: &[&str]) -> (String, bool) {
         .current_dir(cwd)
         .env("RGIT_WORKSPACE_DIR", ws_dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     (

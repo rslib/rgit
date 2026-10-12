@@ -11,7 +11,8 @@ fn isolate(cmd: &mut Command, dir: &Path) {
     cmd.env("HOME", &home)
         .env("GIT_CONFIG_GLOBAL", home.join("gitconfig"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GNUPGHOME", home.join("gnupg"));
+        .env("GNUPGHOME", home.join("gnupg"))
+        .env("RGIT_OUTPUT", "human");
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {

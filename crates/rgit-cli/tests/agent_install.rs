@@ -82,6 +82,7 @@ impl Env {
             .env("FAKE_CLAUDE_HOME", &self.home)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("RGIT_OPLOG", "0")
+            .env("RGIT_OUTPUT", "human")
             .env_remove("CODEX_HOME")
             .env_remove("PI_CODING_AGENT_DIR");
         cmd
@@ -777,6 +778,7 @@ fn extension_drives_rgit() {
             .env("HOME", &env.home)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("RGIT_OPLOG", "0")
+            .env("RGIT_OUTPUT", "human")
             .arg(package.join("test/run.mjs"))
             .arg(&file)
             .arg(&env.project)

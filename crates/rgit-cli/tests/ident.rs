@@ -27,6 +27,7 @@ fn run(dir: &Path, bin: &str, args: &[&str]) -> String {
         .env_remove("EMAIL")
         .envs(ENV)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     assert!(

@@ -5,7 +5,7 @@ description: Load before you run any git command or answer a git question in thi
 
 # rgit
 
-Inspect and change the git repository in the current directory. Type `rgit` wherever you would type `git`. rgit takes git's commands and flags and prints git's text, so `git status --short` becomes `rgit status --short` and `git rev-parse HEAD` becomes `rgit rev-parse HEAD`. Do not run `git` or `rgit git` for a command rgit has. Always pass `--toon` (alias `--axi`) or `--json`: without them rgit prints git's human text. Run `rgit --toon` with no other arguments first: it prints the repo's current state and the next useful commands.
+Inspect and change the git repository in the current directory. Type `rgit` wherever you would type `git`. rgit takes git's commands and flags, so `git status --short` becomes `rgit status --short` and `git rev-parse HEAD` becomes `rgit rev-parse HEAD`. Do not run `git` or `rgit git` for a command rgit has. rgit prints TOON by default when an agent harness runs it; `--json` gives the same data as JSON, and `--human` (or `RGIT_OUTPUT=human`) prints git's text. Run `rgit` with no other arguments first: it prints the repo's current state and the next useful commands.
 
 If `rgit` is not on PATH, install it with `cargo install --locked --git https://github.com/rslib/rgit rgit-cli`.
 
@@ -19,7 +19,7 @@ If `rgit` is not on PATH, install it with `cargo install --locked --git https://
 
 ## Output
 
-- rgit prints human text by default, as git does, even when stdout is not a terminal. Agents must add `--toon` (alias `--axi`) to every command for structured TOON with no color, spinners, or prompts; `--json` gives the same data as JSON. Other examples in this skill and its reference omit the flag; add it.
+- rgit prints TOON by default when an agent harness runs it, so no output flag is needed: structured lines and tables, no color, spinners or prompts, and `help` lines that name the next command. The harness is one of Claude Code, Codex, Gemini CLI, Cursor, OpenCode, goose, amp or pi. `--json` prints the same data as JSON. `--human` (or `RGIT_OUTPUT=human`, or config `rgit.output=human`) prints git's text, as does a shell with no harness marker. Other examples in this skill and its reference omit the output flag; it is already on.
 - Use `--toon` or `--axi`, not `--porcelain`. In rgit, as in git, `--porcelain` exists only on `status` and prints git's raw script format, with no counts, hints, or schema.
 - Output ends with `help` lines naming useful next commands, already carrying `--toon` (or `--json`); follow them. Lists include counts (`count: 20 of 65 total`) and say explicitly when they are empty.
 - `--fields a,b` adds table columns; an unknown field lists the valid ones. `--full` disables truncation of patches, commit bodies, and long output.

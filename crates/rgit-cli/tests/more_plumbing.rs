@@ -11,6 +11,7 @@ fn run(bin: &str, dir: &Path, args: &[&str], input: Option<&[u8]>) -> Output {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .env("GIT_AUTHOR_DATE", "2024-01-01T10:00:00+0000")
         .env("GIT_COMMITTER_DATE", "2024-01-01T10:00:00+0000")
         .env("GIT_AUTHOR_NAME", "t")

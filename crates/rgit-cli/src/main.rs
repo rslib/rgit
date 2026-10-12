@@ -26,6 +26,7 @@ mod extra;
 mod forge;
 mod globals;
 mod graph;
+mod help;
 mod interactive;
 mod lanes;
 mod logging;
@@ -119,7 +120,7 @@ fn main() -> ! {
         Ok(cli) => cli,
         Err(e) => usage_exit(e, &args),
     };
-    let output_mode = cli.output_mode();
+    let output_mode = output_mode(cli.output_flag(), &args);
     let structured_output = output_mode != OutputMode::Text;
     let mut cli = cli;
     if !structured_output && cli.command.is_none() && !stdout_is_terminal {
@@ -382,8 +383,11 @@ fn main() -> ! {
                 Err(e) => die(anyhow::anyhow!("could not run git: {e}"), &emit),
             }
         }
-        // git's own status formats are for scripts: print them raw in every mode.
-        Some(command @ Command::Status { .. }) if matches!(&command, Command::Status { fmt, .. } if fmt.any()) =>
+        // git's own status formats are for scripts: print them raw in human
+        // mode. In the agent modes the flag's text is carried in the result.
+        Some(command @ Command::Status { .. })
+            if emit.mode == OutputMode::Text
+                && matches!(&command, Command::Status { fmt, .. } if fmt.any()) =>
         {
             let backend = match discover_or_init(false) {
                 Ok(backend) => backend,
@@ -1286,24 +1290,113 @@ fn forge_output(text: String, list_cmd: Option<&str>, full: bool) -> Output {
     }
 }
 
+/// The output mode for this run: the output flag, then `RGIT_OUTPUT`, then
+/// the repo's `rgit.output`, then an agent marker, then human text. git's own
+/// machine formats (`-z`, `--porcelain`, `--format`, `--pretty`) keep git's
+/// bytes when an agent marker, not a flag, defaulted the mode to TOON.
+fn output_mode(flag: Option<OutputMode>, args: &[String]) -> OutputMode {
+    if let Some(mode) = flag {
+        return mode;
+    }
+    if let Some(mode) = std::env::var("RGIT_OUTPUT")
+        .ok()
+        .and_then(|v| Cli::parse_output_mode(&v))
+    {
+        return mode;
+    }
+    if let Some(mode) = rgit_git::config_get("rgit.output").and_then(|v| Cli::parse_output_mode(&v))
+    {
+        return mode;
+    }
+    if Cli::agent_harness() && !git_bytes_format(args) {
+        return OutputMode::Porcelain;
+    }
+    OutputMode::Text
+}
+
+/// Whether the command line asks for git's own bytes, so an agent marker must
+/// not turn the output into TOON: a machine format before `--`, or the `git`
+/// passthrough, whose structured path does not pass stdin to git.
+fn git_bytes_format(args: &[String]) -> bool {
+    if globals::command_name(args).as_deref() == Some("git") {
+        return true;
+    }
+    args.iter().take_while(|a| *a != "--").any(|a| {
+        a == "--null"
+            || a == "--porcelain"
+            || a.starts_with("--porcelain=")
+            || a == "--line-porcelain"
+            || a == "--format"
+            || a.starts_with("--format=")
+            || a == "--pretty"
+            || a.starts_with("--pretty=")
+            || a.strip_prefix('-').is_some_and(|cluster| {
+                !cluster.starts_with('-')
+                    && cluster.contains('z')
+                    && cluster.chars().all(|c| c.is_ascii_alphabetic())
+            })
+    })
+}
+
+/// The output mode a parse failure ran under, from the raw arguments alone.
+fn output_mode_from_args(args: &[String]) -> OutputMode {
+    let has = |flags: &[&str]| args.iter().any(|a| flags.contains(&a.as_str()));
+    let flag = if has(&["--json"]) {
+        Some(OutputMode::Json)
+    } else if has(&["--toon", "--axi"]) {
+        Some(OutputMode::Porcelain)
+    } else if has(&["--human", "--text"]) {
+        Some(OutputMode::Text)
+    } else {
+        None
+    };
+    output_mode(flag, args)
+}
+
+/// Print a command's help as a value, for the TOON and JSON modes, and exit 0.
+fn print_structured_help(cmd: &clap::Command, path: &str, mode: OutputMode) {
+    let out = help::structured(cmd, path);
+    let mut value = match out.finalize(&[], false, path) {
+        Ok(value) => value,
+        Err(_) => Vec::new(),
+    };
+    if mode == OutputMode::Json {
+        value.push(("ok".to_owned(), Node::Bool(true)));
+        println!("{}", json(value));
+    } else {
+        println!("{}", toon::encode(&value));
+    }
+    exit(0);
+}
+
+/// A command's full human help, as `--help` prints it.
+fn long_help(cmd: &clap::Command, path: &str) -> String {
+    let mut cmd = cmd.clone().bin_name(path);
+    cmd.render_long_help().to_string()
+}
+
 /// Report a clap parse error. Humans get clap's own message; agents get the
 /// error, clap's tips, and the valid flags or subcommands at the failing level.
 fn usage_exit(e: clap::Error, args: &[String]) -> ! {
     use clap::error::ErrorKind;
-    let has = |flags: &[&str]| args.iter().any(|a| flags.contains(&a.as_str()));
-    let mode = if has(&["--json"]) {
-        OutputMode::Json
-    } else if has(&["--toon", "--axi"]) {
-        OutputMode::Porcelain
-    } else {
-        OutputMode::Text
-    };
+    let mode = output_mode_from_args(args);
     let (cmd, path) = subcommand_at(args);
     let before_dashes = args.iter().take_while(|a| *a != "--");
-    if e.kind() == ErrorKind::DisplayHelp && before_dashes.clone().any(|a| a == "-h")
-        || e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-            && mode == OutputMode::Text
+    // Help in a structured mode is a value, not clap's prose.
+    if mode != OutputMode::Text
+        && matches!(
+            e.kind(),
+            ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        )
     {
+        print_structured_help(&cmd, &path, mode);
+    }
+    // A bare command group prints its full help on stdout and succeeds.
+    if e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+        print_raw(&long_help(&cmd, &path));
+        exit(0);
+    }
+    if e.kind() == ErrorKind::DisplayHelp && before_dashes.clone().any(|a| a == "-h") {
         print_raw(&short_usage(&cmd, &path));
         exit(129);
     }
@@ -1314,9 +1407,6 @@ fn usage_exit(e: clap::Error, args: &[String]) -> ! {
         let (text, code) = git_usage_error(&e, args, &cmd, &path);
         eprint!("{text}");
         exit(code);
-    }
-    if e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
-        e.exit();
     }
 
     let rendered = e.render().to_string();
@@ -1681,10 +1771,9 @@ fn compact_config() -> bool {
         .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1"))
 }
 
-/// The home view is what session hooks show an agent, so it says how to keep
-/// structured output.
-const OUTPUT_HINT: &str =
-    "Pass `--toon` (or `--json`) to every rgit command; without it rgit prints git's human text";
+/// The home view is what session hooks show an agent, so it says how the
+/// output mode is chosen.
+const OUTPUT_HINT: &str = "rgit prints TOON by default under an agent harness; pass `--json` for JSON, or `--human` (or `RGIT_OUTPUT=human`) for git's text";
 /// Agents reach for `git` out of habit, so the home view says rgit takes its
 /// place.
 const GIT_HINT: &str = "Type `rgit` wherever you would type `git`: it takes git's commands and flags, such as `rgit status --short` or `rgit rev-parse HEAD`";

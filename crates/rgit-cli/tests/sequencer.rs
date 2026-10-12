@@ -49,6 +49,7 @@ fn rgit(dir: &Path, args: &[&str]) -> (String, bool) {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .env("GIT_AUTHOR_DATE", DATE)
         .env("GIT_COMMITTER_DATE", DATE)
         .env("GIT_EDITOR", "true")
@@ -485,6 +486,7 @@ fn octopus_edit_opens_the_editor() {
         .args(["merge", "-e", "a", "b"])
         .current_dir(&dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .env("GIT_EDITOR", format!("sh {}", editor.display()))
         .envs(isolated())
         .output()
@@ -1199,6 +1201,7 @@ fn rgit_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, bool) {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .env("GIT_AUTHOR_DATE", DATE)
         .env("GIT_COMMITTER_DATE", DATE)
         .env("GIT_EDITOR", "true")
@@ -2193,6 +2196,7 @@ fn octopus_merges_like_gits_script() {
             .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
             .env("GIT_EDITOR", "true")
             .env("RGIT_OPLOG", "0")
+            .env("RGIT_OUTPUT", "human")
             .output()
             .unwrap();
         let file = std::fs::read_to_string(dir.join("f")).unwrap();

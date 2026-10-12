@@ -18,6 +18,7 @@ fn run(program: &str, dir: &Path, args: &[&str], input: Option<&[u8]>) -> Output
         .env("GIT_AUTHOR_DATE", DATE)
         .env("GIT_COMMITTER_DATE", DATE)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

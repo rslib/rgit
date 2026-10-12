@@ -26,6 +26,7 @@ fn rgit(dir: &Path, args: &[&str]) {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     assert!(
@@ -98,6 +99,7 @@ fn a_line_that_starts_no_hunk_is_an_error() {
         .args(["--toon", "stage", "f.txt", "--hunk", "99"])
         .current_dir(&dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);

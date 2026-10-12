@@ -29,6 +29,7 @@ fn run(
         .env("XDG_CACHE_HOME", dir.join("cache"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .env("RGIT_TEST_MAINT_SCHEDULER_DIR", dir.join("sched"))
         .env_remove("GIT_ASKPASS")
         .env_remove("SSH_ASKPASS")

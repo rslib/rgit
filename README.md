@@ -5,7 +5,7 @@ A magit-style git TUI that also works as a CLI and an MCP server.
 ```sh
 cargo install --locked --git https://github.com/rslib/rgit rgit-cli
 rgit            # open the TUI (without a terminal, print git's usage)
-rgit status     # subcommands print git's human text; agents add --toon
+rgit status     # subcommands print git's human text; an agent harness gets TOON
 ```
 
 ## Forge support
@@ -23,11 +23,14 @@ across amend, reword, squash, and rebase.
 
 ## Using rgit from a coding agent
 
-rgit prints human text by default, as git does, even when piped. Agents pass
-`--toon` (alias `--axi`) on every command for compact TOON with next-step
-hints, or `--json` for JSON. `--compact` (or `rgit.compact=true`) keeps rgit's
-short human forms of `status`, `diff`, `log`, `show` and `blame`. There are two
-ways to give an agent rgit context, and both tell it to pass `--toon`.
+rgit prints human text in a person's shell, as git does, even when piped. When
+an agent harness runs it (Claude Code, Codex, Gemini CLI, Cursor, OpenCode,
+goose, amp or pi) rgit prints TOON by default: compact, structured lines and
+tables with next-step hints. `--json` gives the same data as JSON, and
+`--human` (or `RGIT_OUTPUT=human`, or config `rgit.output=human`) keeps git's
+text. `--compact` (or `rgit.compact=true`) keeps rgit's short human forms of
+`status`, `diff`, `log`, `show` and `blame`. There are two
+ways to give an agent rgit context, and both rely on the TOON default.
 `rgit agent install` sets up every agent app it finds (Claude Code, Codex,
 OpenCode, pi, omp) with both:
 

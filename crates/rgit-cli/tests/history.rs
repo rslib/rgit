@@ -38,6 +38,7 @@ fn same(dir: &Path, args: &[&str]) {
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("RGIT_OPLOG", "0")
+            .env("RGIT_OUTPUT", "human")
             .env_remove("GIT_AUTHOR_NAME")
             .env_remove("GIT_AUTHOR_EMAIL")
             .env_remove("GIT_COMMITTER_NAME")
@@ -116,6 +117,7 @@ fn rgit(dir: &Path, args: &[&str]) -> (String, bool) {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -885,6 +887,7 @@ fn all_same(dir: &Path, cases: &[&[&str]]) {
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("RGIT_OPLOG", "0")
+            .env("RGIT_OUTPUT", "human")
             .env_remove("GIT_AUTHOR_NAME")
             .env_remove("GIT_AUTHOR_EMAIL")
             .env_remove("GIT_COMMITTER_NAME")

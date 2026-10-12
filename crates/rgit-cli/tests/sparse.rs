@@ -13,6 +13,7 @@ fn run(program: &str, dir: &Path, args: &[&str], stdin: &str) -> (String, String
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(Stdio::piped())

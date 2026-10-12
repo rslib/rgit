@@ -31,6 +31,7 @@ fn rgit(dir: &Path, args: &[&str]) -> (String, bool) {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .output()
         .unwrap();
@@ -260,6 +261,7 @@ fn stash_push_patch_picks_hunks_on_a_terminal() {
         .args(["stash", "push", "-p", "-m", "picked"])
         .current_dir(&dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1089,6 +1091,7 @@ fn exact(dir: &Path, args: &[&str]) {
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("RGIT_OPLOG", "0")
+            .env("RGIT_OUTPUT", "human")
             .env("COLUMNS", "40")
             .output()
             .unwrap();

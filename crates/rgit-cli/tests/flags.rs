@@ -45,6 +45,7 @@ fn rgit(dir: &Path, args: &[&str]) -> (String, String, bool) {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     (
@@ -441,6 +442,7 @@ fn default_non_tty_prints_human_text() {
         .arg("status")
         .current_dir(&dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -531,6 +533,7 @@ fn toon_no_args_prints_home_view() {
         .arg("--toon")
         .current_dir(&dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -741,18 +744,41 @@ fn status_porcelain_matches_git_in_every_mode() {
     write(&dir, "new", "n\n");
 
     let want = git_out(&dir, &["status", "--porcelain"]);
-    for mode in ["--human", "--toon", "--json"] {
-        let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
-            .args([mode, "status", "--porcelain"])
-            .current_dir(&dir)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stdout), want, "mode {mode}");
-    }
+    // Human mode prints git's bytes for the format flag.
+    let human = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(["--human", "status", "--porcelain"])
+        .current_dir(&dir)
+        .env("RGIT_OUTPUT", "human")
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    assert_eq!(String::from_utf8_lossy(&human.stdout), want, "human");
+    // An explicit agent mode wins over the flag, carrying its text.
+    let toon = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(["--toon", "status", "--porcelain"])
+        .current_dir(&dir)
+        .env("RGIT_OUTPUT", "human")
+        .output()
+        .unwrap();
+    assert!(toon.status.success());
+    let toon = String::from_utf8_lossy(&toon.stdout);
+    assert!(toon.contains("lines["), "{toon}");
+    assert!(toon.contains("?? new"), "{toon}");
+    let json = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(["--json", "status", "--porcelain"])
+        .current_dir(&dir)
+        .env("RGIT_OUTPUT", "human")
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let json = String::from_utf8_lossy(&json.stdout);
+    assert!(json.contains("\"lines\""), "{json}");
+    assert!(json.contains("?? new"), "{json}");
+    // No mode flag keeps git's bytes.
     let short = Command::new(env!("CARGO_BIN_EXE_rgit"))
         .args(["status", "-sb"])
         .current_dir(&dir)
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     assert_eq!(
@@ -826,6 +852,7 @@ fn fixed(program: &str, dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_DATE", "2024-01-01T00:00:00Z")
@@ -937,6 +964,7 @@ fn stash_takes_identity_like_git() {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("RGIT_OPLOG", "0")
+            .env("RGIT_OUTPUT", "human")
             .env_remove("EMAIL")
             .envs(env.iter().copied())
             .output()

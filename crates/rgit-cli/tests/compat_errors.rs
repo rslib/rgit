@@ -22,6 +22,7 @@ fn run(bin: &str, dir: &Path, args: &[&str]) -> Output {
         .env("GIT_AUTHOR_DATE", "1700000000 +0000")
         .env("GIT_COMMITTER_DATE", "1700000000 +0000")
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap()
 }

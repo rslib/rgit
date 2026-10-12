@@ -9,6 +9,7 @@ fn env<'a>(cmd: &'a mut Command, home: &Path) -> &'a mut Command {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("HOME", home)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {

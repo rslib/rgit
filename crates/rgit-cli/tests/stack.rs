@@ -27,6 +27,7 @@ fn rgit(dir: &Path, args: &[&str]) -> (String, bool) {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     (

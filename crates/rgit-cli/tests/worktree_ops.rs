@@ -26,6 +26,7 @@ fn rgit(dir: &Path, args: &[&str]) -> (String, bool) {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     (
@@ -813,7 +814,11 @@ fn status_formats_match_git() {
         &["status", "-sb", "--no-ahead-behind"],
         &["status", "-sb", "--ahead-behind"],
     ] {
-        assert_eq!(ok(&dir, args), git(&dir, args), "{args:?}");
+        // git's status formats are script output: human mode keeps its bytes.
+        let rgit_args: Vec<&str> = std::iter::once("--human")
+            .chain(args.iter().copied())
+            .collect();
+        assert_eq!(ok(&dir, &rgit_args), git(&dir, args), "{args:?}");
     }
 }
 
@@ -829,6 +834,7 @@ fn status_same(dir: &Path, args: &[&str]) {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("RGIT_OPLOG", "0")
+            .env("RGIT_OUTPUT", "human")
             .env("COLUMNS", "60")
             .output()
             .unwrap();
@@ -971,6 +977,7 @@ fn commit_same(tag: &str, setup: impl Fn(&Path), args: &[&str]) {
             .env("GIT_AUTHOR_DATE", "2020-01-01T00:00:00Z")
             .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
             .env("RGIT_OPLOG", "0")
+            .env("RGIT_OUTPUT", "human")
             .output()
             .unwrap();
         let seen =
@@ -1134,6 +1141,7 @@ fn add_edit_stages_the_edited_patch() {
             .current_dir(&dir)
             .env("GIT_EDITOR", &editor)
             .env("RGIT_OPLOG", "0")
+            .env("RGIT_OUTPUT", "human")
             .output()
             .unwrap();
         (out.status.success(), state(&dir))

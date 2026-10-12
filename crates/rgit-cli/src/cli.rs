@@ -20,8 +20,8 @@ use crate::render;
     version,
     about = "A magit-style git TUI, also usable as a CLI and an MCP server.",
     long_about = "Run with no subcommand to open the TUI. Subcommands drive the same in-process \
-                  git backend and print git's human text; agents pass --toon (or --json) for \
-                  structured output.",
+                  git backend. They print TOON when an agent harness runs them and git's human \
+                  text otherwise; --toon, --json and --human pick one.",
     after_help = "git's global options go before the command: -C <path>, -c <name>=<value>, \
                   --config-env=<name>=<env>, --git-dir, --work-tree, --bare, --namespace, \
                   -p/--paginate, -P/--no-pager, --literal/--noglob/--icase-pathspecs, \
@@ -40,12 +40,12 @@ pub struct Cli {
     #[arg(long, global = true, conflicts_with_all = ["toon", "human"])]
     pub json: bool,
 
-    /// Print TOON for agents: no color, spinners, or prompts. Agents should
-    /// always pass it (or --json); human text is the default.
+    /// Print TOON for agents: no color, spinners, or prompts. The default when
+    /// an agent harness runs rgit.
     #[arg(long, visible_alias = "axi", global = true, conflicts_with = "human")]
     pub toon: bool,
 
-    /// Print human text (the default).
+    /// Print human text, git's own output. The default outside an agent harness.
     #[arg(long, alias = "text", global = true)]
     pub human: bool,
 
@@ -92,14 +92,55 @@ pub enum OutputMode {
 }
 
 impl Cli {
-    pub fn output_mode(&self) -> OutputMode {
+    /// The mode the output flags ask for, if any of them is given.
+    pub fn output_flag(&self) -> Option<OutputMode> {
         if self.json {
-            OutputMode::Json
+            Some(OutputMode::Json)
         } else if self.toon {
-            OutputMode::Porcelain
+            Some(OutputMode::Porcelain)
+        } else if self.human {
+            Some(OutputMode::Text)
         } else {
-            OutputMode::Text
+            None
         }
+    }
+
+    /// The mode `RGIT_OUTPUT` or the `rgit.output` config names, if it names one.
+    pub fn parse_output_mode(value: &str) -> Option<OutputMode> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "human" | "text" => Some(OutputMode::Text),
+            "toon" | "axi" | "porcelain" => Some(OutputMode::Porcelain),
+            "json" => Some(OutputMode::Json),
+            _ => None,
+        }
+    }
+
+    /// Whether an agent harness ran this process: one of the marker variables
+    /// is set, or `AGENT` names goose or amp. `CODEX_HOME` is not a marker: a
+    /// person who has Codex installed has it too.
+    pub fn agent_harness() -> bool {
+        const MARKERS: [&str; 8] = [
+            "AI_AGENT",
+            "CLAUDECODE",
+            "CODEX_SANDBOX",
+            "CODEX_THREAD_ID",
+            "GEMINI_CLI",
+            "CURSOR_AGENT",
+            "OPENCODE",
+            "OPENCODE_CLIENT",
+        ];
+        if MARKERS
+            .iter()
+            .any(|m| std::env::var_os(m).is_some_and(|v| !v.is_empty()))
+        {
+            return true;
+        }
+        matches!(
+            std::env::var("AGENT")
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Ok("goose" | "amp")
+        )
     }
 }
 
@@ -868,9 +909,9 @@ pub struct PathspecFile {
 #[derive(Subcommand)]
 pub enum Command {
     /// Working-tree status as git prints it (`--compact` for rgit's short form).
-    /// Agents: add `--toon` for a structured table. `--porcelain`, `--short`,
-    /// `--branch`, `-z`, `-v` and git's other status flags print git's own
-    /// formats byte for byte, for scripts.
+    /// In human mode `--porcelain`, `--short`, `--branch`, `-z`, `-v` and git's
+    /// other status flags print git's own formats byte for byte, for scripts.
+    /// Under an agent harness `--porcelain` and `-z` still do.
     Status {
         #[command(flatten)]
         fmt: StatusArgs,
@@ -7578,7 +7619,7 @@ description: Load before you run any git command or answer a git question in thi
 
 # rgit
 
-{DESCRIPTION}. Type `rgit` wherever you would type `git`. rgit takes git's commands and flags and prints git's text, so `git status --short` becomes `rgit status --short` and `git rev-parse HEAD` becomes `rgit rev-parse HEAD`. Do not run `git` or `rgit git` for a command rgit has. Always pass `--toon` (alias `--axi`) or `--json`: without them rgit prints git's human text. Run `rgit --toon` with no other arguments first: it prints the repo's current state and the next useful commands.
+{DESCRIPTION}. Type `rgit` wherever you would type `git`. rgit takes git's commands and flags, so `git status --short` becomes `rgit status --short` and `git rev-parse HEAD` becomes `rgit rev-parse HEAD`. Do not run `git` or `rgit git` for a command rgit has. rgit prints TOON by default when an agent harness runs it; `--json` gives the same data as JSON, and `--human` (or `RGIT_OUTPUT=human`) prints git's text. Run `rgit` with no other arguments first: it prints the repo's current state and the next useful commands.
 
 If `rgit` is not on PATH, install it with `cargo install --locked --git https://github.com/rslib/rgit rgit-cli`.
 
@@ -7589,7 +7630,7 @@ If `rgit` is not on PATH, install it with `cargo install --locked --git https://
 const SKILL_RULES: &str = r#"
 ## Output
 
-- rgit prints human text by default, as git does, even when stdout is not a terminal. Agents must add `--toon` (alias `--axi`) to every command for structured TOON with no color, spinners, or prompts; `--json` gives the same data as JSON. Other examples in this skill and its reference omit the flag; add it.
+- rgit prints TOON by default when an agent harness runs it, so no output flag is needed: structured lines and tables, no color, spinners or prompts, and `help` lines that name the next command. The harness is one of Claude Code, Codex, Gemini CLI, Cursor, OpenCode, goose, amp or pi. `--json` prints the same data as JSON. `--human` (or `RGIT_OUTPUT=human`, or config `rgit.output=human`) prints git's text, as does a shell with no harness marker. Other examples in this skill and its reference omit the output flag; it is already on.
 - Use `--toon` or `--axi`, not `--porcelain`. In rgit, as in git, `--porcelain` exists only on `status` and prints git's raw script format, with no counts, hints, or schema.
 - Output ends with `help` lines naming useful next commands, already carrying `--toon` (or `--json`); follow them. Lists include counts (`count: 20 of 65 total`) and say explicitly when they are empty.
 - `--fields a,b` adds table columns; an unknown field lists the valid ones. `--full` disables truncation of patches, commit bodies, and long output.
@@ -7636,7 +7677,7 @@ pub(crate) fn skill_markdown() -> String {
 pub(crate) fn skill_reference() -> String {
     use clap::CommandFactory;
     let mut out = String::from(
-        "# rgit command reference\n\nEvery command with what it does and example invocations. Run `rgit <command> --help` for every flag. The examples omit the output flag: agents add `--toon` (or `--json`) to each one for structured output.\n",
+        "# rgit command reference\n\nEvery command with what it does and example invocations. Run `rgit <command> --help` for every flag. The examples omit the output flag: under an agent harness TOON is already the default, and `--json` gives the same data as JSON.\n",
     );
     let root = Cli::command();
     for (group, names) in SKILL_GROUPS {

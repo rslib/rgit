@@ -11,6 +11,7 @@ fn base(cmd: &mut Command, dir: &Path) {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_PAGER")
@@ -302,6 +303,7 @@ fn paged(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Option<String> {
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
     cmd.env("GIT_CONFIG_SYSTEM", "/dev/null");
     cmd.env("RGIT_OPLOG", "0");
+    cmd.env("RGIT_OUTPUT", "human");
     cmd.env("TERM", "dumb");
     cmd.env_remove("LESS");
     cmd.env(
@@ -413,6 +415,7 @@ fn no_command_without_terminal_prints_usage_like_git() {
     let bare = Command::new(env!("CARGO_BIN_EXE_rgit"))
         .current_dir(&r)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     let want = git(&r, &[]);
@@ -423,6 +426,7 @@ fn no_command_without_terminal_prints_usage_like_git() {
     let toon = Command::new(env!("CARGO_BIN_EXE_rgit"))
         .current_dir(&r)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .arg("--toon")
         .output()
         .unwrap();

@@ -26,6 +26,7 @@ fn rgit(dir: &Path, args: &[&str]) -> (String, bool) {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     (
@@ -178,6 +179,7 @@ fn run_isolated(tool: &str, dir: &Path, args: &[&str], input: &str) -> (String, 
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -309,6 +311,7 @@ fn stdout_of(tool: &str, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (St
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("RGIT_OPLOG", "0")
+        .env("RGIT_OUTPUT", "human")
         .output()
         .unwrap();
     (
