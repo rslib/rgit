@@ -228,8 +228,7 @@ async fn repository_current_user_maps_fields() {
 fn pull_request_json() -> serde_json::Value {
     serde_json::json!({
         "id": 70,
-        "number": 701,
-        "index": 7,
+        "number": 7,
         "title": "Improve forge",
         "body": "Adds Forgejo pulls",
         "state": "open",
@@ -258,6 +257,24 @@ fn pulls_list_stub(state: &str, body: serde_json::Value) -> Mock {
                 .insert_header("x-total-count", "1")
                 .set_body_json(body),
         )
+}
+
+#[tokio::test]
+async fn pull_request_list_reads_null_lists() {
+    let server = MockServer::start().await;
+    let mut pull = pull_request_json();
+    pull["labels"] = serde_json::Value::Null;
+    pull["requested_reviewers"] = serde_json::Value::Null;
+    pulls_list_stub("open", serde_json::json!([pull]))
+        .mount(&server)
+        .await;
+    let listing = client(&server)
+        .pull_requests(&repo(), 1, PullRequestState::Open, None, None)
+        .await
+        .expect("pulls");
+    assert_eq!(listing.items[0].number, 7);
+    assert!(listing.items[0].labels.is_empty());
+    assert!(listing.items[0].reviewers.is_empty());
 }
 
 #[tokio::test]

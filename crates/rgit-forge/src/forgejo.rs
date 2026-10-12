@@ -36,7 +36,7 @@ fn state_param(state: PullRequestState) -> &'static str {
 /// default because list entries may omit them.
 #[derive(Deserialize)]
 struct ApiPullRequest {
-    index: u64,
+    number: u64,
     title: String,
     state: String,
     html_url: String,
@@ -50,12 +50,20 @@ struct ApiPullRequest {
     body: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     labels: Vec<ApiLabel>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     requested_reviewers: Vec<ApiAccount>,
     head: ApiRef,
     base: ApiRef,
+}
+
+fn null_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[derive(Deserialize)]
@@ -78,7 +86,7 @@ struct ApiRef {
 impl From<ApiPullRequest> for PullRequest {
     fn from(request: ApiPullRequest) -> Self {
         Self {
-            number: request.index,
+            number: request.number,
             title: request.title,
             state: request.state,
             html_url: request.html_url,
@@ -599,7 +607,7 @@ impl ForgejoClient {
     ) -> Result<PullRequestChecks, ForgeError> {
         #[derive(Deserialize)]
         struct ApiCombinedStatus {
-            #[serde(default)]
+            #[serde(default, deserialize_with = "null_as_empty")]
             statuses: Vec<ApiCommitStatus>,
         }
         #[derive(Deserialize)]
@@ -670,9 +678,9 @@ struct ApiIssue {
     state: String,
     user: Option<ApiAccount>,
     body: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     labels: Vec<ApiLabel>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     assignees: Vec<ApiAccount>,
     html_url: String,
     created_at: Option<String>,
