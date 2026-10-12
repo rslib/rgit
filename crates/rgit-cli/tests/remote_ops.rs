@@ -1643,13 +1643,12 @@ impl Daemon {
             .local_addr()
             .unwrap()
             .port();
-        let child = env(&mut Command::new("git"), base)
-            .args([
-                "daemon",
-                "--reuseaddr",
-                "--export-all",
-                "--listen=127.0.0.1",
-            ])
+        // `git daemon` forks git-daemon and waits, so killing it would orphan
+        // the server. Run git-daemon itself so Drop stops the real process.
+        let exec_path = git(base, &["--exec-path"]);
+        let daemon = Path::new(exec_path.trim()).join("git-daemon");
+        let child = env(&mut Command::new(daemon), base)
+            .args(["--reuseaddr", "--export-all", "--listen=127.0.0.1"])
             .arg(format!("--port={port}"))
             .arg(format!("--base-path={}", base.display()))
             .arg(base)
