@@ -120,6 +120,7 @@ fn main() -> ! {
         Ok(cli) => cli,
         Err(e) => usage_exit(e, &args),
     };
+    let _ = DEFAULT_MODE.set(output_mode(None, &args));
     let output_mode = output_mode(cli.output_flag(), &args);
     let structured_output = output_mode != OutputMode::Text;
     let mut cli = cli;
@@ -637,9 +638,16 @@ fn fail(message: String, help: Vec<String>, code: i32, mode: OutputMode) -> ! {
     exit(code);
 }
 
+/// The mode a command line with no output flag gets here, set once in `main`.
+static DEFAULT_MODE: std::sync::OnceLock<OutputMode> = std::sync::OnceLock::new();
+
 /// A hint's `rgit ...` commands with the output flag in use, so an agent that
-/// follows them keeps structured output.
+/// follows them keeps structured output. A hint needs no flag when the mode is
+/// what a bare command gets anyway, such as TOON under an agent harness.
 fn keep_mode(hint: &str, mode: OutputMode) -> String {
+    if DEFAULT_MODE.get() == Some(&mode) {
+        return hint.to_owned();
+    }
     let flag = match mode {
         OutputMode::Text => return hint.to_owned(),
         OutputMode::Porcelain => "--toon",
@@ -1375,11 +1383,16 @@ fn long_help(cmd: &clap::Command, path: &str) -> String {
     cmd.render_long_help().to_string()
 }
 
+/// A usage error lists the valid subcommands or flags only up to this many;
+/// past it, the full list buries the error, so it points at `--help`.
+const MAX_LISTED: usize = 20;
+
 /// Report a clap parse error. Humans get clap's own message; agents get the
 /// error, clap's tips, and the valid flags or subcommands at the failing level.
 fn usage_exit(e: clap::Error, args: &[String]) -> ! {
     use clap::error::ErrorKind;
     let mode = output_mode_from_args(args);
+    let _ = DEFAULT_MODE.set(output_mode(None, args));
     let (cmd, path) = subcommand_at(args);
     let before_dashes = args.iter().take_while(|a| *a != "--");
     // Help in a structured mode is a value, not clap's prose.
@@ -1445,10 +1458,11 @@ fn usage_exit(e: clap::Error, args: &[String]) -> ! {
             .filter(|c| !c.is_hide_set())
             .map(|c| c.get_name())
             .collect();
-        help.push(format!(
-            "valid subcommands for `{path}`: {}",
-            subs.join(", ")
-        ));
+        help.push(if subs.len() > MAX_LISTED {
+            format!("Run `{path} --help` for its {} subcommands", subs.len())
+        } else {
+            format!("valid subcommands for `{path}`: {}", subs.join(", "))
+        });
     } else {
         let flags: Vec<String> = cmd
             .get_arguments()
@@ -1457,7 +1471,9 @@ fn usage_exit(e: clap::Error, args: &[String]) -> ! {
             .filter(|l| !matches!(*l, "help" | "version"))
             .map(|l| format!("--{l}"))
             .collect();
-        if !flags.is_empty() {
+        if flags.len() > MAX_LISTED {
+            help.push(format!("Run `{path} --help` for its {} flags", flags.len()));
+        } else if !flags.is_empty() {
             help.push(format!("valid flags for `{path}`: {}", flags.join(", ")));
         }
     }

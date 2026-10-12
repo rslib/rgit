@@ -507,7 +507,7 @@ fn porcelain_unknown_flag_is_usage_error_on_stdout() {
     assert_eq!(out.status.code(), Some(2));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.starts_with("error: "), "{stdout}");
-    assert!(stdout.contains("valid flags for `rgit diff`"), "{stdout}");
+    assert!(stdout.contains("diff --help` for its"), "{stdout}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

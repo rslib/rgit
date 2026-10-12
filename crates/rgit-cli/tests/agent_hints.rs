@@ -107,3 +107,45 @@ fn toon_default_hint() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn hints_carry_a_flag_only_when_the_default_differs() {
+    let dir = repo("hint-flag");
+    let marked = [("AI_AGENT", "pi")];
+
+    let got = stdout(&rgit(&dir, &marked, &["status"]));
+    assert!(got.contains("Run `rgit stage <path>`"), "{got}");
+    assert!(!got.contains("--toon"), "{got}");
+
+    let got = stdout(&rgit(&dir, &marked, &["--toon", "status"]));
+    assert!(!got.contains("--toon"), "{got}");
+
+    let got = stdout(&rgit(&dir, &[], &["--toon", "status"]));
+    assert!(got.contains("Run `rgit --toon stage <path>`"), "{got}");
+
+    let got = stdout(&rgit(&dir, &marked, &["--json", "status"]));
+    assert!(got.contains("rgit --json stage <path>"), "{got}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_long_list_of_choices_points_at_help() {
+    let dir = repo("long-list");
+    let marked = [("AI_AGENT", "pi")];
+
+    let got = stdout(&rgit(&dir, &marked, &["nosuch"]));
+    assert!(got.contains("Run `rgit --help` for its "), "{got}");
+    assert!(!got.contains("valid subcommands"), "{got}");
+
+    let got = stdout(&rgit(&dir, &marked, &["log", "--bogus"]));
+    assert!(got.contains("Run `rgit log --help` for its "), "{got}");
+
+    let got = stdout(&rgit(&dir, &marked, &["stash", "bogus"]));
+    assert!(
+        got.contains("valid flags for `rgit stash`: --message"),
+        "{got}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
