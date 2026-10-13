@@ -39,4 +39,4 @@ russh = { version = "0.63", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync"], optional = true }
 tokio-util = { version = "0.7", features = ["io-util"], optional = true }
 home = { version = "0.5", optional = true }
-nix = { version = "0.31", features = ["socket", "uio"], optional = true }
+nix = { version = "0.31", features = ["socket", "uio", "fs"], optional = true }

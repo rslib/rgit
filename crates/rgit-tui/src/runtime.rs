@@ -394,6 +394,13 @@ async fn event_loop(
     app.backend()
         .set_credential_prompt(Box::new(TuiCredentialPrompt { tx: msg_tx.clone() }));
 
+    // The CLI installed a terminal ssh password prompt at startup; while the
+    // TUI runs, route those prompts to the same masked minibuffer instead.
+    let ssh_tx = msg_tx.clone();
+    rgit_git::set_password_provider(move |label| {
+        TuiCredentialPrompt { tx: ssh_tx.clone() }.ask(label.to_owned(), true)
+    });
+
     // Auto-refresh on worktree changes; kept alive for the loop's duration.
     let _watcher = spawn_watcher(app.backend().clone(), msg_tx.clone());
     let gate = RefreshGate::default();
@@ -2610,11 +2617,54 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, HostEditor, Msg, RefreshGate, base64_encode, editor_open_command,
+        App, HostEditor, Msg, RefreshGate, TuiCredentialPrompt, base64_encode, editor_open_command,
         finish_gated_refresh, grep_hits, read_stamped, restack_note, snippet_sections,
         sort_watch_paths, update,
     };
     use rgit_git::RestackOutcome;
+
+    #[test]
+    fn tui_ssh_password_closed_channel_is_none() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let prompt = TuiCredentialPrompt { tx };
+        // No main loop runs, and dropping the receiver closes the channel, so
+        // the request send fails and ask gives up with None instead of hanging.
+        drop(rx);
+        assert_eq!(prompt.ask("ssh password".to_owned(), true), None);
+    }
+
+    #[test]
+    fn tui_ssh_password_sends_masked_request_and_returns_the_reply() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let prompt = TuiCredentialPrompt { tx };
+        let handle = std::thread::spawn(move || prompt.ask("git@h's password: ".to_owned(), true));
+        // Answer the request the way the main loop would.
+        let Msg::CredentialRequest {
+            label,
+            masked,
+            reply,
+        } = rx.blocking_recv().unwrap()
+        else {
+            panic!("expected CredentialRequest");
+        };
+        assert_eq!(label, "git@h's password: ");
+        assert!(masked);
+        let _ = reply.send(Some("hunter2".to_owned()));
+        assert_eq!(handle.join().unwrap().as_deref(), Some("hunter2"));
+    }
+
+    #[test]
+    fn tui_ssh_password_none_reply_is_none() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
+        let prompt = TuiCredentialPrompt { tx };
+        let handle = std::thread::spawn(move || prompt.ask("git@h's password: ".to_owned(), true));
+        let Msg::CredentialRequest { reply, .. } = rx.blocking_recv().unwrap() else {
+            panic!("expected CredentialRequest");
+        };
+        // The user pressed Esc: the main loop answers None, and so must ask.
+        let _ = reply.send(None);
+        assert_eq!(handle.join().unwrap(), None);
+    }
 
     #[test]
     fn host_editor_detect_reads_the_environment() {

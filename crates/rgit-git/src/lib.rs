@@ -79,10 +79,15 @@ pub mod xdiff;
 /// argument is a human-readable prompt; return `None` to decline. No-op when the
 /// `ssh` feature is disabled.
 #[cfg(feature = "ssh")]
-pub use ssh::set_password_provider;
+pub use ssh::{askpass_reexec, set_password_provider};
 
 #[cfg(not(feature = "ssh"))]
 pub fn set_password_provider(_ask: impl Fn(&str) -> Option<String> + Send + Sync + 'static) {}
+
+#[cfg(not(feature = "ssh"))]
+pub fn askpass_reexec() -> ! {
+    std::process::exit(1);
+}
 
 pub mod workspace;
 

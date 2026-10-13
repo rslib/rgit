@@ -98,6 +98,11 @@ struct Emit {
 }
 
 fn main() -> ! {
+    // Askpass re-exec: a ControlMaster started with our SSH_ASKPASS env runs
+    // this same binary with RGIT_ASKPASS_SOCKET set to answer one prompt.
+    if std::env::var_os("RGIT_ASKPASS_SOCKET").is_some() {
+        rgit_git::askpass_reexec();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let [flag] = args.as_slice()
         && flag == "-V"
