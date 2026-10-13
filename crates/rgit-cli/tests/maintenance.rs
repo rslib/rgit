@@ -2422,7 +2422,6 @@ fn signs_and_verifies_with_ssh_like_git() {
     let (want, _) = git_all(&dir, &["verify-commit", "HEAD"]);
     assert_eq!(fails(&dir, &["verify-commit", "HEAD"]), want);
 
-    std::fs::write(&allowed, format!("t@t {public}")).unwrap();
     git(
         &dir,
         &[
@@ -2431,6 +2430,15 @@ fn signs_and_verifies_with_ssh_like_git() {
             allowed.to_str().unwrap(),
         ],
     );
+    // A configured file that does not exist still checks the signature.
+    for args in [
+        &["verify-commit", "HEAD"][..],
+        &["log", "-1", "--format=%G? %GK%n%GG"],
+    ] {
+        assert_eq!(rgit_in(&dir, args, b""), git_all(&dir, args), "{args:?}");
+    }
+
+    std::fs::write(&allowed, format!("t@t {public}")).unwrap();
     same_signatures(&dir);
     // A key no allowed signer lists is checked but not trusted.
     let public = std::fs::read_to_string(other.with_extension("pub")).unwrap();

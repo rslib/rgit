@@ -377,8 +377,9 @@ fn check_ssh(
     signature: &str,
     mut c: SignatureCheck,
 ) -> Result<SignatureCheck, GitError> {
-    let allowed = cfg(repo, "gpg.ssh.allowedSignersFile").map(|p| expand_home(&p));
-    let Some(allowed) = allowed.filter(|p| std::path::Path::new(p).exists()) else {
+    // Like git, only an unset file is an error. A missing one still checks the
+    // signature, as good but untrusted.
+    let Some(allowed) = cfg(repo, "gpg.ssh.allowedSignersFile").map(|p| expand_home(&p)) else {
         c.output = "error: gpg.ssh.allowedSignersFile needs to be configured and exist for ssh signature verification\n".to_owned();
         c.result = 'N';
         return Ok(c);
