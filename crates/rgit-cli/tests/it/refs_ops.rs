@@ -1318,12 +1318,62 @@ fn stash_list_and_show_take_log_and_diff_forms() {
     exact(&dir, &["stash", "show"]);
     git(&dir, &["config", "stash.showIncludeUntracked", "true"]);
     exact(&dir, &["stash", "show"]);
-
     assert_eq!(ok(&dir, &["--human", "stash", "apply", "-q", "1"]), "");
     git(&dir, &["checkout", "-q", "--", "a"]);
     assert_eq!(ok(&dir, &["--human", "stash", "drop", "-q", "1"]), "");
     assert_eq!(ok(&dir, &["--human", "stash", "pop", "-q"]), "");
     assert_eq!(git(&dir, &["stash", "list"]), "");
+}
+
+/// A repo with a stash made by `git stash -u`: a modified `a` and an
+/// untracked `new`.
+fn stash_untracked_repo(tag: &str) -> PathBuf {
+    let dir = repo(tag);
+    std::fs::write(dir.join("a"), "a\nmore\n").unwrap();
+    std::fs::write(dir.join("new"), "new\n").unwrap();
+    git(&dir, &["stash", "-q", "-u"]);
+    dir
+}
+
+#[test]
+fn stash_show_toon_untracked_config_lists_new() {
+    let dir = stash_untracked_repo("show-untracked-config");
+    git(&dir, &["config", "stash.showIncludeUntracked", "true"]);
+    let out = ok(&dir, &["stash", "show"]);
+    assert!(out.contains("files[2]"), "{out}");
+    assert!(out.contains("\n  a,M"), "{out}");
+    assert!(out.contains("\n  new,A"), "{out}");
+    let js = ok(&dir, &["--json", "stash", "show"]);
+    assert!(js.contains("\"path\":\"new\""), "{js}");
+    assert!(js.contains("\"status\":\"A\""), "{js}");
+}
+
+#[test]
+fn stash_show_toon_untracked_absent_without_config() {
+    let dir = stash_untracked_repo("show-untracked-absent");
+    let out = ok(&dir, &["stash", "show"]);
+    assert!(out.contains("files[1]"), "{out}");
+    assert!(out.contains("\n  a,M"), "{out}");
+    assert!(!out.contains("new"), "{out}");
+}
+
+#[test]
+fn stash_show_toon_untracked_only_untracked_wins() {
+    let dir = stash_untracked_repo("show-untracked-only");
+    git(&dir, &["config", "stash.showIncludeUntracked", "true"]);
+    let out = ok(&dir, &["stash", "show", "--only-untracked"]);
+    assert!(out.contains("files[1]"), "{out}");
+    assert!(out.contains("\n  new,A"), "{out}");
+    assert!(!out.contains("\n  a,M"), "{out}");
+}
+
+#[test]
+fn stash_show_toon_untracked_flag_lists_new() {
+    let dir = stash_untracked_repo("show-untracked-flag");
+    let out = ok(&dir, &["stash", "show", "-u"]);
+    assert!(out.contains("files[2]"), "{out}");
+    assert!(out.contains("\n  a,M"), "{out}");
+    assert!(out.contains("\n  new,A"), "{out}");
 }
 
 #[test]

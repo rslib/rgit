@@ -412,10 +412,17 @@ pub fn run(
             ..
         } => {
             let i = index.unwrap_or(0);
+            let bool_config = |k: &str, default: bool| {
+                backend.config_get(k).ok().flatten().map_or(default, |v| {
+                    matches!(v.to_lowercase().as_str(), "true" | "yes" | "on" | "1")
+                })
+            };
+            let untracked = include_untracked
+                || !only_untracked && bool_config("stash.showIncludeUntracked", false);
             let files = crate::cli::stash_diff(
                 backend,
                 i,
-                (!only_untracked, include_untracked || only_untracked),
+                (!only_untracked, untracked || only_untracked),
             )?;
             let mut format = DiffFormat {
                 patch: patch || patch_with_stat,
@@ -426,11 +433,6 @@ pub fn run(
                 ..DiffFormat::default()
             };
             if !format.any() {
-                let bool_config = |k: &str, default: bool| {
-                    backend.config_get(k).ok().flatten().map_or(default, |v| {
-                        matches!(v.to_lowercase().as_str(), "true" | "yes" | "on" | "1")
-                    })
-                };
                 format.stat = bool_config("stash.showStat", true);
                 format.patch = bool_config("stash.showPatch", false);
             }
