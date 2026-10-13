@@ -1,5 +1,6 @@
 [package]
 name = "rgit-cli"
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -38,6 +39,10 @@ open = "5"
 [[bin]]
 name = "rgit"
 path = "src/main.rs"
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
 
 [dev-dependencies]
 portable-pty = "0.9"

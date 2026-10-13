@@ -1,5 +1,6 @@
 [package]
 name = "rgit-git"
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -40,3 +41,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macro
 tokio-util = { version = "0.7", features = ["io-util"], optional = true }
 home = { version = "0.5", optional = true }
 nix = { version = "0.31", features = ["socket", "uio", "fs"], optional = true }
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"

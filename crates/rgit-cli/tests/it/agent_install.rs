@@ -37,7 +37,7 @@ impl Env {
         for app in apps {
             let path = env.bin.join(app);
             let text = if *app == "claude" {
-                include_str!("fixtures/fake-claude.sh")
+                include_str!("../fixtures/fake-claude.sh")
             } else {
                 "#!/bin/sh\n"
             };
@@ -800,11 +800,11 @@ fn agent_skill_prints_the_committed_skill() {
     let env = Env::new("skill", &[]);
     assert_eq!(
         env.ok(&["agent", "skill"]),
-        include_str!("../../../skills/rgit/SKILL.md")
+        include_str!("../../../../skills/rgit/SKILL.md")
     );
     assert_eq!(
         env.ok(&["agent", "skill", "--reference"]),
-        include_str!("../../../skills/rgit/references/commands.md")
+        include_str!("../../../../skills/rgit/references/commands.md")
     );
 }
 

@@ -1,0 +1,13 @@
+mod absorb;
+mod change_id;
+mod compat;
+mod history;
+mod index_sync;
+mod lanes;
+mod merge;
+mod oplog;
+mod stack;
+mod stage_paths;
+mod status;
+mod workflow;
+mod workspace;
