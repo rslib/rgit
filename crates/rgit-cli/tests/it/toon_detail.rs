@@ -465,6 +465,142 @@ fn combined_log_lists_the_merge_combined() {
     assert!(out.contains("++both"), "{out}");
 }
 
+/// Merges `other` into the checked-out branch, which stops on a conflict,
+/// leaving the merge for the caller to resolve and commit.
+fn merge_stopped(dir: &Path, other: &str) {
+    let merging = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["merge", "--no-commit", other])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(!merging.status.success());
+}
+
+/// A merge of 3 parents that all changed line 2 of `f`, resolved to `all`;
+/// `git merge` cannot make a conflicted octopus, so the commit is written
+/// from the tree.
+fn octopus_repo(tag: &str) -> PathBuf {
+    let dir = detail_repo(tag);
+    for name in ["one", "two"] {
+        git(&dir, &["checkout", "-q", "-b", name, "main"]);
+        commit_file(&dir, "f", &format!("a\n{name}\nc\nd\n"));
+    }
+    git(&dir, &["checkout", "-q", "main"]);
+    commit_file(&dir, "f", "a\nmain\nc\nd\n");
+    std::fs::write(dir.join("f"), "a\nall\nc\nd\n").unwrap();
+    git(&dir, &["add", "f"]);
+    let tree = git(&dir, &["write-tree"]).trim().to_owned();
+    let merge = git(
+        &dir,
+        &["commit-tree", &tree, "-p", "main", "-p", "one", "-p", "two", "-m", "octopus"],
+    );
+    git(&dir, &["reset", "-q", "--hard", merge.trim()]);
+    dir
+}
+
+#[test]
+fn combined_octopus_shows_its_files() {
+    let dir = octopus_repo("combined-octopus");
+    let js = json_out(&dir, &["show", "HEAD"]);
+    assert_eq!(js["diff"], "combined");
+    let hunks = js["files"][0]["hunks"].as_array().unwrap();
+    assert_eq!(hunks[0]["at"], "-1,4 -1,4 -1,4 +1,4");
+    assert!(
+        hunks[0]["lines"].as_array().unwrap().iter().any(|l| l == "+++all"),
+        "{js}"
+    );
+    let out = toon(&dir, &["show", "HEAD"]);
+    assert!(!out.contains("0 files in the combined diff"), "{out}");
+}
+
+#[test]
+fn combined_binary_file_resolved_by_hand_is_listed() {
+    let dir = detail_repo("combined-binary");
+    std::fs::write(dir.join("bin"), b"\0base").unwrap();
+    git(&dir, &["add", "bin"]);
+    git(&dir, &["commit", "-qm", "bin"]);
+    git(&dir, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(dir.join("bin"), b"\0side").unwrap();
+    git(&dir, &["commit", "-qam", "side"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    std::fs::write(dir.join("bin"), b"\0main").unwrap();
+    git(&dir, &["commit", "-qam", "main"]);
+    merge_stopped(&dir, "side");
+    std::fs::write(dir.join("bin"), b"\0both").unwrap();
+    git(&dir, &["add", "bin"]);
+    git(&dir, &["commit", "-qm", "merge"]);
+    let js = json_out(&dir, &["show", "HEAD"]);
+    assert_eq!(js["diff"], "combined");
+    let file = file_by_path(&js["files"], "bin");
+    assert_eq!(file["binary"], true, "{js}");
+    assert_eq!(file["hunks"].as_array().unwrap().len(), 0, "{js}");
+}
+
+#[test]
+fn combined_crlf_lines_keep_their_carriage_return() {
+    let dir = detail_repo("combined-crlf");
+    commit_file(&dir, "f", "a\r\nb\r\nc\r\nd\r\n");
+    git(&dir, &["checkout", "-q", "-b", "side"]);
+    commit_file(&dir, "f", "a\r\nside\r\nc\r\nd\r\n");
+    git(&dir, &["checkout", "-q", "main"]);
+    commit_file(&dir, "f", "a\r\nmain\r\nc\r\nd\r\n");
+    merge_stopped(&dir, "side");
+    std::fs::write(dir.join("f"), "a\r\nboth\r\nc\r\nd\r\n").unwrap();
+    git(&dir, &["add", "f"]);
+    git(&dir, &["commit", "-qm", "merge"]);
+    let js = json_out(&dir, &["show", "HEAD"]);
+    let lines = js["files"][0]["hunks"][0]["lines"].as_array().unwrap();
+    assert!(lines.iter().any(|l| l == "++both\r"), "{js}");
+    assert!(lines.iter().any(|l| l == "  a\r"), "{js}");
+}
+
+#[test]
+fn combined_dash_c_lists_the_files_of_dash_dash_cc() {
+    let dir = conflict_merge_repo("combined-c");
+    let cc = json_out(&dir, &["show", "--cc", "HEAD"]);
+    let c = json_out(&dir, &["show", "-c", "HEAD"]);
+    assert_eq!(c["diff"], "combined");
+    assert_eq!(c["files"], cc["files"]);
+}
+
+#[test]
+fn combined_diff_merges_off_prints_no_diff() {
+    let dir = conflict_merge_repo("combined-off");
+    for flag in ["--diff-merges=off", "--no-diff-merges"] {
+        let js = json_out(&dir, &["show", flag, "HEAD"]);
+        assert_eq!(js["diff"], "off", "{flag}: {js}");
+        assert!(js.get("files").is_none(), "{flag}: {js}");
+        assert!(js.get("total").is_none(), "{flag}: {js}");
+        let out = toon(&dir, &["show", flag, "HEAD"]);
+        assert!(out.contains("diff: off"), "{flag}: {out}");
+        assert!(!out.contains("files"), "{flag}: {out}");
+    }
+}
+
+#[test]
+fn combined_total_matches_gits_shortstat() {
+    let dir = detail_repo("combined-total");
+    git(&dir, &["checkout", "-q", "-b", "side"]);
+    commit_file(&dir, "f", "a\nside\nc\nd\nS\n");
+    git(&dir, &["checkout", "-q", "main"]);
+    commit_file(&dir, "f", "a\nmain\nc\nd\n");
+    merge_stopped(&dir, "side");
+    std::fs::write(dir.join("f"), "a\nboth\nc\nd\nS\nextra\n").unwrap();
+    git(&dir, &["add", "f"]);
+    git(&dir, &["commit", "-qm", "merge"]);
+    let stat = git(&dir, &["show", "--cc", "--shortstat", "--format=", "HEAD"]);
+    assert!(stat.contains("1 file changed, 3 insertions(+), 1 deletion(-)"), "{stat}");
+    for args in [&["show", "HEAD"][..], &["show", "--shortstat", "HEAD"]] {
+        let js = json_out(&dir, args);
+        assert_eq!(js["total"], "1 files, +3 -1", "{args:?}: {js}");
+    }
+    let js = json_out(&dir, &["show", "HEAD"]);
+    assert!(js["files"][0].get("added").is_none(), "{js}");
+}
+
 /// Unstaged: line `the quick fox` changed to `the slow fox`, with `a` above.
 fn word_repo(tag: &str) -> PathBuf {
     let dir = detail_repo(tag);
@@ -514,6 +650,29 @@ fn word_diff_color_words_gives_plain_lines() {
     assert!(out.contains("the [-quick-]{+slow+} fox"), "{out}");
     let out = toon(&dir, &["diff", "--color-words"]);
     assert!(out.contains("the [-quick-]{+slow+} fox"), "{out}");
+}
+
+#[test]
+fn word_diff_marks_several_changed_words_in_one_line() {
+    let dir = detail_repo("word-several");
+    commit_file(&dir, "f", "a\nthe quick brown fox jumps\nz\n");
+    std::fs::write(dir.join("f"), "a\nthe slow brown cat jumps\nz\n").unwrap();
+    let want = "the [-quick-]{+slow+} brown [-fox-]{+cat+} jumps";
+    assert_eq!(
+        git(&dir, &["diff", "--word-diff"]).lines().filter(|l| *l == want).count(),
+        1
+    );
+    let lines = word_lines(&json_out(&dir, &["diff", "--word-diff"]));
+    assert_eq!(lines, ["a", want, "z"]);
+}
+
+#[test]
+fn word_diff_shows_a_removed_whole_line() {
+    let dir = detail_repo("word-removed");
+    commit_file(&dir, "f", "a\nkeep\ngone line\nz\n");
+    std::fs::write(dir.join("f"), "a\nkeep\nz\n").unwrap();
+    let lines = word_lines(&json_out(&dir, &["diff", "--word-diff"]));
+    assert_eq!(lines, ["a", "keep", "[-gone line-]", "z"]);
 }
 
 #[test]
