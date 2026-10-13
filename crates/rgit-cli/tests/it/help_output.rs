@@ -184,3 +184,118 @@ fn bare_group() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+#[test]
+fn missing_argument_names() {
+    let dir = scratch("missing-arg");
+
+    // TOON: the missing positional is named, with the usage and the hint.
+    let toon = rgit(&dir, &[], &["--toon", "branch", "create"]);
+    assert_eq!(toon.status.code(), Some(2), "{:?}", toon);
+    let text = stdout(&toon);
+    assert!(text.contains("missing required argument: <NAME>"), "{text}");
+    assert!(text.contains("usage: rgit branch create"), "{text}");
+    assert!(
+        text.contains("Run `rgit --toon branch create --help` for details"),
+        "{text}"
+    );
+
+    // JSON: a missing required flag is named in the error field.
+    let json_out = rgit(&dir, &[], &["--json", "reword"]);
+    assert_eq!(json_out.status.code(), Some(2), "{:?}", json_out);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&json_out)).expect("json envelope");
+    assert_eq!(
+        value["error"],
+        "missing required argument: --message <MESSAGE>"
+    );
+    let help: Vec<&str> = value["help"]
+        .as_array()
+        .expect("help list")
+        .iter()
+        .map(|h| h.as_str().unwrap())
+        .collect();
+    assert!(
+        help.iter().any(|h| h.starts_with("usage: rgit reword")),
+        "{help:?}"
+    );
+    assert!(
+        help.contains(&"Run `rgit --json reword --help` for details"),
+        "{help:?}"
+    );
+
+    // Human: git's message keeps each name on its own line and exits 129.
+    let human = rgit(&dir, &[], &["--human", "remote", "add"]);
+    assert_eq!(human.status.code(), Some(129), "{:?}", human);
+    let err = stderr(&human);
+    assert!(
+        err.starts_with("error: the following required arguments were not provided:\n"),
+        "{err}"
+    );
+    assert!(err.contains("\n    <NAME>\n"), "{err}");
+    assert!(err.contains("\n    <URL>\n"), "{err}");
+    assert!(err.contains("usage: rgit remote add"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn help_builtin_structured() {
+    let dir = scratch("help-builtin");
+
+    // `rgit help` in TOON is the same value as `rgit -h`.
+    let help = rgit(&dir, &[], &["--toon", "help"]);
+    assert_eq!(help.status.code(), Some(0), "{:?}", help);
+    let text = stdout(&help);
+    assert!(text.contains("subcommands["), "{text}");
+    assert!(text.contains("\n  status,"), "{text}");
+    let direct = rgit(&dir, &[], &["--toon", "-h"]);
+    assert_eq!(stdout(&help), stdout(&direct));
+
+    // `rgit help -a` as JSON parses and lists the subcommands.
+    let all = rgit(&dir, &[], &["--json", "help", "-a"]);
+    assert_eq!(all.status.code(), Some(0), "{:?}", all);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&all)).expect("json envelope");
+    let subs = value["subcommands"].as_array().expect("subcommands list");
+    assert!(subs.iter().any(|s| s["name"] == "commit"), "{subs:?}");
+
+    // Human output is unchanged.
+    let human = rgit(&dir, &[], &["help"]);
+    assert_eq!(human.status.code(), Some(0), "{:?}", human);
+    assert!(
+        stdout(&human).starts_with("See 'rgit help <command>'"),
+        "{}",
+        stdout(&human)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn help_builtin_nested() {
+    let dir = scratch("help-nested");
+    let repo = repo("help-nested-stash");
+
+    // `rgit help <group> <command>` is `<group> <command> --help` in TOON.
+    let through = rgit(&dir, &[], &["--toon", "help", "forge", "pr"]);
+    let direct = rgit(&dir, &[], &["--toon", "forge", "pr", "--help"]);
+    assert_eq!(through.status.code(), Some(0), "{:?}", through);
+    assert_eq!(stdout(&through), stdout(&direct));
+
+    // The same rewrite keeps human output byte for byte.
+    let nested = rgit(&repo, &[], &["help", "stash", "push"]);
+    let stash = rgit(&repo, &[], &["stash", "push", "--help"]);
+    assert_eq!(nested.status.code(), Some(0), "{:?}", nested);
+    assert_eq!(stdout(&nested), stdout(&stash));
+
+    // A name that does not resolve fails like an unknown command.
+    let bogus = rgit(&dir, &[], &["help", "forge", "nope"]);
+    assert_eq!(bogus.status.code(), Some(1), "{:?}", bogus);
+    assert!(
+        stderr(&bogus).contains("'forge nope' is not a git command"),
+        "{}",
+        stderr(&bogus)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&repo);
+}

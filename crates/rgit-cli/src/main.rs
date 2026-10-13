@@ -1388,6 +1388,19 @@ fn long_help(cmd: &clap::Command, path: &str) -> String {
     cmd.render_long_help().to_string()
 }
 
+/// The names clap reports for a missing required argument. clap renders them
+/// after the first message line, so they come from the error context.
+fn missing_argument_names(e: &clap::Error) -> Vec<String> {
+    e.context()
+        .find_map(|(kind, value)| match (kind, value) {
+            (clap::error::ContextKind::InvalidArg, clap::error::ContextValue::Strings(names)) => {
+                Some(names.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// A usage error lists the valid subcommands or flags only up to this many;
 /// past it, the full list buries the error, so it points at `--help`.
 const MAX_LISTED: usize = 20;
@@ -1425,6 +1438,25 @@ fn usage_exit(e: clap::Error, args: &[String]) -> ! {
         let (text, code) = git_usage_error(&e, args, &cmd, &path);
         eprint!("{text}");
         exit(code);
+    }
+
+    if e.kind() == ErrorKind::MissingRequiredArgument {
+        let names = missing_argument_names(&e);
+        let message = match names.as_slice() {
+            [one] => format!("missing required argument: {one}"),
+            many => format!("missing required arguments: {}", many.join(", ")),
+        };
+        let usage = cmd.clone().bin_name(&path).render_usage().to_string();
+        let usage = usage.trim_start_matches("Usage: ").trim();
+        fail(
+            message,
+            vec![
+                format!("usage: {usage}"),
+                format!("Run `{path} --help` for details"),
+            ],
+            2,
+            mode,
+        );
     }
 
     let rendered = e.render().to_string();
@@ -1685,6 +1717,15 @@ fn git_usage_error(
                 128,
             )
         }
+        ErrorKind::MissingRequiredArgument => {
+            let mut text =
+                String::from("error: the following required arguments were not provided:\n");
+            for name in missing_argument_names(e) {
+                text.push_str(&format!("    {name}\n"));
+            }
+            text.push_str(&usage());
+            (text, 129)
+        }
         _ => (format!("error: {first}\n{}", usage()), 129),
     }
 }
@@ -1725,6 +1766,10 @@ fn help_and_version(mut args: Vec<String>) -> Vec<String> {
                 .collect();
             match names.as_slice() {
                 [] | ["-a" | "--all", ..] => {
+                    let mode = output_mode_from_args(&args);
+                    if mode != OutputMode::Text {
+                        print_structured_help(&Cli::command(), "rgit", mode);
+                    }
                     let cli = Cli::command();
                     let subs: Vec<&clap::Command> =
                         cli.get_subcommands().filter(|c| !c.is_hide_set()).collect();
@@ -1747,13 +1792,28 @@ fn help_and_version(mut args: Vec<String>) -> Vec<String> {
                     );
                     exit(0)
                 }
-                [name] if !name.starts_with('-') => {
-                    if Cli::command().find_subcommand(name).is_none() {
-                        eprintln!("rgit: '{name}' is not a git command. See 'rgit --help'.");
-                        exit(1)
+                [name, rest @ ..]
+                    if !name.starts_with('-') && rest.iter().all(|n| !n.starts_with('-')) =>
+                {
+                    let names: Vec<&str> =
+                        std::iter::once(*name).chain(rest.iter().copied()).collect();
+                    let mut cmd = Cli::command();
+                    for n in &names {
+                        match cmd.find_subcommand(n) {
+                            Some(sub) => cmd = sub.clone(),
+                            None => {
+                                eprintln!(
+                                    "rgit: '{}' is not a git command. See 'rgit --help'.",
+                                    names.join(" ")
+                                );
+                                exit(1)
+                            }
+                        }
                     }
                     args.truncate(at);
-                    args.push((*name).to_owned());
+                    for n in &names {
+                        args.push((*n).to_owned());
+                    }
                     args.push("--help".to_owned());
                     args
                 }
