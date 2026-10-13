@@ -182,20 +182,12 @@ pub fn run(
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs() as i64);
-            let mut whens = std::collections::HashMap::new();
-            for line in &all.lines {
-                if line.id.is_empty() {
-                    continue;
-                }
-                whens
-                    .entry(line.id.clone())
-                    .or_insert_with(|| {
-                        backend
-                            .read_object(&line.id)
-                            .map(|o| commit_when(&o.data, now))
-                            .unwrap_or_default()
-                    });
-            }
+            let whens = blame_whens(&all.lines, start, end, |id| {
+                backend
+                    .read_object(id)
+                    .map(|o| commit_when(&o.data, now))
+                    .unwrap_or_default()
+            });
             blame(&all.lines, &whens, &path, start, end)
         }
         Command::Plumbing(c) => crate::plumbing::run(backend, c, false)?,
@@ -1604,6 +1596,28 @@ fn zone_offset(zone: &str) -> i32 {
         .unwrap_or(0)
 }
 
+/// The `when` ages for the blame rows on screen: only the shown rows'
+/// commits are read, so paging a big file costs one page of object reads.
+fn blame_whens(
+    all: &[BlameLine],
+    start: usize,
+    end: usize,
+    mut read: impl FnMut(&str) -> String,
+) -> std::collections::HashMap<String, String> {
+    let lo = start.saturating_sub(1).min(all.len());
+    let hi = end.min(all.len()).max(lo);
+    let mut whens = std::collections::HashMap::new();
+    for line in &all[lo..hi] {
+        if line.id.is_empty() {
+            continue;
+        }
+        whens
+            .entry(line.id.clone())
+            .or_insert_with(|| read(&line.id));
+    }
+    whens
+}
+
 fn blame(
     all: &[BlameLine],
     whens: &std::collections::HashMap<String, String>,
@@ -2087,5 +2101,40 @@ fn next_steps(c: &Command) -> Vec<String> {
             cmd: Some(WorkspaceCmd::New { .. }),
         } => vec!["Run `rgit workspace` to list workspaces and their paths".into()],
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(id: &str) -> BlameLine {
+        BlameLine {
+            short_id: String::new(),
+            author: String::new(),
+            line: String::new(),
+            id: id.to_owned(),
+            email: String::new(),
+            orig_line: 0,
+            orig_path: String::new(),
+            boundary: false,
+            final_line: 0,
+            ignored: false,
+            unblamable: false,
+            previous: None,
+        }
+    }
+
+    #[test]
+    fn blame_whens_reads_only_shown_rows() {
+        let all = vec![line("a"), line(""), line("b"), line("b"), line("c")];
+        let mut read = Vec::new();
+        let whens = blame_whens(&all, 3, 4, |id| {
+            read.push(id.to_owned());
+            id.to_owned()
+        });
+        assert_eq!(read, vec!["b".to_owned()]);
+        assert_eq!(whens.len(), 1);
+        assert_eq!(whens["b"], "b");
     }
 }
