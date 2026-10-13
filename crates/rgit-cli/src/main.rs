@@ -1369,10 +1369,7 @@ fn output_mode_from_args(args: &[String]) -> OutputMode {
 /// Print a command's help as a value, for the TOON and JSON modes, and exit 0.
 fn print_structured_help(cmd: &clap::Command, path: &str, mode: OutputMode) {
     let out = help::structured(cmd, path);
-    let mut value = match out.finalize(&[], false, path) {
-        Ok(value) => value,
-        Err(_) => Vec::new(),
-    };
+    let mut value = out.finalize(&[], false, path).unwrap_or_default();
     if mode == OutputMode::Json {
         value.push(("ok".to_owned(), Node::Bool(true)));
         println!("{}", json(value));
