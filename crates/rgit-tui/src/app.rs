@@ -874,8 +874,15 @@ pub enum Msg {
     Refresh,
     /// A refresh triggered by the file watcher; quiet (no loading indicator).
     AutoRefresh,
-    /// Boxed because a `RepoStatus` is far larger than the other variants.
-    Refreshed(Box<RefreshResult>),
+    /// A finished background status read. `generation` orders reads by start
+    /// time so a slow read that finishes late is dropped; `gated` marks reads
+    /// the refresh gate started. Boxed because a `RepoStatus` is far larger
+    /// than the other variants.
+    Refreshed {
+        generation: u64,
+        gated: bool,
+        result: Box<RefreshResult>,
+    },
 }
 
 /// A repository mutation, resolved from the target under the cursor.
@@ -2290,6 +2297,8 @@ pub struct App {
     forge_detail: Option<(bool, u64)>,
     /// When the background forge snapshot was last requested.
     last_remote_fetch: Option<std::time::Instant>,
+    /// Generation of the last applied status read; older results are dropped.
+    last_refresh_gen: u64,
     /// Last status snapshot, for the adaptive preview pane.
     snapshot: Option<Arc<RepoStatus>>,
     /// What the preview buffer currently holds, so it is rebuilt only when the
@@ -2429,6 +2438,7 @@ impl App {
             pending_forge_issue_comment: None,
             forge_tab: crate::forge::ForgeTab::Requests,
             last_remote_fetch: None,
+            last_refresh_gen: 0,
             forge_open_requested: false,
             forge_detail: None,
             snapshot: None,
@@ -4525,7 +4535,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             return vec![Effect::Refresh];
         }
         Msg::AutoRefresh => return vec![Effect::Refresh],
-        Msg::Refreshed(result) => return refreshed(app, *result),
+        Msg::Refreshed {
+            generation, result, ..
+        } => return refreshed(app, generation, *result),
     }
     Vec::new()
 }
@@ -5699,7 +5711,11 @@ fn resolve_conflict_at(app: &mut App, ours: bool) -> Vec<Effect> {
     Vec::new()
 }
 
-fn refreshed(app: &mut App, result: RefreshResult) -> Vec<Effect> {
+fn refreshed(app: &mut App, generation: u64, result: RefreshResult) -> Vec<Effect> {
+    if generation < app.last_refresh_gen {
+        return Vec::new();
+    }
+    app.last_refresh_gen = generation;
     app.loading = false;
     // A labeled operation that just finished reports its outcome as a toast.
     let finished = app.busy.take();

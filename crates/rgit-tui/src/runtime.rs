@@ -664,6 +664,30 @@ impl RefreshGate {
     }
 }
 
+/// Orders status reads by start time across every spawn site.
+static REFRESH_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_refresh_generation() -> u64 {
+    REFRESH_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run a status read stamped with its start order. The stamp comes first so
+/// a slow read that finishes last still loses to a read that started later.
+fn read_stamped(
+    backend: &dyn GitBackend,
+    work: impl FnOnce(&dyn GitBackend) -> Result<RepoStatus, GitError>,
+) -> (u64, Result<RepoStatus, GitError>) {
+    let generation = next_refresh_generation();
+    (generation, work(backend))
+}
+
+/// Whether `msg` ends the gated refresh, so a queued one runs now. Only a
+/// read the gate started finishes it; mutation and commit results carry
+/// their own status and must not clear another read's inflight flag.
+fn finish_gated_refresh(msg: &Msg, gate: &RefreshGate) -> bool {
+    matches!(msg, Msg::Refreshed { gated: true, .. }) && gate.finish()
+}
+
 async fn run_msg(
     app: &mut App,
     msg: Msg,
@@ -672,7 +696,7 @@ async fn run_msg(
     msg_tx: &UnboundedSender<Msg>,
     gate: &RefreshGate,
 ) -> std::io::Result<()> {
-    let requeue = matches!(msg, Msg::Refreshed(_)) && gate.finish();
+    let requeue = finish_gated_refresh(&msg, gate);
     let started = Instant::now();
     let effects = update(app, msg);
     tracing::debug!(elapsed_ms = started.elapsed().as_millis(), "update");
@@ -704,25 +728,37 @@ async fn run_msg(
                 let backend = app.backend();
                 let tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    let status = (|| -> Result<RepoStatus, GitError> {
+                    let (generation, status) = (|| -> (u64, Result<RepoStatus, GitError>) {
                         let started = Instant::now();
-                        apply_mutation(&*backend, &mutation)?;
+                        if let Err(e) = apply_mutation(&*backend, &mutation) {
+                            return (next_refresh_generation(), Err(e));
+                        }
                         tracing::debug!(
                             elapsed_ms = started.elapsed().as_millis(),
                             "mutation applied"
                         );
-                        if restack_after && let Some(note) = auto_restack_note(&*backend)? {
-                            let _ = tx.send(Msg::AutoRestackNote(note));
+                        if restack_after {
+                            match auto_restack_note(&*backend) {
+                                Ok(Some(note)) => {
+                                    let _ = tx.send(Msg::AutoRestackNote(note));
+                                }
+                                Ok(None) => {}
+                                Err(e) => return (next_refresh_generation(), Err(e)),
+                            }
                         }
                         let started = Instant::now();
-                        let status = backend.status();
+                        let (generation, status) = read_stamped(&*backend, |b| b.status());
                         tracing::debug!(
                             elapsed_ms = started.elapsed().as_millis(),
                             "status after mutation"
                         );
-                        status
+                        (generation, status)
                     })();
-                    let _ = tx.send(Msg::Refreshed(Box::new(status)));
+                    let _ = tx.send(Msg::Refreshed {
+                        generation,
+                        gated: false,
+                        result: Box::new(status),
+                    });
                 });
             }
             Effect::Commit { amend } => commit_flow(app, events, terminal, msg_tx, amend).await?,
@@ -1543,16 +1579,17 @@ fn spawn_watcher(
         let Ok(events) = res else {
             return;
         };
-        let mut interesting: Vec<std::path::PathBuf> = Vec::new();
-        for event in events {
-            if is_git_internal(&watchdir_in, &event.path) {
-                continue;
-            }
-            interesting.push(event.path);
-        }
-        if interesting.is_empty() {
+        let batch = sort_watch_paths(&watchdir_in, events.into_iter().map(|event| event.path));
+        // libgit2 reports every path under `.git` as ignored, so git state
+        // refreshes on its own without the ignore check below.
+        if batch.git_state {
+            let _ = msg_tx.send(Msg::AutoRefresh);
             return;
         }
+        if batch.worktree.is_empty() {
+            return;
+        }
+        let interesting = batch.worktree;
         // `.gitignore`-driven check: one lock acquisition for the batch.
         let backend = Arc::clone(&backend);
         let msg_tx = msg_tx.clone();
@@ -1579,8 +1616,52 @@ fn spawn_watcher(
     Some(debouncer)
 }
 
+/// A debounced batch of watch events, sorted for filtering.
+struct WatchBatch {
+    git_state: bool,
+    worktree: Vec<std::path::PathBuf>,
+}
+
+/// Sort watch events into git state versus worktree paths. Git state is
+/// `.git/index`, `.git/HEAD`, `.git/packed-refs` and anything under
+/// `.git/refs/`; other `.git` paths are dropped. Paths outside the workdir
+/// stay in the worktree group, as the ignore check below still applies.
+fn sort_watch_paths(
+    workdir: &Path,
+    paths: impl IntoIterator<Item = std::path::PathBuf>,
+) -> WatchBatch {
+    let mut batch = WatchBatch {
+        git_state: false,
+        worktree: Vec::new(),
+    };
+    for path in paths {
+        if is_git_state(workdir, &path) {
+            batch.git_state = true;
+        } else if is_git_internal(workdir, &path) {
+            continue;
+        } else {
+            batch.worktree.push(path);
+        }
+    }
+    batch
+}
+
+/// Whether `path` changes git state that rgit shows (staging, branches).
+fn is_git_state(workdir: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(workdir) else {
+        return false;
+    };
+    let Ok(rest) = rel.strip_prefix(".git") else {
+        return false;
+    };
+    rest == Path::new("index")
+        || rest == Path::new("HEAD")
+        || rest == Path::new("packed-refs")
+        || rest.starts_with("refs")
+}
+
 /// Whether `path` is `.git` plumbing whose change cannot alter what rgit
-/// shows. Index, HEAD and refs do matter (staging, branch switches).
+/// shows.
 fn is_git_internal(workdir: &Path, path: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(workdir) else {
         return false;
@@ -1589,13 +1670,7 @@ fn is_git_internal(workdir: &Path, path: &Path) -> bool {
     if parts.next() != Some(std::path::Component::Normal(".git".as_ref())) {
         return false;
     }
-    let rest = rel
-        .strip_prefix(".git")
-        .expect("checked first component above");
-    if rest.as_os_str().is_empty() {
-        return true;
-    }
-    !(rest == Path::new("index") || rest == Path::new("HEAD") || rest.starts_with("refs"))
+    !is_git_state(workdir, path)
 }
 /// Run a synchronous read/mutation on a blocking task and report the resulting
 /// status back as a [`Msg`], so the render loop never blocks.
@@ -1607,14 +1682,18 @@ where
     let msg_tx = msg_tx.clone();
     tokio::task::spawn_blocking(move || {
         let started = Instant::now();
-        let result = work(&*backend);
+        let (generation, result) = read_stamped(&*backend, work);
         tracing::info!(
             target: "startup",
             elapsed_ms = started.elapsed().as_millis(),
             "git refresh completed"
         );
         tracing::debug!(elapsed_ms = started.elapsed().as_millis(), "git read");
-        let _ = msg_tx.send(Msg::Refreshed(Box::new(result)));
+        let _ = msg_tx.send(Msg::Refreshed {
+            generation,
+            gated: true,
+            result: Box::new(result),
+        });
     });
 }
 
@@ -1939,18 +2018,28 @@ async fn commit_flow(
     let auto_restack = app.auto_restack();
     let tx = msg_tx.clone();
     tokio::task::spawn_blocking(move || {
-        let status = (|| -> Result<RepoStatus, GitError> {
-            if amend {
-                backend.amend(&message)?;
-                if auto_restack && let Some(note) = auto_restack_note(&*backend)? {
-                    let _ = tx.send(Msg::AutoRestackNote(note));
+        let (generation, status) = (|| -> (u64, Result<RepoStatus, GitError>) {
+            let applied = (|| -> Result<(), GitError> {
+                if amend {
+                    backend.amend(&message)?;
+                    if auto_restack && let Some(note) = auto_restack_note(&*backend)? {
+                        let _ = tx.send(Msg::AutoRestackNote(note));
+                    }
+                } else {
+                    backend.commit(&message)?;
                 }
-            } else {
-                backend.commit(&message)?;
+                Ok(())
+            })();
+            if let Err(e) = applied {
+                return (next_refresh_generation(), Err(e));
             }
-            backend.status()
+            read_stamped(&*backend, |b| b.status())
         })();
-        let _ = tx.send(Msg::Refreshed(Box::new(status)));
+        let _ = tx.send(Msg::Refreshed {
+            generation,
+            gated: false,
+            result: Box::new(status),
+        });
     });
     Ok(())
 }
@@ -2521,7 +2610,9 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HostEditor, base64_encode, editor_open_command, grep_hits, restack_note, snippet_sections,
+        App, HostEditor, Msg, RefreshGate, base64_encode, editor_open_command,
+        finish_gated_refresh, grep_hits, read_stamped, restack_note, snippet_sections,
+        sort_watch_paths, update,
     };
     use rgit_git::RestackOutcome;
 
@@ -2722,5 +2813,124 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    fn watch_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from("/repo")
+    }
+
+    #[test]
+    fn stale_refresh_applies_the_newer_result() {
+        let mut app = refresh_app();
+        update(&mut app, refreshed_msg(2, true, "new"));
+        assert_eq!(app_branch(&app), Some("new".to_owned()));
+    }
+
+    #[test]
+    fn stale_refresh_drops_the_older_result() {
+        let mut app = refresh_app();
+        update(&mut app, refreshed_msg(2, true, "new"));
+        update(&mut app, refreshed_msg(1, false, "old"));
+        assert_eq!(app_branch(&app), Some("new".to_owned()));
+    }
+
+    #[test]
+    fn stale_refresh_generation_stamped_when_the_read_starts() {
+        use std::sync::mpsc::channel;
+        let backend = rgit_git::Git2Backend::discover(".").unwrap();
+        let (started_tx, started_rx) = channel();
+        let slow = std::thread::spawn(move || {
+            read_stamped(&backend, |_| {
+                started_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                Ok(rgit_git::RepoStatus::default())
+            })
+        });
+        started_rx.recv().unwrap();
+        let backend = rgit_git::Git2Backend::discover(".").unwrap();
+        let (fast_gen, _) = read_stamped(&backend, |_| Ok(rgit_git::RepoStatus::default()));
+        let (slow_gen, _) = slow.join().unwrap();
+        assert!(
+            slow_gen < fast_gen,
+            "a read started first keeps the lower generation even when it finishes last"
+        );
+    }
+
+    #[test]
+    fn stale_refresh_mutation_result_keeps_the_gated_read_inflight() {
+        let gate = RefreshGate::default();
+        assert!(gate.start_or_queue());
+        assert!(!finish_gated_refresh(
+            &refreshed_msg(2, false, "new"),
+            &gate
+        ));
+        assert!(!gate.start_or_queue());
+    }
+
+    fn refresh_app() -> App {
+        App::new(
+            std::sync::Arc::new(rgit_git::Git2Backend::discover(".").unwrap()),
+            crate::config::Config::default(),
+        )
+    }
+
+    fn refreshed_msg(generation: u64, gated: bool, branch: &str) -> Msg {
+        Msg::Refreshed {
+            generation,
+            gated,
+            result: Box::new(Ok(rgit_git::RepoStatus {
+                head: rgit_git::Head {
+                    branch: Some(branch.to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn app_branch(app: &App) -> Option<String> {
+        app.head.as_ref().and_then(|head| head.branch.clone())
+    }
+
+    #[test]
+    fn watch_git_state_flags_index_head_packed_refs_and_refs() {
+        let workdir = watch_dir();
+        for rel in [
+            ".git/index",
+            ".git/HEAD",
+            ".git/packed-refs",
+            ".git/refs/heads/main",
+            ".git/refs/tags/v1",
+        ] {
+            let batch = sort_watch_paths(&workdir, [workdir.join(rel)]);
+            assert!(batch.git_state, "{rel} is git state");
+            assert!(batch.worktree.is_empty(), "{rel} skips the ignore check");
+        }
+    }
+
+    #[test]
+    fn watch_git_state_drops_other_git_internals() {
+        let workdir = watch_dir();
+        let batch = sort_watch_paths(&workdir, [workdir.join(".git/objects/ab/cd")]);
+        assert!(!batch.git_state);
+        assert!(batch.worktree.is_empty());
+    }
+
+    #[test]
+    fn watch_git_state_sends_worktree_paths_to_the_ignore_check() {
+        let workdir = watch_dir();
+        let path = workdir.join("src/main.rs");
+        let batch = sort_watch_paths(&workdir, [path.clone()]);
+        assert!(!batch.git_state);
+        assert_eq!(batch.worktree, vec![path]);
+    }
+
+    #[test]
+    fn watch_git_state_keeps_paths_outside_the_workdir() {
+        let workdir = watch_dir();
+        let path = std::path::PathBuf::from("/elsewhere/file.rs");
+        let batch = sort_watch_paths(&workdir, [path.clone()]);
+        assert!(!batch.git_state);
+        assert_eq!(batch.worktree, vec![path]);
     }
 }
