@@ -793,7 +793,8 @@ fn count_shorthand(args: &[String]) -> Vec<String> {
 fn diff_shorthand(args: Vec<String>) -> Vec<String> {
     let Some(at) = args
         .iter()
-        .position(|a| matches!(a.as_str(), "diff" | "log" | "show" | "whatchanged"))
+        .position(|a| !a.starts_with('-'))
+        .filter(|&i| matches!(args[i].as_str(), "diff" | "log" | "show" | "whatchanged"))
     else {
         return args;
     };

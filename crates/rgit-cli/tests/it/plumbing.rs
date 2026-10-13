@@ -3813,6 +3813,9 @@ fn diff_renames_config_leaves_other_commands_alone() {
     git(&dir, &["add", "s.txt"], &[]);
     same(
         &dir,
-        &[&["grep", "-n", "-e", "show", "-C", "1", "--", "s.txt"][..]],
+        &[
+            &["grep", "-n", "-e", "show", "-C", "1", "--", "s.txt"][..],
+            &["grep", "-n", "-e", "show", "-B1", "--", "s.txt"],
+        ],
     );
 }
