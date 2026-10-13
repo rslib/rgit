@@ -708,7 +708,7 @@ impl GitBackend for Git2Backend {
             repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
         // Detect renames so a moved file lists once as "old -> new" with only its
         // real +/- counts, matching the working-tree and detail views.
-        if let Some(mut fopts) = crate::diff::find_options(display_renames(&repo)) {
+        if let Some(mut fopts) = crate::diff::find_options(display_renames(&repo)?) {
             diff.find_similar(Some(&mut fopts))?;
         }
 
@@ -825,7 +825,7 @@ impl GitBackend for Git2Backend {
             }
             (None, None) => repo.diff_index_to_workdir(None, Some(&mut opts))?,
         };
-        if let Some(mut fopts) = crate::diff::find_options(display_renames(&repo)) {
+        if let Some(mut fopts) = crate::diff::find_options(display_renames(&repo)?) {
             if let Some(n) = t.rename_limit {
                 fopts.rename_limit(n);
             }
@@ -11919,7 +11919,7 @@ fn repo_is_dirty(repo: &Repository) -> bool {
 /// Rename detection for a display diff: the command line wins, else
 /// `diff.renames` (none for `false`, renames for `true` or unset, renames
 /// and copies for `copies`).
-fn display_renames(repo: &Repository) -> u8 {
+fn display_renames(repo: &Repository) -> Result<u8, GitError> {
     let value = open_config(repo, ConfigScope::Any, false)
         .ok()
         .and_then(|c| c.get_string("diff.renames").ok());
@@ -11931,7 +11931,7 @@ fn display_renames(repo: &Repository) -> u8 {
 /// real content changes (none, for a pure move). Staging/patch-apply diffs skip
 /// this: they key on exact per-file paths.
 fn extract_with_renames(repo: &Repository, mut diff: Diff) -> Result<Vec<FileDiff>, GitError> {
-    if let Some(mut fopts) = crate::diff::find_options(display_renames(repo)) {
+    if let Some(mut fopts) = crate::diff::find_options(display_renames(repo)?) {
         diff.find_similar(Some(&mut fopts))?;
     }
     extract(repo, &diff)

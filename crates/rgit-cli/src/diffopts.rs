@@ -167,12 +167,13 @@ pub struct DiffOptArgs {
     /// Do not detect renames.
     #[arg(long)]
     pub no_renames: bool,
-    /// Detect renames, optionally at this similarity (git's -M).
+    /// Detect renames, optionally at this similarity (git's -M[<n>]).
     #[arg(
         short = 'M',
         long,
         value_name = "N",
         num_args = 0..=1,
+        require_equals = true,
         default_missing_value = "",
         value_parser = |v: &str| {
             let score = v.trim_end_matches('%');
@@ -182,12 +183,13 @@ pub struct DiffOptArgs {
         }
     )]
     pub find_renames: Option<String>,
-    /// Detect copies as well as renames (git's -C).
+    /// Detect copies as well as renames (git's -C[<n>]).
     #[arg(
         short = 'C',
         long = "find-copies",
         value_name = "N",
         num_args = 0..=1,
+        require_equals = true,
         default_missing_value = "",
         value_parser = |v: &str| {
             let score = v.trim_end_matches('%');
@@ -426,6 +428,14 @@ impl DiffOptArgs {
         }
     }
 
+    /// The similarity `-M<n>` or `-C<n>` asked for, when it gave one.
+    fn rename_score(&self) -> Option<&str> {
+        self.find_copies
+            .as_deref()
+            .or(self.find_renames.as_deref())
+            .filter(|s| !s.is_empty())
+    }
+
     /// Set the diff settings for this command: the backend's and the
     /// renderer's. `porcelain` is `git diff` (external tools on by default).
     pub fn apply(
@@ -440,6 +450,7 @@ impl DiffOptArgs {
         if let Some(level) = self.rename_level() {
             push_rename_config(level);
         }
+        rgit_git::set_rename_score(self.rename_score());
         let cfg = |k: &str| backend.config_get(k).ok().flatten();
         let truthy = |k: &str| {
             cfg(k).is_some_and(|v| {
@@ -681,6 +692,7 @@ fn push_rename_config(level: u8) {
 pub fn clear() {
     BACKEND.with(|b| *b.borrow_mut() = None);
     rgit_git::xdiff::set_tweaks(DiffTweaks::default());
+    rgit_git::set_rename_score(None);
     set(Render::default());
 }
 

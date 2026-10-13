@@ -114,11 +114,10 @@ fn main() -> ! {
     let args = whatchanged(help_and_version(globals::dispatch(args, &mut paginate)));
     logging::init();
     let stdout_is_terminal = std::io::stdout().is_terminal();
+    let argv = rename_flags(diff_shorthand(count_shorthand(&plumbing::grep_tokens(&args))));
     let parsed = examples::apply(Cli::command())
         .try_get_matches_from(
-            std::iter::once("rgit".to_owned()).chain(sticky_sign(diff_scores(blame_scores(
-                diff_shorthand(count_shorthand(&plumbing::grep_tokens(&args))),
-            )))),
+            std::iter::once("rgit".to_owned()).chain(sticky_sign(diff_scores(blame_scores(argv)))),
         )
         .and_then(|m| Cli::from_arg_matches(&m));
     let cli = match parsed {
@@ -907,6 +906,57 @@ fn diff_scores(mut args: Vec<String>) -> Vec<String> {
         };
     }
     args
+}
+
+/// git's rename flags for `diff`, `log` and `show`: `-M[<n>]` and `-C[<n>]`
+/// take a score only when attached, so `-M HEAD~1` leaves the revision
+/// alone, and the last of `-M`, `-C` and `--no-renames` wins. A repeated
+/// `-C` or `--find-copies-harder` counts as one `-C`.
+fn rename_flags(args: Vec<String>) -> Vec<String> {
+    let Some(at) = args
+        .iter()
+        .position(|a| !a.starts_with('-'))
+        .filter(|&i| matches!(args[i].as_str(), "diff" | "log" | "show" | "whatchanged"))
+    else {
+        return args;
+    };
+    let flag = |a: &str| -> Option<String> {
+        let (long, score) = match a {
+            "--no-renames" => return Some(a.to_owned()),
+            "--find-copies-harder" => ("--find-copies", ""),
+            _ => {
+                if let Some(n) = a.strip_prefix("--find-renames=") {
+                    ("--find-renames", n)
+                } else if let Some(n) = a.strip_prefix("--find-copies=") {
+                    ("--find-copies", n)
+                } else if a == "--find-renames" || a == "--find-copies" {
+                    (a, "")
+                } else if let Some(n) = a.strip_prefix("-M") {
+                    ("--find-renames", n)
+                } else {
+                    ("--find-copies", a.strip_prefix("-C")?)
+                }
+            }
+        };
+        Some(match score {
+            "" => long.to_owned(),
+            n => format!("{long}={n}"),
+        })
+    };
+    let end = args[at + 1..]
+        .iter()
+        .position(|a| a == "--")
+        .map_or(args.len(), |n| at + 1 + n);
+    let last = (at + 1..end).rfind(|&i| flag(&args[i]).is_some());
+    let mut out = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+        match flag(a).filter(|_| i > at && i < end) {
+            Some(f) if Some(i) == last => out.push(f),
+            Some(_) => {}
+            None => out.push(a.clone()),
+        }
+    }
+    out
 }
 
 /// The current invocation as a copy-pasteable command, for `--full` hints.

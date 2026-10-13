@@ -1771,9 +1771,12 @@ fn diff_renames_config_false_human_matches_git() {
 fn diff_renames_config_unset_toon_finds_rename() {
     let dir = renames_config_repo("renames-unset");
     let out = toon_out(&dir, &["diff", "--cached", "--name-status"]);
-    assert!(out.contains("\n  h,R"), "{out}");
+    assert_eq!(out, "files[1]{path,status}:\n  h,R\n");
     let js = json_out(&dir, &["diff", "--cached", "--name-status"]);
-    assert!(js.contains("\"status\":\"R\""), "{js}");
+    assert_eq!(
+        js,
+        "{\"files\":[{\"path\":\"h\",\"status\":\"R\"}],\"ok\":true}\n"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1806,7 +1809,10 @@ fn diff_renames_config_cli_wins_over_false() {
     let dir = renames_config_repo("renames-cli");
     git(&dir, &["config", "diff.renames", "false"], &[]);
     same(&dir, &[&["diff", "--cached", "--name-status", "-M"]]);
-    same(&dir, &[&["diff", "--cached", "--name-status", "--no-renames"]]);
+    same(
+        &dir,
+        &[&["diff", "--cached", "--name-status", "--no-renames"]],
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1827,6 +1833,208 @@ fn diff_renames_config_false_stash_show_matches_git() {
     git(&dir, &["config", "diff.renames", "false"], &[]);
     git(&dir, &["stash", "-q"], &[]);
     same(&dir, &[&["stash", "show", "--name-status"]]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A repo with a 20-line `g` committed, then staged as renamed to `h` with 8
+/// of its lines replaced: about 59% similar.
+fn similar_rename_repo(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rgit-plumbing-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"], &[]);
+    git(&dir, &["config", "user.email", "t@example.com"], &[]);
+    git(&dir, &["config", "user.name", "T"], &[]);
+    let line = |n: u32| format!("line number {n} of the file\n");
+    write(&dir, "g", (1..=20).map(line).collect::<String>().as_bytes());
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 1, "one", "T");
+    git(&dir, &["mv", "g", "h"], &[]);
+    let mut text: String = (1..=12).map(line).collect();
+    text.extend((1..=8).map(|n| format!("other content here {n} xx\n")));
+    write(&dir, "h", text.as_bytes());
+    git(&dir, &["add", "."], &[]);
+    dir
+}
+
+#[test]
+fn diff_renames_config_flag_before_revision_matches_git() {
+    let dir = similar_rename_repo("renames-before-rev");
+    let want = git(
+        &dir,
+        &["diff", "--cached", "--name-status", "-M", "HEAD"],
+        &[],
+    );
+    assert!(want.starts_with("R"), "{want}");
+    same(
+        &dir,
+        &[
+            &["diff", "--cached", "--name-status", "-M", "HEAD"],
+            &["diff", "--cached", "-M", "HEAD", "--name-status"],
+            &["diff", "--cached", "--name-status", "-C", "HEAD"],
+            &[
+                "diff",
+                "--cached",
+                "--name-status",
+                "--find-renames",
+                "HEAD",
+            ],
+            &[
+                "diff",
+                "--cached",
+                "--name-status",
+                "--find-renames=50%",
+                "HEAD",
+            ],
+        ],
+    );
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 2, "two", "T");
+    let sha = git(&dir, &["rev-parse", "HEAD"], &[]);
+    let sha = sha.trim();
+    let want = git(
+        &dir,
+        &["show", "--name-status", "--format=", "-M", sha],
+        &[],
+    );
+    assert!(want.starts_with("R"), "{want}");
+    same(
+        &dir,
+        &[
+            &["show", "--name-status", "--format=", "-M", sha],
+            &["show", "-M", sha],
+            &["log", "--name-status", "--format=", "-M", "-n", "1", "HEAD"],
+            &["log", "--name-status", "--format=", "-C", "HEAD"],
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn diff_renames_config_score_matches_git() {
+    let dir = similar_rename_repo("renames-score");
+    let at = |score: &str| git(&dir, &["diff", "--cached", "--name-status", score], &[]);
+    assert!(at("-M50%").starts_with("R"), "{}", at("-M50%"));
+    assert_eq!(at("-M90%"), "D\tg\nA\th\n");
+    same(
+        &dir,
+        &[
+            &["diff", "--cached", "--name-status", "-M50%"],
+            &["diff", "--cached", "--name-status", "-M90%"],
+            &["diff", "--cached", "--name-status", "-M5"],
+            &["diff", "--cached", "--name-status", "-M7"],
+            &["diff", "--cached", "--name-status", "-M05"],
+            &["diff", "--cached", "--name-status", "-M0.9"],
+            &["diff", "--cached", "--name-status", "--find-renames=90%"],
+            &["diff", "--cached", "--name-status", "-C90%"],
+            &["diff", "--cached", "--name-status", "-M50", "-M90"],
+            &["diff", "--cached", "--name-status", "-M90", "-M"],
+            &["diff", "--cached", "--name-status", "-M90", "-C"],
+            &["diff", "--cached", "--numstat", "-M90%"],
+            &["diff", "--cached", "--stat", "-M50%"],
+        ],
+    );
+    let toon = toon_out(&dir, &["diff", "--cached", "--name-status", "-M90%"]);
+    assert_eq!(toon, "files[2]{path,status}:\n  g,D\n  h,A\n");
+    let toon = toon_out(&dir, &["diff", "--cached", "--name-status", "-M50%"]);
+    assert_eq!(toon, "files[1]{path,status}:\n  h,R\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn diff_renames_config_last_flag_wins() {
+    let dir = similar_rename_repo("renames-last");
+    let want = git(
+        &dir,
+        &["diff", "--cached", "--name-status", "-M", "--no-renames"],
+        &[],
+    );
+    assert_eq!(want, "D\tg\nA\th\n");
+    let want = git(
+        &dir,
+        &["diff", "--cached", "--name-status", "--no-renames", "-M"],
+        &[],
+    );
+    assert!(want.starts_with("R"), "{want}");
+    same(
+        &dir,
+        &[
+            &["diff", "--cached", "--name-status", "-M", "--no-renames"],
+            &["diff", "--cached", "--name-status", "--no-renames", "-M"],
+            &["diff", "--cached", "--name-status", "-C", "--no-renames"],
+            &["diff", "--cached", "--name-status", "--no-renames", "-C"],
+            &["diff", "--cached", "--name-status", "-C", "-M"],
+            &["diff", "--cached", "--name-status", "-M", "-M"],
+            &["diff", "--cached", "--name-status", "-C", "-C"],
+            &["diff", "--cached", "--name-status", "--find-copies-harder"],
+            &[
+                "diff",
+                "--cached",
+                "--name-status",
+                "-C",
+                "--no-renames",
+                "-M",
+            ],
+        ],
+    );
+    git(&dir, &["config", "diff.renames", "false"], &[]);
+    same(
+        &dir,
+        &[
+            &["diff", "--cached", "--name-status", "--no-renames", "-M"],
+            &["diff", "--cached", "--name-status", "-C", "-C"],
+        ],
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn diff_renames_config_empty_and_invalid_value() {
+    let dir = renames_config_repo("renames-empty");
+    git(&dir, &["config", "diff.renames", ""], &[]);
+    let want = git(&dir, &["diff", "--cached", "--name-status"], &[]);
+    assert_eq!(want, "D\tg\nA\th\n");
+    same(&dir, &[&["diff", "--cached", "--name-status"]]);
+    git(&dir, &["config", "diff.renames", "maybe"], &[]);
+    let want = run("git", &dir, &["diff", "--cached", "--name-status"], &[]);
+    let got = rgit(&dir, &["diff", "--cached", "--name-status"]);
+    assert_eq!(want.status.code(), Some(128));
+    assert_eq!(got.status.code(), Some(128), "{got:?}");
+    assert!(got.stdout.is_empty(), "{got:?}");
+    assert_eq!(got.stderr, want.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn diff_renames_config_false_toon_json_show_and_log_stat() {
+    let dir = renames_config_repo("renames-structured");
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 2, "two", "T");
+    git(&dir, &["config", "diff.renames", "false"], &[]);
+    let log = toon_out(&dir, &["log", "--stat", "-n", "1"]);
+    assert!(
+        log.contains(
+            "    files[2]{path,status,added,removed}:\n      g,D,0,20\n      h,A,20,0\n"
+        ),
+        "{log}"
+    );
+    assert!(!log.contains(",R,"), "{log}");
+    let show = toon_out(&dir, &["show", "HEAD"]);
+    assert!(show.contains("  - path: g\n    status: D\n"), "{show}");
+    assert!(show.contains("  - path: h\n    status: A\n"), "{show}");
+    assert!(!show.contains("status: R"), "{show}");
+    let log = json_out(&dir, &["log", "--stat", "-n", "1"]);
+    assert!(
+        log.contains(
+            "\"files\":[{\"path\":\"g\",\"status\":\"D\",\"added\":0,\"removed\":20},\
+             {\"path\":\"h\",\"status\":\"A\",\"added\":20,\"removed\":0}]"
+        ),
+        "{log}"
+    );
+    let show = json_out(&dir, &["show", "HEAD"]);
+    assert!(show.contains("\"path\":\"g\",\"status\":\"D\""), "{show}");
+    assert!(show.contains("\"path\":\"h\",\"status\":\"A\""), "{show}");
+    assert!(!show.contains("\"status\":\"R\""), "{show}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3596,4 +3804,15 @@ fn unlabeled(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn diff_renames_config_leaves_other_commands_alone() {
+    let dir = repo("renames-other-commands");
+    std::fs::write(dir.join("s.txt"), "a\nshow\nb\n").unwrap();
+    git(&dir, &["add", "s.txt"], &[]);
+    same(
+        &dir,
+        &[&["grep", "-n", "-e", "show", "-C", "1", "--", "s.txt"][..]],
+    );
 }
