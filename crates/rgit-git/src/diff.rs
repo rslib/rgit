@@ -1,3 +1,28 @@
+use git2::DiffFindOptions;
+
+/// Effective rename detection from `diff.renames`: none for `false`, renames
+/// for `true` or unset, renames and copies for `copies`.
+pub fn detect_level(config: Option<&str>) -> u8 {
+    match config.map(|v| v.to_ascii_lowercase()).as_deref() {
+        Some("copies") | Some("copy") => 2,
+        Some("false") | Some("no") | Some("off") | Some("0") => 0,
+        _ => 1,
+    }
+}
+
+/// libgit2 rename options for `level` (`detect_level`), None when off.
+pub fn find_options(level: u8) -> Option<DiffFindOptions> {
+    if level == 0 {
+        return None;
+    }
+    let mut opts = DiffFindOptions::new();
+    opts.renames(true);
+    if level >= 2 {
+        opts.copies(true);
+    }
+    Some(opts)
+}
+
 /// A diff for one file, produced in-process from a libgit2 patch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {

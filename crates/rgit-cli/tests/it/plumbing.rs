@@ -1724,6 +1724,112 @@ fn rename_repo(tag: &str) -> PathBuf {
     dir
 }
 
+/// A repo with `g` committed, then staged as renamed to `h`.
+fn renames_config_repo(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rgit-plumbing-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"], &[]);
+    git(&dir, &["config", "user.email", "t@example.com"], &[]);
+    git(&dir, &["config", "user.name", "T"], &[]);
+    write(&dir, "g", &lines(1, 20));
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 1, "one", "T");
+    git(&dir, &["mv", "g", "h"], &[]);
+    dir
+}
+
+/// `rgit --toon <args>` and `rgit --json <args>` in a plumbing fixture.
+fn toon_out(dir: &Path, args: &[&str]) -> String {
+    let mut full = vec!["--toon"];
+    full.extend(args);
+    let out = run(env!("CARGO_BIN_EXE_rgit"), dir, &full, &[]);
+    assert!(out.status.success(), "rgit --toon {args:?}: {out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn json_out(dir: &Path, args: &[&str]) -> String {
+    let mut full = vec!["--json"];
+    full.extend(args);
+    let out = run(env!("CARGO_BIN_EXE_rgit"), dir, &full, &[]);
+    assert!(out.status.success(), "rgit --json {args:?}: {out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn diff_renames_config_false_human_matches_git() {
+    let dir = renames_config_repo("renames-false");
+    git(&dir, &["config", "diff.renames", "false"], &[]);
+    let want = git(&dir, &["diff", "--cached", "--name-status"], &[]);
+    assert!(want.contains("D\tg"), "{want}");
+    assert!(want.contains("A\th"), "{want}");
+    same(&dir, &[&["diff", "--cached", "--name-status"]]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn diff_renames_config_unset_toon_finds_rename() {
+    let dir = renames_config_repo("renames-unset");
+    let out = toon_out(&dir, &["diff", "--cached", "--name-status"]);
+    assert!(out.contains("\n  h,R"), "{out}");
+    let js = json_out(&dir, &["diff", "--cached", "--name-status"]);
+    assert!(js.contains("\"status\":\"R\""), "{js}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn diff_renames_config_copies_human_matches_git() {
+    let dir = std::env::temp_dir().join(format!(
+        "rgit-plumbing-{}-renames-copies",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"], &[]);
+    git(&dir, &["config", "user.email", "t@example.com"], &[]);
+    git(&dir, &["config", "user.name", "T"], &[]);
+    write(&dir, "a", &lines(1, 40));
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 1, "one", "T");
+    std::fs::copy(dir.join("a"), dir.join("c")).unwrap();
+    write(&dir, "a", &[lines(1, 40), b"extra\n".to_vec()].concat());
+    git(&dir, &["add", "."], &[]);
+    git(&dir, &["config", "diff.renames", "copies"], &[]);
+    let want = git(&dir, &["diff", "--cached", "--name-status"], &[]);
+    assert!(want.lines().any(|l| l.starts_with('C')), "{want}");
+    same(&dir, &[&["diff", "--cached", "--name-status"]]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn diff_renames_config_cli_wins_over_false() {
+    let dir = renames_config_repo("renames-cli");
+    git(&dir, &["config", "diff.renames", "false"], &[]);
+    same(&dir, &[&["diff", "--cached", "--name-status", "-M"]]);
+    same(&dir, &[&["diff", "--cached", "--name-status", "--no-renames"]]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn diff_renames_config_false_show_log_match_git() {
+    let dir = renames_config_repo("renames-show");
+    git(&dir, &["add", "."], &[]);
+    commit(&dir, 2, "two", "T");
+    git(&dir, &["config", "diff.renames", "false"], &[]);
+    same(&dir, &[&["show", "--name-status", "HEAD"]]);
+    same(&dir, &[&["log", "--name-status", "-n", "1"]]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn diff_renames_config_false_stash_show_matches_git() {
+    let dir = renames_config_repo("renames-stash");
+    git(&dir, &["config", "diff.renames", "false"], &[]);
+    git(&dir, &["stash", "-q"], &[]);
+    same(&dir, &[&["stash", "show", "--name-status"]]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn diff_plumbing_renames_stats_and_merges_match_git() {
     let dir = rename_repo("diff-renames");

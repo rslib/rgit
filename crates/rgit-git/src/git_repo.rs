@@ -708,9 +708,9 @@ impl GitBackend for Git2Backend {
             repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
         // Detect renames so a moved file lists once as "old -> new" with only its
         // real +/- counts, matching the working-tree and detail views.
-        let mut fopts = DiffFindOptions::new();
-        fopts.renames(true);
-        diff.find_similar(Some(&mut fopts))?;
+        if let Some(mut fopts) = crate::diff::find_options(display_renames(&repo)) {
+            diff.find_similar(Some(&mut fopts))?;
+        }
 
         let mut files = Vec::with_capacity(diff.deltas().len());
         for idx in 0..diff.deltas().len() {
@@ -825,12 +825,12 @@ impl GitBackend for Git2Backend {
             }
             (None, None) => repo.diff_index_to_workdir(None, Some(&mut opts))?,
         };
-        let mut fopts = DiffFindOptions::new();
-        fopts.renames(true);
-        if let Some(n) = t.rename_limit {
-            fopts.rename_limit(n);
+        if let Some(mut fopts) = crate::diff::find_options(display_renames(&repo)) {
+            if let Some(n) = t.rename_limit {
+                fopts.rename_limit(n);
+            }
+            diff.find_similar(Some(&mut fopts))?;
         }
-        diff.find_similar(Some(&mut fopts))?;
         let mut files = extract(&repo, &diff)?;
         crate::xdiff::finish(&repo, &diff, &mut files, spec, &t);
         crate::userdiff::refine(
@@ -11916,14 +11916,24 @@ fn repo_is_dirty(repo: &Repository) -> bool {
     }
 }
 
+/// Rename detection for a display diff: the command line wins, else
+/// `diff.renames` (none for `false`, renames for `true` or unset, renames
+/// and copies for `copies`).
+fn display_renames(repo: &Repository) -> u8 {
+    let value = open_config(repo, ConfigScope::Any, false)
+        .ok()
+        .and_then(|c| c.get_string("diff.renames").ok());
+    crate::diff::detect_level(value.as_deref())
+}
+
 /// Run libgit2 rename detection over a display diff, then extract it. A moved
 /// file collapses from a delete+add pair into one renamed delta showing only its
 /// real content changes (none, for a pure move). Staging/patch-apply diffs skip
 /// this: they key on exact per-file paths.
 fn extract_with_renames(repo: &Repository, mut diff: Diff) -> Result<Vec<FileDiff>, GitError> {
-    let mut fopts = DiffFindOptions::new();
-    fopts.renames(true);
-    diff.find_similar(Some(&mut fopts))?;
+    if let Some(mut fopts) = crate::diff::find_options(display_renames(repo)) {
+        diff.find_similar(Some(&mut fopts))?;
+    }
     extract(repo, &diff)
 }
 
