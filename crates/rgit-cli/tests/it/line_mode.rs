@@ -186,6 +186,49 @@ fn dumb_terminal_select_by_fuzzy_text() {
     );
 }
 
+/// True when `out` ends in an interactive picker prompt. Trailing newlines
+/// are skipped but trailing spaces are kept, so a help line ending in
+/// `\n` is false while `"[..]? "`, `"What now> "`, `"Update>> "` and
+/// `"Revert>> "` are true.
+fn prompt_ready(out: &[u8]) -> bool {
+    let mut end = out.len();
+    while end > 0 && (out[end - 1] == b'\n' || out[end - 1] == b'\r') {
+        end -= 1;
+    }
+    let trimmed = &out[..end];
+    trimmed.ends_with(b"? ") || trimmed.ends_with(b"> ")
+}
+
+#[test]
+fn prompt_ready_add_p() {
+    assert!(prompt_ready(
+        b"Stage this hunk [y,n,q,a,d,k,K,j,J,g,/,s,e,p,P,?]? "
+    ));
+}
+
+#[test]
+fn prompt_ready_what_now() {
+    assert!(prompt_ready(b"*** Commands ***\nWhat now> "));
+}
+
+#[test]
+fn prompt_ready_update() {
+    assert!(prompt_ready(b"Update>> "));
+    assert!(prompt_ready(b"Revert>> "));
+}
+
+#[test]
+fn prompt_ready_help_newline() {
+    assert!(!prompt_ready(b"y - stage this hunk\n"));
+    assert!(!prompt_ready(b"s - split the current hunk\n"));
+}
+
+#[test]
+fn prompt_ready_midline() {
+    assert!(!prompt_ready(b"foo? bar"));
+    assert!(!prompt_ready(b"What now> qux"));
+}
+
 /// Run `argv` in `dir` on a dumb pty with echo off, answering one line of
 /// `keys` each time the output goes quiet (then end of input), and return
 /// all it printed.
@@ -226,25 +269,43 @@ fn drive(dir: &Path, argv: &[&str], keys: &[&str], editor: &Path) -> String {
     });
     let mut out = Vec::new();
     let mut keys = keys.iter();
+    // Offset in `out` up to which a key was already sent: only output
+    // written after the last key can trigger the next one, so an old
+    // prompt never fires twice.
+    let mut sent_upto = 0usize;
+    let mut last_output = std::time::Instant::now();
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        match rx.recv_timeout(Duration::from_millis(400)) {
-            Ok(chunk) => out.extend(chunk),
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(chunk) => {
+                out.extend(chunk);
+                last_output = std::time::Instant::now();
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if child.try_wait().ok().flatten().is_some() || std::time::Instant::now() > deadline
                 {
                     break;
                 }
-                match keys.next() {
-                    Some(k) => writeln!(writer, "{k}").expect("write"),
-                    None => write!(writer, "\x04").expect("eof"),
+                // Nothing arrived in the last 25 ms: answer at once when a
+                // fresh prompt is showing, else fall back to answering
+                // after 400 ms of silence (output with no prompt, e.g. the
+                // editor case).
+                let prompted = prompt_ready(&out[sent_upto..]);
+                let silent = std::time::Instant::now() - last_output >= Duration::from_millis(400);
+                if prompted || silent {
+                    match keys.next() {
+                        Some(k) => writeln!(writer, "{k}").expect("write"),
+                        None => write!(writer, "\x04").expect("eof"),
+                    }
+                    let _ = writer.flush();
+                    sent_upto = out.len();
+                    last_output = std::time::Instant::now();
                 }
-                let _ = writer.flush();
             }
         }
     }
-    while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(200)) {
+    while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(50)) {
         out.extend(chunk);
     }
     let _ = child.kill();
@@ -357,7 +418,8 @@ fn mask_picker(text: &str) -> String {
 /// git's and rgit's pickers print the same and leave the same index and
 /// working tree for the same keys.
 fn same_picker(tag: &str, args: &[&str], keys: &[&str]) {
-    let editor = std::env::temp_dir().join(format!("rgit-line-{}-hunkedit", std::process::id()));
+    let editor =
+        std::env::temp_dir().join(format!("rgit-line-{}-{tag}-hunkedit", std::process::id()));
     std::fs::write(&editor, "#!/bin/sh\nsed -i.bak 's/^+x3$/+EDITED/' \"$1\"\n").unwrap();
     let mut perm = std::fs::metadata(&editor).unwrap().permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
@@ -422,13 +484,21 @@ fn split_refuses_unsplittable() -> bool {
 }
 
 #[test]
-fn patch_picker_matches_git() {
+fn picker_case_basic() {
     same_picker(
         "basic",
         &["add", "-p"],
         &["y", "n", "y", "n", "y", "y", "n"],
     );
+}
+
+#[test]
+fn picker_case_help() {
     same_picker("help", &["add", "-p"], &["?", "q"]);
+}
+
+#[test]
+fn picker_case_nav() {
     // Old git does not roll `K` backwards off the first hunk; drop that
     // one key there so the compared navigation stays generation-agnostic.
     let nav: &[&str] = if prev_hunk_wraps() {
@@ -437,52 +507,128 @@ fn patch_picker_matches_git() {
         &["J", "j", "K", "k", "J", "J", "J", "y", "q"]
     };
     same_picker("nav", &["add", "-p"], nav);
+}
+
+#[test]
+fn picker_case_goto() {
     same_picker("goto", &["add", "-p"], &["g", "3", "y", "g9", "g2", "q"]);
+}
+
+#[test]
+fn picker_case_search() {
     same_picker("search", &["add", "-p"], &["/x20", "y", "/nomatch", "q"]);
+}
+
+#[test]
+fn picker_case_split() {
     same_picker("split", &["add", "-p"], &["s", "y", "n", "y", "q"]);
+}
+
+#[test]
+fn picker_case_edit() {
     same_picker("edit", &["add", "-p"], &["s", "n", "e", "q"]);
+}
+
+#[test]
+fn picker_case_bad() {
     same_picker("bad", &["add", "-p"], &["zz", "x", "yes", "p", "q"]);
+}
+
+#[test]
+fn picker_case_reset() {
     same_picker("reset", &["reset", "-p"], &["y", "n", "y"]);
+}
+
+#[test]
+fn picker_case_reset_rev() {
     same_picker("reset-rev", &["reset", "-p", "HEAD~1"], &["y", "n", "q"]);
+}
+
+#[test]
+fn picker_case_checkout() {
     // This case presses `s` on a hunk git 2.55-final deems unsplittable;
     // rgit keeps the older no-op split, so skip it when the oracle refuses.
     if !split_refuses_unsplittable() {
         same_picker("checkout", &["checkout", "-p"], &["y", "n", "s", "y", "q"]);
     }
+}
+
+#[test]
+fn picker_case_checkout_head() {
     same_picker(
         "checkout-head",
         &["checkout", "-p", "HEAD"],
         &["n", "y", "q"],
     );
+}
+
+#[test]
+fn picker_case_restore() {
     same_picker("restore", &["restore", "-p"], &["y", "n", "q"]);
+}
+
+#[test]
+fn picker_case_restore_staged() {
     same_picker(
         "restore-staged",
         &["restore", "-p", "--staged"],
         &["y", "q"],
     );
+}
+
+#[test]
+fn picker_case_restore_src() {
     same_picker(
         "restore-src",
         &["restore", "-p", "--source=HEAD~1", "--staged", "--worktree"],
         &["y", "n", "q"],
     );
+}
+
+#[test]
+fn picker_case_stash() {
     same_picker("stash", &["stash", "push", "-p"], &["y", "n", "y", "q"]);
 }
 
 #[test]
-fn add_interactive_matches_git() {
+fn picker_case_i_status() {
     same_picker(
         "i-status",
         &["add", "-i"],
         &["s", "h", "?", "9", "zz", "", "q"],
     );
+}
+
+#[test]
+fn picker_case_i_update() {
     same_picker("i-update", &["add", "-i"], &["u", "1-2", "-1", "", "q"]);
+}
+
+#[test]
+fn picker_case_i_revert() {
     same_picker("i-revert", &["add", "-i"], &["r", "*", "q"]);
+}
+
+#[test]
+fn picker_case_i_untracked() {
     same_picker("i-untracked", &["add", "-i"], &["a", "n", "", "q"]);
+}
+
+#[test]
+fn picker_case_i_patch() {
     same_picker(
         "i-patch",
         &["add", "-i"],
         &["p", "1", "", "y", "n", "q", "q"],
     );
+}
+
+#[test]
+fn picker_case_i_diff() {
     same_picker("i-diff", &["add", "-i"], &["d", "1", "quit"]);
+}
+
+#[test]
+fn picker_case_i_eof() {
     same_picker("i-eof", &["add", "-i"], &[]);
 }
