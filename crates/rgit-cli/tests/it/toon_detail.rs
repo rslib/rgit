@@ -50,6 +50,8 @@ fn toon(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
     assert!(
@@ -67,6 +69,8 @@ fn json_out(dir: &Path, args: &[&str]) -> serde_json::Value {
         .args(args)
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
     assert!(
