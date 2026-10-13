@@ -5,14 +5,14 @@
 use std::sync::Arc;
 
 use rgit_git::{
-    BlameLine, CommitDetails, FileDiff, GitBackend, LineOrigin, LogEntry, LogOptions, RefKind,
-    RepoStatus, SmartlogEntry, StatusCode,
+    BlameLine, CombinedFile, CommitDetails, FileDiff, GitBackend, LineOrigin, LogEntry,
+    LogOptions, RefKind, RepoStatus, SmartlogEntry, StatusCode,
 };
 
 use crate::cli::{
     ApplyArgs, BranchCmd, BundleCmd, Command, CommitGraphCmd, ConfigArgs, DiffFormat, FlowCmd,
-    HookCmd, IndexCmd, LanesCmd, MaintenanceCmd, MidxCmd, NotesCmd, RemoteCmd, StackCmd, StashCmd,
-    SubmoduleCmd, WorkspaceCmd, WorktreeCmd,
+    HookCmd, IndexCmd, LanesCmd, MaintenanceCmd, MergeDiff, MidxCmd, NotesCmd, RemoteCmd,
+    StackCmd, StashCmd, SubmoduleCmd, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::render;
@@ -150,9 +150,16 @@ pub fn run(
             format,
             ref pretty,
             no_patch,
+            ref merge_diff,
+            first_parent,
             ..
         } if !pretty.any() && !revs.iter().any(|r| r.contains(':')) => {
-            show(backend, revs, paths, format, no_patch)?
+            let (mode, _) = merge_diff.resolve(if first_parent {
+                MergeDiff::FirstParent
+            } else {
+                MergeDiff::Dense
+            })?;
+            show(backend, revs, paths, format, no_patch, mode)?
         }
         Command::Blame {
             args,
@@ -1009,7 +1016,7 @@ fn file_row(f: &FileDiff, hunks: bool) -> crate::toon::Obj {
     if hunks {
         row.push((
             "hunks".to_owned(),
-            crate::toon::Node::List(f.hunks.iter().map(hunk_row).collect()),
+            crate::toon::Node::List(f.hunks.iter().map(|h| hunk_row(h, f)).collect()),
         ));
     }
     row
@@ -1017,7 +1024,7 @@ fn file_row(f: &FileDiff, hunks: bool) -> crate::toon::Obj {
 
 /// A hunk: its ranges, git's function context, and each diff line with its
 /// `+`, `-`, space or `\` prefix kept.
-fn hunk_row(h: &rgit_git::Hunk) -> crate::toon::Node {
+fn hunk_row(h: &rgit_git::Hunk, f: &FileDiff) -> crate::toon::Node {
     let body = h.header.strip_prefix("@@ ").unwrap_or(&h.header);
     let (ranges, context) = match body.find(" @@") {
         Some(i) => (&body[..i], body[i + 3..].trim()),
@@ -1027,23 +1034,23 @@ fn hunk_row(h: &rgit_git::Hunk) -> crate::toon::Node {
     if !context.is_empty() {
         row.push(("context".to_owned(), context.to_owned().into()));
     }
-    row.push((
-        "lines".to_owned(),
-        crate::toon::Node::List(
-            h.lines
-                .iter()
-                .map(|l| {
-                    let mark = match l.origin {
-                        LineOrigin::Context => " ",
-                        LineOrigin::Added => "+",
-                        LineOrigin::Removed => "-",
-                        LineOrigin::Meta => "",
-                    };
-                    crate::toon::Node::Str(format!("{mark}{}", l.text))
-                })
-                .collect(),
-        ),
-    ));
+    let lines = match crate::render::word_lines(f, h) {
+        Some(words) => words.into_iter().map(crate::toon::Node::Str).collect(),
+        None => h
+            .lines
+            .iter()
+            .map(|l| {
+                let mark = match l.origin {
+                    LineOrigin::Context => " ",
+                    LineOrigin::Added => "+",
+                    LineOrigin::Removed => "-",
+                    LineOrigin::Meta => "",
+                };
+                crate::toon::Node::Str(format!("{mark}{}", l.text))
+            })
+            .collect(),
+    };
+    row.push(("lines".to_owned(), crate::toon::Node::List(lines)));
     crate::toon::Node::Obj(row)
 }
 
@@ -1279,7 +1286,105 @@ fn diff(files: &[FileDiff], scope: &str, format: DiffFormat) -> Output {
 /// One commit's header and diff as structured fields: the full id, the author
 /// and committer as `Name <email>`, strict ISO dates, the message, and the
 /// files for the format in use.
-fn commit_fields(c: &CommitDetails, format: DiffFormat, no_patch: bool) -> crate::toon::Obj {
+/// A merge's combined files for the `files` list, when `mode` asks for the
+/// combined diff and hunks would print; else None for the first-parent diff.
+fn combined_files(
+    backend: &Arc<dyn GitBackend>,
+    c: &CommitDetails,
+    paths: &[String],
+    mode: MergeDiff,
+    format: DiffFormat,
+    no_patch: bool,
+) -> anyhow::Result<Option<Vec<CombinedFile>>> {
+    if c.parents.len() < 2
+        || !matches!(mode, MergeDiff::Combined | MergeDiff::Dense)
+        || no_patch
+        || (format.stat && !format.patch)
+    {
+        return Ok(None);
+    }
+    let files = backend.combined_diff(&c.full_id, paths, mode == MergeDiff::Dense)?;
+    Ok(Some(
+        files
+            .into_iter()
+            .filter(|f| f.patch.contains("\n@@@ "))
+            .collect(),
+    ))
+}
+
+/// The hunks of one `diff --cc` patch: `(at, context, lines)` each, `at` the
+/// space-joined ranges, lines with git's prefix columns kept.
+fn combined_hunks(patch: &str) -> Vec<(String, String, Vec<String>)> {
+    let mut hunks = Vec::new();
+    let mut cur: Option<(String, String, Vec<String>)> = None;
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("@@@ ") {
+            if let Some(h) = cur.take() {
+                hunks.push(h);
+            }
+            let (ranges, context) = match rest.find(" @@@") {
+                Some(i) => (rest[..i].to_owned(), rest[i + 4..].trim().to_owned()),
+                None => (rest.to_owned(), String::new()),
+            };
+            cur = Some((ranges, context, Vec::new()));
+        } else if let Some((_, _, lines)) = cur.as_mut() {
+            lines.push(line.to_owned());
+        }
+    }
+    if let Some(h) = cur {
+        hunks.push(h);
+    }
+    hunks
+}
+
+/// A merge's combined files as `files` rows, with hunks like `file_rows` so
+/// the shared line budget cuts them the same way.
+fn combined_rows(files: &[CombinedFile]) -> (Vec<crate::toon::Obj>, String) {
+    let (mut add, mut del) = (0, 0);
+    let rows = files
+        .iter()
+        .map(|f| {
+            let prefix = f.status.len();
+            let hunks = combined_hunks(&f.patch)
+                .into_iter()
+                .map(|(at, context, lines)| {
+                    for l in &lines {
+                        match l.chars().nth(prefix.saturating_sub(1)) {
+                            Some('+') => add += 1,
+                            Some('-') => del += 1,
+                            _ => {}
+                        }
+                    }
+                    let mut h = crate::obj! { "at" => at };
+                    if !context.is_empty() {
+                        h.push(("context".to_owned(), context.into()));
+                    }
+                    h.push((
+                        "lines".to_owned(),
+                        crate::toon::Node::List(
+                            lines.into_iter().map(crate::toon::Node::Str).collect(),
+                        ),
+                    ));
+                    crate::toon::Node::Obj(h)
+                })
+                .collect();
+            let mut row = crate::obj! {
+                "path" => f.path,
+                "status" => f.status.iter().collect::<String>(),
+            };
+            row.push(("hunks".to_owned(), crate::toon::Node::List(hunks)));
+            row
+        })
+        .collect();
+    (rows, format!("{} files, +{add} -{del}", files.len()))
+}
+
+fn commit_fields(
+    c: &CommitDetails,
+    format: DiffFormat,
+    no_patch: bool,
+    combined: Option<&[CombinedFile]>,
+) -> crate::toon::Obj {
     let mut lines = c.message.trim_end().lines();
     let subject = lines.next().unwrap_or_default().to_owned();
     let body = lines
@@ -1312,7 +1417,9 @@ fn commit_fields(c: &CommitDetails, format: DiffFormat, no_patch: bool) -> crate
                     .collect(),
             ),
         ));
-        if let Some((first, _)) = c.parents.first() {
+        if combined.is_some() {
+            out.push(("diff".to_owned(), "combined".into()));
+        } else if let Some((first, _)) = c.parents.first() {
             out.push(("diff".to_owned(), format!("first parent {first}").into()));
         }
     }
@@ -1325,7 +1432,10 @@ fn commit_fields(c: &CommitDetails, format: DiffFormat, no_patch: bool) -> crate
         ));
     }
     if !no_patch {
-        let (rows, total) = file_rows(&c.files, !format.stat || format.patch);
+        let (rows, total) = match combined {
+            Some(files) => combined_rows(files),
+            None => file_rows(&c.files, !format.stat || format.patch),
+        };
         out.push(("total".to_owned(), total.into()));
         if !format.shortstat {
             out.push((
@@ -1339,7 +1449,12 @@ fn commit_fields(c: &CommitDetails, format: DiffFormat, no_patch: bool) -> crate
 
 /// One commit as `show` prints it: the header fields, with `body` cut unless
 /// `--full` and the file rows registered for `--fields`.
-fn commit_out(c: &CommitDetails, format: DiffFormat, no_patch: bool) -> Output {
+fn commit_out(
+    c: &CommitDetails,
+    format: DiffFormat,
+    no_patch: bool,
+    combined: Option<&[CombinedFile]>,
+) -> Output {
     if !no_patch && (format.name_status || format.numstat) {
         return diff_form(&c.files, format, "0 files changed");
     }
@@ -1348,7 +1463,7 @@ fn commit_out(c: &CommitDetails, format: DiffFormat, no_patch: bool) -> Output {
         return Output::new(paths.join("\n")).with("files", paths);
     }
     let mut out = Output::new(render::commit_details(c));
-    for (key, value) in commit_fields(c, format, no_patch) {
+    for (key, value) in commit_fields(c, format, no_patch, combined) {
         match (key.as_str(), value) {
             ("body", crate::toon::Node::Str(body)) => out = out.long("body", body),
             ("files", crate::toon::Node::List(rows)) => {
@@ -1359,7 +1474,11 @@ fn commit_out(c: &CommitDetails, format: DiffFormat, no_patch: bool) -> Output {
                         _ => crate::toon::Obj::new(),
                     })
                     .collect();
-                out = out.list("files", objs, FILE_COLS, "0 files changed");
+                let empty = match combined {
+                    Some(_) => "0 files in the combined diff",
+                    None => "0 files changed",
+                };
+                out = out.list("files", objs, FILE_COLS, empty);
             }
             (key, value) => out.data.push((key.to_owned(), value)),
         }
@@ -1369,12 +1488,17 @@ fn commit_out(c: &CommitDetails, format: DiffFormat, no_patch: bool) -> Output {
 
 /// One commit of a `commits` list, with the file form `--name-only`,
 /// `--name-status` or `--numstat` asks for.
-fn commit_item(c: &CommitDetails, format: DiffFormat, no_patch: bool) -> crate::toon::Obj {
+fn commit_item(
+    c: &CommitDetails,
+    format: DiffFormat,
+    no_patch: bool,
+    combined: Option<&[CombinedFile]>,
+) -> crate::toon::Obj {
     let wants_form = format.name_only || format.name_status || format.numstat;
     if no_patch || !wants_form {
-        return commit_fields(c, format, no_patch);
+        return commit_fields(c, format, no_patch, combined);
     }
-    let mut item = commit_fields(c, format, true);
+    let mut item = commit_fields(c, format, true, None);
     let form = if format.name_only {
         let paths: Vec<&str> = c.files.iter().map(|f| f.path.as_str()).collect();
         Output::new("").with("files", paths)
@@ -1392,6 +1516,7 @@ fn show(
     paths: &[String],
     format: DiffFormat,
     no_patch: bool,
+    mode: MergeDiff,
 ) -> anyhow::Result<Output> {
     let trim = |mut c: CommitDetails| {
         if !paths.is_empty() {
@@ -1408,7 +1533,8 @@ fn show(
         let mut text = String::new();
         for rev in revs {
             let c = trim(backend.commit_details(rev)?);
-            items.push(commit_item(&c, format, no_patch));
+            let combined = combined_files(backend, &c, paths, mode, format, no_patch)?;
+            items.push(commit_item(&c, format, no_patch, combined.as_deref()));
             text.push_str(&render::commit_details(&c));
             text.push_str("\n\n");
         }
@@ -1418,7 +1544,8 @@ fn show(
     }
     let rev = revs.first().map_or("HEAD", String::as_str);
     let c = trim(backend.commit_details(rev)?);
-    let mut out = commit_out(&c, format, no_patch);
+    let combined = combined_files(backend, &c, paths, mode, format, no_patch)?;
+    let mut out = commit_out(&c, format, no_patch, combined.as_deref());
     if let Ok(obj) = backend.read_object(rev)
         && obj.kind == "tag"
         && let Some(tag) = tag_fields(&obj.data)
@@ -1442,6 +1569,18 @@ fn log_structured(
     format: DiffFormat,
 ) -> anyhow::Result<Output> {
     let opts: LogOptions = crate::cli::log_options(backend, command)?;
+    let (mode, _) = match command {
+        Command::Log {
+            merge_diff,
+            first_parent,
+            ..
+        } => merge_diff.resolve(if *first_parent {
+            MergeDiff::FirstParent
+        } else {
+            MergeDiff::Dense
+        })?,
+        _ => (MergeDiff::Dense, false),
+    };
     let entries = backend.log(&opts)?;
     let mut rows = Vec::new();
     for e in &entries {
@@ -1450,7 +1589,8 @@ fn log_structured(
             c.files
                 .retain(|f| rgit_git::pathspec_matches(&opts.paths, &f.path));
         }
-        rows.push(commit_fields(&c, format, false));
+        let combined = combined_files(backend, &c, &opts.paths, mode, format, false)?;
+        rows.push(commit_fields(&c, format, false, combined.as_deref()));
     }
     Ok(
         Output::new(render::log(&entries)).list(

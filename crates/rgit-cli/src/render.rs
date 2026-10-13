@@ -603,6 +603,42 @@ pub fn set_words(words: Option<Words>) {
     *WORDS.lock().expect("words lock") = words;
 }
 
+/// One hunk's lines for TOON and JSON with `--word-diff`: every style prints
+/// git's plain word form, `[-old-]{+new+}`, context lines plain; None when
+/// no word diff was asked.
+pub fn word_lines(f: &rgit_git::FileDiff, h: &rgit_git::Hunk) -> Option<Vec<String>> {
+    let words = WORDS.lock().expect("words lock");
+    let w = words.as_ref()?;
+    let old = (f.status != rgit_git::StatusCode::Added)
+        .then(|| f.old_path.as_deref().unwrap_or(&f.path));
+    let re = (w.regex)(old, &f.path).map(|re| {
+        rgit_git::userdiff::Regex::new(
+            &re,
+            rgit_git::userdiff::EXTENDED | rgit_git::userdiff::NEWLINE,
+        )
+        .unwrap_or_else(|_| {
+            crate::globals::fatal(
+                &format!(
+                    "invalid regular expression: {}",
+                    String::from_utf8_lossy(&re)
+                ),
+                128,
+            )
+        })
+    });
+    let out = word_hunk(
+        &h.lines,
+        rgit_git::userdiff::WordStyle::Plain,
+        re.as_ref(),
+        false,
+    );
+    let mut lines: Vec<String> = out.split('\n').map(str::to_owned).collect();
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    Some(lines)
+}
+
 /// One hunk's lines as git's word diff prints them: context lines as they
 /// are, each run of removed and added lines diffed by words.
 fn word_hunk(

@@ -383,7 +383,137 @@ fn show_merge_names_its_diff_base() {
     git(&dir, &["merge", "-q", "--no-ff", "topic", "-m", "merge"]);
     let out = toon(&dir, &["show", "HEAD"]);
     assert!(out.contains("parents[2]:"), "{out}");
+    assert!(out.contains("diff: combined"), "{out}");
+}
+
+/// A merge of two branches that both changed line 2 of `f`, resolved to
+/// `both`.
+fn conflict_merge_repo(tag: &str) -> PathBuf {
+    let dir = detail_repo(tag);
+    git(&dir, &["checkout", "-q", "-b", "side"]);
+    commit_file(&dir, "f", "a\nside\nc\nd\n");
+    git(&dir, &["checkout", "-q", "main"]);
+    commit_file(&dir, "f", "a\nmain\nc\nd\n");
+    let merging = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["merge", "--no-commit", "side"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(!merging.status.success());
+    std::fs::write(dir.join("f"), "a\nboth\nc\nd\n").unwrap();
+    git(&dir, &["add", "f"]);
+    git(&dir, &["commit", "-qm", "merge"]);
+    dir
+}
+
+/// A clean merge of branches that changed different files.
+fn clean_merge_repo(tag: &str) -> PathBuf {
+    let dir = detail_repo(tag);
+    git(&dir, &["checkout", "-q", "-b", "topic"]);
+    commit_file(&dir, "f", "a\nb\nc\nd\ntopic\n");
+    git(&dir, &["checkout", "-q", "main"]);
+    commit_file(&dir, "m", "main\n");
+    git(&dir, &["merge", "-q", "--no-ff", "topic", "-m", "merge"]);
+    dir
+}
+
+#[test]
+fn combined_conflict_fix_shows_in_hunk() {
+    let dir = conflict_merge_repo("combined-conflict");
+    let out = toon(&dir, &["show", "HEAD"]);
+    assert!(out.contains("diff: combined"), "{out}");
+    assert!(out.contains("at: \"-1,4 -1,4 +1,4\""), "{out}");
+    assert!(out.contains("++both"), "{out}");
+
+    let js = json_out(&dir, &["show", "HEAD"]);
+    assert_eq!(js["diff"], "combined");
+    let hunks = js["files"][0]["hunks"].as_array().unwrap();
+    assert_eq!(hunks[0]["at"], "-1,4 -1,4 +1,4");
+    assert!(
+        hunks[0]["lines"].as_array().unwrap().iter().any(|l| l == "++both"),
+        "{js}"
+    );
+}
+
+#[test]
+fn combined_clean_merge_has_no_files() {
+    let dir = clean_merge_repo("combined-clean");
+    let out = toon(&dir, &["show", "HEAD"]);
+    assert!(out.contains("diff: combined"), "{out}");
+    assert!(
+        out.contains("files: 0 files in the combined diff"),
+        "{out}"
+    );
+}
+
+#[test]
+fn combined_first_parent_keeps_first_parent_diff() {
+    let dir = clean_merge_repo("combined-first-parent");
+    let out = toon(&dir, &["show", "--first-parent", "HEAD"]);
     assert!(out.contains("diff: first parent "), "{out}");
+    assert!(out.contains("hunks"), "{out}");
+}
+
+#[test]
+fn combined_log_lists_the_merge_combined() {
+    let dir = conflict_merge_repo("combined-log");
+    let out = toon(&dir, &["log", "-p", "-n", "1"]);
+    assert!(out.contains("diff: combined"), "{out}");
+    assert!(out.contains("++both"), "{out}");
+}
+
+/// Unstaged: line `the quick fox` changed to `the slow fox`, with `a` above.
+fn word_repo(tag: &str) -> PathBuf {
+    let dir = detail_repo(tag);
+    std::fs::write(dir.join("f"), "a\nthe quick fox\n").unwrap();
+    git(&dir, &["add", "f"]);
+    git(&dir, &["commit", "-qm", "words"]);
+    std::fs::write(dir.join("f"), "a\nthe slow fox\n").unwrap();
+    dir
+}
+
+fn word_lines(js: &serde_json::Value) -> Vec<String> {
+    js["files"][0]["hunks"][0]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn word_diff_plain_marks_changed_words() {
+    let dir = word_repo("word-plain");
+    let out = toon(&dir, &["diff", "--word-diff"]);
+    assert!(out.contains("the [-quick-]{+slow+} fox"), "{out}");
+    let lines = word_lines(&json_out(&dir, &["diff", "--word-diff"]));
+    assert!(lines.iter().any(|l| l == "the [-quick-]{+slow+} fox"), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "a"), "{lines:?}");
+    git(&dir, &["add", "f"]);
+    git(&dir, &["commit", "-qm", "slow"]);
+    let out = toon(&dir, &["show", "HEAD", "--word-diff"]);
+    assert!(out.contains("the [-quick-]{+slow+} fox"), "{out}");
+}
+
+#[test]
+fn word_diff_porcelain_gives_same_lines() {
+    let dir = word_repo("word-porcelain");
+    let out = toon(&dir, &["diff", "--word-diff=porcelain"]);
+    assert!(out.contains("the [-quick-]{+slow+} fox"), "{out}");
+    let lines = word_lines(&json_out(&dir, &["diff", "--word-diff=porcelain"]));
+    assert!(lines.iter().any(|l| l == "the [-quick-]{+slow+} fox"), "{lines:?}");
+}
+
+#[test]
+fn word_diff_color_words_gives_plain_lines() {
+    let dir = word_repo("word-color");
+    let out = toon(&dir, &["diff", "--word-diff=color", "--color-words"]);
+    assert!(out.contains("the [-quick-]{+slow+} fox"), "{out}");
+    let out = toon(&dir, &["diff", "--color-words"]);
+    assert!(out.contains("the [-quick-]{+slow+} fox"), "{out}");
 }
 
 #[test]
