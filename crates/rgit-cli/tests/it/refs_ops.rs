@@ -1546,3 +1546,56 @@ fn worktree_add_guesses_the_remote_branch() {
         .unwrap();
     assert!(!out.status.success());
 }
+
+/// `rgit <args>` stdout, stderr and exit code.
+fn run(dir: &Path, args: &[&str]) -> (String, String, i32) {
+    let out = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .args(args)
+        .current_dir(dir)
+        .env("RGIT_OPLOG", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn branch_delete_names_a_missing_branch_like_git() {
+    let dir = repo("branch-del-missing");
+    git(&dir, &["branch", "y"]);
+    let (out, err, code) = run(&dir, &["--human", "branch", "-d", "nope", "y"]);
+    assert!(out.starts_with("Deleted branch y (was "), "{out}");
+    assert_eq!(err, "error: branch 'nope' not found\n");
+    assert_eq!(code, 1);
+    assert!(!git(&dir, &["branch"]).contains(" y\n"));
+
+    git(&dir, &["branch", "z"]);
+    let (out, err, code) = run(&dir, &["--toon", "branch", "-d", "nope", "z"]);
+    let all = format!("{out}{err}");
+    assert!(all.contains("branch 'nope' not found"), "{all}");
+    assert!(all.contains("deleted z"), "{all}");
+    assert!(!all.contains("class="), "{all}");
+    assert_eq!(code, 1);
+}
+
+#[test]
+fn tag_delete_names_a_missing_tag_like_git() {
+    let dir = repo("tag-del-missing");
+    git(&dir, &["tag", "t1"]);
+    let (out, err, code) = run(&dir, &["--human", "tag", "-d", "nope", "t1"]);
+    assert!(out.starts_with("Deleted tag 't1' (was "), "{out}");
+    assert_eq!(err, "error: tag 'nope' not found.\n");
+    assert_eq!(code, 1);
+
+    git(&dir, &["tag", "t2"]);
+    let (out, err, code) = run(&dir, &["--toon", "tag", "-d", "nope", "t2"]);
+    let all = format!("{out}{err}");
+    assert!(all.contains("tag 'nope' not found"), "{all}");
+    assert!(all.contains("deleted t2"), "{all}");
+    assert!(!all.contains("class="), "{all}");
+    assert_eq!(code, 1);
+}

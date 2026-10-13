@@ -9647,24 +9647,24 @@ fn run_command(
                     return Err(CliError::usage("tag -d needs a tag name"));
                 }
                 let mut deleted = String::new();
-                let failed: Vec<String> = names
-                    .iter()
-                    .filter_map(|n| {
-                        let was = backend
-                            .read_object(&format!("refs/tags/{n}"))
-                            .and_then(|o| backend.abbrev_id(&o.id, 7))
-                            .unwrap_or_default();
-                        match backend.delete_tag(n) {
-                            Ok(()) => {
-                                deleted.push_str(&format!("Deleted tag '{n}' (was {was})\n"));
-                                None
-                            }
-                            Err(e) => Some(format!("{n}: {e}")),
+                let mut done = Vec::new();
+                let mut failed = Vec::new();
+                for n in &names {
+                    let Ok(object) = backend.read_object(&format!("refs/tags/{n}")) else {
+                        failed.push(format!("tag '{n}' not found."));
+                        continue;
+                    };
+                    let was = backend.abbrev_id(&object.id, 7).unwrap_or_default();
+                    match backend.delete_tag(n) {
+                        Ok(()) => {
+                            deleted.push_str(&format!("Deleted tag '{n}' (was {was})\n"));
+                            done.push(n.as_str());
                         }
-                    })
-                    .collect();
+                        Err(e) => failed.push(format!("{n}: {e}")),
+                    }
+                }
                 if !failed.is_empty() {
-                    anyhow::bail!("could not delete {}", failed.join("; "));
+                    return Err(partial_delete(&deleted, &done, &failed));
                 }
                 if render::text_mode() {
                     deleted
@@ -13400,30 +13400,50 @@ fn delete_branches(
     names: &[String],
     force: bool,
 ) -> anyhow::Result<String> {
+    let local = backend.local_branches()?;
     let mut deleted = String::new();
-    let failed: Vec<String> = names
-        .iter()
-        .filter_map(|n| {
-            let was = backend
-                .rev_parse(&format!("refs/heads/{n}"))
-                .and_then(|id| backend.abbrev_id(&id, 7))
-                .unwrap_or_default();
-            match backend.delete_branch(n, force) {
-                Ok(()) => {
-                    deleted.push_str(&format!("Deleted branch {n} (was {was}).\n"));
-                    None
-                }
-                Err(e) => Some(format!("{n}: {e}")),
+    let mut done = Vec::new();
+    let mut failed = Vec::new();
+    for n in names {
+        if !local.contains(n) {
+            failed.push(format!("branch '{n}' not found"));
+            continue;
+        }
+        let was = backend
+            .rev_parse(&format!("refs/heads/{n}"))
+            .and_then(|id| backend.abbrev_id(&id, 7))
+            .unwrap_or_default();
+        match backend.delete_branch(n, force) {
+            Ok(()) => {
+                deleted.push_str(&format!("Deleted branch {n} (was {was}).\n"));
+                done.push(n.as_str());
             }
-        })
-        .collect();
+            Err(e) => failed.push(format!("{n}: {e}")),
+        }
+    }
     if !failed.is_empty() {
-        anyhow::bail!("could not delete {}", failed.join("; "));
+        return Err(partial_delete(&deleted, &done, &failed));
     }
     if render::text_mode() {
         return Ok(deleted);
     }
     Ok(format!("deleted branch {}", names.join(", ")))
+}
+
+/// The error of a delete that failed for some names: git prints the deleted
+/// names on stdout and one `error:` line per failure; the agent modes name
+/// both in one message.
+fn partial_delete(deleted: &str, done: &[&str], failed: &[String]) -> anyhow::Error {
+    if render::text_mode() {
+        print!("{deleted}");
+        let lines: Vec<String> = failed.iter().map(|f| format!("error: {f}")).collect();
+        return anyhow::anyhow!(lines.join("\n"));
+    }
+    let mut message = failed.join("; ");
+    if !done.is_empty() {
+        message.push_str(&format!(" (deleted {})", done.join(", ")));
+    }
+    anyhow::anyhow!(message)
 }
 
 /// `rgit branch` with git's flags that change branches: create, delete,
