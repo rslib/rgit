@@ -11,7 +11,7 @@ If `rgit` is not on PATH, install it with `cargo install --locked --git https://
 
 ## Start here
 
-- Run `rgit --toon diff --patch` to see unstaged changes
+- Run `rgit --toon diff` to see unstaged changes
 - Run `rgit --toon stage <path>` to stage a file
 - Run `rgit --toon commit -m "<message>"` to commit staged changes
 - Run `rgit --toon log --limit 20` for recent commits

@@ -372,7 +372,7 @@ pub fn translate(error: &anyhow::Error) -> (String, Vec<String>, i32) {
         GitError::NotFastForward => "Run `rgit pull --rebase` to integrate upstream commits",
         GitError::PushRejected => "Run `rgit pull --rebase`, then `rgit push`",
         GitError::DetachedHead => "Run `rgit checkout <branch>` to get on a branch",
-        GitError::HunkNotFound { .. } => "Run `rgit diff --patch` to see the current hunks",
+        GitError::HunkNotFound { .. } => "Run `rgit diff` to see the current hunks",
         GitError::Conflict(_) => "Run `rgit status` to see the conflicted files",
         _ => "",
     };

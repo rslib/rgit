@@ -7369,7 +7369,7 @@ pub const DESCRIPTION: &str = "Inspect and change the git repository in the curr
 
 /// Next-step commands shared by the home view and the installed skill.
 pub const HOME_HELP: [&str; 5] = [
-    "Run `rgit diff --patch` to see unstaged changes",
+    "Run `rgit diff` to see unstaged changes",
     "Run `rgit stage <path>` to stage a file",
     "Run `rgit commit -m \"<message>\"` to commit staged changes",
     "Run `rgit log --limit 20` for recent commits",
