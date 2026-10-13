@@ -21,6 +21,7 @@ mod remote_ops;
 mod sequencer;
 mod sparse;
 mod stack;
+mod toon_detail;
 mod workflow;
 mod workspace;
 mod worktree_ops;

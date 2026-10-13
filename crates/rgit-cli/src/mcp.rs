@@ -5757,13 +5757,13 @@ mod tests {
 
         std::fs::write(dir.join("f.txt"), "y\n".repeat(2000)).unwrap();
         let patch = call(&backend, "git_diff", json!({ "patch": true })).unwrap();
-        assert!(patch.contains("truncated"), "{patch}");
+        assert!(patch.contains("count: 200 of 2001 diff lines"), "{patch}");
         assert!(
-            patch.contains("Call git_diff with full=true to see the complete patch"),
+            patch.contains("Call git_diff with full=true to see the whole patch"),
             "{patch}"
         );
         let whole = call(&backend, "git_diff", json!({ "patch": true, "full": true })).unwrap();
-        assert!(!whole.contains("truncated"));
+        assert!(!whole.contains("count:"));
 
         let created = call(&backend, "git_branch_create", json!({ "name": "b1" })).unwrap();
         assert!(

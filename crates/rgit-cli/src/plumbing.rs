@@ -592,11 +592,18 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                 return Ok(Output::new(String::new()));
             }
             let text = String::from_utf8_lossy(&obj.data).into_owned();
-            Output::new(text.clone())
+            let mut out = Output::new(text.clone())
                 .with("type", obj.kind)
                 .with("id", obj.id)
-                .with("size", obj.data.len())
-                .long("content", text)
+                .with("size", obj.data.len());
+            // A commit or tag keeps each line its own value, so no `\n` hide
+            // inside one string.
+            if obj.kind == "commit" || obj.kind == "tag" {
+                out.set("lines", text.lines().collect::<Vec<_>>());
+                out
+            } else {
+                out.long("content", text)
+            }
         }
         Plumbing::ShowRef {
             heads,

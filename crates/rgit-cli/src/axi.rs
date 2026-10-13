@@ -10,8 +10,8 @@ use rgit_git::{
 };
 
 use crate::cli::{
-    ApplyArgs, BranchCmd, BundleCmd, Command, CommitGraphCmd, ConfigArgs, FlowCmd, HookCmd,
-    IndexCmd, LanesCmd, MaintenanceCmd, MidxCmd, NotesCmd, RemoteCmd, StackCmd, StashCmd,
+    ApplyArgs, BranchCmd, BundleCmd, Command, CommitGraphCmd, ConfigArgs, DiffFormat, FlowCmd,
+    HookCmd, IndexCmd, LanesCmd, MaintenanceCmd, MidxCmd, NotesCmd, RemoteCmd, StackCmd, StashCmd,
     SubmoduleCmd, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
@@ -86,6 +86,19 @@ pub fn run(
             format,
             ref pretty,
             ref line_ranges,
+            walk_reflogs,
+            ..
+        } if (format.patch || format.stat)
+            && !pretty.any()
+            && !walk_reflogs
+            && line_ranges.is_empty() =>
+        {
+            log_structured(backend, &command, format)?
+        }
+        Command::Log {
+            format,
+            ref pretty,
+            ref line_ranges,
             ..
         } if !format.any() && !pretty.any() && line_ranges.is_empty() => {
             let opts: LogOptions = crate::cli::log_options(backend, &command)?;
@@ -123,29 +136,12 @@ pub fn run(
             }
             log(&entries, total, filtered, &base)
         }
-        Command::Diff {
-            format,
-            ref revs,
-            cached,
-            ..
-        } => {
+        Command::Diff { format, .. } => {
             let (files, scope) = crate::cli::diff_files(backend, &command)?;
-            let mut base = String::from("rgit diff");
-            for rev in revs {
-                base.push(' ');
-                base.push_str(rev);
-            }
-            if cached {
-                base.push_str(" --cached");
-            }
-            if format.name_status
-                || format.numstat
-                || format.shortstat
-                || format.patch && format.stat
-            {
-                Output::new(crate::cli::diff_out(&files, format))
+            if format.name_status || format.numstat || format.shortstat {
+                diff_form(&files, format, &format!("0 {scope} changes"))
             } else {
-                diff(&files, &scope, &base, format.patch, format.name_only)
+                diff(&files, &scope, format)
             }
         }
         Command::Show {
@@ -155,19 +151,8 @@ pub fn run(
             ref pretty,
             no_patch,
             ..
-        } if revs.len() <= 1
-            && !revs.iter().any(|r| r.contains(':'))
-            && !(pretty.any() || format.name_status || format.numstat) =>
-        {
-            let mut c = backend.commit_details(revs.first().map_or("HEAD", String::as_str))?;
-            if !paths.is_empty() {
-                c.files
-                    .retain(|f| rgit_git::pathspec_matches(paths, &f.path));
-            }
-            if no_patch {
-                c.files.clear();
-            }
-            show(&c, format.patch && !no_patch, format.name_only && !no_patch)
+        } if !pretty.any() && !revs.iter().any(|r| r.contains(':')) => {
+            show(backend, revs, paths, format, no_patch)?
         }
         Command::Blame {
             args,
@@ -194,7 +179,24 @@ pub fn run(
                 other => other.into(),
             })?;
             let (start, end) = paged.unwrap_or((1, usize::MAX));
-            blame(&all.lines, &path, start, end)
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            let mut whens = std::collections::HashMap::new();
+            for line in &all.lines {
+                if line.id.is_empty() {
+                    continue;
+                }
+                whens
+                    .entry(line.id.clone())
+                    .or_insert_with(|| {
+                        backend
+                            .read_object(&line.id)
+                            .map(|o| commit_when(&o.data, now))
+                            .unwrap_or_default()
+                    });
+            }
+            blame(&all.lines, &whens, &path, start, end)
         }
         Command::Plumbing(c) => crate::plumbing::run(backend, c, false)?,
         Command::Extra(c) => crate::extra::run(backend, c, false)?,
@@ -407,10 +409,12 @@ pub fn run(
                     index,
                     patch,
                     name_only,
+                    name_status,
+                    numstat,
+                    stat,
+                    patch_with_stat,
                     include_untracked,
                     only_untracked,
-                    name_status: false,
-                    numstat: false,
                     ..
                 }),
             ..
@@ -421,8 +425,28 @@ pub fn run(
                 i,
                 (!only_untracked, include_untracked || only_untracked),
             )?;
-            let base = format!("rgit stash show stash@{{{i}}}");
-            diff(&files, &format!("stash@{{{i}}}"), &base, patch, name_only)
+            let mut format = DiffFormat {
+                patch: patch || patch_with_stat,
+                stat: stat || patch_with_stat,
+                name_only,
+                name_status,
+                numstat,
+                ..DiffFormat::default()
+            };
+            if !format.any() {
+                let bool_config = |k: &str, default: bool| {
+                    backend.config_get(k).ok().flatten().map_or(default, |v| {
+                        matches!(v.to_lowercase().as_str(), "true" | "yes" | "on" | "1")
+                    })
+                };
+                format.stat = bool_config("stash.showStat", true);
+                format.patch = bool_config("stash.showPatch", false);
+            }
+            if name_status || numstat {
+                diff_form(&files, format, "0 files changed")
+            } else {
+                diff(&files, &format!("stash@{{{i}}}"), format)
+            }
         }
         Command::Stash {
             cmd: Some(StashCmd::List {
@@ -508,7 +532,7 @@ pub fn run(
             Output::new(render::worktrees(&list)).list(
                 "worktrees",
                 rows,
-                &["name", "branch", "path"],
+                &["name", "branch", "path", "head"],
                 "0 worktrees",
             )
         }
@@ -972,7 +996,64 @@ pub(crate) fn line_counts(f: &FileDiff) -> (usize, usize) {
     (add, del)
 }
 
-fn stat_rows(files: &[FileDiff]) -> (Vec<crate::toon::Obj>, String) {
+/// One file of a diff: counts, its rename source and binary mark, and the
+/// hunks when the patch is shown.
+fn file_row(f: &FileDiff, hunks: bool) -> crate::toon::Obj {
+    let (added, removed) = line_counts(f);
+    let mut row = crate::obj! {
+        "path" => f.path,
+        "status" => f.status.letter(),
+        "added" => added,
+        "removed" => removed,
+    };
+    if let Some(old) = &f.old_path {
+        row.push(("old_path".to_owned(), old.clone().into()));
+    }
+    if f.binary {
+        row.push(("binary".to_owned(), true.into()));
+    }
+    if hunks {
+        row.push((
+            "hunks".to_owned(),
+            crate::toon::Node::List(f.hunks.iter().map(hunk_row).collect()),
+        ));
+    }
+    row
+}
+
+/// A hunk: its ranges, git's function context, and each diff line with its
+/// `+`, `-`, space or `\` prefix kept.
+fn hunk_row(h: &rgit_git::Hunk) -> crate::toon::Node {
+    let body = h.header.strip_prefix("@@ ").unwrap_or(&h.header);
+    let (ranges, context) = match body.find(" @@") {
+        Some(i) => (&body[..i], body[i + 3..].trim()),
+        None => (body, ""),
+    };
+    let mut row = crate::obj! { "at" => ranges };
+    if !context.is_empty() {
+        row.push(("context".to_owned(), context.to_owned().into()));
+    }
+    row.push((
+        "lines".to_owned(),
+        crate::toon::Node::List(
+            h.lines
+                .iter()
+                .map(|l| {
+                    let mark = match l.origin {
+                        LineOrigin::Context => " ",
+                        LineOrigin::Added => "+",
+                        LineOrigin::Removed => "-",
+                        LineOrigin::Meta => "",
+                    };
+                    crate::toon::Node::Str(format!("{mark}{}", l.text))
+                })
+                .collect(),
+        ),
+    ));
+    crate::toon::Node::Obj(row)
+}
+
+fn file_rows(files: &[FileDiff], hunks: bool) -> (Vec<crate::toon::Obj>, String) {
     let (mut add, mut del) = (0, 0);
     let rows = files
         .iter()
@@ -980,11 +1061,13 @@ fn stat_rows(files: &[FileDiff]) -> (Vec<crate::toon::Obj>, String) {
             let (a, d) = line_counts(f);
             add += a;
             del += d;
-            crate::obj! { "path" => f.path, "added" => a, "removed" => d, "binary" => f.binary }
+            file_row(f, hunks)
         })
         .collect();
     (rows, format!("{} files, +{add} -{del}", files.len()))
 }
+
+const FILE_COLS: &[&str] = &["path", "status", "old_path", "added", "removed", "binary", "hunks"];
 
 /// The structured working-tree status, also used by the home view.
 pub fn run_status(s: &RepoStatus) -> Output {
@@ -1141,9 +1224,43 @@ fn log(entries: &[LogEntry], total: Option<usize>, filtered: bool, base: &str) -
         .help("Run `rgit show <id>` for a commit's details")
 }
 
-fn diff(files: &[FileDiff], scope: &str, base: &str, patch: bool, name_only: bool) -> Output {
+/// git's list forms of a diff as structured data: `--name-status` and
+/// `--numstat` as a file table, `--shortstat` as the summary alone.
+fn diff_form(files: &[FileDiff], format: DiffFormat, empty: &str) -> Output {
+    let text = crate::cli::diff_out(files, format);
+    if format.shortstat {
+        let (_, total) = file_rows(files, false);
+        return Output::new(text).with("total", total);
+    }
+    let rows: Vec<crate::toon::Obj> = files
+        .iter()
+        .map(|f| {
+            let mut row = if format.numstat {
+                let (added, removed) = line_counts(f);
+                crate::obj! { "path" => f.path, "added" => added, "removed" => removed }
+            } else {
+                crate::obj! { "path" => f.path, "status" => f.status.letter() }
+            };
+            if let Some(old) = &f.old_path {
+                row.push(("old_path".to_owned(), old.clone().into()));
+            }
+            if f.binary {
+                row.push(("binary".to_owned(), true.into()));
+            }
+            row
+        })
+        .collect();
+    let cols: &[&str] = if format.numstat {
+        &["path", "added", "removed"]
+    } else {
+        &["path", "status"]
+    };
+    Output::new(text).list("files", rows, cols, empty)
+}
+
+fn diff(files: &[FileDiff], scope: &str, format: DiffFormat) -> Output {
     let empty = format!("0 {scope} changes");
-    if name_only {
+    if format.name_only {
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         let out = Output::new(paths.join("\n"));
         return if paths.is_empty() {
@@ -1152,65 +1269,348 @@ fn diff(files: &[FileDiff], scope: &str, base: &str, patch: bool, name_only: boo
             out.with("files", paths)
         };
     }
-    let (rows, total) = stat_rows(files);
-    if patch {
-        let text = render::patch(files);
-        return if files.is_empty() {
-            Output::new(text).with("patch", empty)
-        } else {
-            Output::new(text.clone())
-                .with("total", total)
-                .long("patch", text)
-        };
-    }
-    let mut out = Output::new(render::diffstat(files));
+    let (rows, total) = file_rows(files, !format.stat || format.patch);
+    let mut out = Output::new(render::diffstat(files)).list("files", rows, FILE_COLS, empty);
     if !files.is_empty() {
         out = out.with("total", total);
     }
-    out = out.list("files", rows, &["path", "added", "removed"], empty);
-    if !files.is_empty() {
-        out = out.help(format!("Run `{base} --patch` for the full patch"));
-        if scope == "unstaged" {
-            out = out.help("Run `rgit stage <path>` to stage a file");
-        }
+    if !files.is_empty() && scope == "unstaged" {
+        out = out.help("Run `rgit stage <path>` to stage a file");
     } else if scope == "unstaged" {
         out = out.help("Run `rgit diff --cached` to see staged changes");
     }
     out
 }
 
-fn show(c: &CommitDetails, patch: bool, name_only: bool) -> Output {
-    if name_only {
+/// One commit's header and diff as structured fields: the full id, the author
+/// and committer as `Name <email>`, strict ISO dates, the message, and the
+/// files for the format in use.
+fn commit_fields(c: &CommitDetails, format: DiffFormat, no_patch: bool) -> crate::toon::Obj {
+    let mut lines = c.message.trim_end().lines();
+    let subject = lines.next().unwrap_or_default().to_owned();
+    let body = lines
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned();
+    let author = format!("{} <{}>", c.author, c.email);
+    let mut out = crate::obj! {
+        "id" => c.full_id.clone(),
+        "author" => author.clone(),
+        "date" => iso_date(&c.author_date),
+        "when" => c.when.clone(),
+        "subject" => subject,
+    };
+    if !body.is_empty() {
+        out.push(("body".to_owned(), body.into()));
+    }
+    let committer = format!("{} <{}>", c.committer, c.committer_email);
+    if committer != author {
+        out.push(("committer".to_owned(), committer.into()));
+    }
+    if c.parents.len() > 1 {
+        out.push((
+            "parents".to_owned(),
+            crate::toon::Node::List(
+                c.parents
+                    .iter()
+                    .map(|(id, _)| id.clone().into())
+                    .collect(),
+            ),
+        ));
+        if let Some((first, _)) = c.parents.first() {
+            out.push(("diff".to_owned(), format!("first parent {first}").into()));
+        }
+    }
+    if !c.refs.is_empty() {
+        out.push((
+            "refs".to_owned(),
+            crate::toon::Node::List(
+                c.refs.iter().map(|r| r.clone().into()).collect(),
+            ),
+        ));
+    }
+    if !no_patch {
+        let (rows, total) = file_rows(&c.files, !format.stat || format.patch);
+        out.push(("total".to_owned(), total.into()));
+        if !format.shortstat {
+            out.push((
+                "files".to_owned(),
+                crate::toon::Node::List(rows.into_iter().map(crate::toon::Node::Obj).collect()),
+            ));
+        }
+    }
+    out
+}
+
+/// One commit as `show` prints it: the header fields, with `body` cut unless
+/// `--full` and the file rows registered for `--fields`.
+fn commit_out(c: &CommitDetails, format: DiffFormat, no_patch: bool) -> Output {
+    if !no_patch && (format.name_status || format.numstat) {
+        return diff_form(&c.files, format, "0 files changed");
+    }
+    if format.name_only && !no_patch {
         let paths: Vec<&str> = c.files.iter().map(|f| f.path.as_str()).collect();
         return Output::new(paths.join("\n")).with("files", paths);
     }
-    if patch {
-        let text = render::patch(&c.files);
-        return Output::new(text.clone())
-            .with("id", c.id.as_str())
-            .long("patch", text);
+    let mut out = Output::new(render::commit_details(c));
+    for (key, value) in commit_fields(c, format, no_patch) {
+        match (key.as_str(), value) {
+            ("body", crate::toon::Node::Str(body)) => out = out.long("body", body),
+            ("files", crate::toon::Node::List(rows)) => {
+                let objs = rows
+                    .into_iter()
+                    .map(|r| match r {
+                        crate::toon::Node::Obj(o) => o,
+                        _ => crate::toon::Obj::new(),
+                    })
+                    .collect();
+                out = out.list("files", objs, FILE_COLS, "0 files changed");
+            }
+            (key, value) => out.data.push((key.to_owned(), value)),
+        }
     }
-    let mut lines = c.message.trim_end().lines();
-    let subject = lines.next().unwrap_or_default();
-    let body = lines.collect::<Vec<_>>().join("\n").trim().to_owned();
-    let (rows, total) = stat_rows(&c.files);
-    let mut out = Output::new(render::commit_details(c))
-        .with("id", c.id.as_str())
-        .with("author", c.author.as_str())
-        .with("when", c.when.as_str())
-        .with("subject", subject);
-    if !body.is_empty() {
-        out = out.long("body", body);
+    out
+}
+
+/// One commit of a `commits` list, with the file form `--name-only`,
+/// `--name-status` or `--numstat` asks for.
+fn commit_item(c: &CommitDetails, format: DiffFormat, no_patch: bool) -> crate::toon::Obj {
+    let wants_form = format.name_only || format.name_status || format.numstat;
+    if no_patch || !wants_form {
+        return commit_fields(c, format, no_patch);
     }
-    out.with("total", total).list(
-        "files",
-        rows,
-        &["path", "added", "removed"],
-        "0 files changed",
+    let mut item = commit_fields(c, format, true);
+    let form = if format.name_only {
+        let paths: Vec<&str> = c.files.iter().map(|f| f.path.as_str()).collect();
+        Output::new("").with("files", paths)
+    } else {
+        diff_form(&c.files, format, "0 files changed")
+    };
+    item.extend(form.data);
+    item
+}
+
+/// What `show` prints: one commit, or a `commits` list for several.
+fn show(
+    backend: &Arc<dyn GitBackend>,
+    revs: &[String],
+    paths: &[String],
+    format: DiffFormat,
+    no_patch: bool,
+) -> anyhow::Result<Output> {
+    let trim = |mut c: CommitDetails| {
+        if !paths.is_empty() {
+            c.files
+                .retain(|f| rgit_git::pathspec_matches(paths, &f.path));
+        }
+        if no_patch {
+            c.files.clear();
+        }
+        c
+    };
+    if revs.len() > 1 && !revs.iter().any(|r| r.contains(':')) {
+        let mut items = Vec::new();
+        let mut text = String::new();
+        for rev in revs {
+            let c = trim(backend.commit_details(rev)?);
+            items.push(commit_item(&c, format, no_patch));
+            text.push_str(&render::commit_details(&c));
+            text.push_str("\n\n");
+        }
+        text.pop();
+        text.pop();
+        return Ok(Output::new(text).list("commits", items, COMMIT_COLS, "0 commits"));
+    }
+    let rev = revs.first().map_or("HEAD", String::as_str);
+    let c = trim(backend.commit_details(rev)?);
+    let mut out = commit_out(&c, format, no_patch);
+    if let Ok(obj) = backend.read_object(rev)
+        && obj.kind == "tag"
+        && let Some(tag) = tag_fields(&obj.data)
+    {
+        out.data
+            .insert(0, ("tag".to_owned(), crate::toon::Node::Obj(tag)));
+    }
+    Ok(out)
+}
+
+const COMMIT_COLS: &[&str] = &[
+    "id", "author", "date", "when", "subject", "body", "committer", "parents", "diff", "refs",
+    "total", "files",
+];
+
+/// What `log -p` and `log --stat` print: a `commits` list, each item the show
+/// header and its files, with hunks for `-p` and without for `--stat`.
+fn log_structured(
+    backend: &Arc<dyn GitBackend>,
+    command: &Command,
+    format: DiffFormat,
+) -> anyhow::Result<Output> {
+    let opts: LogOptions = crate::cli::log_options(backend, command)?;
+    let entries = backend.log(&opts)?;
+    let mut rows = Vec::new();
+    for e in &entries {
+        let mut c = backend.commit_details(&e.oid)?;
+        if !opts.paths.is_empty() {
+            c.files
+                .retain(|f| rgit_git::pathspec_matches(&opts.paths, &f.path));
+        }
+        rows.push(commit_fields(&c, format, false));
+    }
+    Ok(
+        Output::new(render::log(&entries)).list(
+            "commits",
+            rows,
+            COMMIT_COLS,
+            "0 commits on this branch",
+        ),
     )
 }
 
-fn blame(all: &[BlameLine], path: &str, start: usize, end: usize) -> Output {
+/// An annotated tag's own fields: its name, tagger, strict ISO date,
+/// message and signature kind, from the tag object's text.
+fn tag_fields(data: &[u8]) -> Option<crate::toon::Obj> {
+    let text = String::from_utf8_lossy(data);
+    let mut name = None;
+    let mut target = None;
+    let mut tagger = None;
+    let mut lines = text.lines();
+    for line in lines.by_ref() {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(v) = line.strip_prefix("tag ") {
+            name = Some(v.to_owned());
+        } else if let Some(v) = line.strip_prefix("object ") {
+            target = Some(v.to_owned());
+        } else if let Some(v) = line.strip_prefix("tagger ") {
+            tagger = Some(v.to_owned());
+        }
+    }
+    let mut message = Vec::new();
+    let mut signature = None;
+    for line in lines {
+        signature = match line {
+            "-----BEGIN PGP SIGNATURE-----" => Some("gpg"),
+            "-----BEGIN SSH SIGNATURE-----" => Some("ssh"),
+            "-----BEGIN SIGNED MESSAGE-----" => Some("x509"),
+            _ => None,
+        };
+        if signature.is_some() {
+            break;
+        }
+        message.push(line);
+    }
+    let message = message.join("\n").trim().to_owned();
+    let mut row = crate::obj! { "name" => name? };
+    if let Some(target) = target {
+        row.push(("object".to_owned(), target.into()));
+    }
+    if let Some(t) = tagger {
+        let (who, epoch, zone) = parse_signature(&t);
+        row.push(("tagger".to_owned(), who.into()));
+        row.push(("date".to_owned(), epoch_iso(epoch, &zone).into()));
+    }
+    row.push(("message".to_owned(), message.into()));
+    if let Some(kind) = signature {
+        row.push(("signature".to_owned(), kind.into()));
+    }
+    Some(row)
+}
+
+/// A git signature line `Name <email> epoch zone` as who, epoch and zone.
+fn parse_signature(line: &str) -> (String, i64, String) {
+    let (who, rest) = match line.split_once(" <") {
+        Some((who, rest)) => (who.to_owned(), rest),
+        None => return (line.to_owned(), 0, "+0000".to_owned()),
+    };
+    let (email, rest) = match rest.split_once("> ") {
+        Some((email, rest)) => (email.to_owned(), rest),
+        None => return (who, 0, "+0000".to_owned()),
+    };
+    let mut words = rest.split_whitespace();
+    let epoch = words.next().and_then(|w| w.parse().ok()).unwrap_or(0);
+    let zone = words.next().unwrap_or("+0000").to_owned();
+    (format!("{who} <{email}>"), epoch, zone)
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// git's default date form (`Thu Sep 24 23:24:06 2026 -0500`) as strict
+/// ISO 8601.
+fn iso_date(d: &str) -> String {
+    let w: Vec<&str> = d.split_whitespace().collect();
+    let [_, month, day, time, year, zone] = w.as_slice() else {
+        return d.to_owned();
+    };
+    let m = MONTHS
+        .iter()
+        .position(|m| *m == *month)
+        .map_or(0, |m| m + 1);
+    format!(
+        "{year}-{m:02}-{day:0>2}T{time}{}",
+        zone_colon(zone)
+    )
+}
+
+/// Unix time and a `+/-HHMM` zone as strict ISO 8601.
+fn epoch_iso(epoch: i64, zone: &str) -> String {
+    let offset = zone_offset(zone);
+    let local = epoch + i64::from(offset) * 60;
+    let days = local.div_euclid(86_400);
+    let secs = local.rem_euclid(86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!(
+        "{y:04}-{month:02}-{day:02}T{:<02}:{:<02}:{:<02}{}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+        zone_colon(zone)
+    )
+}
+
+/// A `+/-HHMM` zone as `+/-HH:MM`.
+fn zone_colon(zone: &str) -> String {
+    let bytes = zone.as_bytes();
+    if bytes.len() == 5 && (bytes[0] == b'+' || bytes[0] == b'-') {
+        format!("{}{}:{}", zone[..1].to_owned(), &zone[1..3], &zone[3..5])
+    } else {
+        zone.to_owned()
+    }
+}
+
+/// A `+/-HHMM` zone's offset in minutes.
+fn zone_offset(zone: &str) -> i32 {
+    let sign = match zone.as_bytes().first() {
+        Some(b'-') => -1,
+        _ => 1,
+    };
+    let digits: String = zone.chars().filter(|c| c.is_ascii_digit()).collect();
+    digits
+        .parse::<i32>()
+        .map(|n| sign * (n / 100 * 60 + n % 100))
+        .unwrap_or(0)
+}
+
+fn blame(
+    all: &[BlameLine],
+    whens: &std::collections::HashMap<String, String>,
+    path: &str,
+    start: usize,
+    end: usize,
+) -> Output {
     let lo = start.saturating_sub(1).min(all.len());
     let hi = end.min(all.len()).max(lo);
     let shown = &all[lo..hi];
@@ -1221,6 +1621,7 @@ fn blame(all: &[BlameLine], path: &str, start: usize, end: usize) -> Output {
                 "line" => b.final_line,
                 "id" => b.short_id,
                 "author" => b.author,
+                "when" => whens.get(&b.id).map(String::as_str).unwrap_or(""),
                 "text" => b.line,
             }
         })
@@ -1242,9 +1643,27 @@ fn blame(all: &[BlameLine], path: &str, start: usize, end: usize) -> Output {
     out.list(
         "lines",
         rows,
-        &["line", "id", "author", "text"],
+        &["line", "id", "author", "when", "text"],
         format!("0 lines in {path} for that range"),
     )
+}
+
+/// A commit's relative age from its raw object text: the author line's unix
+/// time, as `2h` or `3d`.
+fn commit_when(data: &[u8], now: i64) -> String {
+    let text = String::from_utf8_lossy(data);
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("author ") {
+            let (_, epoch, _) = parse_signature(rest);
+            return match (now - epoch).max(0) {
+                d if d < 60 => format!("{d}s"),
+                d if d < 3600 => format!("{}m", d / 60),
+                d if d < 86_400 => format!("{}h", d / 3600),
+                d => format!("{}d", d / 86_400),
+            };
+        }
+    }
+    String::new()
 }
 
 fn smartlog(entries: &[SmartlogEntry]) -> Output {

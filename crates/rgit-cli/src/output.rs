@@ -112,15 +112,31 @@ impl Output {
                 "--fields applies only to commands that print a table",
             ));
         }
+        // A result with text but no structured field keeps its text, so a
+        // TOON or JSON run never prints nothing where git prints text.
+        if self.data.is_empty() && !self.text.trim().is_empty() {
+            let text = std::mem::take(&mut self.text);
+            if text.contains('\n') {
+                self.set("lines", text.lines().collect::<Vec<_>>());
+            } else {
+                self.set("result", text);
+            }
+        }
         let lists = std::mem::take(&mut self.lists);
         for (key, defaults) in &lists {
             let Some(Node::List(rows)) = self.get_mut(key) else {
                 continue;
             };
-            let available: Vec<String> = match rows.first() {
-                Some(Node::Obj(first)) => first.iter().map(|(k, _)| k.clone()).collect(),
-                _ => Vec::new(),
-            };
+            let mut available: Vec<String> = Vec::new();
+            for row in rows.iter() {
+                if let Node::Obj(cells) = row {
+                    for (k, _) in cells {
+                        if !available.contains(k) {
+                            available.push(k.clone());
+                        }
+                    }
+                }
+            }
             if let Some(bad) = fields.iter().find(|f| !available.contains(f)) {
                 return Err(anyhow::Error::new(CliError {
                     message: format!("unknown field {bad} for {key}"),
@@ -155,6 +171,9 @@ impl Output {
             Some(rest) => format!("rgit --full {rest}"),
             None => format!("{rerun} --full"),
         };
+        if !full {
+            cut_diffs(&mut self.data, &mut self.help, &with_full);
+        }
         if !full
             && lists.is_empty()
             && let Some(Node::List(lines)) = self.get_mut("lines")
@@ -185,6 +204,140 @@ impl Output {
             self.set("help", help);
         }
         Ok(self.data)
+    }
+}
+
+/// Cut the diffs of the whole tree at whole hunks unless `--full` is given:
+/// one budget of [`MAX_LINES`] diff lines is shared by every `files` list, one
+/// `count` note goes after the first top-level field that holds a diff, and
+/// one help line says `--full`.
+fn cut_diffs(fields: &mut Obj, help: &mut Vec<String>, with_full: &str) {
+    let mut total = 0;
+    for (key, node) in fields.iter_mut() {
+        visit_files(key, node, &mut |rows| total += diff_lines(rows));
+    }
+    if total <= MAX_LINES {
+        return;
+    }
+    let mut cut = Cut {
+        shown: 0,
+        budget: MAX_LINES,
+        first: true,
+        stopped: false,
+    };
+    let mut at = None;
+    for (i, (key, node)) in fields.iter_mut().enumerate() {
+        visit_files(key, node, &mut |rows| {
+            at.get_or_insert(i);
+            cut.apply(rows);
+        });
+    }
+    let shown = cut.shown;
+    fields.insert(
+        at.map_or(fields.len(), |i| i + 1),
+        (
+            "count".to_owned(),
+            Node::Str(format!("{shown} of {total} diff lines")),
+        ),
+    );
+    help.push(format!("Run `{with_full}` to see the whole patch"));
+}
+
+/// Call `f` on every `files` list in the subtree of `node`, stored under `key`.
+fn visit_files(key: &str, node: &mut Node, f: &mut dyn FnMut(&mut Vec<Node>)) {
+    match node {
+        Node::List(rows) if key == "files" => f(rows),
+        Node::List(items) => {
+            for item in items.iter_mut() {
+                visit_files("", item, f);
+            }
+        }
+        Node::Obj(fields) => {
+            for (k, inner) in fields.iter_mut() {
+                visit_files(k, inner, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn hunk_lines(h: &Node) -> usize {
+    match h {
+        Node::Obj(h) => h
+            .iter()
+            .find(|(k, _)| k == "lines")
+            .and_then(|(_, v)| match v {
+                Node::List(lines) => Some(lines.len()),
+                _ => None,
+            })
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn file_hunks(row: &mut Node) -> Option<&mut Vec<Node>> {
+    let Node::Obj(f) = row else { return None };
+    match f.iter_mut().find(|(k, _)| k == "hunks") {
+        Some((_, Node::List(hunks))) => Some(hunks),
+        _ => None,
+    }
+}
+
+fn diff_lines(rows: &mut [Node]) -> usize {
+    rows.iter_mut()
+        .filter_map(file_hunks)
+        .map(|hunks| hunks.iter().map(hunk_lines).sum::<usize>())
+        .sum()
+}
+
+/// The shared cut: a prefix of the hunks in output order. The first hunk keeps
+/// its first [`MAX_LINES`] lines; a later hunk stays only whole, and once one
+/// does not fit no later hunk is shown.
+struct Cut {
+    shown: usize,
+    budget: usize,
+    first: bool,
+    stopped: bool,
+}
+
+impl Cut {
+    fn apply(&mut self, rows: &mut [Node]) {
+        for row in rows.iter_mut() {
+            let Some(hunks) = file_hunks(row) else { continue };
+            let had = hunks.len();
+            let mut kept = 0;
+            for h in hunks.iter_mut() {
+                let len = hunk_lines(h);
+                let take = if self.stopped {
+                    break;
+                } else if self.first {
+                    len.min(self.budget)
+                } else if len <= self.budget {
+                    len
+                } else {
+                    self.stopped = true;
+                    break;
+                };
+                if let Node::Obj(h) = h
+                    && let Some((_, Node::List(lines))) = h.iter_mut().find(|(k, _)| k == "lines")
+                {
+                    lines.truncate(take);
+                }
+                self.shown += take;
+                self.budget -= take;
+                self.first = false;
+                kept += 1;
+            }
+            hunks.truncate(kept);
+            if kept == 0 && had > 0 {
+                let note = format!("{had} hunk{} not shown", if had == 1 { "" } else { "s" });
+                if let Node::Obj(f) = row
+                    && let Some((_, slot)) = f.iter_mut().find(|(k, _)| k == "hunks")
+                {
+                    *slot = Node::Str(note);
+                }
+            }
+        }
     }
 }
 
