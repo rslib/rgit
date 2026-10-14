@@ -83,4 +83,4 @@ Report a bug or ask a question in the [issue tracker](https://github.com/rslib/r
 
 ## License
 
-MIT.
+MIT. See [LICENSE](LICENSE).
