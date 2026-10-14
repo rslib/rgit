@@ -400,7 +400,7 @@ async fn event_loop(
         TuiCredentialPrompt { tx: ssh_tx.clone() }.ask(label.to_owned(), true)
     });
 
-    // Auto-refresh on worktree changes; kept alive for the loop's duration.
+    // Auto-refresh on worktree and git state changes; kept alive for the loop.
     let _watcher = spawn_watcher(app.backend().clone(), msg_tx.clone());
     let gate = RefreshGate::default();
 
@@ -1569,8 +1569,12 @@ async fn run_msg(
 /// How long git state events (index, HEAD, refs) must be quiet before a
 /// refresh: long enough to merge the writes of one git command.
 const GIT_STATE_WAIT: Duration = Duration::from_millis(150);
-/// How long worktree events must be quiet before a refresh, so a build or an
-/// editor save gives one refresh.
+/// The longest a git state change waits, so a rebase or script that keeps
+/// writing still shows progress.
+const GIT_STATE_MAX_WAIT: Duration = Duration::from_millis(300);
+/// How long after the first pending worktree event a refresh starts, so a
+/// build or an editor save gives one refresh and a steady stream of events
+/// still refreshes once a second.
 const WORKTREE_WAIT: Duration = Duration::from_secs(1);
 /// How often the watcher checks the index, HEAD and the HEAD reflog itself.
 /// macOS can deliver file events seconds late, so staging and commits would
@@ -1578,41 +1582,43 @@ const WORKTREE_WAIT: Duration = Duration::from_secs(1);
 const GIT_STATE_POLL: Duration = Duration::from_millis(100);
 
 /// Watch the worktree and the git folders and post a quiet refresh when they
-/// change. Returns the watcher, which must be held alive for watching to
-/// continue. Degrades to manual refresh (`g`) if the watch cannot be set up.
+/// change. Returns a guard, which must be held alive for watching to continue.
+/// Without a file watch, only the polled git state refreshes on its own.
 ///
 /// Events are filtered so an agent or build churning through ignored paths
 /// does not force a full status refresh per burst: `.git` internals are
 /// dropped by path prefix, and everything else goes through one batched
 /// ignore check before a refresh is queued.
-fn spawn_watcher(
-    backend: Arc<dyn GitBackend>,
-    msg_tx: UnboundedSender<Msg>,
-) -> Option<RecommendedWatcher> {
+fn spawn_watcher(backend: Arc<dyn GitBackend>, msg_tx: UnboundedSender<Msg>) -> WatchGuard {
     let roots = WatchRoots {
         workdir: backend.workdir().to_path_buf(),
         git_dir: backend.git_dir(),
         common_dir: backend.common_dir(),
     };
     let (tx, rx) = std::sync::mpsc::channel::<Vec<std::path::PathBuf>>();
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+    let events = tx.clone();
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
-            let _ = tx.send(event.paths);
+            let _ = events.send(event.paths);
         }
     })
-    .ok()?;
-    watcher
-        .watch(&roots.workdir, RecursiveMode::Recursive)
-        .ok()?;
-    // A linked worktree keeps its index and HEAD, and the shared refs, outside
-    // the worktree; watch them too. A failed extra watch only loses those.
-    if !roots.git_dir.starts_with(&roots.workdir) {
-        let _ = watcher.watch(&roots.git_dir, RecursiveMode::NonRecursive);
-    }
-    if !roots.common_dir.starts_with(&roots.workdir) {
-        let _ = watcher.watch(&roots.common_dir, RecursiveMode::NonRecursive);
-        let _ = watcher.watch(&roots.common_dir.join("refs"), RecursiveMode::Recursive);
-    }
+    .ok()
+    .and_then(|mut watcher| {
+        watcher
+            .watch(&roots.workdir, RecursiveMode::Recursive)
+            .ok()?;
+        // A linked worktree keeps its index and HEAD, and the shared refs,
+        // outside the worktree; watch them too. A failed extra watch only
+        // loses those.
+        if !roots.git_dir.starts_with(&roots.workdir) {
+            let _ = watcher.watch(&roots.git_dir, RecursiveMode::NonRecursive);
+        }
+        if !roots.common_dir.starts_with(&roots.workdir) {
+            let _ = watcher.watch(&roots.common_dir, RecursiveMode::NonRecursive);
+            let _ = watcher.watch(&roots.common_dir.join("refs"), RecursiveMode::Recursive);
+        }
+        Some(watcher)
+    });
     std::thread::spawn(move || {
         let mut debounce = Debounce::default();
         let mut poll = GitStatePoll::new(&roots);
@@ -1647,7 +1653,17 @@ fn spawn_watcher(
             }
         }
     });
-    Some(watcher)
+    WatchGuard {
+        _watcher: watcher,
+        _alive: tx,
+    }
+}
+
+/// Keeps the watch running: the file watcher, when it could start, and a
+/// sender that keeps the poll thread alive without one. Dropping it stops both.
+struct WatchGuard {
+    _watcher: Option<RecommendedWatcher>,
+    _alive: std::sync::mpsc::Sender<Vec<std::path::PathBuf>>,
 }
 
 /// Queue a refresh unless every path is ignored. `.gitignore`-driven check:
@@ -1725,12 +1741,14 @@ enum Flush {
     Worktree(Vec<std::path::PathBuf>),
 }
 
-/// The two watch timers: git state waits [`GIT_STATE_WAIT`] of quiet and
-/// worktree paths [`WORKTREE_WAIT`]. A git state flush also covers pending
-/// worktree paths, since it reads the whole status.
+/// The two watch timers: git state waits [`GIT_STATE_WAIT`] of quiet, at most
+/// [`GIT_STATE_MAX_WAIT`], and worktree paths [`WORKTREE_WAIT`] after the
+/// first. A git state flush also covers pending worktree paths, since it reads
+/// the whole status.
 #[derive(Default)]
 struct Debounce {
     git_state: Option<Instant>,
+    git_first: Option<Instant>,
     worktree: Option<Instant>,
     paths: Vec<std::path::PathBuf>,
 }
@@ -1738,11 +1756,16 @@ struct Debounce {
 impl Debounce {
     fn add(&mut self, batch: WatchBatch, now: Instant) {
         if batch.git_state {
-            self.git_state = Some(now + GIT_STATE_WAIT);
+            let first = *self.git_first.get_or_insert(now);
+            self.git_state = Some((now + GIT_STATE_WAIT).min(first + GIT_STATE_MAX_WAIT));
         }
         if !batch.worktree.is_empty() {
-            self.worktree = Some(now + WORKTREE_WAIT);
-            self.paths.extend(batch.worktree);
+            self.worktree.get_or_insert(now + WORKTREE_WAIT);
+            for path in batch.worktree {
+                if !self.paths.contains(&path) {
+                    self.paths.push(path);
+                }
+            }
         }
     }
 
@@ -1757,6 +1780,7 @@ impl Debounce {
     fn due(&mut self, now: Instant) -> Option<Flush> {
         if self.git_state.is_some_and(|at| at <= now) {
             self.git_state = None;
+            self.git_first = None;
             self.worktree = None;
             self.paths.clear();
             return Some(Flush::GitState);
@@ -3285,5 +3309,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(seen, "a same-size index replaced by rename is a change");
         assert!(gone, "a removed HEAD is a change");
+    }
+
+    #[test]
+    fn watch_debounce_steady_worktree_stream_still_refreshes_each_second() {
+        let base = Instant::now();
+        let mut debounce = Debounce::default();
+        let mut out = Vec::new();
+        for ms in (0..=2500).step_by(10) {
+            let now = base + Duration::from_millis(ms);
+            if ms % 200 == 0 {
+                debounce.add(worktree_batch("/repo/target/x"), now);
+            }
+            while let Some(flush) = debounce.due(now) {
+                out.push((ms, flush));
+            }
+        }
+        let at: Vec<u64> = out.iter().map(|(ms, _)| *ms).collect();
+        assert_eq!(at, vec![1000, 2200], "{out:?}");
+        assert_eq!(
+            out[0].1,
+            Flush::Worktree(vec![std::path::PathBuf::from("/repo/target/x")]),
+            "a repeated path is listed once"
+        );
+    }
+
+    #[test]
+    fn watch_debounce_steady_git_writes_refresh_within_the_max_wait() {
+        let base = Instant::now();
+        let mut debounce = Debounce::default();
+        let mut out = Vec::new();
+        for ms in (0..=1000).step_by(10) {
+            let now = base + Duration::from_millis(ms);
+            if ms % 50 == 0 {
+                debounce.add(git_batch(), now);
+            }
+            while let Some(flush) = debounce.due(now) {
+                out.push(ms);
+                let _ = flush;
+            }
+        }
+        assert!(!out.is_empty(), "no refresh during steady writes");
+        assert!(out[0] <= 300, "first refresh at {} ms", out[0]);
+        // A write every 50 ms, each pending change capped at 300 ms.
+        for pair in out.windows(2) {
+            assert!(pair[1] - pair[0] <= 350, "refreshes at {out:?}");
+        }
     }
 }

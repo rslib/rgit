@@ -21,6 +21,15 @@ fn git(dir: &Path, args: &[&str]) {
     assert!(status.success(), "git {args:?} failed");
 }
 
+/// Removes a test's temp folder when the test ends, pass or fail.
+struct TempDir(PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A repository with one commit and an unstaged change to `f`.
 fn repo(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rgit-tui-refresh-{}-{tag}", std::process::id()));
@@ -133,12 +142,13 @@ impl Tui {
         self.screen.lock().unwrap().len()
     }
 
-    /// Whether the screen output after `mark` showed `text` within `limit`.
+    /// Whether the screen output after `mark` showed the word `text` within
+    /// `limit`; `STAGED` inside `UNSTAGED` does not count.
     fn shows(&self, mark: usize, text: &str, limit: Duration) -> bool {
         let end = Instant::now() + limit;
         loop {
             let raw = self.screen.lock().unwrap()[mark..].to_vec();
-            if strip(&raw).contains(text) {
+            if has_word(&strip(&raw), text) {
                 return true;
             }
             if Instant::now() >= end {
@@ -176,6 +186,14 @@ fn parse_utc(stamp: &str) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::new(u64::try_from(secs).ok()?, nanos))
 }
 
+fn has_word(screen: &str, word: &str) -> bool {
+    screen.match_indices(word).any(|(at, _)| {
+        let before = screen[..at].chars().next_back();
+        let after = screen[at + word.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
 fn strip(raw: &[u8]) -> String {
     let text = String::from_utf8_lossy(raw);
     let mut out = String::with_capacity(text.len());
@@ -201,6 +219,7 @@ fn strip(raw: &[u8]) -> String {
 #[test]
 fn tui_refresh_cli_stage_and_commit_show_fast() {
     let dir = repo("plain");
+    let _cleanup = TempDir(dir.clone());
     let repo = dir.join("repo");
     let tui = Tui::open(&repo, &dir.join("state"));
 
@@ -222,6 +241,7 @@ fn tui_refresh_cli_stage_and_commit_show_fast() {
 #[test]
 fn tui_refresh_linked_worktree_shows_stage_and_commit() {
     let dir = repo("linked");
+    let _cleanup = TempDir(dir.clone());
     let repo = dir.join("repo");
     git(&repo, &["checkout", "-q", "--", "f"]);
     let wt = dir.join("wt");
