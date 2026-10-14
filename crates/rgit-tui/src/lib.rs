@@ -16,6 +16,7 @@ mod runtime;
 pub mod session_log;
 mod theme;
 mod ui;
+mod watch;
 
 pub use config::{Config, load as load_config};
 pub use runtime::run;

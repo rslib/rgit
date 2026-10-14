@@ -53,11 +53,20 @@ struct Tui {
     screen: Arc<Mutex<Vec<u8>>>,
     log: PathBuf,
     _master: Box<dyn portable_pty::MasterPty + Send>,
-    _writer: Box<dyn Write + Send>,
+    writer: Box<dyn Write + Send>,
 }
 
 impl Tui {
     fn open(workdir: &Path, state: &Path) -> Tui {
+        let tui = Tui::spawn(workdir, state);
+        tui.wait_for_refreshes(1, Duration::from_secs(10));
+        // Let the startup reads and their file events settle.
+        std::thread::sleep(Duration::from_millis(1500));
+        tui
+    }
+
+    /// Starts the TUI and returns at once, before it draws anything.
+    fn spawn(workdir: &Path, state: &Path) -> Tui {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 40,
@@ -94,17 +103,32 @@ impl Tui {
                 sink.lock().unwrap().extend_from_slice(&buf[..n]);
             }
         });
-        let tui = Tui {
+        Tui {
             child,
             screen,
             log: state.join("rgit/rgit.log"),
             _master: pair.master,
-            _writer: writer,
-        };
-        tui.wait_for_refreshes(1, Duration::from_secs(10));
-        // Let the startup reads and their file events settle.
-        std::thread::sleep(Duration::from_millis(1500));
-        tui
+            writer,
+        }
+    }
+
+    fn press(&mut self, key: &[u8]) {
+        self.writer.write_all(key).expect("write key");
+        self.writer.flush().expect("flush key");
+    }
+
+    /// Whether the child exited within `limit`.
+    fn exits_within(&mut self, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        loop {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return true;
+            }
+            if Instant::now() >= end {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn refreshes(&self) -> Vec<SystemTime> {
@@ -269,5 +293,82 @@ fn tui_refresh_linked_worktree_shows_stage_and_commit() {
     assert!(
         tui.shows(mark, "two", Duration::from_secs(2)),
         "the new head is not shown"
+    );
+}
+
+/// A repository on `main` with `build/` ignored and `folders` folders in it.
+fn ignored_repo(tag: &str, folders: usize) -> PathBuf {
+    let dir = repo(tag);
+    let repo = dir.join("repo");
+    std::fs::write(repo.join(".gitignore"), "build/\n").expect("write");
+    git(&repo, &["add", ".gitignore", "f"]);
+    git(&repo, &["commit", "-qm", "two"]);
+    for i in 0..folders {
+        std::fs::create_dir_all(repo.join(format!("build/d{i}"))).expect("mkdir");
+    }
+    dir
+}
+
+#[test]
+fn tui_open_first_frame_with_many_ignored_folders() {
+    let dir = ignored_repo("many", 20_000);
+    let _cleanup = TempDir(dir.clone());
+    let started = Instant::now();
+    let mut tui = Tui::spawn(&dir.join("repo"), &dir.join("state"));
+    assert!(
+        tui.shows(0, "main", Duration::from_secs(1)),
+        "no first frame within 1s, waited {:?}",
+        started.elapsed()
+    );
+    tui.press(b"q");
+    assert!(
+        tui.exits_within(Duration::from_secs(2)),
+        "the TUI did not exit within 2s of q"
+    );
+}
+
+#[test]
+fn tui_open_new_folder_shows_without_a_key() {
+    let dir = repo("newdir");
+    let _cleanup = TempDir(dir.clone());
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(repo.join("src")).expect("mkdir");
+    std::fs::write(repo.join("src/lib.rs"), "x\n").expect("write");
+    git(&repo, &["add", "src"]);
+    git(&repo, &["commit", "-qm", "src"]);
+    let tui = Tui::open(&repo, &dir.join("state"));
+
+    let mark = tui.mark();
+    std::fs::create_dir(repo.join("src/new")).expect("mkdir");
+    std::thread::sleep(Duration::from_millis(100));
+    std::fs::write(repo.join("src/new/a.rs"), "y\n").expect("write");
+    // macOS FSEvents alone can take over 7 s to report a new folder.
+    let limit = if cfg!(target_os = "linux") {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(15)
+    };
+    assert!(
+        tui.shows(mark, "new/", limit),
+        "the new folder is not shown within {limit:?}"
+    );
+}
+
+#[test]
+fn tui_open_new_ignored_folder_keeps_running() {
+    let dir = ignored_repo("ignored", 10);
+    let _cleanup = TempDir(dir.clone());
+    let repo = dir.join("repo");
+    let mut tui = Tui::open(&repo, &dir.join("state"));
+
+    std::fs::create_dir_all(repo.join("build/x")).expect("mkdir");
+    assert!(
+        !tui.exits_within(Duration::from_millis(500)),
+        "the TUI exited after an ignored folder appeared"
+    );
+    tui.press(b"q");
+    assert!(
+        tui.exits_within(Duration::from_secs(2)),
+        "the TUI did not exit within 2s of q"
     );
 }

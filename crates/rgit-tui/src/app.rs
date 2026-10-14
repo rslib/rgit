@@ -1979,6 +1979,12 @@ pub enum Effect {
         path: String,
         staged: bool,
     },
+    /// List an untracked folder's first files and build its preview
+    /// off-thread; the snapshot carries no diff text for folders.
+    LoadFolderPreview {
+        key: PreviewKey,
+        path: String,
+    },
     /// Build a large file diff for the preview pane off-thread.
     BuildFilePreview {
         key: PreviewKey,
@@ -2651,6 +2657,15 @@ impl App {
             return Vec::new();
         }
         match &key {
+            // A collapsed folder row previews its file listing, loaded
+            // off-thread like every other preview.
+            PreviewKey::File { path, .. } if path.ends_with('/') => {
+                let path = path.clone();
+                self.set_preview_placeholder();
+                self.preview_key = Some(key.clone());
+                self.preview_followed_hunk = None;
+                vec![Effect::LoadFolderPreview { key, path }]
+            }
             // The snapshot carries no diff text for an untracked file past the
             // eager limit, and none yet for any file in a lazy (pre-fill)
             // snapshot; load it off-thread either way.
@@ -6844,5 +6859,106 @@ mod tests {
             app.tick();
         }
         assert!(app.toasts.is_empty(), "toast expires after its ticks");
+    }
+
+    fn folder_app() -> App {
+        let mut app = App::new(
+            Arc::new(rgit_git::Git2Backend::discover(".").unwrap()),
+            crate::config::Config::default(),
+        );
+        app.snapshot = Some(Arc::new(rgit_git::RepoStatus {
+            entries: vec![rgit_git::StatusEntry {
+                path: "notes/".into(),
+                orig_path: None,
+                index: rgit_git::StatusCode::Unmodified,
+                worktree: rgit_git::StatusCode::Untracked,
+            }],
+            ..Default::default()
+        }));
+        rebuild_status(&mut app);
+        let row = (0..app.buffer().len())
+            .find(|i| {
+                app.buffer_mut().set_cursor(*i);
+                matches!(
+                    app.buffer().target_at_cursor(),
+                    Some(Target::File { path, .. }) if path == "notes/"
+                )
+            })
+            .expect("a row for the folder");
+        app.buffer_mut().set_cursor(row);
+        app
+    }
+
+    #[test]
+    fn folder_preview_emits_load_for_folder_row() {
+        let mut app = folder_app();
+        let fx = app.sync_preview();
+        assert!(
+            matches!(
+                fx.as_slice(),
+                [Effect::LoadFolderPreview { path, .. }] if path == "notes/"
+            ),
+            "cursor on a folder row loads its listing, got {fx:?}"
+        );
+    }
+
+    #[test]
+    fn folder_preview_shows_files_and_total() {
+        let mut app = folder_app();
+        let files = vec!["notes/a.txt".to_owned(), "notes/b.txt".to_owned()];
+        let sections = rgit_model::build_folder_preview("notes/", &files, 2);
+        let key = PreviewKey::File {
+            path: "notes/".into(),
+            staged: false,
+        };
+        update(&mut app, Msg::PreviewBuilt { key, sections });
+        assert!(
+            app.preview_buf.search("notes/a.txt", 0, true).is_some(),
+            "preview lists the folder files"
+        );
+        assert!(
+            app.preview_buf.search("notes/b.txt", 0, true).is_some(),
+            "preview lists the folder files"
+        );
+        assert!(
+            app.preview_buf.search("notes/ (2 of 2)", 0, true).is_some(),
+            "preview shows the total count"
+        );
+    }
+
+    #[test]
+    fn folder_preview_file_row_still_loads_diff() {
+        let mut app = App::new(
+            Arc::new(rgit_git::Git2Backend::discover(".").unwrap()),
+            crate::config::Config::default(),
+        );
+        app.snapshot = Some(Arc::new(rgit_git::RepoStatus {
+            entries: vec![rgit_git::StatusEntry {
+                path: "notes/a.txt".into(),
+                orig_path: None,
+                index: rgit_git::StatusCode::Unmodified,
+                worktree: rgit_git::StatusCode::Untracked,
+            }],
+            ..Default::default()
+        }));
+        rebuild_status(&mut app);
+        let row = (0..app.buffer().len())
+            .find(|i| {
+                app.buffer_mut().set_cursor(*i);
+                matches!(
+                    app.buffer().target_at_cursor(),
+                    Some(Target::File { path, .. }) if path == "notes/a.txt"
+                )
+            })
+            .expect("a row for the file");
+        app.buffer_mut().set_cursor(row);
+        let fx = app.sync_preview();
+        assert!(
+            matches!(
+                fx.as_slice(),
+                [Effect::LoadFilePreview { path, .. }] if path == "notes/a.txt"
+            ),
+            "cursor on a file row loads its diff, got {fx:?}"
+        );
     }
 }

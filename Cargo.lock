@@ -5188,6 +5188,7 @@ name = "rgit-tui"
 version = "0.0.5"
 dependencies = [
  "crossterm",
+ "ignore",
  "notify-debouncer-mini",
  "open",
  "ratatui",

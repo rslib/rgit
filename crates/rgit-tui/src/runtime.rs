@@ -1,9 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use notify_debouncer_mini::notify::{self, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::DefaultTerminal;
 use rgit_git::{GitBackend, GitError, RepoStatus};
 use tokio::sync::mpsc::UnboundedSender;
@@ -17,6 +16,8 @@ use crate::keymap::{
     resolve_split_picker_key, resolve_transient_key,
 };
 use crate::ui;
+#[cfg(test)]
+use crate::watch::{Debounce, Flush, GitStatePoll, WatchBatch, WatchRoots, sort_watch_paths};
 
 fn resolve_forge_key(key: crossterm::event::KeyEvent) -> Option<Msg> {
     use crossterm::event::KeyCode;
@@ -400,8 +401,7 @@ async fn event_loop(
         TuiCredentialPrompt { tx: ssh_tx.clone() }.ask(label.to_owned(), true)
     });
 
-    // Auto-refresh on worktree and git state changes; kept alive for the loop.
-    let _watcher = spawn_watcher(app.backend().clone(), msg_tx.clone());
+    let mut watcher = None;
     let gate = RefreshGate::default();
 
     msg_tx.send(Msg::Refresh).ok();
@@ -494,13 +494,31 @@ async fn event_loop(
                     resolve_key(key)
                 };
                 if let Some(msg) = msg {
-                    run_msg(&mut app, msg, &mut events, terminal, &msg_tx, &gate).await?;
+                    run_msg(
+                        &mut app,
+                        msg,
+                        &mut events,
+                        terminal,
+                        &msg_tx,
+                        &gate,
+                        &mut watcher,
+                    )
+                    .await?;
                 }
                 true
             }
             Incoming::Event(Event::Mouse(m)) => {
                 if let Some(msg) = mouse_msg(&app, m) {
-                    run_msg(&mut app, msg, &mut events, terminal, &msg_tx, &gate).await?;
+                    run_msg(
+                        &mut app,
+                        msg,
+                        &mut events,
+                        terminal,
+                        &msg_tx,
+                        &gate,
+                        &mut watcher,
+                    )
+                    .await?;
                 }
                 true
             }
@@ -513,7 +531,16 @@ async fn event_loop(
             }
             Incoming::Event(Event::Error) => false,
             Incoming::Msg(msg) => {
-                run_msg(&mut app, msg, &mut events, terminal, &msg_tx, &gate).await?;
+                run_msg(
+                    &mut app,
+                    msg,
+                    &mut events,
+                    terminal,
+                    &msg_tx,
+                    &gate,
+                    &mut watcher,
+                )
+                .await?;
                 true
             }
         };
@@ -701,7 +728,19 @@ async fn run_msg(
     terminal: &mut DefaultTerminal,
     msg_tx: &UnboundedSender<Msg>,
     gate: &RefreshGate,
+    watcher: &mut Option<crate::watch::WatchGuard>,
 ) -> std::io::Result<()> {
+    if watcher.is_none()
+        && let Msg::Refreshed { result, .. } = &msg
+        && let Ok(status) = result.as_ref()
+    {
+        let collapsed = crate::watch::collapsed_untracked_dirs(app.backend().workdir(), status);
+        *watcher = Some(crate::watch::spawn_watcher(
+            app.backend().clone(),
+            msg_tx.clone(),
+            collapsed,
+        ));
+    }
     let requeue = finish_gated_refresh(&msg, gate);
     let started = Instant::now();
     let effects = update(app, msg);
@@ -973,6 +1012,18 @@ async fn run_msg(
                 tokio::task::spawn_blocking(move || {
                     let sections = rgit_model::build_diff(&diff.path, std::slice::from_ref(&diff));
                     let _ = msg_tx.send(Msg::PreviewBuilt { key, sections });
+                });
+            }
+            Effect::LoadFolderPreview { key, path } => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                // A big folder lists off the main thread, like every preview.
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(listing) = backend.folder_files(&path) {
+                        let sections =
+                            rgit_model::build_folder_preview(&path, &listing.files, listing.total);
+                        let _ = msg_tx.send(Msg::PreviewBuilt { key, sections });
+                    }
                 });
             }
             Effect::OpenInEditor { path, line, col } => {
@@ -1564,292 +1615,6 @@ async fn run_msg(
         spawn_read(app, msg_tx, |b| b.status());
     }
     Ok(())
-}
-
-/// How long git state events (index, HEAD, refs) must be quiet before a
-/// refresh: long enough to merge the writes of one git command.
-const GIT_STATE_WAIT: Duration = Duration::from_millis(150);
-/// The longest a git state change waits, so a rebase or script that keeps
-/// writing still shows progress.
-const GIT_STATE_MAX_WAIT: Duration = Duration::from_millis(300);
-/// How long after the first pending worktree event a refresh starts, so a
-/// build or an editor save gives one refresh and a steady stream of events
-/// still refreshes once a second.
-const WORKTREE_WAIT: Duration = Duration::from_secs(1);
-/// How often the watcher checks the index, HEAD and the HEAD reflog itself.
-/// macOS can deliver file events seconds late, so staging and commits would
-/// show late if they waited for one.
-const GIT_STATE_POLL: Duration = Duration::from_millis(100);
-
-/// Watch the worktree and the git folders and post a quiet refresh when they
-/// change. Returns a guard, which must be held alive for watching to continue.
-/// Without a file watch, only the polled git state refreshes on its own.
-///
-/// Events are filtered so an agent or build churning through ignored paths
-/// does not force a full status refresh per burst: `.git` internals are
-/// dropped by path prefix, and everything else goes through one batched
-/// ignore check before a refresh is queued.
-fn spawn_watcher(backend: Arc<dyn GitBackend>, msg_tx: UnboundedSender<Msg>) -> WatchGuard {
-    let roots = WatchRoots {
-        workdir: backend.workdir().to_path_buf(),
-        git_dir: backend.git_dir(),
-        common_dir: backend.common_dir(),
-    };
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<std::path::PathBuf>>();
-    let events = tx.clone();
-    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(event) = res {
-            let _ = events.send(event.paths);
-        }
-    })
-    .ok()
-    .and_then(|mut watcher| {
-        watcher
-            .watch(&roots.workdir, RecursiveMode::Recursive)
-            .ok()?;
-        // A linked worktree keeps its index and HEAD, and the shared refs,
-        // outside the worktree; watch them too. A failed extra watch only
-        // loses those.
-        if !roots.git_dir.starts_with(&roots.workdir) {
-            let _ = watcher.watch(&roots.git_dir, RecursiveMode::NonRecursive);
-        }
-        if !roots.common_dir.starts_with(&roots.workdir) {
-            let _ = watcher.watch(&roots.common_dir, RecursiveMode::NonRecursive);
-            let _ = watcher.watch(&roots.common_dir.join("refs"), RecursiveMode::Recursive);
-        }
-        Some(watcher)
-    });
-    std::thread::spawn(move || {
-        let mut debounce = Debounce::default();
-        let mut poll = GitStatePoll::new(&roots);
-        let mut next_poll = Instant::now() + GIT_STATE_POLL;
-        loop {
-            let wake = debounce.next().map_or(next_poll, |at| at.min(next_poll));
-            match rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
-                Ok(paths) => debounce.add(sort_watch_paths(&roots, paths), Instant::now()),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-            let now = Instant::now();
-            if now >= next_poll {
-                if poll.changed() {
-                    debounce.add(
-                        WatchBatch {
-                            git_state: true,
-                            worktree: Vec::new(),
-                        },
-                        now,
-                    );
-                }
-                next_poll = now + GIT_STATE_POLL;
-            }
-            while let Some(flush) = debounce.due(Instant::now()) {
-                match flush {
-                    Flush::GitState => {
-                        let _ = msg_tx.send(Msg::AutoRefresh);
-                    }
-                    Flush::Worktree(paths) => refresh_unless_ignored(&backend, &msg_tx, paths),
-                }
-            }
-        }
-    });
-    WatchGuard {
-        _watcher: watcher,
-        _alive: tx,
-    }
-}
-
-/// Keeps the watch running: the file watcher, when it could start, and a
-/// sender that keeps the poll thread alive without one. Dropping it stops both.
-struct WatchGuard {
-    _watcher: Option<RecommendedWatcher>,
-    _alive: std::sync::mpsc::Sender<Vec<std::path::PathBuf>>,
-}
-
-/// Queue a refresh unless every path is ignored. `.gitignore`-driven check:
-/// one lock acquisition for the batch, off the watch thread.
-fn refresh_unless_ignored(
-    backend: &Arc<dyn GitBackend>,
-    msg_tx: &UnboundedSender<Msg>,
-    paths: Vec<std::path::PathBuf>,
-) {
-    let backend = Arc::clone(backend);
-    let msg_tx = msg_tx.clone();
-    std::thread::spawn(move || {
-        let paths: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
-        let flags = match backend.paths_ignored(&paths) {
-            Ok(flags) => flags,
-            Err(_) => {
-                // Without a verdict, assume the events matter.
-                let _ = msg_tx.send(Msg::AutoRefresh);
-                return;
-            }
-        };
-        if flags.into_iter().any(|ignored| !ignored) {
-            let _ = msg_tx.send(Msg::AutoRefresh);
-        }
-    });
-}
-
-/// A file's change stamp: modification time, size and file id, or `None`
-/// when it is missing. git replaces the index and HEAD by rename, so the file
-/// id changes even within one clock tick.
-type Stamp = Option<(std::time::SystemTime, u64, u64)>;
-
-fn stamp(path: &Path) -> Stamp {
-    let meta = std::fs::metadata(path).ok()?;
-    #[cfg(unix)]
-    let id = std::os::unix::fs::MetadataExt::ino(&meta);
-    #[cfg(not(unix))]
-    let id = 0;
-    Some((meta.modified().ok()?, meta.len(), id))
-}
-
-/// The stamps of this worktree's index, HEAD and HEAD reflog, which a stage,
-/// commit, checkout or reset rewrites.
-struct GitStatePoll {
-    paths: [std::path::PathBuf; 3],
-    stamps: [Stamp; 3],
-}
-
-impl GitStatePoll {
-    fn new(roots: &WatchRoots) -> Self {
-        let paths = [
-            roots.git_dir.join("index"),
-            roots.git_dir.join("HEAD"),
-            roots.git_dir.join("logs/HEAD"),
-        ];
-        let stamps = paths.each_ref().map(|p| stamp(p));
-        GitStatePoll { paths, stamps }
-    }
-
-    /// Whether any stamp differs from the last check.
-    fn changed(&mut self) -> bool {
-        let stamps = self.paths.each_ref().map(|p| stamp(p));
-        let changed = stamps != self.stamps;
-        self.stamps = stamps;
-        changed
-    }
-}
-
-/// What one flush of the watch timers asks for.
-#[derive(Debug, PartialEq, Eq)]
-enum Flush {
-    /// Git state changed: refresh now.
-    GitState,
-    /// Worktree paths changed: refresh unless all are ignored.
-    Worktree(Vec<std::path::PathBuf>),
-}
-
-/// The two watch timers: git state waits [`GIT_STATE_WAIT`] of quiet, at most
-/// [`GIT_STATE_MAX_WAIT`], and worktree paths [`WORKTREE_WAIT`] after the
-/// first. A git state flush also covers pending worktree paths, since it reads
-/// the whole status.
-#[derive(Default)]
-struct Debounce {
-    git_state: Option<Instant>,
-    git_first: Option<Instant>,
-    worktree: Option<Instant>,
-    paths: Vec<std::path::PathBuf>,
-}
-
-impl Debounce {
-    fn add(&mut self, batch: WatchBatch, now: Instant) {
-        if batch.git_state {
-            let first = *self.git_first.get_or_insert(now);
-            self.git_state = Some((now + GIT_STATE_WAIT).min(first + GIT_STATE_MAX_WAIT));
-        }
-        if !batch.worktree.is_empty() {
-            self.worktree.get_or_insert(now + WORKTREE_WAIT);
-            for path in batch.worktree {
-                if !self.paths.contains(&path) {
-                    self.paths.push(path);
-                }
-            }
-        }
-    }
-
-    /// When the next flush is due, if anything is pending.
-    fn next(&self) -> Option<Instant> {
-        match (self.git_state, self.worktree) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
-    }
-
-    fn due(&mut self, now: Instant) -> Option<Flush> {
-        if self.git_state.is_some_and(|at| at <= now) {
-            self.git_state = None;
-            self.git_first = None;
-            self.worktree = None;
-            self.paths.clear();
-            return Some(Flush::GitState);
-        }
-        if self.worktree.is_some_and(|at| at <= now) {
-            self.worktree = None;
-            return Some(Flush::Worktree(std::mem::take(&mut self.paths)));
-        }
-        None
-    }
-}
-
-/// The folders whose events the watcher sorts: the worktree, this worktree's
-/// git folder and the git folder that linked worktrees share.
-struct WatchRoots {
-    workdir: std::path::PathBuf,
-    git_dir: std::path::PathBuf,
-    common_dir: std::path::PathBuf,
-}
-
-/// A batch of watch events, sorted for filtering.
-struct WatchBatch {
-    git_state: bool,
-    worktree: Vec<std::path::PathBuf>,
-}
-
-/// Sort watch events into git state versus worktree paths. Git state is this
-/// worktree's `index` and `HEAD` and the shared `packed-refs` and `refs/`;
-/// other git folder paths are dropped. Paths outside every root stay in the
-/// worktree group, as the ignore check still applies.
-fn sort_watch_paths(
-    roots: &WatchRoots,
-    paths: impl IntoIterator<Item = std::path::PathBuf>,
-) -> WatchBatch {
-    let mut batch = WatchBatch {
-        git_state: false,
-        worktree: Vec::new(),
-    };
-    for path in paths {
-        if is_git_state(roots, &path) {
-            batch.git_state = true;
-        } else if is_git_internal(roots, &path) {
-            continue;
-        } else {
-            batch.worktree.push(path);
-        }
-    }
-    batch
-}
-
-/// Whether `path` changes git state that rgit shows (staging, branches).
-fn is_git_state(roots: &WatchRoots, path: &Path) -> bool {
-    let own = path
-        .strip_prefix(&roots.git_dir)
-        .is_ok_and(|rest| rest == Path::new("index") || rest == Path::new("HEAD"));
-    let shared = path
-        .strip_prefix(&roots.common_dir)
-        .is_ok_and(|rest| rest == Path::new("packed-refs") || rest.starts_with("refs"));
-    own || shared
-}
-
-/// Whether `path` is git folder plumbing whose change cannot alter what rgit
-/// shows.
-fn is_git_internal(roots: &WatchRoots, path: &Path) -> bool {
-    path.starts_with(&roots.git_dir)
-        || path.starts_with(&roots.common_dir)
-        || path
-            .strip_prefix(&roots.workdir)
-            .is_ok_and(|rel| rel.starts_with(".git"))
 }
 
 /// Run a synchronous read/mutation on a blocking task and report the resulting

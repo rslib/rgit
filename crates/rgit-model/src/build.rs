@@ -949,6 +949,27 @@ fn diff_file_header(file: &FileDiff) -> Vec<Span> {
 
 /// Build a read-only diff view between two revisions: a header plus one
 /// foldable section per changed file.
+/// An untracked folder preview: its first files in path order, headed by
+/// how many of the total files are shown.
+pub fn build_folder_preview(folder: &str, files: &[String], total: usize) -> Vec<Section> {
+    let mut sections = vec![Section::leaf(
+        "folder/title",
+        NodeKind::HeadField,
+        vec![Span::new(
+            format!("{} ({} of {})", folder, files.len(), total),
+            Style::FieldLabel,
+        )],
+    )];
+    for (i, path) in files.iter().enumerate() {
+        sections.push(Section::leaf(
+            format!("folder/file/{i}"),
+            NodeKind::Info,
+            vec![Span::plain(path.clone())],
+        ));
+    }
+    sections
+}
+
 pub fn build_diff(title: &str, files: &[FileDiff]) -> Vec<Section> {
     let mut sections = vec![Section::leaf(
         "diff/title",
