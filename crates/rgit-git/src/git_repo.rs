@@ -11920,6 +11920,9 @@ fn repo_is_dirty(repo: &Repository) -> bool {
 /// `diff.renames` (none for `false`, renames for `true` or unset, renames
 /// and copies for `copies`).
 fn display_renames(repo: &Repository) -> Result<u8, GitError> {
+    if let Some(level) = crate::diff::rename_override() {
+        return Ok(level);
+    }
     let value = open_config(repo, ConfigScope::Any, false)
         .ok()
         .and_then(|c| c.get_string("diff.renames").ok());

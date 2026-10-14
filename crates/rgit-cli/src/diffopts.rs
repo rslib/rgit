@@ -9,6 +9,47 @@ use std::sync::Arc;
 use rgit_git::GitBackend;
 use rgit_git::xdiff::{Algorithm, DiffTweaks};
 
+/// git's rename flags, for the commands that take them without the rest
+/// of [`DiffOptArgs`].
+#[derive(clap::Args, Clone, Default, Debug)]
+pub struct RenameArgs {
+    /// Do not detect renames.
+    #[arg(long)]
+    pub no_renames: bool,
+    /// Detect renames, optionally at this similarity (git's -M[<n>]).
+    #[arg(
+        short = 'M',
+        long,
+        value_name = "N",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "",
+        value_parser = |v: &str| {
+            let score = v.trim_end_matches('%');
+            (score.is_empty() || score.parse::<f64>().is_ok())
+                .then(|| v.to_owned())
+                .ok_or_else(|| format!("invalid argument to -M: {v}"))
+        }
+    )]
+    pub find_renames: Option<String>,
+    /// Detect copies as well as renames (git's -C[<n>]).
+    #[arg(
+        short = 'C',
+        long = "find-copies",
+        value_name = "N",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "",
+        value_parser = |v: &str| {
+            let score = v.trim_end_matches('%');
+            (score.is_empty() || score.parse::<f64>().is_ok())
+                .then(|| v.to_owned())
+                .ok_or_else(|| format!("invalid argument to -C: {v}"))
+        }
+    )]
+    pub find_copies: Option<String>,
+}
+
 #[derive(clap::Args, Clone, Default, Debug)]
 pub struct DiffOptArgs {
     /// Spend extra time to find the smallest diff.
@@ -164,41 +205,8 @@ pub struct DiffOptArgs {
     /// Which lines show whitespace errors: context, old, new, all, none, default.
     #[arg(long, value_name = "KIND")]
     pub ws_error_highlight: Option<String>,
-    /// Do not detect renames.
-    #[arg(long)]
-    pub no_renames: bool,
-    /// Detect renames, optionally at this similarity (git's -M[<n>]).
-    #[arg(
-        short = 'M',
-        long,
-        value_name = "N",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "",
-        value_parser = |v: &str| {
-            let score = v.trim_end_matches('%');
-            (score.is_empty() || score.parse::<f64>().is_ok())
-                .then(|| v.to_owned())
-                .ok_or_else(|| format!("invalid argument to -M: {v}"))
-        }
-    )]
-    pub find_renames: Option<String>,
-    /// Detect copies as well as renames (git's -C[<n>]).
-    #[arg(
-        short = 'C',
-        long = "find-copies",
-        value_name = "N",
-        num_args = 0..=1,
-        require_equals = true,
-        default_missing_value = "",
-        value_parser = |v: &str| {
-            let score = v.trim_end_matches('%');
-            (score.is_empty() || score.parse::<f64>().is_ok())
-                .then(|| v.to_owned())
-                .ok_or_else(|| format!("invalid argument to -C: {v}"))
-        }
-    )]
-    pub find_copies: Option<String>,
+    #[command(flatten)]
+    pub renames: RenameArgs,
 }
 
 /// Where the diff runs, for diff.mnemonicPrefix's labels.
@@ -413,10 +421,10 @@ fn usage(msg: String) -> anyhow::Error {
     .into()
 }
 
-impl DiffOptArgs {
+impl RenameArgs {
     /// The command line's rename detection, if a flag asked for one: 0 off,
     /// 1 renames, 2 copies.
-    fn rename_level(&self) -> Option<u8> {
+    fn level(&self) -> Option<u8> {
         if self.find_copies.is_some() {
             Some(2)
         } else if self.find_renames.is_some() {
@@ -429,13 +437,21 @@ impl DiffOptArgs {
     }
 
     /// The similarity `-M<n>` or `-C<n>` asked for, when it gave one.
-    fn rename_score(&self) -> Option<&str> {
+    fn score(&self) -> Option<&str> {
         self.find_copies
             .as_deref()
             .or(self.find_renames.as_deref())
             .filter(|s| !s.is_empty())
     }
 
+    /// Make the running command's diffs follow these flags: -M, -C and
+    /// --no-renames win over `diff.renames`, and a score sets the similarity.
+    pub fn apply(&self) {
+        rgit_git::set_renames(self.level(), self.score());
+    }
+}
+
+impl DiffOptArgs {
     /// Set the diff settings for this command: the backend's and the
     /// renderer's. `porcelain` is `git diff` (external tools on by default).
     pub fn apply(
@@ -445,12 +461,7 @@ impl DiffOptArgs {
         porcelain: bool,
         patch_only: bool,
     ) -> anyhow::Result<()> {
-        // -M, -C and --no-renames act as `-c diff.renames=...` for the running
-        // command, so every diff it prints follows them in all output modes.
-        if let Some(level) = self.rename_level() {
-            push_rename_config(level);
-        }
-        rgit_git::set_rename_score(self.rename_score());
+        self.renames.apply();
         let cfg = |k: &str| backend.config_get(k).ok().flatten();
         let truthy = |k: &str| {
             cfg(k).is_some_and(|v| {
@@ -668,31 +679,11 @@ fn cwd_prefix(backend: &Arc<dyn GitBackend>) -> String {
     }
 }
 
-/// `-M` is renames, `-C` renames and copies, `--no-renames` none: append it
-/// to `GIT_CONFIG_PARAMETERS` as git's `-c` does, so the backend's config
-/// reads see it. The key and values are constants, already quoted.
-fn push_rename_config(level: u8) {
-    let value = match level {
-        0 => "false",
-        2 => "copies",
-        _ => "true",
-    };
-    let mut env = std::env::var("GIT_CONFIG_PARAMETERS").unwrap_or_default();
-    if !env.is_empty() {
-        env.push(' ');
-    }
-    env.push_str("'diff.renames'='");
-    env.push_str(value);
-    env.push('\'');
-    // SAFETY: apply runs on the entry thread before the command starts.
-    unsafe { std::env::set_var("GIT_CONFIG_PARAMETERS", env) };
-}
-
 /// Reset the diff settings, for a command that takes none.
 pub fn clear() {
     BACKEND.with(|b| *b.borrow_mut() = None);
     rgit_git::xdiff::set_tweaks(DiffTweaks::default());
-    rgit_git::set_rename_score(None);
+    rgit_git::set_renames(None, None);
     set(Render::default());
 }
 

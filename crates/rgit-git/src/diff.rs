@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::cell::Cell;
 
 use git2::DiffFindOptions;
 
@@ -24,17 +24,23 @@ pub fn detect_level(config: Option<&str>) -> Result<u8, GitError> {
     }
 }
 
-const DEFAULT_SCORE: u32 = u32::MAX;
+thread_local! {
+    static RENAMES: Cell<(Option<u8>, Option<u16>)> = const { Cell::new((None, None)) };
+}
 
-static RENAME_SCORE: AtomicU32 = AtomicU32::new(DEFAULT_SCORE);
+/// Set the command line's rename detection for the display diffs this thread
+/// runs next: `level` (as `detect_level` returns) wins over `diff.renames`,
+/// and `score` is the similarity of `-M<n>` or `-C<n>` (git's `50%`, `5`,
+/// `0.5`). `None` leaves each to the config and libgit2's default. It is per
+/// thread so that MCP calls, which share one process, cannot see each other's.
+pub fn set_renames(level: Option<u8>, score: Option<&str>) {
+    let score = score.map(crate::wt_status::parse_rename_score);
+    RENAMES.with(|r| r.set((level, score)));
+}
 
-/// Set the similarity of `-M<n>` and `-C<n>` (git's `50%`, `5`, `0.5`) for
-/// every display diff this process runs; `None` is libgit2's default.
-pub fn set_rename_score(score: Option<&str>) {
-    let value = score.map_or(DEFAULT_SCORE, |s| {
-        u32::from(crate::wt_status::parse_rename_score(s))
-    });
-    RENAME_SCORE.store(value, Ordering::Relaxed);
+/// The rename level `set_renames` gave this thread, if any.
+pub fn rename_override() -> Option<u8> {
+    RENAMES.with(|r| r.get().0)
 }
 
 /// libgit2 rename options for `level` (`detect_level`), None when off.
@@ -47,10 +53,9 @@ pub fn find_options(level: u8) -> Option<DiffFindOptions> {
     if level >= 2 {
         opts.copies(true);
     }
-    let score = RENAME_SCORE.load(Ordering::Relaxed);
-    if score != DEFAULT_SCORE {
-        opts.rename_threshold(score as u16);
-        opts.copy_threshold(score as u16);
+    if let Some(score) = RENAMES.with(|r| r.get().1) {
+        opts.rename_threshold(score);
+        opts.copy_threshold(score);
     }
     Some(opts)
 }

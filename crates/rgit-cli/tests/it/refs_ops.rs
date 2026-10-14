@@ -1649,3 +1649,197 @@ fn tag_delete_names_a_missing_tag_like_git() {
     assert!(!all.contains("class="), "{all}");
     assert_eq!(code, 1);
 }
+
+/// A repo whose newest stash renames `g` to `h` and rewrites `changed` of the
+/// 100 lines of `g`.
+fn rename_stash(tag: &str, changed: usize) -> PathBuf {
+    let dir = repo(tag);
+    let text = |n: usize| {
+        (0..100)
+            .map(|i| format!("{} {i:03}\n", if i < n { "chgd" } else { "line" }))
+            .collect::<String>()
+    };
+    std::fs::write(dir.join("g"), text(0)).unwrap();
+    git(&dir, &["add", "g"]);
+    git(&dir, &["commit", "-qm", "add g"]);
+    git(&dir, &["mv", "g", "h"]);
+    std::fs::write(dir.join("h"), text(changed)).unwrap();
+    git(&dir, &["add", "h"]);
+    ok(&dir, &["stash", "push", "-m", "rename"]);
+    dir
+}
+
+#[test]
+fn stash_show_rename_flags_win_over_diff_renames_false() {
+    let dir = rename_stash("stash-show-rn-config", 2);
+    git(&dir, &["config", "diff.renames", "false"]);
+    let ours = ok(&dir, &["--human", "stash", "show", "--name-status", "-M"]);
+    assert_eq!(ours, git(&dir, &["stash", "show", "--name-status", "-M"]));
+    assert!(ours.starts_with('R'), "{ours}");
+    let plain = ok(&dir, &["--human", "stash", "show", "--name-status"]);
+    assert_eq!(plain, git(&dir, &["stash", "show", "--name-status"]));
+    let long = ok(
+        &dir,
+        &[
+            "--human",
+            "stash",
+            "show",
+            "--name-status",
+            "--find-renames",
+        ],
+    );
+    assert_eq!(long, ours);
+}
+
+#[test]
+fn stash_show_rename_flags_no_renames_lists_delete_and_add() {
+    let dir = rename_stash("stash-show-rn-off", 2);
+    let out = ok(
+        &dir,
+        &["--toon", "stash", "show", "--name-status", "--no-renames"],
+    );
+    assert!(out.contains("g,D"), "{out}");
+    assert!(out.contains("h,A"), "{out}");
+    let json = ok(
+        &dir,
+        &["--json", "stash", "show", "--name-status", "--no-renames"],
+    );
+    assert!(!json.contains("\"R\""), "{json}");
+    let human = ok(
+        &dir,
+        &["--human", "stash", "show", "--name-status", "--no-renames"],
+    );
+    assert_eq!(
+        human,
+        git(&dir, &["stash", "show", "--name-status", "--no-renames"])
+    );
+}
+
+#[test]
+fn stash_show_rename_flags_score_decides_the_pair() {
+    let dir = rename_stash("stash-show-rn-score", 41);
+    for score in ["-M90%", "-M50%"] {
+        let ours = ok(&dir, &["--human", "stash", "show", "--name-status", score]);
+        assert_eq!(
+            ours,
+            git(&dir, &["stash", "show", "--name-status", score]),
+            "{score}"
+        );
+    }
+    let strict = ok(
+        &dir,
+        &["--human", "stash", "show", "--name-status", "-M90%"],
+    );
+    let loose = ok(
+        &dir,
+        &["--human", "stash", "show", "--name-status", "-M50%"],
+    );
+    assert!(!strict.contains('R'), "{strict}");
+    assert!(loose.starts_with('R'), "{loose}");
+}
+
+#[test]
+fn stash_show_rename_flags_bare_m_leaves_the_stash_ref_alone() {
+    let dir = rename_stash("stash-show-rn-ref", 2);
+    std::fs::write(dir.join("a"), "newer\n").unwrap();
+    ok(&dir, &["stash", "push", "-m", "newer"]);
+    let args = ["stash", "show", "--name-status", "-M", "stash@{1}"];
+    let ours = ok(
+        &dir,
+        &[
+            "--human",
+            "stash",
+            "show",
+            "--name-status",
+            "-M",
+            "stash@{1}",
+        ],
+    );
+    assert_eq!(ours, git(&dir, &args));
+    assert!(ours.starts_with('R'), "{ours}");
+}
+
+#[test]
+fn stash_show_rename_flags_mcp_tool_takes_renames() {
+    use std::io::Write;
+    let dir = rename_stash("stash-show-rn-mcp", 2);
+    git(&dir, &["config", "diff.renames", "false"]);
+    let tool = |input: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rgit"))
+            .args(["tool", "git_stash_show"])
+            .current_dir(&dir)
+            .env("RGIT_OPLOG", "0")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned()
+    };
+    let with = tool(r#"{"renames": true, "name_only": false}"#);
+    assert!(with.contains("h,R"), "{with}");
+    assert!(!with.contains("g,D"), "{with}");
+    let without = tool(r#"{"name_only": false}"#);
+    assert!(
+        without.contains("g,D"),
+        "{without}"
+    );
+}
+
+#[test]
+fn stash_show_rename_flags_mcp_do_not_leak_into_the_next_call() {
+    use std::io::{BufRead, BufReader, Write};
+    let dir = rename_stash("stash-show-rn-mcp-leak", 2);
+    git(&dir, &["config", "diff.renames", "false"]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rgit"))
+        .arg("mcp")
+        .current_dir(&dir)
+        .env("RGIT_OPLOG", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut replies = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut call = |id: u32, method: &str, params: &str| -> String {
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#
+        )
+        .unwrap();
+        let reply = replies.next().unwrap().unwrap();
+        assert!(reply.contains(&format!(r#""id":{id}"#)), "{reply}");
+        reply
+    };
+    call(
+        1,
+        "initialize",
+        r#"{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}"#,
+    );
+    let tool = |args: &str| format!(r#"{{"name":"git_stash_show","arguments":{args}}}"#);
+    let with = call(2, "tools/call", &tool(r#"{"renames":true}"#));
+    assert!(with.contains("h,R"), "{with}");
+    let without = call(3, "tools/call", &tool("{}"));
+    assert!(without.contains("g,D"), "{without}");
+    assert!(!without.contains("h,R"), "{without}");
+    drop(stdin);
+    child.wait().unwrap();
+}
+
+#[test]
+fn stash_show_rename_flags_leave_stash_push_alone() {
+    let dir = repo("stash-show-rn-push");
+    std::fs::write(dir.join("a"), "changed\n").unwrap();
+    ok(&dir, &["stash", "push", "-m", "show"]);
+    assert_eq!(
+        git(&dir, &["stash", "list", "--format=%gs"]),
+        "On main: show\n"
+    );
+}

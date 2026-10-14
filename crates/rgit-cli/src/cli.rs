@@ -4740,6 +4740,8 @@ pub enum StashCmd {
         /// The diffstat, then the patch.
         #[arg(long = "patch-with-stat")]
         patch_with_stat: bool,
+        #[command(flatten)]
+        renames: crate::diffopts::RenameArgs,
     },
     /// Make a stash commit of the local changes and print its id, without
     /// storing it or touching the working tree (git's `stash create`).
@@ -9570,7 +9572,9 @@ fn run_command(
                 include_untracked,
                 only_untracked,
                 patch_with_stat,
+                renames,
             }) => {
+                renames.apply();
                 let bool_config = |k: &str, default: bool| {
                     backend.config_get(k).ok().flatten().map_or(default, |v| {
                         matches!(v.to_lowercase().as_str(), "true" | "yes" | "on" | "1")

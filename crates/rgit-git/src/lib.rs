@@ -115,7 +115,7 @@ pub use config::{
 pub use creds::CredentialPrompt;
 pub use describe::DescribeOptions;
 pub use diagnose::{bugreport, diagnose, is_partial_clone, strftime_now};
-pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin, set_rename_score};
+pub use diff::{DiffLine, FileDiff, Hunk, LineOrigin, set_renames};
 pub use error::GitError;
 pub use fast_export::fast_export;
 pub use fast_import::{FastImportReport, fast_import};

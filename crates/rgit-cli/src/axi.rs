@@ -414,10 +414,11 @@ pub fn run(
                     patch_with_stat,
                     include_untracked,
                     only_untracked,
-                    ..
+                    renames,
                 }),
             ..
         } => {
+            renames.apply();
             let i = index.unwrap_or(0);
             let bool_config = |k: &str, default: bool| {
                 backend.config_get(k).ok().flatten().map_or(default, |v| {

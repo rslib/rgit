@@ -1914,12 +1914,13 @@ fn tools() -> Vec<Tool> {
             "git_stash_show",
             "The changes the stash at `index` records (default 0), as a diffstat table; \
              `patch` returns the patch, `name_only` the file names; `include_untracked` adds \
-             the untracked files it saved.",
+             the untracked files it saved; `renames` detects renames.",
             &[
                 ("index", "integer", false),
                 ("patch", "boolean", false),
                 ("name_only", "boolean", false),
                 ("include_untracked", "boolean", false),
+                ("renames", "boolean", false),
             ],
         ),
         tool(
@@ -4201,6 +4202,10 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             include_untracked: a.flag("include_untracked"),
             only_untracked: false,
             patch_with_stat: false,
+            renames: crate::diffopts::RenameArgs {
+                find_renames: a.flag("renames").then(String::new),
+                ..Default::default()
+            },
         }),
         "git_stash_branch" => stash(StashCmd::Branch {
             name: a.req("name")?,

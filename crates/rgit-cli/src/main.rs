@@ -909,15 +909,21 @@ fn diff_scores(mut args: Vec<String>) -> Vec<String> {
     args
 }
 
-/// git's rename flags for `diff`, `log` and `show`: `-M[<n>]` and `-C[<n>]`
-/// take a score only when attached, so `-M HEAD~1` leaves the revision
-/// alone, and the last of `-M`, `-C` and `--no-renames` wins. A repeated
+/// git's rename flags for `diff`, `log`, `show` and `stash show`: `-M[<n>]`
+/// and `-C[<n>]` take a score only when attached, so `-M HEAD~1` leaves the
+/// revision alone, and the last of `-M`, `-C` and `--no-renames` wins. A repeated
 /// `-C` or `--find-copies-harder` counts as one `-C`.
 fn rename_flags(args: Vec<String>) -> Vec<String> {
     let Some(at) = args
         .iter()
         .position(|a| !a.starts_with('-'))
-        .filter(|&i| matches!(args[i].as_str(), "diff" | "log" | "show" | "whatchanged"))
+        .and_then(|i| match args[i].as_str() {
+            "diff" | "log" | "show" | "whatchanged" => Some(i),
+            "stash" => (i + 1..args.len())
+                .find(|&j| !args[j].starts_with('-'))
+                .filter(|&j| args[j] == "show"),
+            _ => None,
+        })
     else {
         return args;
     };
