@@ -4,3 +4,4 @@ dist/
 src/content/docs/guides/
 src/content/docs/reference/
 src/generated/
+.theme/

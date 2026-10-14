@@ -1,6 +1,7 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightLinksValidator from 'starlight-links-validator';
+import rslibTheme from 'starlight-theme-rslib';
 
 export default defineConfig({
   site: 'https://rslib.github.io',
@@ -12,7 +13,7 @@ export default defineConfig({
         'A git client for people and coding agents: a magit-style TUI, a git-compatible CLI and an MCP server.',
       favicon: '/favicon.svg',
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/rslib/rgit' }],
-      plugins: [starlightLinksValidator()],
+      plugins: [rslibTheme(), starlightLinksValidator()],
       sidebar: [
         { label: 'Start', items: [{ label: 'rgit', slug: '' }] },
         { label: 'Guides', items: [{ autogenerate: { directory: 'guides' } }] },
@@ -26,4 +27,6 @@ export default defineConfig({
       ],
     }),
   ],
+  // npm links the theme from .theme, so Vite may serve its fonts from there.
+  vite: { server: { fs: { allow: ['.', './.theme/starlight'] } } },
 });

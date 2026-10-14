@@ -1,4 +1,4 @@
-// Usage: node scripts/check.mjs <guides|reference|workflow>
+// Usage: node scripts/check.mjs <guides|reference|workflow|theme>
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -132,8 +132,32 @@ function workflow() {
   assert(readme.includes('https://rslib.github.io/rgit'), 'README links the site');
 }
 
-const parts = { guides, reference, workflow };
+function cssOf(html) {
+  return [...html.matchAll(/<link rel="stylesheet" href="\/rgit\/([^"]+\.css)"/g)]
+    .map((m) => readFileSync(join(dist, m[1]), 'utf8'))
+    .join('\n');
+}
+
+function theme() {
+  buildOrFail([]);
+  const index = page(dist, '');
+  assert(/class="rs-title-org[^"]*"[^>]*>rslib</.test(index), 'the site title shows rslib/');
+  assert(/class="rs-title-project[^"]*"[^>]*>rgit</.test(index), 'the site title shows rgit after rslib/');
+  const css = cssOf(index);
+  assert(css.includes('--rs-code-bg'), 'pages load the theme tokens');
+  assert(css.includes('Bricolage Grotesque'), 'pages load the theme fonts');
+  const guide = page(dist, 'guides/change-id');
+  assert(/<pre[^>]*data-language="sh"/.test(guide), 'code blocks render');
+  // #e0def4 is the rose-pine-moon text color; the theme draws its own code background.
+  assert(/#e0def4/i.test(cssOf(guide) + guide), 'code blocks use the rose-pine colors');
+  const workflowText = readFileSync(join(root, '.github/workflows/docs.yml'), 'utf8');
+  const fetchAt = workflowText.indexOf('run: node site/scripts/fetch-theme.mjs');
+  const installAt = workflowText.indexOf('run: npm --prefix site ci');
+  assert(fetchAt !== -1 && fetchAt < installAt, 'CI fetches the theme before npm ci');
+}
+
+const parts = { guides, reference, workflow, theme };
 const part = process.argv[2];
-if (!parts[part]) fail(`unknown part "${part}"; use guides, reference or workflow`);
+if (!parts[part]) fail(`unknown part "${part}"; use guides, reference, workflow or theme`);
 parts[part]();
 console.log(`${part} checks passed`);
