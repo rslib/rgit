@@ -8635,7 +8635,7 @@ fn run_command(
                 .map(|p| if p == "." { "*".to_owned() } else { p.clone() })
                 .collect();
             let lines: Vec<String> = backend
-                .status()?
+                .status_with(rgit_git::status_walk::UntrackedMode::All)?
                 .entries
                 .into_iter()
                 .filter(|e| !matches!(e.worktree, rgit_git::StatusCode::Unmodified))
@@ -14920,22 +14920,34 @@ pub(crate) fn status_view(
     untracked: Option<&str>,
     ignored: Option<&str>,
 ) -> anyhow::Result<rgit_git::RepoStatus> {
-    let mut s = backend.status()?;
-    if untracked == Some("no") {
-        let gone: Vec<String> = s
-            .entries
-            .iter()
-            .filter(|e| e.is_untracked())
-            .map(|e| e.path.clone())
-            .collect();
-        s.entries.retain(|e| !e.is_untracked());
-        s.unstaged.retain(|d| !gone.contains(&d.path));
-    }
+    // `-u` wins over `status.showUntrackedFiles`; the backend applies it.
+    let mut s = match untracked {
+        Some(mode) => backend.status_with(rgit_git::status_walk::UntrackedMode::from_config(
+            Some(mode),
+        )?)?,
+        None => backend.status()?,
+    };
     if ignored.is_some_and(|m| m != "no") {
         s.entries.extend(backend.ignored()?);
     }
     if !paths.is_empty() {
         let keep = |p: &str| rgit_git::pathspec_matches(paths, p);
+        // A pathspec can reach inside a collapsed folder (`.venv/a.py`), and
+        // git then lists the matching files instead of the folder.
+        let reached: Vec<String> = s
+            .entries
+            .iter()
+            .filter(|e| e.is_untracked() && e.path.ends_with('/') && !keep(&e.path))
+            .map(|e| e.path.clone())
+            .collect();
+        if !reached.is_empty() {
+            let all = backend.status_with(rgit_git::status_walk::UntrackedMode::All)?;
+            s.entries.extend(all.entries.into_iter().filter(|e| {
+                e.is_untracked()
+                    && keep(&e.path)
+                    && reached.iter().any(|dir| e.path.starts_with(dir.as_str()))
+            }));
+        }
         s.entries.retain(|e| keep(&e.path));
         s.unstaged.retain(|d| keep(&d.path));
         s.staged.retain(|d| keep(&d.path));

@@ -60,6 +60,9 @@ mod show_branch;
 mod sign;
 mod smart;
 mod sparse;
+pub mod status_walk;
+
+pub use status_walk::StatusTriple;
 #[cfg(feature = "ssh")]
 mod ssh;
 mod stash;

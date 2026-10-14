@@ -4,6 +4,14 @@ use crate::model::{RepoStatus, StatusEntry};
 /// A remote's refs as (name, id), and the branch its HEAD names.
 pub type RemoteHeads = (Vec<(String, String)>, Option<String>);
 
+/// An untracked folder's preview: the first files in path order, plus how
+/// many files the folder holds in total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderFiles {
+    pub files: Vec<String>,
+    pub total: usize,
+}
+
 /// The read/mutation surface the TUI drives, kept abstract so a gix-native or
 /// libgit2 implementation can back each operation independently.
 ///
@@ -25,6 +33,10 @@ pub trait GitBackend: Send + Sync {
     fn status_full(&self) -> Result<RepoStatus, GitError> {
         self.status()
     }
+
+    /// `status` with an explicit untracked mode, overriding
+    /// `status.showUntrackedFiles` (git's `-u`).
+    fn status_with(&self, mode: crate::status_walk::UntrackedMode) -> Result<RepoStatus, GitError>;
 
     /// The second of the index file's last write: git's racy-clean mark.
     fn index_second(&self) -> Option<i64> {
@@ -466,6 +478,10 @@ pub trait GitBackend: Send + Sync {
     /// The working-tree diff for one file: unstaged (index vs workdir) when
     /// `staged` is false, staged (HEAD vs index) when true. None if unchanged.
     fn file_diff(&self, path: &str, staged: bool) -> Result<Option<crate::FileDiff>, GitError>;
+
+    /// The first files under an untracked folder, in path order, with the
+    /// total count, for the folder preview.
+    fn folder_files(&self, path: &str) -> Result<FolderFiles, GitError>;
 
     /// Blame a working-tree file: each line with the commit that last touched it.
     fn blame(&self, path: &str) -> Result<Vec<crate::BlameLine>, GitError>;

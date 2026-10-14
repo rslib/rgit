@@ -18,8 +18,13 @@ use crate::diff::{DiffLine, FileDiff, Hunk, LineOrigin};
 use crate::error::GitError;
 use crate::model::{Commit, Head, OpProgress, RepoStatus, Stash, StatusCode, StatusEntry};
 use crate::shallow;
+use crate::status_walk::UntrackedMode;
 
 const RECENT_LIMIT: usize = 10;
+
+/// How many files of an untracked folder the preview lists; the total
+/// count comes along regardless.
+const FOLDER_PREVIEW_FILES: usize = 200;
 
 /// An in-process git backend over libgit2. Reads (status, diff, log) never spawn
 /// a subprocess. The repository handle is `!Sync`, so it lives behind a mutex;
@@ -51,46 +56,41 @@ impl Git2Backend {
         Ok(Repository::open(gitdir)?)
     }
 
-    fn status_impl(&self, full: bool) -> Result<RepoStatus, GitError> {
+    /// The untracked mode for a refresh: `status.showUntrackedFiles`,
+    /// unset or `normal` is Normal, `all` is All, `no` or false is No.
+    fn untracked_mode(&self) -> Result<UntrackedMode, GitError> {
+        let repo = self.repo();
+        let value = open_config(&repo, ConfigScope::Any, false)
+            .ok()
+            .and_then(|c| c.get_string("status.showUntrackedFiles").ok());
+        UntrackedMode::from_config(value.as_deref())
+    }
+
+    fn status_impl(&self, full: bool, untracked: UntrackedMode) -> Result<RepoStatus, GitError> {
         let mut repo = self.repo();
         // Reflect any staging done by plain `git` since the last refresh.
         sync_index(&repo)?;
         // stash_foreach needs &mut, so collect stashes before the shared reads.
         let stashes = collect_stashes(&mut repo);
-        let entries = collect_entries(&repo)?;
         let recent = collect_recent(&repo);
         let head = collect_head(&repo, recent.first())?;
-
-        // A full snapshot hashes untracked files' contents (recursing into new
-        // directories) so a brand-new file shows its all-added diff in the
-        // preview, like `git diff` with --no-index would; past EAGER_UNTRACKED
-        // files (an unignored build dir, say) they are left out and
-        // `file_diff` loads one on demand. A lazy snapshot reads deltas only
-        // and `file_diff` covers every file on demand.
-        const EAGER_UNTRACKED: usize = 200;
-        let eager_untracked =
-            full && entries.iter().filter(|e| e.is_untracked()).count() <= EAGER_UNTRACKED;
-        let mut unstaged = if full {
-            extract_with_renames_par(&repo, StatusDiff::Workdir { eager_untracked })?
-        } else {
-            extract_meta(&repo, StatusDiff::Workdir { eager_untracked })?
-        };
-        drop_skipped(&repo, &mut unstaged)?;
-        let staged = if full {
-            extract_with_renames_par(&repo, StatusDiff::Staged)?
-        } else {
-            extract_meta(&repo, StatusDiff::Staged)?
-        };
+        let state = repo_state(&repo);
+        let rebase = rebase_progress(&repo);
+        // Shard handles reopen the repository as this handle sees it, so the
+        // lock is released before a slow worktree walk.
+        let opener = crate::status_walk::Opener::from_repo(&repo, &self.workdir)?;
+        drop(repo);
+        let triple = crate::status_walk::refresh(&opener, full, untracked)?;
 
         Ok(RepoStatus {
             head,
-            entries,
-            unstaged,
-            staged,
+            entries: triple.entries,
+            unstaged: triple.unstaged,
+            staged: triple.staged,
             stashes,
             recent,
-            state: repo_state(&repo),
-            rebase: rebase_progress(&repo),
+            state,
+            rebase,
         })
     }
 
@@ -303,11 +303,17 @@ impl GitBackend for Git2Backend {
     }
 
     fn status(&self) -> Result<RepoStatus, GitError> {
-        self.status_impl(false)
+        let untracked = self.untracked_mode()?;
+        self.status_impl(false, untracked)
     }
 
     fn status_full(&self) -> Result<RepoStatus, GitError> {
-        self.status_impl(true)
+        let untracked = self.untracked_mode()?;
+        self.status_impl(true, untracked)
+    }
+
+    fn status_with(&self, untracked: UntrackedMode) -> Result<RepoStatus, GitError> {
+        self.status_impl(false, untracked)
     }
 
     fn stash_push(&self, include_untracked: bool) -> Result<String, GitError> {
@@ -873,6 +879,46 @@ impl GitBackend for Git2Backend {
         Ok(extract_with_renames(&repo, diff)?
             .into_iter()
             .find(|f| f.path == path))
+    }
+
+    fn folder_files(&self, path: &str) -> Result<crate::backend::FolderFiles, GitError> {
+        let repo = self.repo();
+        let mut rel = Vec::new();
+        let mut stack = vec![self.workdir.join(path)];
+        while let Some(dir) = stack.pop() {
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                let full = entry.path();
+                let Ok(name) = full.strip_prefix(&self.workdir) else {
+                    continue;
+                };
+                let name = name.to_string_lossy().into_owned();
+                // As `git status -uall` lists them: no ignored paths, and a
+                // nested repository as one `dir/` entry.
+                if kind.is_dir() {
+                    let shown = format!("{name}/");
+                    if repo.is_path_ignored(&shown).unwrap_or(false) {
+                        continue;
+                    }
+                    if full.join(".git").exists() {
+                        rel.push(shown);
+                    } else {
+                        stack.push(full);
+                    }
+                } else if !repo.is_path_ignored(&name).unwrap_or(false) {
+                    rel.push(name);
+                }
+            }
+        }
+        rel.sort();
+        let total = rel.len();
+        rel.truncate(FOLDER_PREVIEW_FILES);
+        Ok(crate::backend::FolderFiles { files: rel, total })
     }
 
     fn blame(&self, path: &str) -> Result<Vec<crate::BlameLine>, GitError> {
@@ -4151,8 +4197,19 @@ impl GitBackend for Git2Backend {
             let repo = self.repo();
             sync_index(&repo)?;
             no_match(&repo, path)?;
-            let file = self.workdir.join(path).is_file();
-            if file && repo.status_file(Path::new(path))?.contains(Status::WT_NEW) {
+            let full = self.workdir.join(path);
+            let file = full.is_file();
+            if full.is_dir() && !holds_tracked(&repo.index()?, path) {
+                // A collapsed untracked folder row: drop what `git clean -d`
+                // would, so ignored files and nested repositories stay.
+                let opts = crate::clean::CleanOptions {
+                    dirs: true,
+                    paths: vec![path.to_owned()],
+                    ..Default::default()
+                };
+                let items = crate::clean::candidates(&repo, &opts)?;
+                crate::clean::remove(&self.workdir, &items, &opts);
+            } else if file && repo.status_file(Path::new(path))?.contains(Status::WT_NEW) {
                 std::fs::remove_file(self.workdir.join(path))?;
             } else {
                 // Restore the worktree file to its index (staged) content.
@@ -9781,6 +9838,13 @@ fn index_matches(index: &git2::Index, path: &str) -> Result<Vec<String>, GitErro
     Ok(Pathspec::new([path])?.match_index(index))
 }
 
+fn holds_tracked(index: &git2::Index, dir: &str) -> bool {
+    let prefix = format!("{}/", dir.trim_end_matches('/'));
+    index
+        .iter()
+        .any(|e| e.path.starts_with(prefix.as_bytes()))
+}
+
 /// Fail like git when a pathspec names nothing in the working tree, the index
 /// or HEAD.
 fn no_match(repo: &Repository, path: &str) -> Result<(), GitError> {
@@ -10351,18 +10415,24 @@ fn fill_remotes(repo: &Repository, local: &git2::Branch, branch: &str, head: &mu
 
 /// Drop the deletions libgit2 reports for skip-worktree files, which a
 /// sparse checkout leaves out on purpose.
-fn drop_skipped(repo: &Repository, files: &mut Vec<crate::FileDiff>) -> Result<(), GitError> {
+pub(crate) fn drop_skipped(
+    repo: &Repository,
+    files: &mut Vec<crate::FileDiff>,
+) -> Result<(), GitError> {
     let skips = crate::sparse::skipped_paths(&repo.index()?);
     files.retain(|f| f.status != StatusCode::Deleted || !skips.contains(&f.path));
     Ok(())
 }
 
-fn collect_entries(repo: &Repository) -> Result<Vec<StatusEntry>, GitError> {
+pub(crate) fn collect_entries(
+    repo: &Repository,
+    untracked: UntrackedMode,
+) -> Result<Vec<StatusEntry>, GitError> {
     // Worktree renames stay off, as in `git status`: pairing a deletion with an
     // untracked file would make one entry stand for two paths that stage apart.
     let mut opts = StatusOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
+    opts.include_untracked(untracked.include_untracked())
+        .recurse_untracked_dirs(untracked.recurse_untracked_dirs())
         .renames_head_to_index(true);
 
     let statuses = repo.statuses(Some(&mut opts))?;
@@ -10408,7 +10478,7 @@ fn collect_entries(repo: &Repository) -> Result<Vec<StatusEntry>, GitError> {
     Ok(entries)
 }
 
-fn index_code(s: Status) -> StatusCode {
+pub(crate) fn index_code(s: Status) -> StatusCode {
     if s.contains(Status::INDEX_NEW) {
         StatusCode::Added
     } else if s.contains(Status::INDEX_MODIFIED) {
@@ -10424,7 +10494,7 @@ fn index_code(s: Status) -> StatusCode {
     }
 }
 
-fn worktree_code(s: Status) -> StatusCode {
+pub(crate) fn worktree_code(s: Status) -> StatusCode {
     if s.contains(Status::WT_NEW) {
         StatusCode::Untracked
     } else if s.contains(Status::CONFLICTED) {
@@ -11950,9 +12020,13 @@ fn extract_with_renames(repo: &Repository, mut diff: Diff) -> Result<Vec<FileDif
 /// Which diff `extract_with_renames_par` builds; workers rebuild it on their
 /// own repository handle.
 #[derive(Clone, Copy)]
-enum StatusDiff {
-    /// index -> workdir; whether to hash untracked file contents eagerly.
-    Workdir { eager_untracked: bool },
+pub(crate) enum StatusDiff {
+    /// index -> workdir; whether to hash untracked file contents eagerly,
+    /// and how far to report them.
+    Workdir {
+        eager_untracked: bool,
+        untracked: UntrackedMode,
+    },
     /// HEAD tree -> index.
     Staged,
 }
@@ -11960,11 +12034,14 @@ enum StatusDiff {
 impl StatusDiff {
     fn make<'a>(&self, repo: &'a Repository) -> Result<Diff<'a>, GitError> {
         match self {
-            StatusDiff::Workdir { eager_untracked } => {
+            StatusDiff::Workdir {
+                eager_untracked,
+                untracked,
+            } => {
                 let mut opts = DiffOptions::new();
-                if *eager_untracked {
+                if *eager_untracked && untracked.include_untracked() {
                     opts.include_untracked(true)
-                        .recurse_untracked_dirs(true)
+                        .recurse_untracked_dirs(untracked.recurse_untracked_dirs())
                         // Emit the file's lines as additions, not a bare delta.
                         .show_untracked_content(true);
                 }
@@ -11998,7 +12075,7 @@ struct DiffMeta {
     similarity: u16,
 }
 
-fn extract_with_renames_par(
+pub(crate) fn extract_with_renames_par(
     repo: &Repository,
     kind: StatusDiff,
 ) -> Result<Vec<FileDiff>, GitError> {
@@ -12158,57 +12235,62 @@ fn extract_chunk(
 /// The lazy snapshot's diff list: one delta-only [`FileDiff`] per changed
 /// file, rename pairing applied, but no patch text (`loaded: false`).
 /// `file_diff` materializes a single file on demand; `status_full` fills all.
-fn extract_meta(repo: &Repository, kind: StatusDiff) -> Result<Vec<FileDiff>, GitError> {
+pub(crate) fn extract_meta(repo: &Repository, kind: StatusDiff) -> Result<Vec<FileDiff>, GitError> {
     let mut diff = kind.make(repo)?;
     let mut fopts = DiffFindOptions::new();
     fopts.renames(true);
     diff.find_similar(Some(&mut fopts))?;
     let mut files = Vec::with_capacity(diff.deltas().len());
-    for idx in 0..diff.deltas().len() {
-        let delta = diff.get_delta(idx).expect("delta in range");
-        let path = delta
-            .new_file()
-            .path()
-            .or_else(|| delta.old_file().path())
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let old_path = matches!(delta.status(), Delta::Renamed | Delta::Copied)
-            .then(|| {
-                delta
-                    .old_file()
-                    .path()
-                    .map(|p| p.to_string_lossy().into_owned())
-            })
-            .flatten()
-            .filter(|old| *old != path);
-        files.push(FileDiff {
-            path,
-            similarity: if old_path.is_some() {
-                similarity(repo, &delta)
-            } else {
-                0
-            },
-            old_path,
-            status: delta_status(delta.status()),
-            hunks: Vec::new(),
-            binary: delta.flags().is_binary(),
-            header: String::new(),
-            sizes: (delta.old_file().size(), delta.new_file().size()),
-            modes: (
-                u32::from(delta.old_file().mode()),
-                u32::from(delta.new_file().mode()),
-            ),
-            ids: (
-                delta.old_file().id().to_string(),
-                delta.new_file().id().to_string(),
-            ),
-            loaded: false,
-        });
+    for delta in diff.deltas() {
+        files.push(delta_meta(repo, &delta));
     }
     Ok(files)
 }
 
-fn extract(repo: &Repository, diff: &Diff) -> Result<Vec<FileDiff>, GitError> {
+/// One delta-only [`FileDiff`] for a status snapshot: paths, status and rename
+/// score, but no patch text (`loaded: false`).
+pub(crate) fn delta_meta(repo: &Repository, delta: &git2::DiffDelta) -> FileDiff {
+    let path = delta
+        .new_file()
+        .path()
+        .or_else(|| delta.old_file().path())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let old_path = matches!(delta.status(), Delta::Renamed | Delta::Copied)
+        .then(|| {
+            delta
+                .old_file()
+                .path()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+        .flatten()
+        .filter(|old| *old != path);
+    FileDiff {
+        path,
+        similarity: if old_path.is_some() {
+            similarity(repo, delta)
+        } else {
+            0
+        },
+        old_path,
+        status: delta_status(delta.status()),
+        hunks: Vec::new(),
+        binary: delta.flags().is_binary(),
+        header: String::new(),
+        sizes: (delta.old_file().size(), delta.new_file().size()),
+        modes: (
+            u32::from(delta.old_file().mode()),
+            u32::from(delta.new_file().mode()),
+        ),
+        ids: (
+            delta.old_file().id().to_string(),
+            delta.new_file().id().to_string(),
+        ),
+        loaded: false,
+    }
+}
+
+pub(crate) fn extract(repo: &Repository, diff: &Diff) -> Result<Vec<FileDiff>, GitError> {
     let count = diff.deltas().len();
     let mut files = Vec::with_capacity(count);
 
@@ -12429,7 +12511,7 @@ pub(crate) fn span_hashes(data: &[u8]) -> std::collections::HashMap<u32, u64> {
     out
 }
 
-fn delta_status(d: Delta) -> StatusCode {
+pub(crate) fn delta_status(d: Delta) -> StatusCode {
     match d {
         Delta::Added | Delta::Untracked => StatusCode::Added,
         Delta::Deleted => StatusCode::Deleted,

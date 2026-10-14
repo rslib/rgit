@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
+use rgit_git::status_walk::UntrackedMode;
 use rgit_git::{Git2Backend, GitBackend, LogOptions, StatusCode};
 
 /// A scratch directory in the system temp tree, outside the project so
@@ -1212,8 +1213,192 @@ fn many_untracked_files_load_their_diff_on_demand() {
     }
     let backend = Git2Backend::discover(&dir).unwrap();
     let status = backend.status().unwrap();
-    assert_eq!(status.entries.len(), 300);
+    assert_eq!(status.entries.len(), 1);
+    assert_eq!(status.entries[0].path, "build/");
+    let all = backend.status_with(UntrackedMode::All).unwrap();
+    assert_eq!(all.entries.len(), 300);
     assert!(status.unstaged.is_empty(), "contents are not read up front");
     let diff = backend.file_diff("build/7.txt", false).unwrap().unwrap();
     assert_eq!(diff.hunks[0].lines[0].text, "x");
+}
+
+fn untracked_repo(name: &str) -> std::path::PathBuf {
+    let dir = init_repo(name);
+    std::fs::create_dir(dir.join("build")).unwrap();
+    for i in 0..300 {
+        std::fs::write(dir.join(format!("build/{i}.txt")), "x\n").unwrap();
+    }
+    dir
+}
+
+#[test]
+fn untracked_folder_collapses() {
+    let dir = untracked_repo("folder-collapse");
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let status = backend.status().unwrap();
+    assert_eq!(status.entries.len(), 1);
+    let entry = &status.entries[0];
+    assert_eq!(entry.path, "build/");
+    assert_eq!(entry.worktree, StatusCode::Untracked);
+    assert!(
+        status.unstaged.iter().all(|d| !d.path.starts_with("build")),
+        "a collapsed folder has no diff text"
+    );
+    let diff = backend.file_diff("build/7.txt", false).unwrap().unwrap();
+    assert_eq!(diff.hunks[0].lines[0].text, "x");
+    assert!(
+        backend.file_diff("build/", false).unwrap().is_none(),
+        "a folder path has no file diff"
+    );
+}
+
+#[test]
+fn untracked_folder_all_lists_files() {
+    let dir = untracked_repo("folder-all");
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let status = backend.status_with(UntrackedMode::All).unwrap();
+    assert_eq!(status.entries.len(), 300);
+    assert!(
+        status
+            .entries
+            .iter()
+            .all(|e| e.worktree == StatusCode::Untracked),
+        "every entry is untracked"
+    );
+}
+
+#[test]
+fn untracked_folder_no_hides() {
+    let dir = untracked_repo("folder-no");
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let status = backend.status_with(UntrackedMode::No).unwrap();
+    assert!(status.entries.is_empty());
+    assert!(status.unstaged.is_empty());
+    git(&dir, &["config", "status.showUntrackedFiles", "no"]);
+    let status = backend.status().unwrap();
+    assert!(status.entries.is_empty(), "config no hides untracked");
+}
+
+#[test]
+fn untracked_folder_config_all() {
+    let dir = untracked_repo("folder-config");
+    git(&dir, &["config", "status.showUntrackedFiles", "all"]);
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let status = backend.status().unwrap();
+    assert_eq!(status.entries.len(), 300);
+}
+
+#[test]
+fn untracked_folder_ignored_only() {
+    let dir = init_repo("folder-ignored");
+    std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::create_dir(dir.join("logs")).unwrap();
+    std::fs::write(dir.join("logs/a.log"), "a\n").unwrap();
+    git(&dir, &["add", ".gitignore"]);
+    git(&dir, &["commit", "-q", "-m", "seed"]);
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let status = backend.status().unwrap();
+    assert!(
+        status.entries.iter().all(|e| !e.path.starts_with("logs")),
+        "an ignored-only folder gives no entry"
+    );
+}
+
+#[test]
+fn untracked_folder_nested() {
+    let dir = init_repo("folder-nested");
+    std::fs::create_dir_all(dir.join("src/new")).unwrap();
+    std::fs::write(dir.join("src/keep.txt"), "keep\n").unwrap();
+    std::fs::write(dir.join("src/new/n.txt"), "n\n").unwrap();
+    git(&dir, &["add", "src/keep.txt"]);
+    git(&dir, &["commit", "-q", "-m", "seed"]);
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let status = backend.status().unwrap();
+    assert_eq!(status.entries.len(), 1);
+    assert_eq!(status.entries[0].path, "src/new/");
+    assert_eq!(status.entries[0].worktree, StatusCode::Untracked);
+}
+
+#[test]
+fn untracked_folder_files_lists_first_200_and_total() {
+    let dir = init_repo("folder-files");
+    std::fs::create_dir(dir.join(".venv")).unwrap();
+    for i in 0..20000 {
+        std::fs::write(dir.join(format!(".venv/{i}.py")), "x\n").unwrap();
+    }
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let listing = backend.folder_files(".venv/").unwrap();
+    assert_eq!(listing.total, 20000);
+    assert_eq!(listing.files.len(), 200);
+    let mut sorted = listing.files.clone();
+    sorted.sort();
+    assert_eq!(listing.files, sorted, "files come in path order");
+    assert!(listing.files.iter().all(|p| p.starts_with(".venv/")));
+}
+
+#[test]
+fn untracked_folder_files_small_folder() {
+    let dir = init_repo("folder-files-small");
+    std::fs::create_dir(dir.join("notes")).unwrap();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(dir.join(format!("notes/{name}")), "x\n").unwrap();
+    }
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let listing = backend.folder_files("notes/").unwrap();
+    assert_eq!(listing.total, 3);
+    assert_eq!(
+        listing.files,
+        vec![
+            "notes/a.txt".to_owned(),
+            "notes/b.txt".to_owned(),
+            "notes/c.txt".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn untracked_folder_stage_dir() {
+    let dir = untracked_repo("folder-stage");
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.stage_paths(&["build/".to_owned()]).unwrap();
+    let status = backend.status().unwrap();
+    assert_eq!(status.entries.len(), 300);
+    assert!(
+        status.entries.iter().all(|e| e.index == StatusCode::Added),
+        "staging dir/ stages every file in it"
+    );
+}
+
+#[test]
+fn untracked_folder_discard_removes_its_files() {
+    let dir = untracked_repo("folder-discard");
+    std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(dir.join("build/keep.log"), "x\n").unwrap();
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.discard_file("build/").unwrap();
+    assert!(!dir.join("build/7.txt").exists());
+    assert!(
+        dir.join("build/keep.log").exists(),
+        "ignored files stay, as with git clean -d"
+    );
+}
+
+#[test]
+fn untracked_folder_files_skip_ignored_and_nested_repos() {
+    let dir = init_repo("folder-files-ignored");
+    std::fs::write(dir.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::create_dir_all(dir.join("logs/nest")).unwrap();
+    std::fs::write(dir.join("logs/x.txt"), "x\n").unwrap();
+    for i in 0..3 {
+        std::fs::write(dir.join(format!("logs/{i}.log")), "x\n").unwrap();
+    }
+    git(&dir.join("logs/nest"), &["init", "-q"]);
+    std::fs::write(dir.join("logs/nest/a.txt"), "x\n").unwrap();
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let listing = backend.folder_files("logs/").unwrap();
+    assert_eq!(
+        listing.files,
+        vec!["logs/nest/".to_owned(), "logs/x.txt".to_owned()]
+    );
+    assert_eq!(listing.total, 2);
 }

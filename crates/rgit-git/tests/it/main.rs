@@ -9,5 +9,6 @@ mod oplog;
 mod stack;
 mod stage_paths;
 mod status;
+mod status_walk;
 mod workflow;
 mod workspace;

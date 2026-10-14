@@ -22,6 +22,7 @@ mod remote_ops;
 mod sequencer;
 mod sparse;
 mod stack;
+mod status_untracked;
 mod toon_detail;
 mod tui_refresh;
 mod workflow;
