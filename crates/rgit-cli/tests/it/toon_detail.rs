@@ -400,9 +400,17 @@ fn conflict_merge_repo(tag: &str) -> PathBuf {
         .args(["merge", "--no-commit", "side"])
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
         .output()
         .unwrap();
-    assert!(!merging.status.success());
+    assert!(
+        dir.join(".git/MERGE_HEAD").exists(),
+        "the merge did not stop on its conflict: {}",
+        String::from_utf8_lossy(&merging.stderr)
+    );
     std::fs::write(dir.join("f"), "a\nboth\nc\nd\n").unwrap();
     git(&dir, &["add", "f"]);
     git(&dir, &["commit", "-qm", "merge"]);
@@ -474,9 +482,17 @@ fn merge_stopped(dir: &Path, other: &str) {
         .args(["merge", "--no-commit", other])
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@t")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@t")
         .output()
         .unwrap();
-    assert!(!merging.status.success());
+    assert!(
+        dir.join(".git/MERGE_HEAD").exists(),
+        "the merge of {other} did not stop on its conflict: {}",
+        String::from_utf8_lossy(&merging.stderr)
+    );
 }
 
 /// A merge of 3 parents that all changed line 2 of `f`, resolved to `all`;
