@@ -5415,6 +5415,10 @@ impl GitBackend for Git2Backend {
         self.repo().path().to_path_buf()
     }
 
+    fn common_dir(&self) -> PathBuf {
+        self.repo().commondir().to_path_buf()
+    }
+
     fn read_object(&self, rev: &str) -> Result<crate::RawObject, GitError> {
         crate::plumbing::read_object(&self.repo(), rev)
     }

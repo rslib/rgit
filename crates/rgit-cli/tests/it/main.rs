@@ -22,6 +22,7 @@ mod sequencer;
 mod sparse;
 mod stack;
 mod toon_detail;
+mod tui_refresh;
 mod workflow;
 mod workspace;
 mod worktree_ops;

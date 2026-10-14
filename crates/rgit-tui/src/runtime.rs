@@ -3,8 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use notify_debouncer_mini::notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
+use notify_debouncer_mini::notify::{self, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::DefaultTerminal;
 use rgit_git::{GitBackend, GitError, RepoStatus};
 use tokio::sync::mpsc::UnboundedSender;
@@ -1567,9 +1566,20 @@ async fn run_msg(
     Ok(())
 }
 
-/// Watch the worktree and post a quiet refresh when files change. Returns the
-/// debouncer, which must be held alive for watching to continue. Degrades to
-/// manual refresh (`g`) if the watch cannot be set up.
+/// How long git state events (index, HEAD, refs) must be quiet before a
+/// refresh: long enough to merge the writes of one git command.
+const GIT_STATE_WAIT: Duration = Duration::from_millis(150);
+/// How long worktree events must be quiet before a refresh, so a build or an
+/// editor save gives one refresh.
+const WORKTREE_WAIT: Duration = Duration::from_secs(1);
+/// How often the watcher checks the index, HEAD and the HEAD reflog itself.
+/// macOS can deliver file events seconds late, so staging and commits would
+/// show late if they waited for one.
+const GIT_STATE_POLL: Duration = Duration::from_millis(100);
+
+/// Watch the worktree and the git folders and post a quiet refresh when they
+/// change. Returns the watcher, which must be held alive for watching to
+/// continue. Degrades to manual refresh (`g`) if the watch cannot be set up.
 ///
 /// Events are filtered so an agent or build churning through ignored paths
 /// does not force a full status refresh per burst: `.git` internals are
@@ -1578,63 +1588,207 @@ async fn run_msg(
 fn spawn_watcher(
     backend: Arc<dyn GitBackend>,
     msg_tx: UnboundedSender<Msg>,
-) -> Option<Debouncer<RecommendedWatcher>> {
-    let workdir = backend.workdir().to_path_buf();
-    let watchdir = workdir.clone();
-    let watchdir_in = workdir.clone();
-    let mut debouncer = new_debouncer(Duration::from_secs(1), move |res: DebounceEventResult| {
-        let Ok(events) = res else {
-            return;
-        };
-        let batch = sort_watch_paths(&watchdir_in, events.into_iter().map(|event| event.path));
-        // libgit2 reports every path under `.git` as ignored, so git state
-        // refreshes on its own without the ignore check below.
-        if batch.git_state {
-            let _ = msg_tx.send(Msg::AutoRefresh);
-            return;
+) -> Option<RecommendedWatcher> {
+    let roots = WatchRoots {
+        workdir: backend.workdir().to_path_buf(),
+        git_dir: backend.git_dir(),
+        common_dir: backend.common_dir(),
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<std::path::PathBuf>>();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            let _ = tx.send(event.paths);
         }
-        if batch.worktree.is_empty() {
-            return;
-        }
-        let interesting = batch.worktree;
-        // `.gitignore`-driven check: one lock acquisition for the batch.
-        let backend = Arc::clone(&backend);
-        let msg_tx = msg_tx.clone();
-        std::thread::spawn(move || {
-            let paths: Vec<&std::path::Path> = interesting.iter().map(|p| p.as_path()).collect();
-            let flags = match backend.paths_ignored(&paths) {
-                Ok(flags) => flags,
-                Err(_) => {
-                    // Without a verdict, assume the events matter.
-                    let _ = msg_tx.send(Msg::AutoRefresh);
-                    return;
-                }
-            };
-            if flags.into_iter().any(|ignored| !ignored) {
-                let _ = msg_tx.send(Msg::AutoRefresh);
-            }
-        });
     })
     .ok()?;
-    debouncer
-        .watcher()
-        .watch(&watchdir, RecursiveMode::Recursive)
+    watcher
+        .watch(&roots.workdir, RecursiveMode::Recursive)
         .ok()?;
-    Some(debouncer)
+    // A linked worktree keeps its index and HEAD, and the shared refs, outside
+    // the worktree; watch them too. A failed extra watch only loses those.
+    if !roots.git_dir.starts_with(&roots.workdir) {
+        let _ = watcher.watch(&roots.git_dir, RecursiveMode::NonRecursive);
+    }
+    if !roots.common_dir.starts_with(&roots.workdir) {
+        let _ = watcher.watch(&roots.common_dir, RecursiveMode::NonRecursive);
+        let _ = watcher.watch(&roots.common_dir.join("refs"), RecursiveMode::Recursive);
+    }
+    std::thread::spawn(move || {
+        let mut debounce = Debounce::default();
+        let mut poll = GitStatePoll::new(&roots);
+        let mut next_poll = Instant::now() + GIT_STATE_POLL;
+        loop {
+            let wake = debounce.next().map_or(next_poll, |at| at.min(next_poll));
+            match rx.recv_timeout(wake.saturating_duration_since(Instant::now())) {
+                Ok(paths) => debounce.add(sort_watch_paths(&roots, paths), Instant::now()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            let now = Instant::now();
+            if now >= next_poll {
+                if poll.changed() {
+                    debounce.add(
+                        WatchBatch {
+                            git_state: true,
+                            worktree: Vec::new(),
+                        },
+                        now,
+                    );
+                }
+                next_poll = now + GIT_STATE_POLL;
+            }
+            while let Some(flush) = debounce.due(Instant::now()) {
+                match flush {
+                    Flush::GitState => {
+                        let _ = msg_tx.send(Msg::AutoRefresh);
+                    }
+                    Flush::Worktree(paths) => refresh_unless_ignored(&backend, &msg_tx, paths),
+                }
+            }
+        }
+    });
+    Some(watcher)
 }
 
-/// A debounced batch of watch events, sorted for filtering.
+/// Queue a refresh unless every path is ignored. `.gitignore`-driven check:
+/// one lock acquisition for the batch, off the watch thread.
+fn refresh_unless_ignored(
+    backend: &Arc<dyn GitBackend>,
+    msg_tx: &UnboundedSender<Msg>,
+    paths: Vec<std::path::PathBuf>,
+) {
+    let backend = Arc::clone(backend);
+    let msg_tx = msg_tx.clone();
+    std::thread::spawn(move || {
+        let paths: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+        let flags = match backend.paths_ignored(&paths) {
+            Ok(flags) => flags,
+            Err(_) => {
+                // Without a verdict, assume the events matter.
+                let _ = msg_tx.send(Msg::AutoRefresh);
+                return;
+            }
+        };
+        if flags.into_iter().any(|ignored| !ignored) {
+            let _ = msg_tx.send(Msg::AutoRefresh);
+        }
+    });
+}
+
+/// A file's change stamp: modification time, size and file id, or `None`
+/// when it is missing. git replaces the index and HEAD by rename, so the file
+/// id changes even within one clock tick.
+type Stamp = Option<(std::time::SystemTime, u64, u64)>;
+
+fn stamp(path: &Path) -> Stamp {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let id = std::os::unix::fs::MetadataExt::ino(&meta);
+    #[cfg(not(unix))]
+    let id = 0;
+    Some((meta.modified().ok()?, meta.len(), id))
+}
+
+/// The stamps of this worktree's index, HEAD and HEAD reflog, which a stage,
+/// commit, checkout or reset rewrites.
+struct GitStatePoll {
+    paths: [std::path::PathBuf; 3],
+    stamps: [Stamp; 3],
+}
+
+impl GitStatePoll {
+    fn new(roots: &WatchRoots) -> Self {
+        let paths = [
+            roots.git_dir.join("index"),
+            roots.git_dir.join("HEAD"),
+            roots.git_dir.join("logs/HEAD"),
+        ];
+        let stamps = paths.each_ref().map(|p| stamp(p));
+        GitStatePoll { paths, stamps }
+    }
+
+    /// Whether any stamp differs from the last check.
+    fn changed(&mut self) -> bool {
+        let stamps = self.paths.each_ref().map(|p| stamp(p));
+        let changed = stamps != self.stamps;
+        self.stamps = stamps;
+        changed
+    }
+}
+
+/// What one flush of the watch timers asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum Flush {
+    /// Git state changed: refresh now.
+    GitState,
+    /// Worktree paths changed: refresh unless all are ignored.
+    Worktree(Vec<std::path::PathBuf>),
+}
+
+/// The two watch timers: git state waits [`GIT_STATE_WAIT`] of quiet and
+/// worktree paths [`WORKTREE_WAIT`]. A git state flush also covers pending
+/// worktree paths, since it reads the whole status.
+#[derive(Default)]
+struct Debounce {
+    git_state: Option<Instant>,
+    worktree: Option<Instant>,
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl Debounce {
+    fn add(&mut self, batch: WatchBatch, now: Instant) {
+        if batch.git_state {
+            self.git_state = Some(now + GIT_STATE_WAIT);
+        }
+        if !batch.worktree.is_empty() {
+            self.worktree = Some(now + WORKTREE_WAIT);
+            self.paths.extend(batch.worktree);
+        }
+    }
+
+    /// When the next flush is due, if anything is pending.
+    fn next(&self) -> Option<Instant> {
+        match (self.git_state, self.worktree) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn due(&mut self, now: Instant) -> Option<Flush> {
+        if self.git_state.is_some_and(|at| at <= now) {
+            self.git_state = None;
+            self.worktree = None;
+            self.paths.clear();
+            return Some(Flush::GitState);
+        }
+        if self.worktree.is_some_and(|at| at <= now) {
+            self.worktree = None;
+            return Some(Flush::Worktree(std::mem::take(&mut self.paths)));
+        }
+        None
+    }
+}
+
+/// The folders whose events the watcher sorts: the worktree, this worktree's
+/// git folder and the git folder that linked worktrees share.
+struct WatchRoots {
+    workdir: std::path::PathBuf,
+    git_dir: std::path::PathBuf,
+    common_dir: std::path::PathBuf,
+}
+
+/// A batch of watch events, sorted for filtering.
 struct WatchBatch {
     git_state: bool,
     worktree: Vec<std::path::PathBuf>,
 }
 
-/// Sort watch events into git state versus worktree paths. Git state is
-/// `.git/index`, `.git/HEAD`, `.git/packed-refs` and anything under
-/// `.git/refs/`; other `.git` paths are dropped. Paths outside the workdir
-/// stay in the worktree group, as the ignore check below still applies.
+/// Sort watch events into git state versus worktree paths. Git state is this
+/// worktree's `index` and `HEAD` and the shared `packed-refs` and `refs/`;
+/// other git folder paths are dropped. Paths outside every root stay in the
+/// worktree group, as the ignore check still applies.
 fn sort_watch_paths(
-    workdir: &Path,
+    roots: &WatchRoots,
     paths: impl IntoIterator<Item = std::path::PathBuf>,
 ) -> WatchBatch {
     let mut batch = WatchBatch {
@@ -1642,9 +1796,9 @@ fn sort_watch_paths(
         worktree: Vec::new(),
     };
     for path in paths {
-        if is_git_state(workdir, &path) {
+        if is_git_state(roots, &path) {
             batch.git_state = true;
-        } else if is_git_internal(workdir, &path) {
+        } else if is_git_internal(roots, &path) {
             continue;
         } else {
             batch.worktree.push(path);
@@ -1654,31 +1808,26 @@ fn sort_watch_paths(
 }
 
 /// Whether `path` changes git state that rgit shows (staging, branches).
-fn is_git_state(workdir: &Path, path: &Path) -> bool {
-    let Ok(rel) = path.strip_prefix(workdir) else {
-        return false;
-    };
-    let Ok(rest) = rel.strip_prefix(".git") else {
-        return false;
-    };
-    rest == Path::new("index")
-        || rest == Path::new("HEAD")
-        || rest == Path::new("packed-refs")
-        || rest.starts_with("refs")
+fn is_git_state(roots: &WatchRoots, path: &Path) -> bool {
+    let own = path
+        .strip_prefix(&roots.git_dir)
+        .is_ok_and(|rest| rest == Path::new("index") || rest == Path::new("HEAD"));
+    let shared = path
+        .strip_prefix(&roots.common_dir)
+        .is_ok_and(|rest| rest == Path::new("packed-refs") || rest.starts_with("refs"));
+    own || shared
 }
 
-/// Whether `path` is `.git` plumbing whose change cannot alter what rgit
+/// Whether `path` is git folder plumbing whose change cannot alter what rgit
 /// shows.
-fn is_git_internal(workdir: &Path, path: &Path) -> bool {
-    let Ok(rel) = path.strip_prefix(workdir) else {
-        return false;
-    };
-    let mut parts = rel.components();
-    if parts.next() != Some(std::path::Component::Normal(".git".as_ref())) {
-        return false;
-    }
-    !is_git_state(workdir, path)
+fn is_git_internal(roots: &WatchRoots, path: &Path) -> bool {
+    path.starts_with(&roots.git_dir)
+        || path.starts_with(&roots.common_dir)
+        || path
+            .strip_prefix(&roots.workdir)
+            .is_ok_and(|rel| rel.starts_with(".git"))
 }
+
 /// Run a synchronous read/mutation on a blocking task and report the resulting
 /// status back as a [`Msg`], so the render loop never blocks.
 fn spawn_read<F>(app: &App, msg_tx: &UnboundedSender<Msg>, work: F)
@@ -2619,9 +2768,10 @@ mod tests {
     use super::{
         App, HostEditor, Msg, RefreshGate, TuiCredentialPrompt, base64_encode, editor_open_command,
         finish_gated_refresh, grep_hits, read_stamped, restack_note, snippet_sections,
-        sort_watch_paths, update,
+        sort_watch_paths, update, Debounce, Flush, GitStatePoll, WatchBatch, WatchRoots,
     };
     use rgit_git::RestackOutcome;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn tui_ssh_password_closed_channel_is_none() {
@@ -2869,6 +3019,23 @@ mod tests {
         std::path::PathBuf::from("/repo")
     }
 
+    fn main_roots() -> WatchRoots {
+        WatchRoots {
+            workdir: watch_dir(),
+            git_dir: watch_dir().join(".git"),
+            common_dir: watch_dir().join(".git"),
+        }
+    }
+
+    /// A linked worktree at `/wt` of the repository at `/repo`.
+    fn linked_roots() -> WatchRoots {
+        WatchRoots {
+            workdir: std::path::PathBuf::from("/wt"),
+            git_dir: watch_dir().join(".git/worktrees/wt"),
+            common_dir: watch_dir().join(".git"),
+        }
+    }
+
     #[test]
     fn stale_refresh_applies_the_newer_result() {
         let mut app = refresh_app();
@@ -2944,6 +3111,7 @@ mod tests {
 
     #[test]
     fn watch_git_state_flags_index_head_packed_refs_and_refs() {
+        let roots = main_roots();
         let workdir = watch_dir();
         for rel in [
             ".git/index",
@@ -2952,7 +3120,7 @@ mod tests {
             ".git/refs/heads/main",
             ".git/refs/tags/v1",
         ] {
-            let batch = sort_watch_paths(&workdir, [workdir.join(rel)]);
+            let batch = sort_watch_paths(&roots, [workdir.join(rel)]);
             assert!(batch.git_state, "{rel} is git state");
             assert!(batch.worktree.is_empty(), "{rel} skips the ignore check");
         }
@@ -2960,27 +3128,162 @@ mod tests {
 
     #[test]
     fn watch_git_state_drops_other_git_internals() {
-        let workdir = watch_dir();
-        let batch = sort_watch_paths(&workdir, [workdir.join(".git/objects/ab/cd")]);
+        let batch = sort_watch_paths(&main_roots(), [watch_dir().join(".git/objects/ab/cd")]);
         assert!(!batch.git_state);
         assert!(batch.worktree.is_empty());
     }
 
     #[test]
     fn watch_git_state_sends_worktree_paths_to_the_ignore_check() {
-        let workdir = watch_dir();
-        let path = workdir.join("src/main.rs");
-        let batch = sort_watch_paths(&workdir, [path.clone()]);
+        let path = watch_dir().join("src/main.rs");
+        let batch = sort_watch_paths(&main_roots(), [path.clone()]);
         assert!(!batch.git_state);
         assert_eq!(batch.worktree, vec![path]);
     }
 
     #[test]
     fn watch_git_state_keeps_paths_outside_the_workdir() {
-        let workdir = watch_dir();
         let path = std::path::PathBuf::from("/elsewhere/file.rs");
-        let batch = sort_watch_paths(&workdir, [path.clone()]);
+        let batch = sort_watch_paths(&main_roots(), [path.clone()]);
         assert!(!batch.git_state);
         assert_eq!(batch.worktree, vec![path]);
+    }
+
+    fn git_batch() -> WatchBatch {
+        WatchBatch {
+            git_state: true,
+            worktree: Vec::new(),
+        }
+    }
+
+    fn worktree_batch(path: &str) -> WatchBatch {
+        WatchBatch {
+            git_state: false,
+            worktree: vec![std::path::PathBuf::from(path)],
+        }
+    }
+
+    /// Flushes from `debounce`, checked every 10 ms from `base` up to `end_ms`.
+    fn flushes(debounce: &mut Debounce, base: Instant, end_ms: u64) -> Vec<(u64, Flush)> {
+        let mut out = Vec::new();
+        for ms in (0..=end_ms).step_by(10) {
+            while let Some(flush) = debounce.due(base + Duration::from_millis(ms)) {
+                out.push((ms, flush));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn watch_debounce_one_git_command_gives_one_fast_refresh() {
+        let base = Instant::now();
+        let mut debounce = Debounce::default();
+        for ms in [0, 40, 80] {
+            debounce.add(git_batch(), base + Duration::from_millis(ms));
+        }
+        let out = flushes(&mut debounce, base, 2000);
+        assert_eq!(out.len(), 1, "{out:?}");
+        let (at, flush) = &out[0];
+        assert_eq!(*flush, Flush::GitState);
+        assert!((80..=300).contains(at), "refresh at {at} ms");
+    }
+
+    #[test]
+    fn watch_debounce_worktree_save_keeps_the_one_second_wait() {
+        let base = Instant::now();
+        let mut debounce = Debounce::default();
+        debounce.add(worktree_batch("/repo/src/a.rs"), base);
+        let out = flushes(&mut debounce, base, 2000);
+        assert_eq!(out.len(), 1, "{out:?}");
+        let (at, flush) = &out[0];
+        assert_eq!(
+            *flush,
+            Flush::Worktree(vec![std::path::PathBuf::from("/repo/src/a.rs")])
+        );
+        assert!((1000..=1300).contains(at), "refresh at {at} ms");
+    }
+
+    #[test]
+    fn watch_debounce_mixed_events_take_the_fast_path() {
+        let base = Instant::now();
+        let mut debounce = Debounce::default();
+        debounce.add(worktree_batch("/repo/src/a.rs"), base);
+        debounce.add(git_batch(), base + Duration::from_millis(50));
+        let out = flushes(&mut debounce, base, 2000);
+        assert_eq!(out.len(), 1, "{out:?}");
+        let (at, flush) = &out[0];
+        assert_eq!(*flush, Flush::GitState);
+        assert!(*at <= 350, "refresh at {at} ms");
+    }
+
+    #[test]
+    fn watch_debounce_nothing_pending_waits_for_events() {
+        let mut debounce = Debounce::default();
+        assert_eq!(debounce.next(), None);
+        assert_eq!(debounce.due(Instant::now()), None);
+    }
+
+    #[test]
+    fn watch_linked_worktree_flags_its_index_head_and_the_shared_refs() {
+        let roots = linked_roots();
+        for path in [
+            "/repo/.git/worktrees/wt/index",
+            "/repo/.git/worktrees/wt/HEAD",
+            "/repo/.git/packed-refs",
+            "/repo/.git/refs/heads/side",
+        ] {
+            let batch = sort_watch_paths(&roots, [std::path::PathBuf::from(path)]);
+            assert!(batch.git_state, "{path} is git state");
+            assert!(batch.worktree.is_empty(), "{path} skips the ignore check");
+        }
+    }
+
+    #[test]
+    fn watch_linked_worktree_drops_another_worktrees_index() {
+        let roots = linked_roots();
+        for path in [
+            "/repo/.git/worktrees/other/index",
+            "/repo/.git/HEAD",
+            "/repo/.git/objects/ab/cd",
+            "/wt/.git",
+        ] {
+            let batch = sort_watch_paths(&roots, [std::path::PathBuf::from(path)]);
+            assert!(!batch.git_state, "{path} is not this worktree's state");
+            assert!(batch.worktree.is_empty(), "{path} is dropped");
+        }
+    }
+
+    #[test]
+    fn watch_linked_worktree_sends_its_files_to_the_ignore_check() {
+        let path = std::path::PathBuf::from("/wt/src/main.rs");
+        let batch = sort_watch_paths(&linked_roots(), [path.clone()]);
+        assert!(!batch.git_state);
+        assert_eq!(batch.worktree, vec![path]);
+    }
+
+    #[test]
+    fn watch_debounce_poll_sees_a_rewritten_index() {
+        let dir = std::env::temp_dir().join(format!("rgit-tui-poll-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        for f in ["index", "HEAD", "logs/HEAD"] {
+            std::fs::write(dir.join(f), "a").unwrap();
+        }
+        let roots = WatchRoots {
+            workdir: dir.clone(),
+            git_dir: dir.clone(),
+            common_dir: dir.clone(),
+        };
+        let mut poll = GitStatePoll::new(&roots);
+        assert!(!poll.changed(), "nothing changed yet");
+        std::fs::write(dir.join("index.lock"), "a").unwrap();
+        std::fs::rename(dir.join("index.lock"), dir.join("index")).unwrap();
+        let seen = poll.changed();
+        assert!(!poll.changed(), "a second check sees no new change");
+        std::fs::remove_file(dir.join("HEAD")).unwrap();
+        let gone = poll.changed();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(seen, "a same-size index replaced by rename is a change");
+        assert!(gone, "a removed HEAD is a change");
     }
 }

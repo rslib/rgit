@@ -1344,6 +1344,12 @@ pub trait GitBackend: Send + Sync {
     /// The repository's `.git` directory.
     fn git_dir(&self) -> std::path::PathBuf;
 
+    /// The git directory that linked worktrees share (refs, packed-refs);
+    /// the same as `git_dir` outside a linked worktree.
+    fn common_dir(&self) -> std::path::PathBuf {
+        self.git_dir()
+    }
+
     /// An object's type, id and raw content (`git cat-file`).
     fn read_object(&self, rev: &str) -> Result<crate::RawObject, GitError>;
 
