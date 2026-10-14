@@ -914,6 +914,8 @@ impl<'r> Wt<'r> {
             untracked: self.untracked_mode,
             ignored: self.ignored_mode,
             spec: self.spec.as_ref(),
+            #[cfg(test)]
+            reads: Default::default(),
         };
         let mut unt = Vec::new();
         let mut ign = Vec::new();
@@ -2942,6 +2944,8 @@ struct Walk<'a> {
     untracked: Untracked,
     ignored: Ignored,
     spec: Option<&'a crate::pathspec::Pathspec>,
+    #[cfg(test)]
+    reads: std::cell::Cell<usize>,
 }
 
 enum Kind {
@@ -2952,6 +2956,8 @@ enum Kind {
 
 impl Walk<'_> {
     fn children(&self, dir: &str) -> Vec<(String, Kind)> {
+        #[cfg(test)]
+        self.reads.set(self.reads.get() + 1);
         let Ok(read) = std::fs::read_dir(self.workdir.join(dir)) else {
             return Vec::new();
         };
@@ -3050,6 +3056,12 @@ impl Walk<'_> {
             }
             return;
         }
+        if self.untracked == Untracked::Normal && self.ignored == Ignored::No {
+            if self.any_untracked(dir) {
+                unt.push(dir.to_owned());
+            }
+            return;
+        }
         let (mut u, mut i) = (Vec::new(), Vec::new());
         let any = self.scan(dir, &mut u, &mut i);
         if self.untracked == Untracked::All {
@@ -3126,6 +3138,21 @@ impl Walk<'_> {
         any
     }
 
+    /// Whether an unignored folder holds an untracked file. It stops at the
+    /// first one, as git's check_only read of a folder does.
+    fn any_untracked(&self, dir: &str) -> bool {
+        self.children(dir)
+            .into_iter()
+            .any(|(path, kind)| match kind {
+                Kind::File => self.matches(&path) && !self.is_ignored(&path),
+                Kind::Repo => !self.is_ignored(&format!("{path}/")),
+                Kind::Dir => {
+                    let d = format!("{path}/");
+                    !self.is_ignored(&d) && self.any_untracked(&d)
+                }
+            })
+    }
+
     fn has_any(&self, dir: &str) -> bool {
         let mut v = Vec::new();
         self.all_files(dir, &mut v);
@@ -3144,5 +3171,70 @@ impl Walk<'_> {
                 Kind::Dir => self.all_files(&format!("{path}/"), out),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Ignored, Untracked, Walk};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    fn untracked_tree(tag: &str) -> (PathBuf, git2::Repository) {
+        let root = std::env::temp_dir().join(format!("rgit-wt-walk-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in 0..30 {
+            std::fs::create_dir_all(root.join(format!("u/d{d}"))).unwrap();
+            std::fs::write(root.join(format!("u/d{d}/f")), "x").unwrap();
+        }
+        std::fs::write(root.join("f"), "x").unwrap();
+        let repo = git2::Repository::init(&root).unwrap();
+        (root, repo)
+    }
+
+    fn walk(
+        repo: &git2::Repository,
+        root: &PathBuf,
+        untracked: Untracked,
+        ignored: Ignored,
+    ) -> (Vec<String>, Vec<String>, usize) {
+        let files = HashSet::from(["f".to_owned()]);
+        let dirs = HashSet::new();
+        let walk = Walk {
+            repo,
+            workdir: root,
+            files: &files,
+            dirs: &dirs,
+            untracked,
+            ignored,
+            spec: None,
+            reads: Default::default(),
+        };
+        let (mut unt, mut ign) = (Vec::new(), Vec::new());
+        walk.tracked_dir("", &mut unt, &mut ign);
+        unt.sort();
+        (unt, ign, walk.reads.get())
+    }
+
+    #[test]
+    fn untracked_walk_stops_at_the_first_file() {
+        let (root, repo) = untracked_tree("first");
+        let (unt, ign, reads) = walk(&repo, &root, Untracked::Normal, Ignored::No);
+        assert_eq!(unt, ["u/"]);
+        assert!(ign.is_empty());
+        assert!(reads <= 3, "read {reads} folders to report u/");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn untracked_walk_all_and_ignored_still_read_every_folder() {
+        let (root, repo) = untracked_tree("all");
+        let (unt, _, reads) = walk(&repo, &root, Untracked::All, Ignored::No);
+        assert_eq!(unt.len(), 30);
+        assert_eq!(reads, 32);
+        let (unt, _, reads) = walk(&repo, &root, Untracked::Normal, Ignored::Traditional);
+        assert_eq!(unt, ["u/"]);
+        assert_eq!(reads, 32);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
