@@ -2,6 +2,7 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightLinksValidator from 'starlight-links-validator';
 import rslibTheme from 'starlight-theme-rslib';
+import commandGroups from './src/generated/sidebar.json' with { type: 'json' };
 
 export default defineConfig({
   site: 'https://rslib.github.io',
@@ -20,7 +21,10 @@ export default defineConfig({
         {
           label: 'Reference',
           items: [
-            { label: 'Commands', slug: 'reference/commands' },
+            { label: 'Commands overview', slug: 'reference/commands' },
+            ...commandGroups.map((group) => ({ label: group.label, collapsed: true, items: group.items })),
+            { label: 'Global options', slug: 'reference/commands/global-options' },
+            { label: 'TUI keys', slug: 'reference/tui-keys' },
             { label: 'Configuration', slug: 'reference/configuration' },
           ],
         },

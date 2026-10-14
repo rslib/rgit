@@ -1747,6 +1747,10 @@ fn context_hints(app: &App) -> (Option<String>, Vec<(&'static str, &'static str)
     }
 }
 
+pub(crate) fn help_groups() -> &'static [(&'static str, &'static [(&'static str, &'static str)])] {
+    HELP_GROUPS
+}
+
 /// Grouped keybinding reference, shown full-screen while `app.help` is set.
 const HELP_GROUPS: &[(&str, &[(&str, &str)])] = &[
     (

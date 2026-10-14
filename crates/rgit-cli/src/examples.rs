@@ -1603,6 +1603,7 @@ const EXAMPLES: &[Entry] = &[
         "agent skill",
         &["rgit agent skill", "rgit agent skill --reference"],
     ),
+    ("agent docs", &["rgit agent docs --out docs/reference"]),
     ("index", &["rgit index status"]),
     (
         "index build",

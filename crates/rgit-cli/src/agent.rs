@@ -109,6 +109,23 @@ pub fn run(cmd: AgentCmd) -> Result<Output> {
             }
             .trim_end(),
         )),
+        AgentCmd::Docs { out } => {
+            let files = crate::cli::docs_reference();
+            for (rel, text) in &files {
+                let path = out.join(rel);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("cannot create {}", parent.display()))?;
+                }
+                std::fs::write(&path, text)
+                    .with_context(|| format!("cannot write {}", path.display()))?;
+            }
+            Ok(Output::message(format!(
+                "wrote {} files to {}",
+                files.len(),
+                out.display()
+            )))
+        }
     }
 }
 

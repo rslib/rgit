@@ -1,0 +1,48 @@
+# rgit diff-index
+
+Compare a tree with the working tree or the index, like `git diff-index`
+
+## Usage
+
+```sh
+rgit diff-index [OPTIONS] <TREE-ISH>... [-- <PATHS>...]
+```
+
+## Examples
+
+```sh
+rgit diff-index HEAD
+rgit diff-index --cached --name-only HEAD
+rgit diff-index --cached -C --name-status HEAD
+```
+
+## Arguments
+
+| Argument | Description |
+| --- | --- |
+| `<TREE-ISH>...` | The tree-ish, then paths |
+| `[PATHS]...` | Limit to these paths |
+
+## Options
+
+| Option | Value | Description |
+| --- | --- | --- |
+| `-p, --patch` |  | Show patches instead of the raw listing |
+| `-s, --no-patch` |  | Show no diff (only diff-tree's commit id) |
+| `--raw` |  | Show the raw listing (the default) |
+| `--name-only` |  | Show only the names of changed files |
+| `--name-status` |  | Show the names and status letters of changed files |
+| `-z` |  | NUL-terminated output |
+| `-r` |  | Recurse into subtrees |
+| `-t` |  | Show changed trees too while recursing (implies -r) |
+| `--exit-code` |  | Exit 1 when there are changes |
+| `--quiet` |  | Print nothing; exit 1 when there are changes |
+| `--stat` | `WIDTH` | Show a diffstat, optionally this many columns wide |
+| `--summary` |  | Show created, deleted, renamed and mode-changed files |
+| `--find-renames` | `N` | Detect renames, optionally at this similarity (git's -M[&lt;n&gt;]) |
+| `--find-copies` | `N` | Detect copies as well as renames (git's -C[&lt;n&gt;]); twice is --find-copies-harder |
+| `--find-copies-harder` |  | Look for copy sources among unmodified files too |
+| `--abbrev` | `N` | Abbreviate raw object ids, to this many digits if given |
+| `--cached` |  | Compare with the index, not the working tree |
+
+See the [global options](global-options.md) that every command accepts.

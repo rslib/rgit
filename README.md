@@ -61,6 +61,9 @@ Run `rgit --help` for every command and `rgit <command> --help` for its flags.
 ## Learn more
 
 - [Read the documentation site](https://rslib.github.io/rgit): every guide, the command reference and the TUI settings.
+- [Get started](docs/tutorial.md): make your first commit in the TUI, then undo it.
+- [Use the TUI](docs/tui.md): stage hunks, commit, rebase, sync and undo from the TUI.
+- [Commands](docs/reference/commands/index.md): one page for each rgit command.
 - [Use rgit from a coding agent](docs/agent-integration.md): output modes, `rgit agent install` and the MCP tools.
 - [Use rgit with Forgejo](docs/forgejo.md): forge profiles for GitHub, GitLab and Forgejo.
 - [Add Change-Id trailers](docs/change-id.md): stable change ids for Gerrit-style review.

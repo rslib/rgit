@@ -1,7 +1,7 @@
 // Copies the single-source docs into the generated folders that Astro reads.
 // Run from `npm run build` and `npm run dev`. Generated folders are git-ignored.
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const site = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -29,6 +29,8 @@ function rewriteLinks(text) {
     if (path === 'config.example.toml') return `](${base}/reference/configuration/${suffix})`;
     const guide = path.match(/^(?:\.\/)?([^/]+)\.md$/);
     if (guide) return `](${base}/guides/${guide[1]}/${suffix})`;
+    const reference = path.match(/^(?:\.\/)?reference\/(.+?)(?:\/index)?\.md$/);
+    if (reference) return `](${base}/reference/${reference[1]}/${suffix})`;
     if (path.startsWith('../')) return `](${repoBlob}/${path.slice(3)}${suffix})`;
     return match;
   });
@@ -48,12 +50,23 @@ function splitTitle(text, file) {
   return { title, body: lines.join('\n').replace(/^\n+/, '') };
 }
 
+// The tutorial and the TUI page come first, then the rest by name.
+const guideFirst = ['tutorial.md', 'tui.md'];
+const guides = [];
 for (const dir of docsDirs) {
-  for (const name of readdirSync(dir).filter((f) => f.endsWith('.md')).sort()) {
-    const { title, body } = splitTitle(readFileSync(join(dir, name), 'utf8'), join(dir, name));
-    writeFileSync(join(guidesOut, name), `---\ntitle: ${quote(title)}\n---\n\n${rewriteLinks(body)}`);
-  }
+  for (const name of readdirSync(dir).filter((f) => f.endsWith('.md'))) guides.push({ dir, name });
 }
+guides.sort((a, b) => {
+  const rank = (g) => (guideFirst.includes(g.name) ? guideFirst.indexOf(g.name) : guideFirst.length);
+  return rank(a) - rank(b) || a.name.localeCompare(b.name);
+});
+guides.forEach(({ dir, name }, order) => {
+  const { title, body } = splitTitle(readFileSync(join(dir, name), 'utf8'), join(dir, name));
+  writeFileSync(
+    join(guidesOut, name),
+    `---\ntitle: ${quote(title)}\nsidebar:\n  order: ${order}\n---\n\n${rewriteLinks(body)}`,
+  );
+});
 
 // Install and quickstart come from README sections so they cannot drift.
 const readme = readFileSync(join(root, 'README.md'), 'utf8');
@@ -70,14 +83,37 @@ const referenceOut = join(site, 'src/content/docs/reference');
 rmSync(referenceOut, { recursive: true, force: true });
 mkdirSync(referenceOut, { recursive: true });
 
-const commands = splitTitle(
-  readFileSync(join(root, 'skills/rgit/references/commands.md'), 'utf8'),
-  'skills/rgit/references/commands.md',
-);
-writeFileSync(
-  join(referenceOut, 'commands.md'),
-  `---\ntitle: ${quote('Command reference')}\n---\n\n${rewriteLinks(commands.body)}`,
-);
+// Links between generated pages are relative `.md` files; they become page slugs.
+function rewriteReferenceLinks(text, fromDir) {
+  return text.replace(/\]\(([^)\s]+)\)/g, (match, target) => {
+    if (/^(?:[a-z][a-z0-9+.-]*:|#|\/)/i.test(target)) return match;
+    const [path, hash = ''] = target.split('#');
+    if (!path.endsWith('.md')) return match;
+    const slug = posix.join(fromDir, path.slice(0, -3)).replace(/\/index$/, '');
+    return `](${base}/reference/${slug}/${hash ? `#${hash}` : ''})`;
+  });
+}
+
+function copyReference(dir, relDir = '') {
+  for (const entry of readdirSync(join(dir, relDir), { withFileTypes: true })) {
+    const rel = posix.join(relDir, entry.name);
+    if (entry.isDirectory()) {
+      mkdirSync(join(referenceOut, rel), { recursive: true });
+      copyReference(dir, rel);
+    } else if (entry.name === 'sidebar.json') {
+      copyFileSync(join(dir, rel), join(generatedOut, 'sidebar.json'));
+    } else if (entry.name.endsWith('.md')) {
+      const { title, body } = splitTitle(readFileSync(join(dir, rel), 'utf8'), join(dir, rel));
+      const command = relDir === 'commands' && entry.name !== 'index.md' && entry.name !== 'global-options.md';
+      const label = command ? `sidebar:\n  label: ${quote(entry.name.slice(0, -3).replace(/-command$/, ''))}\n` : '';
+      writeFileSync(
+        join(referenceOut, rel),
+        `---\ntitle: ${quote(title)}\n${label}---\n\n${rewriteReferenceLinks(body, relDir)}`,
+      );
+    }
+  }
+}
+copyReference(join(root, 'docs/reference'));
 
 const exampleConfig = readFileSync(join(root, 'docs/config.example.toml'), 'utf8').trimEnd();
 writeFileSync(

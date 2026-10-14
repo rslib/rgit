@@ -1,0 +1,226 @@
+[
+  {
+    "label": "Inspect",
+    "items": [
+      "reference/commands/status",
+      "reference/commands/log",
+      "reference/commands/diff",
+      "reference/commands/show",
+      "reference/commands/blame",
+      "reference/commands/refs",
+      "reference/commands/smartlog",
+      "reference/commands/describe"
+    ]
+  },
+  {
+    "label": "Stage and discard",
+    "items": [
+      "reference/commands/stage",
+      "reference/commands/unstage",
+      "reference/commands/stage-all",
+      "reference/commands/unstage-all",
+      "reference/commands/add",
+      "reference/commands/discard",
+      "reference/commands/restore",
+      "reference/commands/resolve",
+      "reference/commands/rm",
+      "reference/commands/mv",
+      "reference/commands/clean",
+      "reference/commands/sparse-checkout"
+    ]
+  },
+  {
+    "label": "Commit and rewrite history",
+    "items": [
+      "reference/commands/commit",
+      "reference/commands/extend",
+      "reference/commands/reword",
+      "reference/commands/uncommit",
+      "reference/commands/squash",
+      "reference/commands/move",
+      "reference/commands/split",
+      "reference/commands/absorb",
+      "reference/commands/cherry-pick",
+      "reference/commands/revert",
+      "reference/commands/reset"
+    ]
+  },
+  {
+    "label": "Undo",
+    "items": [
+      "reference/commands/undo",
+      "reference/commands/redo",
+      "reference/commands/oplog"
+    ]
+  },
+  {
+    "label": "Branches, tags, stashes",
+    "items": [
+      "reference/commands/branch",
+      "reference/commands/checkout",
+      "reference/commands/switch",
+      "reference/commands/merge",
+      "reference/commands/rebase",
+      "reference/commands/tag",
+      "reference/commands/stash",
+      "reference/commands/bisect",
+      "reference/commands/rerere",
+      "reference/commands/prune"
+    ]
+  },
+  {
+    "label": "Stacks, lanes, workspaces, worktrees",
+    "items": [
+      "reference/commands/stack",
+      "reference/commands/next",
+      "reference/commands/prev",
+      "reference/commands/sync",
+      "reference/commands/submit",
+      "reference/commands/lanes",
+      "reference/commands/workspace",
+      "reference/commands/worktree",
+      "reference/commands/flow"
+    ]
+  },
+  {
+    "label": "Remotes and forge (GitHub/GitLab)",
+    "items": [
+      "reference/commands/fetch",
+      "reference/commands/pull",
+      "reference/commands/push",
+      "reference/commands/ls-remote",
+      "reference/commands/remote",
+      "reference/commands/forge"
+    ]
+  },
+  {
+    "label": "Patches, notes, config and maintenance",
+    "items": [
+      "reference/commands/format-patch",
+      "reference/commands/am",
+      "reference/commands/apply",
+      "reference/commands/archive",
+      "reference/commands/notes",
+      "reference/commands/config",
+      "reference/commands/update-ref",
+      "reference/commands/hash-object",
+      "reference/commands/gc",
+      "reference/commands/fsck",
+      "reference/commands/verify-commit",
+      "reference/commands/verify-tag",
+      "reference/commands/repack",
+      "reference/commands/pack-refs",
+      "reference/commands/commit-graph",
+      "reference/commands/multi-pack-index",
+      "reference/commands/maintenance",
+      "reference/commands/for-each-repo",
+      "reference/commands/scalar",
+      "reference/commands/credential",
+      "reference/commands/credential-store",
+      "reference/commands/credential-cache",
+      "reference/commands/credential-cache--daemon",
+      "reference/commands/hook",
+      "reference/commands/cherry",
+      "reference/commands/bundle",
+      "reference/commands/request-pull",
+      "reference/commands/range-diff",
+      "reference/commands/difftool",
+      "reference/commands/mergetool"
+    ]
+  },
+  {
+    "label": "Plumbing (git's own output formats)",
+    "items": [
+      "reference/commands/rev-parse",
+      "reference/commands/ls-files",
+      "reference/commands/ls-tree",
+      "reference/commands/cat-file",
+      "reference/commands/show-ref",
+      "reference/commands/for-each-ref",
+      "reference/commands/rev-list",
+      "reference/commands/merge-base",
+      "reference/commands/reflog",
+      "reference/commands/shortlog",
+      "reference/commands/grep",
+      "reference/commands/check-ignore",
+      "reference/commands/var",
+      "reference/commands/symbolic-ref",
+      "reference/commands/count-objects",
+      "reference/commands/name-rev",
+      "reference/commands/check-attr",
+      "reference/commands/check-ref-format",
+      "reference/commands/patch-id",
+      "reference/commands/stripspace",
+      "reference/commands/column",
+      "reference/commands/diff-tree",
+      "reference/commands/diff-index",
+      "reference/commands/diff-files",
+      "reference/commands/merge-tree",
+      "reference/commands/merge-file",
+      "reference/commands/fast-export",
+      "reference/commands/fast-import",
+      "reference/commands/replay",
+      "reference/commands/commit-tree",
+      "reference/commands/write-tree",
+      "reference/commands/read-tree",
+      "reference/commands/update-index",
+      "reference/commands/checkout-index",
+      "reference/commands/mktree",
+      "reference/commands/mktag",
+      "reference/commands/get-tar-commit-id",
+      "reference/commands/fmt-merge-msg",
+      "reference/commands/mailsplit",
+      "reference/commands/mailinfo",
+      "reference/commands/interpret-trailers",
+      "reference/commands/show-branch",
+      "reference/commands/fetch-pack",
+      "reference/commands/send-pack",
+      "reference/commands/diff-pairs"
+    ]
+  },
+  {
+    "label": "Object replacement, packs and diagnostics",
+    "items": [
+      "reference/commands/replace",
+      "reference/commands/check-mailmap",
+      "reference/commands/verify-pack",
+      "reference/commands/show-index",
+      "reference/commands/index-pack",
+      "reference/commands/unpack-objects",
+      "reference/commands/pack-objects",
+      "reference/commands/prune-packed",
+      "reference/commands/update-server-info",
+      "reference/commands/unpack-file",
+      "reference/commands/merge-one-file",
+      "reference/commands/merge-index",
+      "reference/commands/bugreport",
+      "reference/commands/diagnose",
+      "reference/commands/backfill"
+    ]
+  },
+  {
+    "label": "Code search",
+    "items": [
+      "reference/commands/index-command"
+    ]
+  },
+  {
+    "label": "Repositories and escape hatch",
+    "items": [
+      "reference/commands/init",
+      "reference/commands/clone",
+      "reference/commands/submodule",
+      "reference/commands/git"
+    ]
+  },
+  {
+    "label": "Agent integration and servers",
+    "items": [
+      "reference/commands/agent",
+      "reference/commands/completion",
+      "reference/commands/mcp",
+      "reference/commands/tool",
+      "reference/commands/serve"
+    ]
+  }
+]

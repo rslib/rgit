@@ -104,8 +104,20 @@ function reference() {
   buildOrFail([]);
   const commands = page(dist, 'reference/commands');
   for (const name of ['status', 'stash', 'agent']) {
-    assert(new RegExp(`<code[^>]*>${name}</code>`).test(commands), `reference page names ${name}`);
+    assert(
+      new RegExp(`<a href="/rgit/reference/commands/${name}/"[^>]*><code[^>]*>${name}</code></a>`).test(commands),
+      `commands overview links ${name}`,
+    );
   }
+  const status = page(dist, 'reference/commands/status');
+  for (const heading of ['Usage', 'Examples', 'Options']) {
+    assert(new RegExp(`<h2 id="${heading.toLowerCase()}"`).test(status), `status page has ${heading}`);
+  }
+  assert(/<table[\s\S]*<code[^>]*>--porcelain<\/code>/.test(status), 'status options table names --porcelain');
+  const stash = page(dist, 'reference/commands/stash');
+  assert(/<h3 id="rgit-stash-pop"/.test(stash), 'stash page has a rgit stash pop section');
+  const keys = page(dist, 'reference/tui-keys');
+  assert(/<table[\s\S]*stage \/ unstage at point/.test(keys), 'tui-keys page has a table with stage / unstage at point');
   const config = page(dist, 'reference/configuration');
   assert(/<pre[^>]*data-language="toml"/.test(config), 'configuration page has a toml code block');
   assert(/<pre[^>]*data-language="toml"[\s\S]*\[theme\]/.test(config), 'configuration page shows [theme]');

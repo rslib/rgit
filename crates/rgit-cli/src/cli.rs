@@ -4329,6 +4329,13 @@ pub enum AgentCmd {
         #[arg(long)]
         reference: bool,
     },
+    /// Write the Markdown command reference and TUI key table for the docs site.
+    #[command(hide = true)]
+    Docs {
+        /// The folder to write into.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7739,6 +7746,245 @@ fn skill_entry(out: &mut String, cmd: &clap::Command, path: &str, depth: usize) 
     for sub in cmd.get_subcommands().filter(|s| !s.is_hide_set()) {
         skill_entry(out, sub, &format!("{path} {}", sub.get_name()), depth + 1);
     }
+}
+
+/// Escapes text for a Markdown table cell, readable on GitHub and safe from
+/// being read as HTML.
+fn md_cell(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('|', "\\|")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn md_code_cell(text: &str) -> String {
+    format!("`{}`", text.replace('|', "\\|"))
+}
+
+fn md_takes_value(arg: &clap::Arg) -> bool {
+    !matches!(
+        arg.get_action(),
+        clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Count
+    ) && arg.get_num_args().is_none_or(|r| r.max_values() > 0)
+}
+
+fn md_option_row(arg: &clap::Arg) -> String {
+    let mut forms = Vec::new();
+    if let Some(short) = arg.get_short() {
+        forms.push(format!("-{short}"));
+    }
+    if let Some(long) = arg.get_long() {
+        forms.push(format!("--{long}"));
+    }
+    let value = md_takes_value(arg)
+        .then(|| {
+            arg.get_value_names()
+                .map(|names| {
+                    names
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_else(|| arg.get_id().as_str().to_uppercase())
+        })
+        .map(|v| md_code_cell(&v))
+        .unwrap_or_default();
+    let mut help = md_cell(&arg.get_help().map(|h| h.to_string()).unwrap_or_default());
+    let defaults: Vec<String> = arg
+        .get_default_values()
+        .iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
+    if md_takes_value(arg) && !defaults.is_empty() {
+        help.push_str(&format!(" (default: `{}`)", defaults.join(",")));
+    }
+    format!(
+        "| {} | {value} | {help} |\n",
+        md_code_cell(&forms.join(", "))
+    )
+}
+
+fn md_visible_args(cmd: &clap::Command) -> impl Iterator<Item = &clap::Arg> {
+    cmd.get_arguments()
+        .filter(|a| !a.is_hide_set() && !a.is_global_set())
+        .filter(|a| !matches!(a.get_id().as_str(), "help" | "version"))
+}
+
+fn md_positional_row(arg: &clap::Arg) -> String {
+    let name = arg
+        .get_value_names()
+        .and_then(|n| n.first().map(|n| n.to_string()))
+        .unwrap_or_else(|| arg.get_id().as_str().to_uppercase());
+    let many = arg.get_num_args().is_some_and(|r| r.max_values() > 1);
+    let name = match (arg.is_required_set(), many) {
+        (true, false) => format!("<{name}>"),
+        (true, true) => format!("<{name}>..."),
+        (false, false) => format!("[{name}]"),
+        (false, true) => format!("[{name}]..."),
+    };
+    let help = md_cell(&arg.get_help().map(|h| h.to_string()).unwrap_or_default());
+    format!("| {} | {help} |\n", md_code_cell(&name))
+}
+
+/// One command's section: about, usage, examples, arguments and options, then
+/// its subcommands. `depth` 0 is a page; deeper levels are sections.
+fn md_command(out: &mut String, cmd: &clap::Command, path: &str, depth: usize) {
+    let heading = "#".repeat((2 + depth).min(6));
+    let inner = "#".repeat(if depth == 0 { 2 } else { (3 + depth).min(6) });
+    if depth > 0 {
+        out.push_str(&format!("{heading} rgit {path}\n\n"));
+    }
+    let about = cmd.get_about().map(|a| a.to_string()).unwrap_or_default();
+    if !about.is_empty() {
+        out.push_str(&format!("{about}\n\n"));
+    }
+    if let Some(long) = cmd.get_long_about().map(|a| a.to_string())
+        && long.trim() != about.trim()
+        && !long.trim().is_empty()
+    {
+        out.push_str(&format!("{}\n\n", long.trim()));
+    }
+    let usage = cmd.clone().render_usage().to_string();
+    let usage = usage.trim().strip_prefix("Usage: ").unwrap_or(usage.trim());
+    out.push_str(&format!("{inner} Usage\n\n```sh\n{usage}\n```\n\n"));
+    if let Some(examples) = crate::examples::lookup(path) {
+        out.push_str(&format!("{inner} Examples\n\n```sh\n"));
+        for e in examples {
+            out.push_str(&format!("{e}\n"));
+        }
+        out.push_str("```\n\n");
+    }
+    let positionals: Vec<&clap::Arg> = md_visible_args(cmd).filter(|a| a.is_positional()).collect();
+    if !positionals.is_empty() {
+        out.push_str(&format!(
+            "{inner} Arguments\n\n| Argument | Description |\n| --- | --- |\n"
+        ));
+        for arg in positionals {
+            out.push_str(&md_positional_row(arg));
+        }
+        out.push('\n');
+    }
+    let options: Vec<&clap::Arg> = md_visible_args(cmd)
+        .filter(|a| !a.is_positional())
+        .collect();
+    if !options.is_empty() {
+        out.push_str(&format!(
+            "{inner} Options\n\n| Option | Value | Description |\n| --- | --- | --- |\n"
+        ));
+        for arg in options {
+            out.push_str(&md_option_row(arg));
+        }
+        out.push('\n');
+    }
+    let subs: Vec<&clap::Command> = cmd
+        .get_subcommands()
+        .filter(|s| !s.is_hide_set() && s.get_name() != "help")
+        .collect();
+    if !subs.is_empty() {
+        if depth == 0 {
+            out.push_str("## Subcommands\n\n");
+        }
+        for sub in subs {
+            md_command(out, sub, &format!("{path} {}", sub.get_name()), depth + 1);
+        }
+    }
+}
+
+/// The docs site's reference pages, as `(relative path, content)` sorted by
+/// path: a page per command, the global options, the sidebar and the TUI keys.
+pub(crate) fn docs_reference() -> std::collections::BTreeMap<String, String> {
+    use clap::CommandFactory;
+    let mut root = Cli::command();
+    root.build();
+    let mut files = std::collections::BTreeMap::new();
+
+    let mut index = String::from(
+        "# Commands\n\nEvery rgit command, grouped by task. Options that work with every command are on the [global options](global-options.md) page.\n",
+    );
+    let mut sidebar = Vec::new();
+    for (group, names) in SKILL_GROUPS {
+        index.push_str(&format!(
+            "\n## {group}\n\n| Command | What it does |\n| --- | --- |\n"
+        ));
+        let mut items = Vec::new();
+        for name in *names {
+            let Some(cmd) = root.find_subcommand(name) else {
+                continue;
+            };
+            let about = cmd.get_about().map(|a| a.to_string()).unwrap_or_default();
+            // `index.md` is the overview page, so the `index` command gets a suffix.
+            let stem = if *name == "index" {
+                "index-command"
+            } else {
+                name
+            };
+            index.push_str(&format!(
+                "| [`{name}`]({stem}.md) | {} |\n",
+                md_cell(&summary(&about))
+            ));
+            items.push(format!("reference/commands/{stem}"));
+            let mut page = format!("# rgit {name}\n\n");
+            md_command(&mut page, cmd, name, 0);
+            page.push_str(
+                "See the [global options](global-options.md) that every command accepts.\n",
+            );
+            files.insert(format!("commands/{stem}.md"), page);
+        }
+        sidebar.push(serde_json::json!({ "label": group, "items": items }));
+    }
+    files.insert("commands/index.md".to_owned(), index);
+    files.insert(
+        "commands/sidebar.json".to_owned(),
+        serde_json::to_string_pretty(&sidebar).expect("sidebar is JSON") + "\n",
+    );
+
+    let mut global = String::from(
+        "# Global options\n\nThese options go before or after any command.\n\n| Option | Value | Description |\n| --- | --- | --- |\n",
+    );
+    for arg in root
+        .get_arguments()
+        .filter(|a| a.is_global_set() && !a.is_hide_set())
+    {
+        global.push_str(&md_option_row(arg));
+    }
+    files.insert("commands/global-options.md".to_owned(), global);
+
+    let mut keys =
+        String::from("# TUI keys\n\nEvery key the TUI binds, grouped as in its `?` help screen.\n");
+    for (group, rows) in rgit_tui::help_groups() {
+        keys.push_str(&format!(
+            "\n## {group}\n\n| Key | Action |\n| --- | --- |\n"
+        ));
+        for (key, action) in *rows {
+            keys.push_str(&format!(
+                "| {} | {} |\n",
+                md_code_cell(key),
+                md_cell(action)
+            ));
+        }
+    }
+    files.insert("tui-keys.md".to_owned(), keys);
+    files
+}
+
+/// The first clause of a command's about line, for the overview table: up to
+/// the first sentence break or semicolon, without a closing parenthesis.
+fn summary(about: &str) -> String {
+    let end = [". ", "; "]
+        .iter()
+        .filter_map(|stop| about.find(stop))
+        .min()
+        .unwrap_or(about.len());
+    let mut text = about[..end].trim_end_matches('.').trim().to_owned();
+    if text.ends_with(')')
+        && let Some(open) = text.rfind(" (")
+    {
+        text.truncate(open);
+    }
+    text
 }
 
 /// Parse a 1-based `START,END` line range (git's -L).
@@ -16551,5 +16797,32 @@ mod tests {
             "skills/rgit/references/commands.md is stale; run \
              `rgit --human agent skill --reference > skills/rgit/references/commands.md`"
         );
+    }
+
+    #[test]
+    fn committed_docs_reference_matches_generated() {
+        let stale = "docs/reference is stale; run `rgit --human agent docs --out docs/reference`";
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference");
+        let generated = super::docs_reference();
+        let mut committed = Vec::new();
+        let mut stack = vec![dir.clone()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap_or_else(|_| panic!("{stale}")) {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(&dir).expect("under docs/reference");
+                    committed.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        committed.sort();
+        let expected: Vec<&String> = generated.keys().collect();
+        assert_eq!(committed.iter().collect::<Vec<_>>(), expected, "{stale}");
+        for (rel, text) in &generated {
+            let on_disk = std::fs::read_to_string(dir.join(rel)).expect("committed file");
+            assert_eq!(&on_disk, text, "{stale} ({rel})");
+        }
     }
 }
