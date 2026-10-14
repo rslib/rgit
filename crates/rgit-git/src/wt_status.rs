@@ -450,7 +450,7 @@ impl<'r> Wt<'r> {
             detect_rename,
             rename_score,
             rename_limit,
-            hints: !opts.template && get_bool("advice.statusHints").unwrap_or(true),
+            hints: !opts.template && advice_on() && get_bool("advice.statusHints").unwrap_or(true),
             // A number limits the commits shown; true (-1) shows them all.
             submodule_summary: match get("status.submoduleSummary") {
                 Some(v) => match v.trim().parse::<i64>() {
@@ -1231,7 +1231,7 @@ impl<'r> Wt<'r> {
         let Some(t) = self.tracking(branch) else {
             return;
         };
-        let hints = self.cfg.get_bool("advice.statusHints").unwrap_or(true);
+        let hints = advice_on() && self.cfg.get_bool("advice.statusHints").unwrap_or(true);
         let base = &t.base;
         let mut sb = String::new();
         if t.gone {
@@ -2544,6 +2544,12 @@ fn submodule_dirty(sub: &Repository, untracked: bool) -> u8 {
         }
     }
     dirty
+}
+
+/// Whether advice is on: `GIT_ADVICE=0` (git's `--no-advice`) turns every
+/// hint off, `advice.statusHints` included.
+fn advice_on() -> bool {
+    std::env::var("GIT_ADVICE").map_or(true, |v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
 }
 
 /// git's parse_rename_score: `50`, `50%` or `0.5` as a percentage.
