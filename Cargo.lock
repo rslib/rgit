@@ -5071,7 +5071,7 @@ dependencies = [
 
 [[package]]
 name = "rgit-cli"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -5101,7 +5101,7 @@ dependencies = [
 
 [[package]]
 name = "rgit-forge"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "base64 0.23.1",
  "keyring",
@@ -5122,7 +5122,7 @@ dependencies = [
 
 [[package]]
 name = "rgit-git"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "base64 0.23.1",
  "fancy-regex 0.19.2",
@@ -5150,7 +5150,7 @@ dependencies = [
 
 [[package]]
 name = "rgit-index"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "bincode 2.0.1",
  "ignore",
@@ -5175,7 +5175,7 @@ dependencies = [
 
 [[package]]
 name = "rgit-model"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "rayon",
  "rgit-git",
@@ -5185,7 +5185,7 @@ dependencies = [
 
 [[package]]
 name = "rgit-tui"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "crossterm",
  "notify-debouncer-mini",
@@ -5205,7 +5205,7 @@ dependencies = [
 
 [[package]]
 name = "rgit-web"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "ammonia",
  "axum",
