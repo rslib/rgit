@@ -60,6 +60,7 @@ Run `rgit --help` for every command and `rgit <command> --help` for its flags.
 
 ## Learn more
 
+- [Read the documentation site](https://rslib.github.io/rgit): every guide, the command reference and the TUI settings.
 - [Use rgit from a coding agent](docs/agent-integration.md): output modes, `rgit agent install` and the MCP tools.
 - [Use rgit with Forgejo](docs/forgejo.md): forge profiles for GitHub, GitLab and Forgejo.
 - [Add Change-Id trailers](docs/change-id.md): stable change ids for Gerrit-style review.
