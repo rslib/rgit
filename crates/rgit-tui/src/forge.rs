@@ -325,8 +325,13 @@ fn remote_failure(error: &ForgeError) -> bool {
     )
 }
 
+/// The load result when there is no forge to read: no `origin` remote, or one
+/// that names no GitHub, GitLab or Forgejo repository. It is a normal state,
+/// so the app shows no error for it.
+pub(crate) const UNSUPPORTED_REMOTE: &str = "the current remote is not a supported forge repository";
+
 fn unsupported_remote() -> String {
-    "the current remote is not a supported forge repository".to_owned()
+    UNSUPPORTED_REMOTE.to_owned()
 }
 
 fn forge_error(target: &ForgeTarget, error: impl std::fmt::Display) -> String {

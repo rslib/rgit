@@ -4008,6 +4008,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
             return Vec::new();
         }
+        Msg::ForgeLoaded(Err(e)) if e == crate::forge::UNSUPPORTED_REMOTE => {}
         Msg::ForgeLoaded(Err(e)) => app.push_toast(ToastKind::Error, e),
         Msg::Error(e) => {
             app.loading = false;
@@ -6334,6 +6335,19 @@ mod tests {
             assignees: vec!["dev-2".to_owned()],
             thread: crate::forge::ThreadState::Unloaded,
         }
+    }
+
+    #[test]
+    fn forge_without_a_forge_remote_shows_no_error() {
+        let mut app = App::new(
+            Arc::new(rgit_git::Git2Backend::discover(".").unwrap()),
+            crate::config::Config::default(),
+        );
+        let unsupported = crate::forge::UNSUPPORTED_REMOTE.to_owned();
+        update(&mut app, Msg::ForgeLoaded(Err(unsupported)));
+        assert!(app.toasts.is_empty(), "no toast for a repo without a forge remote");
+        update(&mut app, Msg::ForgeLoaded(Err("github API error: bad token".to_owned())));
+        assert_eq!(app.toasts.len(), 1, "other forge errors still show");
     }
 
     /// An app with two loaded requests (12 open on `feature`, 13 draft on
