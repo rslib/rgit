@@ -9840,9 +9840,7 @@ fn index_matches(index: &git2::Index, path: &str) -> Result<Vec<String>, GitErro
 
 fn holds_tracked(index: &git2::Index, dir: &str) -> bool {
     let prefix = format!("{}/", dir.trim_end_matches('/'));
-    index
-        .iter()
-        .any(|e| e.path.starts_with(prefix.as_bytes()))
+    index.iter().any(|e| e.path.starts_with(prefix.as_bytes()))
 }
 
 /// Fail like git when a pathspec names nothing in the working tree, the index
