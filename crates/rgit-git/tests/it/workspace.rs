@@ -170,7 +170,8 @@ fn create_cleans_up_clone_when_branch_already_exists() {
     assert!(result.is_err(), "branch already exists in the clone");
     assert!(
         !dest.exists(),
-        "failed create should not leave an orphan dir"
+        "failed create should not leave an orphan dir: {:?}",
+        result.err()
     );
 
     let _ = std::fs::remove_dir_all(&dir);

@@ -53,14 +53,17 @@ pub fn create(backend: &dyn GitBackend, name: &str) -> Result<String, GitError> 
     }
     std::fs::create_dir_all(&base)?;
 
-    let reflinked = clone_tree(&root, &dest)?;
-
-    let clone = Git2Backend::discover(&dest)?;
-    // Clean up the clone if branching fails, so we do not leave an orphan dir.
-    if let Err(e) = clone.create_branch(name) {
-        let _ = std::fs::remove_dir_all(&dest);
-        return Err(e);
-    }
+    // Remove a half-made clone on any failure, so no orphan dir is left.
+    let reflinked = match clone_tree(&root, &dest).and_then(|reflinked| {
+        Git2Backend::discover(&dest)?.create_branch(name)?;
+        Ok(reflinked)
+    }) {
+        Ok(reflinked) => reflinked,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dest);
+            return Err(e);
+        }
+    };
 
     let how = if reflinked {
         "reflink (copy-on-write, shares disk blocks)"
