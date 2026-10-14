@@ -356,6 +356,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `agent status`: Show each app's plugin or extension, skill, hook and tools state. e.g. `rgit agent status`
   - `agent uninstall`: Remove what `rgit agent install` added (from every app by default). e.g. `rgit agent uninstall codex`, `rgit agent uninstall --tools-only`
   - `agent skill`: Print the rgit SKILL.md, or its command reference. e.g. `rgit agent skill`, `rgit agent skill --reference`
+- `completion`: Print a shell completion script for rgit's commands and flags. e.g. `rgit completion zsh > ~/.zfunc/_rgit`, `rgit completion bash`
 - `mcp`: Run the Model Context Protocol server over stdio. e.g. `rgit mcp`
 - `tool`: Run one MCP tool with its arguments as a JSON object on stdin and print its TOON result, as the pi and omp extension does. e.g. `echo '{}' | rgit tool git_status`, `echo '{"limit": 5}' | rgit tool git_log`
 - `serve`: Serve the web viewer for this repository, or a directory of repositories. e.g. `rgit serve`, `rgit serve --port 9000`, `rgit serve --root ~/code --clone-base https://git.example.dev`

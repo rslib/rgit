@@ -1575,6 +1575,13 @@ const EXAMPLES: &[Entry] = &[
     ("lanes push", &["rgit lanes push <lane>"]),
     ("lanes pr", &["rgit lanes pr <lane>"]),
     ("lanes restack", &["rgit lanes restack"]),
+    (
+        "completion",
+        &[
+            "rgit completion zsh > ~/.zfunc/_rgit",
+            "rgit completion bash",
+        ],
+    ),
     ("agent", &["rgit agent install", "rgit agent status"]),
     (
         "agent install",

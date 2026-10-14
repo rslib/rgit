@@ -1022,6 +1022,7 @@ pub enum Command {
         /// Revisions to walk (`main`, `^main`, `A..B`, `A...B`; default HEAD),
         /// then paths: `rgit log <rev>...` or `rgit log <rev> -- <path>...`.
         #[arg(value_name = "REV_OR_PATH")]
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::revs_or_paths))]
         revs: Vec<String>,
         /// Limit to commits touching these paths (after `--`).
         #[arg(last = true, value_name = "PATH")]
@@ -1034,6 +1035,7 @@ pub enum Command {
         /// the working tree; `A B`, `A..B`, or `A...B` from their merge base),
         /// then paths.
         #[arg(value_name = "REV_OR_PATH")]
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::revs_or_paths))]
         revs: Vec<String>,
         /// Limit to these paths (after `--`).
         #[arg(last = true, value_name = "PATH")]
@@ -1079,6 +1081,7 @@ pub enum Command {
         /// The commits to show (branch, tag, or sha; default HEAD), or `rev:path`
         /// to print a file as it is at `rev` (`:path` for the staged version).
         #[arg(value_name = "REV")]
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::revs))]
         revs: Vec<String>,
         /// Limit the listed changes to these paths (after `--`).
         #[arg(last = true, value_name = "PATH")]
@@ -1128,6 +1131,7 @@ pub enum Command {
     Stage {
         /// The paths to stage: files, folders or globs.
         #[arg(required = true)]
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::changed))]
         paths: Vec<String>,
         /// Stage only the hunks at these new-side start lines (comma-separated).
         #[arg(long, value_delimiter = ',')]
@@ -1140,6 +1144,7 @@ pub enum Command {
     Unstage {
         /// The paths to unstage: files, folders or globs.
         #[arg(required = true)]
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::staged))]
         paths: Vec<String>,
         /// Unstage only the hunks at these new-side start lines (comma-separated).
         #[arg(long, value_delimiter = ',')]
@@ -1151,6 +1156,7 @@ pub enum Command {
     /// Stage paths as git's `add` does: `add <paths>`, `add .`, `add -A`, `add -u`.
     Add {
         /// The paths to add: files, folders or globs.
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::changed))]
         paths: Vec<String>,
         #[command(flatten)]
         pathspec_file: PathspecFile,
@@ -1224,6 +1230,7 @@ pub enum Command {
     Restore {
         /// The paths to restore: files, folders or globs.
         #[arg(required_unless_present_any = ["patch", "pathspec_from_file"])]
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::changed))]
         paths: Vec<String>,
         #[command(flatten)]
         pathspec_file: PathspecFile,
@@ -1473,6 +1480,7 @@ pub enum Command {
     /// Fetch the current branch's remote, or `<repository> [<refspec>...]`.
     Fetch {
         /// The remote to fetch (defaults to the branch's upstream remote).
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::remotes))]
         repository: Option<String>,
         /// Refs to fetch, as in git (`main`, `src:dst`); defaults to the remote's.
         refspecs: Vec<String>,
@@ -1543,6 +1551,7 @@ pub enum Command {
     /// diverged, unless `pull.rebase` says otherwise).
     Pull {
         /// The remote to pull from (defaults to the upstream's remote).
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::remotes))]
         repository: Option<String>,
         /// The remote branch to integrate (defaults to the upstream branch).
         branch: Option<String>,
@@ -1594,6 +1603,7 @@ pub enum Command {
     /// Push the current branch to its upstream, or `<repository> [<refspec>...]`.
     Push {
         /// The remote to push to (defaults to the branch's upstream remote).
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::remotes))]
         repository: Option<String>,
         /// Refs to push, as in git: `branch`, `src:dst`, `:branch` (delete),
         /// `+src:dst` (force).
@@ -1661,10 +1671,12 @@ pub enum Command {
     Checkout {
         /// The branch or revision, `-` for the previous one (prompted for if
         /// omitted on a terminal). A path here restores it from the index.
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::revs))]
         rev: Option<String>,
         /// Paths to restore from `rev` (index and working tree), or from the
         /// index when no revision is given.
         #[arg(value_name = "PATH")]
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::files))]
         pathspec: Vec<String>,
         /// Create a new branch and switch to it (git's -b), from `rev` or HEAD.
         #[arg(
@@ -1728,6 +1740,7 @@ pub enum Command {
     Switch {
         /// The branch to switch to (`-` for the previous one); with -c, -C or
         /// --detach, the start point (prompted for if omitted on a terminal).
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::revs))]
         rev: Option<String>,
         /// Create a new branch and switch to it.
         #[arg(
@@ -1774,6 +1787,7 @@ pub enum Command {
     /// Merge revisions into the current branch (several make an octopus merge).
     Merge {
         /// The branches or revisions to merge (prompted for if omitted).
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::revs))]
         revs: Vec<String>,
         #[command(flatten)]
         sign: SignArgs,
@@ -1865,8 +1879,10 @@ pub enum Command {
     Rebase {
         /// The upstream to rebase onto (prompted for if omitted). With --onto,
         /// this is the upstream whose commits after it are replayed.
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::revs))]
         onto: Option<String>,
         /// Check out this branch first and rebase it (git's `<upstream> <branch>`).
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::revs))]
         branch: Option<String>,
         /// Replay commits after <upstream> onto this new base (git's --onto).
         #[arg(long = "onto", value_name = "NEWBASE")]
@@ -1941,10 +1957,12 @@ pub enum Command {
     Reset {
         /// The revision to reset to (prompted for if omitted on a terminal). A
         /// path here unstages it (git's `reset <paths>`).
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::revs))]
         rev: Option<String>,
         /// Paths whose index entries to reset to `rev` (default HEAD), leaving
         /// HEAD alone.
         #[arg(value_name = "PATH")]
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::files))]
         pathspec: Vec<String>,
         /// Move HEAD only, keep the index and working tree.
         #[arg(long, conflicts_with_all = ["hard", "mixed", "keep", "merge"])]
@@ -1977,6 +1995,7 @@ pub enum Command {
     /// Cherry-pick commits onto HEAD, or continue/skip/abort a stopped one.
     CherryPick {
         /// Commits or ranges `A..B` to apply in order (prompted for if omitted on a terminal).
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::revs))]
         revs: Vec<String>,
         #[command(flatten)]
         sign: SignArgs,
@@ -2031,6 +2050,7 @@ pub enum Command {
     /// Revert commits on HEAD, or continue/skip/abort a stopped revert.
     Revert {
         /// Commits or ranges `A..B` to revert, newest first (prompted for if omitted on a terminal).
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::revs))]
         revs: Vec<String>,
         #[command(flatten)]
         sign: SignArgs,
@@ -2849,6 +2869,12 @@ pub enum Command {
     Agent {
         #[command(subcommand)]
         cmd: AgentCmd,
+    },
+    /// Print a shell completion script for rgit's commands and flags.
+    Completion {
+        /// The shell: bash, zsh, fish, elvish or powershell.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
     /// Semantic code search: build the on-disk vector index or query it.
     Index {
@@ -4671,6 +4697,7 @@ pub enum StashCmd {
     Pop {
         /// The stash: `N` or `stash@{N}` (defaults to the most recent).
         #[arg(value_parser = stash_ref)]
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::stashes))]
         index: Option<usize>,
         /// Restore the staged changes too (git's --index).
         #[arg(long = "index")]
@@ -4683,6 +4710,7 @@ pub enum StashCmd {
     Apply {
         /// The stash: `N` or `stash@{N}` (defaults to the most recent).
         #[arg(value_parser = stash_ref)]
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::stashes))]
         index: Option<usize>,
         /// Restore the staged changes too (git's --index).
         #[arg(long = "index")]
@@ -4695,6 +4723,7 @@ pub enum StashCmd {
     Drop {
         /// The stash: `N` or `stash@{N}` (defaults to the most recent).
         #[arg(value_parser = stash_ref)]
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::stashes))]
         index: Option<usize>,
         /// Print nothing on success.
         #[arg(short, long)]
@@ -4715,6 +4744,7 @@ pub enum StashCmd {
     Show {
         /// The stash: `N` or `stash@{N}` (defaults to the most recent).
         #[arg(value_parser = stash_ref)]
+        #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::stashes))]
         index: Option<usize>,
         /// Print the full unified patch (git's -p).
         #[arg(short, long)]
@@ -7610,7 +7640,7 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Agent integration and servers",
-        &["agent", "mcp", "tool", "serve"],
+        &["agent", "completion", "mcp", "tool", "serve"],
     ),
 ];
 
@@ -10967,6 +10997,7 @@ fn run_command(
         | Command::CredentialCacheDaemon { .. }
         | Command::Scalar { .. }
         | Command::Mcp { .. }
+        | Command::Completion { .. }
         | Command::Serve { .. }
         | Command::Forge { .. } => unreachable!("handled before dispatch"),
     })

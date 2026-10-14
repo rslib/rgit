@@ -16,6 +16,7 @@ mod agent;
 mod axi;
 mod clean;
 mod cli;
+mod completion;
 mod credential;
 mod creds;
 mod date;
@@ -97,6 +98,9 @@ struct Emit {
     command: Option<String>,
 }
 
+/// The variable a shell's completion script sets to ask rgit for candidates.
+const COMPLETE_VAR: &str = "RGIT_COMPLETE";
+
 fn main() -> ! {
     // Askpass re-exec: a ControlMaster started with our SSH_ASKPASS env runs
     // this same binary with RGIT_ASKPASS_SOCKET set to answer one prompt.
@@ -108,6 +112,22 @@ fn main() -> ! {
         && flag == "-V"
     {
         println!("{}", env!("CARGO_PKG_VERSION"));
+        exit(0);
+    }
+    // Only a shell's own name asks for candidates; any other value of the
+    // variable is not ours, so rgit runs as usual.
+    if std::env::var(COMPLETE_VAR).is_ok_and(|v| {
+        clap_complete::env::Shells::builtins()
+            .completer(&v)
+            .is_some()
+    }) {
+        let _ = clap_complete::CompleteEnv::with_factory(|| {
+            completion::attach(examples::apply(Cli::command()))
+        })
+        .var(COMPLETE_VAR)
+        .bin("rgit")
+        .completer("rgit")
+        .try_complete(std::env::args_os(), std::env::current_dir().ok().as_deref());
         exit(0);
     }
     let (args, mut paginate) = globals::apply(args);
@@ -124,6 +144,17 @@ fn main() -> ! {
         Ok(cli) => cli,
         Err(e) => usage_exit(e, &args),
     };
+    if let Some(Command::Completion { shell }) = cli.command {
+        // The raw registration script in every output mode, as git's own
+        // machine formats.
+        let mut script = Vec::new();
+        let _ = clap_complete::env::Shells::builtins()
+            .completer(&shell.to_string())
+            .expect("a built-in shell")
+            .write_registration(COMPLETE_VAR, "rgit", "rgit", "rgit", &mut script);
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), &script);
+        exit(0);
+    }
     let _ = DEFAULT_MODE.set(output_mode(None, &args));
     let output_mode = output_mode(cli.output_flag(), &args);
     let structured_output = output_mode != OutputMode::Text;
@@ -1487,6 +1518,11 @@ fn usage_exit(e: clap::Error, args: &[String]) -> ! {
     }
     if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
         e.exit();
+    }
+    if mode == OutputMode::Text && path == "rgit completion" {
+        // rgit's own command: clap's message names the valid shells.
+        eprint!("{}", e.render());
+        exit(2);
     }
     if mode == OutputMode::Text {
         let (text, code) = git_usage_error(&e, args, &cmd, &path);

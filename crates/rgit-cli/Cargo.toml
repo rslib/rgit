@@ -35,6 +35,7 @@ rmcp = { version = "3", features = [
 ] }
 axum = "0.8"
 open = "5"
+clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 
 [[bin]]
 name = "rgit"

@@ -1,6 +1,7 @@
 mod agent_hints;
 mod agent_install;
 mod compat_errors;
+mod completion;
 mod credentials;
 mod fast_import;
 mod flags;
