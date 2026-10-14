@@ -609,8 +609,8 @@ pub fn set_words(words: Option<Words>) {
 pub fn word_lines(f: &rgit_git::FileDiff, h: &rgit_git::Hunk) -> Option<Vec<String>> {
     let words = WORDS.lock().expect("words lock");
     let w = words.as_ref()?;
-    let old = (f.status != rgit_git::StatusCode::Added)
-        .then(|| f.old_path.as_deref().unwrap_or(&f.path));
+    let old =
+        (f.status != rgit_git::StatusCode::Added).then(|| f.old_path.as_deref().unwrap_or(&f.path));
     let re = (w.regex)(old, &f.path).map(|re| {
         rgit_git::userdiff::Regex::new(
             &re,

@@ -303,7 +303,9 @@ struct Cut {
 impl Cut {
     fn apply(&mut self, rows: &mut [Node]) {
         for row in rows.iter_mut() {
-            let Some(hunks) = file_hunks(row) else { continue };
+            let Some(hunks) = file_hunks(row) else {
+                continue;
+            };
             let had = hunks.len();
             let mut kept = 0;
             for h in hunks.iter_mut() {

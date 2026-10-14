@@ -134,7 +134,9 @@ fn main() -> ! {
     let args = whatchanged(help_and_version(globals::dispatch(args, &mut paginate)));
     logging::init();
     let stdout_is_terminal = std::io::stdout().is_terminal();
-    let argv = rename_flags(diff_shorthand(count_shorthand(&plumbing::grep_tokens(&args))));
+    let argv = rename_flags(diff_shorthand(count_shorthand(&plumbing::grep_tokens(
+        &args,
+    ))));
     let parsed = examples::apply(Cli::command())
         .try_get_matches_from(
             std::iter::once("rgit".to_owned()).chain(sticky_sign(diff_scores(blame_scores(argv)))),
@@ -945,16 +947,16 @@ fn diff_scores(mut args: Vec<String>) -> Vec<String> {
 /// revision alone, and the last of `-M`, `-C` and `--no-renames` wins. A repeated
 /// `-C` or `--find-copies-harder` counts as one `-C`.
 fn rename_flags(args: Vec<String>) -> Vec<String> {
-    let Some(at) = args
-        .iter()
-        .position(|a| !a.starts_with('-'))
-        .and_then(|i| match args[i].as_str() {
-            "diff" | "log" | "show" | "whatchanged" => Some(i),
-            "stash" => (i + 1..args.len())
-                .find(|&j| !args[j].starts_with('-'))
-                .filter(|&j| args[j] == "show"),
-            _ => None,
-        })
+    let Some(at) =
+        args.iter()
+            .position(|a| !a.starts_with('-'))
+            .and_then(|i| match args[i].as_str() {
+                "diff" | "log" | "show" | "whatchanged" => Some(i),
+                "stash" => (i + 1..args.len())
+                    .find(|&j| !args[j].starts_with('-'))
+                    .filter(|&j| args[j] == "show"),
+                _ => None,
+            })
     else {
         return args;
     };

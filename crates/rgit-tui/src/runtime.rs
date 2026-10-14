@@ -2790,9 +2790,9 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, HostEditor, Msg, RefreshGate, TuiCredentialPrompt, base64_encode, editor_open_command,
-        finish_gated_refresh, grep_hits, read_stamped, restack_note, snippet_sections,
-        sort_watch_paths, update, Debounce, Flush, GitStatePoll, WatchBatch, WatchRoots,
+        App, Debounce, Flush, GitStatePoll, HostEditor, Msg, RefreshGate, TuiCredentialPrompt,
+        WatchBatch, WatchRoots, base64_encode, editor_open_command, finish_gated_refresh,
+        grep_hits, read_stamped, restack_note, snippet_sections, sort_watch_paths, update,
     };
     use rgit_git::RestackOutcome;
     use std::time::{Duration, Instant};

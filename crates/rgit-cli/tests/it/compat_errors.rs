@@ -248,7 +248,8 @@ fn dash_h_prints_usage_and_exits_129() {
 fn first_commit_with_nothing_staged_fails_like_git() {
     let fresh = |bin: &str| {
         let tag = if bin == RGIT { "rgit" } else { "git" };
-        let dir = std::env::temp_dir().join(format!("rgit-errors-{}-first-{tag}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("rgit-errors-{}-first-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         git(&dir, &["init", "-q", "-b", "main"]);
@@ -266,11 +267,16 @@ fn first_commit_with_nothing_staged_fails_like_git() {
         report(&args, &want, &got)
     );
     assert!(
-        !run(RGIT, &rdir, &["rev-parse", "--verify", "-q", "HEAD"]).status.success(),
+        !run(RGIT, &rdir, &["rev-parse", "--verify", "-q", "HEAD"])
+            .status
+            .success(),
         "rgit made a commit"
     );
     let empty = ["commit", "--allow-empty", "-m", "x"];
-    assert!(run(RGIT, &rdir, &empty).status.success(), "--allow-empty commits");
+    assert!(
+        run(RGIT, &rdir, &empty).status.success(),
+        "--allow-empty commits"
+    );
 }
 
 #[test]

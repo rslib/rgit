@@ -6345,8 +6345,14 @@ mod tests {
         );
         let unsupported = crate::forge::UNSUPPORTED_REMOTE.to_owned();
         update(&mut app, Msg::ForgeLoaded(Err(unsupported)));
-        assert!(app.toasts.is_empty(), "no toast for a repo without a forge remote");
-        update(&mut app, Msg::ForgeLoaded(Err("github API error: bad token".to_owned())));
+        assert!(
+            app.toasts.is_empty(),
+            "no toast for a repo without a forge remote"
+        );
+        update(
+            &mut app,
+            Msg::ForgeLoaded(Err("github API error: bad token".to_owned())),
+        );
         assert_eq!(app.toasts.len(), 1, "other forge errors still show");
     }
 

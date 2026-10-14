@@ -226,14 +226,20 @@ fn tui_refresh_cli_stage_and_commit_show_fast() {
     let (before, mark) = (SystemTime::now(), tui.mark());
     git(&repo, &["add", "f"]);
     let took = tui.refresh_after(before, Duration::from_secs(5));
-    assert!(tui.shows(mark, "STAGED", Duration::from_secs(5)), "f is not shown staged");
+    assert!(
+        tui.shows(mark, "STAGED", Duration::from_secs(5)),
+        "f is not shown staged"
+    );
     let took = took.expect("no refresh after git add");
     assert!(took <= Duration::from_millis(500), "refresh after {took:?}");
 
     let (before, mark) = (SystemTime::now(), tui.mark());
     git(&repo, &["commit", "-qm", "two"]);
     let took = tui.refresh_after(before, Duration::from_secs(5));
-    assert!(tui.shows(mark, "two", Duration::from_secs(5)), "the new head is not shown");
+    assert!(
+        tui.shows(mark, "two", Duration::from_secs(5)),
+        "the new head is not shown"
+    );
     let took = took.expect("no refresh after git commit");
     assert!(took <= Duration::from_millis(500), "refresh after {took:?}");
 }
@@ -245,14 +251,23 @@ fn tui_refresh_linked_worktree_shows_stage_and_commit() {
     let repo = dir.join("repo");
     git(&repo, &["checkout", "-q", "--", "f"]);
     let wt = dir.join("wt");
-    git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "side"]);
+    git(
+        &repo,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "side"],
+    );
     std::fs::write(wt.join("f"), "a\nc\n").expect("write");
     let tui = Tui::open(&wt, &dir.join("state"));
 
     let mark = tui.mark();
     git(&wt, &["add", "f"]);
-    assert!(tui.shows(mark, "STAGED", Duration::from_secs(2)), "f is not shown staged");
+    assert!(
+        tui.shows(mark, "STAGED", Duration::from_secs(2)),
+        "f is not shown staged"
+    );
     let mark = tui.mark();
     git(&wt, &["commit", "-qm", "two"]);
-    assert!(tui.shows(mark, "two", Duration::from_secs(2)), "the new head is not shown");
+    assert!(
+        tui.shows(mark, "two", Duration::from_secs(2)),
+        "the new head is not shown"
+    );
 }

@@ -140,7 +140,14 @@ fn forms_patch_stat_is_not_empty() {
     assert_eq!(files[0]["added"], 1);
     assert_eq!(files[1]["path"], "g");
     assert_eq!(files[1]["removed"], 2);
-    assert_eq!(files[0]["hunks"][0]["lines"].as_array().unwrap().last().unwrap(), "+e");
+    assert_eq!(
+        files[0]["hunks"][0]["lines"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap(),
+        "+e"
+    );
     assert_eq!(files[1]["hunks"][0]["lines"].as_array().unwrap().len(), 2);
 }
 
@@ -156,7 +163,10 @@ fn stash_repo(tag: &str) -> PathBuf {
 fn forms_stash_show_defaults_to_the_stat() {
     let dir = stash_repo("stash-stat");
     let out = toon(&dir, &["stash", "show"]);
-    assert!(out.contains("files[1]{path,status,added,removed}:"), "{out}");
+    assert!(
+        out.contains("files[1]{path,status,added,removed}:"),
+        "{out}"
+    );
     assert!(out.contains("\n  f,M,1,0"), "{out}");
     assert!(!out.contains("hunks"), "{out}");
 }
@@ -253,7 +263,10 @@ fn diff_stat_omits_hunks() {
     git(&dir, &["add", "f", "g"]);
     git(&dir, &["commit", "-qm", "two"]);
     let out = toon(&dir, &["show", "--stat", "HEAD"]);
-    assert!(out.contains("files[2]{path,status,added,removed}:"), "{out}");
+    assert!(
+        out.contains("files[2]{path,status,added,removed}:"),
+        "{out}"
+    );
     assert!(!out.contains("hunks"), "{out}");
 }
 
@@ -352,7 +365,11 @@ fn show_plain_commit_has_the_full_header() {
         ("GIT_COMMITTER_EMAIL", "t@t"),
     ];
     std::fs::write(dir.join("f"), "a\nb\nc\nd\ne\n").unwrap();
-    git_env(&dir, &who, &["commit", "-am", "change f", "-m", "body line"]);
+    git_env(
+        &dir,
+        &who,
+        &["commit", "-am", "change f", "-m", "body line"],
+    );
     let out = toon(&dir, &["show", "HEAD"]);
     let id = out
         .lines()
@@ -368,9 +385,13 @@ fn show_plain_commit_has_the_full_header() {
 
     let js = json_out(&dir, &["show", "HEAD"]);
     assert_eq!(js["author"], "T <t@t>");
-    assert!(js["date"]
-        .as_str()
-        .is_some_and(|d| d.len() == 25 && d.as_bytes()[10] == b'T'), "{}", js["date"]);
+    assert!(
+        js["date"]
+            .as_str()
+            .is_some_and(|d| d.len() == 25 && d.as_bytes()[10] == b'T'),
+        "{}",
+        js["date"]
+    );
 }
 
 #[test]
@@ -441,7 +462,11 @@ fn combined_conflict_fix_shows_in_hunk() {
     let hunks = js["files"][0]["hunks"].as_array().unwrap();
     assert_eq!(hunks[0]["at"], "-1,4 -1,4 +1,4");
     assert!(
-        hunks[0]["lines"].as_array().unwrap().iter().any(|l| l == "++both"),
+        hunks[0]["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == "++both"),
         "{js}"
     );
 }
@@ -451,10 +476,7 @@ fn combined_clean_merge_has_no_files() {
     let dir = clean_merge_repo("combined-clean");
     let out = toon(&dir, &["show", "HEAD"]);
     assert!(out.contains("diff: combined"), "{out}");
-    assert!(
-        out.contains("files: 0 files in the combined diff"),
-        "{out}"
-    );
+    assert!(out.contains("files: 0 files in the combined diff"), "{out}");
 }
 
 #[test]
@@ -511,7 +533,18 @@ fn octopus_repo(tag: &str) -> PathBuf {
     let tree = git(&dir, &["write-tree"]).trim().to_owned();
     let merge = git(
         &dir,
-        &["commit-tree", &tree, "-p", "main", "-p", "one", "-p", "two", "-m", "octopus"],
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            "main",
+            "-p",
+            "one",
+            "-p",
+            "two",
+            "-m",
+            "octopus",
+        ],
     );
     git(&dir, &["reset", "-q", "--hard", merge.trim()]);
     dir
@@ -525,7 +558,11 @@ fn combined_octopus_shows_its_files() {
     let hunks = js["files"][0]["hunks"].as_array().unwrap();
     assert_eq!(hunks[0]["at"], "-1,4 -1,4 -1,4 +1,4");
     assert!(
-        hunks[0]["lines"].as_array().unwrap().iter().any(|l| l == "+++all"),
+        hunks[0]["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == "+++all"),
         "{js}"
     );
     let out = toon(&dir, &["show", "HEAD"]);
@@ -608,7 +645,10 @@ fn combined_total_matches_gits_shortstat() {
     git(&dir, &["add", "f"]);
     git(&dir, &["commit", "-qm", "merge"]);
     let stat = git(&dir, &["show", "--cc", "--shortstat", "--format=", "HEAD"]);
-    assert!(stat.contains("1 file changed, 3 insertions(+), 1 deletion(-)"), "{stat}");
+    assert!(
+        stat.contains("1 file changed, 3 insertions(+), 1 deletion(-)"),
+        "{stat}"
+    );
     for args in [&["show", "HEAD"][..], &["show", "--shortstat", "HEAD"]] {
         let js = json_out(&dir, args);
         assert_eq!(js["total"], "1 files, +3 -1", "{args:?}: {js}");
@@ -642,7 +682,10 @@ fn word_diff_plain_marks_changed_words() {
     let out = toon(&dir, &["diff", "--word-diff"]);
     assert!(out.contains("the [-quick-]{+slow+} fox"), "{out}");
     let lines = word_lines(&json_out(&dir, &["diff", "--word-diff"]));
-    assert!(lines.iter().any(|l| l == "the [-quick-]{+slow+} fox"), "{lines:?}");
+    assert!(
+        lines.iter().any(|l| l == "the [-quick-]{+slow+} fox"),
+        "{lines:?}"
+    );
     assert!(lines.iter().any(|l| l == "a"), "{lines:?}");
     git(&dir, &["add", "f"]);
     git(&dir, &["commit", "-qm", "slow"]);
@@ -656,7 +699,10 @@ fn word_diff_porcelain_gives_same_lines() {
     let out = toon(&dir, &["diff", "--word-diff=porcelain"]);
     assert!(out.contains("the [-quick-]{+slow+} fox"), "{out}");
     let lines = word_lines(&json_out(&dir, &["diff", "--word-diff=porcelain"]));
-    assert!(lines.iter().any(|l| l == "the [-quick-]{+slow+} fox"), "{lines:?}");
+    assert!(
+        lines.iter().any(|l| l == "the [-quick-]{+slow+} fox"),
+        "{lines:?}"
+    );
 }
 
 #[test]
@@ -675,7 +721,10 @@ fn word_diff_marks_several_changed_words_in_one_line() {
     std::fs::write(dir.join("f"), "a\nthe slow brown cat jumps\nz\n").unwrap();
     let want = "the [-quick-]{+slow+} brown [-fox-]{+cat+} jumps";
     assert_eq!(
-        git(&dir, &["diff", "--word-diff"]).lines().filter(|l| *l == want).count(),
+        git(&dir, &["diff", "--word-diff"])
+            .lines()
+            .filter(|l| *l == want)
+            .count(),
         1
     );
     let lines = word_lines(&json_out(&dir, &["diff", "--word-diff"]));
@@ -787,7 +836,11 @@ fn log_stat_shows_files_without_hunks() {
     commit_file(&dir, "f", "a\nb\nc\nd\ne\n");
     commit_file(&dir, "f", "A\nb\nc\nd\ne\n");
     let out = toon(&dir, &["log", "--stat", "-2"]);
-    assert_eq!(out.matches("files[1]{path,status,added,removed}:").count(), 2, "{out}");
+    assert_eq!(
+        out.matches("files[1]{path,status,added,removed}:").count(),
+        2,
+        "{out}"
+    );
     assert!(!out.contains("hunks"), "{out}");
 }
 
@@ -797,17 +850,19 @@ fn misc_blame_has_a_date() {
     std::fs::write(dir.join("f"), "one\ntwo\nthree\n").unwrap();
     git(&dir, &["commit", "-qam", "three lines"]);
     let out = toon(&dir, &["blame", "f"]);
-    assert!(
-        out.contains("lines[3]{line,id,author,when,text}:"),
-        "{out}"
-    );
+    assert!(out.contains("lines[3]{line,id,author,when,text}:"), "{out}");
     let row = out
         .lines()
         .find_map(|l| l.trim().strip_prefix("1,"))
         .unwrap_or_default();
     let cells: Vec<&str> = row.split(',').collect();
     assert_eq!(cells[1], "t", "{out}");
-    assert!(cells[2].strip_suffix('s').is_some_and(|n| n.parse::<u64>().is_ok()), "{out}");
+    assert!(
+        cells[2]
+            .strip_suffix('s')
+            .is_some_and(|n| n.parse::<u64>().is_ok()),
+        "{out}"
+    );
 
     let js = json_out(&dir, &["blame", "f"]);
     assert!(js["lines"][0]["when"].is_string(), "{}", js);
@@ -818,7 +873,10 @@ fn misc_worktree_list_has_the_head() {
     let dir = detail_repo("worktree");
     git(&dir, &["worktree", "add", "wt2", "-b", "wt2"]);
     let out = toon(&dir, &["worktree", "list"]);
-    assert!(out.contains("worktrees[2]{name,branch,path,head}:"), "{out}");
+    assert!(
+        out.contains("worktrees[2]{name,branch,path,head}:"),
+        "{out}"
+    );
     let short = git(&dir, &["rev-parse", "--short", "HEAD"]);
     let short = short.trim();
     assert_eq!(out.matches(short).count(), 2, "{out}");
@@ -879,7 +937,10 @@ fn diff_mixed_rows_keep_old_path_and_binary() {
     assert_eq!(files.as_array().unwrap().len(), 3, "{js}");
     let a = file_by_path(files, "a");
     assert_eq!(a["status"], "M");
-    assert!(a.get("old_path").is_none() && a.get("binary").is_none(), "{a}");
+    assert!(
+        a.get("old_path").is_none() && a.get("binary").is_none(),
+        "{a}"
+    );
     let bin = file_by_path(files, "b.bin");
     assert_eq!(bin["status"], "A");
     assert_eq!(bin["binary"], true);
@@ -920,7 +981,13 @@ fn diff_budget_cut_is_a_prefix_of_the_hunks() {
     );
     let js = json_out(&dir, &["show", "HEAD"]);
     let files = &js["files"];
-    assert_eq!(file_by_path(files, "p1")["hunks"][0]["lines"].as_array().unwrap().len(), 150);
+    assert_eq!(
+        file_by_path(files, "p1")["hunks"][0]["lines"]
+            .as_array()
+            .unwrap()
+            .len(),
+        150
+    );
     assert_eq!(file_by_path(files, "p2")["hunks"], "1 hunk not shown");
     assert_eq!(file_by_path(files, "p3")["hunks"], "1 hunk not shown");
     assert_eq!(js["count"], "150 of 310 diff lines");
@@ -940,7 +1007,13 @@ fn diff_budget_is_shared_across_commits() {
     let js = json_out(&dir, &["log", "-p", "-2"]);
     assert_eq!(js["count"], "150 of 300 diff lines");
     let commits = js["commits"].as_array().unwrap();
-    assert_eq!(commits[0]["files"][0]["hunks"][0]["lines"].as_array().unwrap().len(), 150);
+    assert_eq!(
+        commits[0]["files"][0]["hunks"][0]["lines"]
+            .as_array()
+            .unwrap()
+            .len(),
+        150
+    );
     assert_eq!(commits[1]["files"][0]["hunks"], "1 hunk not shown");
     assert!(commits[0].get("count").is_none() && commits[1].get("count").is_none());
 }

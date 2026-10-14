@@ -5,14 +5,14 @@
 use std::sync::Arc;
 
 use rgit_git::{
-    BlameLine, CombinedFile, CommitDetails, FileDiff, GitBackend, LineOrigin, LogEntry,
-    LogOptions, RefKind, RepoStatus, SmartlogEntry, StatusCode,
+    BlameLine, CombinedFile, CommitDetails, FileDiff, GitBackend, LineOrigin, LogEntry, LogOptions,
+    RefKind, RepoStatus, SmartlogEntry, StatusCode,
 };
 
 use crate::cli::{
     ApplyArgs, BranchCmd, BundleCmd, Command, CommitGraphCmd, ConfigArgs, DiffFormat, FlowCmd,
-    HookCmd, IndexCmd, LanesCmd, MaintenanceCmd, MergeDiff, MidxCmd, NotesCmd, RemoteCmd,
-    StackCmd, StashCmd, SubmoduleCmd, WorkspaceCmd, WorktreeCmd,
+    HookCmd, IndexCmd, LanesCmd, MaintenanceCmd, MergeDiff, MidxCmd, NotesCmd, RemoteCmd, StackCmd,
+    StashCmd, SubmoduleCmd, WorkspaceCmd, WorktreeCmd,
 };
 use crate::output::Output;
 use crate::render;
@@ -427,11 +427,8 @@ pub fn run(
             };
             let untracked = include_untracked
                 || !only_untracked && bool_config("stash.showIncludeUntracked", false);
-            let files = crate::cli::stash_diff(
-                backend,
-                i,
-                (!only_untracked, untracked || only_untracked),
-            )?;
+            let files =
+                crate::cli::stash_diff(backend, i, (!only_untracked, untracked || only_untracked))?;
             let mut format = DiffFormat {
                 patch: patch || patch_with_stat,
                 stat: stat || patch_with_stat,
@@ -1069,7 +1066,9 @@ fn file_rows(files: &[FileDiff], hunks: bool) -> (Vec<crate::toon::Obj>, String)
     (rows, format!("{} files, +{add} -{del}", files.len()))
 }
 
-const FILE_COLS: &[&str] = &["path", "status", "old_path", "added", "removed", "binary", "hunks"];
+const FILE_COLS: &[&str] = &[
+    "path", "status", "old_path", "added", "removed", "binary", "hunks",
+];
 
 /// The structured working-tree status, also used by the home view.
 pub fn run_status(s: &RepoStatus) -> Output {
@@ -1408,11 +1407,7 @@ fn commit_fields(
     let no_patch = no_patch || merge.is_some_and(MergeView::is_off);
     let mut lines = c.message.trim_end().lines();
     let subject = lines.next().unwrap_or_default().to_owned();
-    let body = lines
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_owned();
+    let body = lines.collect::<Vec<_>>().join("\n").trim().to_owned();
     let author = format!("{} <{}>", c.author, c.email);
     let mut out = crate::obj! {
         "id" => c.full_id.clone(),
@@ -1431,12 +1426,7 @@ fn commit_fields(
     if c.parents.len() > 1 {
         out.push((
             "parents".to_owned(),
-            crate::toon::Node::List(
-                c.parents
-                    .iter()
-                    .map(|(id, _)| id.clone().into())
-                    .collect(),
-            ),
+            crate::toon::Node::List(c.parents.iter().map(|(id, _)| id.clone().into()).collect()),
         ));
         match merge {
             Some(MergeView::Combined(_)) => out.push(("diff".to_owned(), "combined".into())),
@@ -1451,9 +1441,7 @@ fn commit_fields(
     if !c.refs.is_empty() {
         out.push((
             "refs".to_owned(),
-            crate::toon::Node::List(
-                c.refs.iter().map(|r| r.clone().into()).collect(),
-            ),
+            crate::toon::Node::List(c.refs.iter().map(|r| r.clone().into()).collect()),
         ));
     }
     if !no_patch {
@@ -1586,8 +1574,18 @@ fn show(
 }
 
 const COMMIT_COLS: &[&str] = &[
-    "id", "author", "date", "when", "subject", "body", "committer", "parents", "diff", "refs",
-    "total", "files",
+    "id",
+    "author",
+    "date",
+    "when",
+    "subject",
+    "body",
+    "committer",
+    "parents",
+    "diff",
+    "refs",
+    "total",
+    "files",
 ];
 
 /// What `log -p` and `log --stat` print: a `commits` list, each item the show
@@ -1621,14 +1619,12 @@ fn log_structured(
         let merge = merge_view(backend, &c, &opts.paths, mode, format, false)?;
         rows.push(commit_fields(&c, format, false, merge.as_ref()));
     }
-    Ok(
-        Output::new(render::log(&entries)).list(
-            "commits",
-            rows,
-            COMMIT_COLS,
-            "0 commits on this branch",
-        ),
-    )
+    Ok(Output::new(render::log(&entries)).list(
+        "commits",
+        rows,
+        COMMIT_COLS,
+        "0 commits on this branch",
+    ))
 }
 
 /// An annotated tag's own fields: its name, tagger, strict ISO date,
@@ -1713,10 +1709,7 @@ fn iso_date(d: &str) -> String {
         .iter()
         .position(|m| *m == *month)
         .map_or(0, |m| m + 1);
-    format!(
-        "{year}-{m:02}-{day:0>2}T{time}{}",
-        zone_colon(zone)
-    )
+    format!("{year}-{m:02}-{day:0>2}T{time}{}", zone_colon(zone))
 }
 
 /// Unix time and a `+/-HHMM` zone as strict ISO 8601.

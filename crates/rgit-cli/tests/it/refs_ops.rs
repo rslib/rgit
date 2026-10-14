@@ -1786,10 +1786,7 @@ fn stash_show_rename_flags_mcp_tool_takes_renames() {
     assert!(with.contains("h,R"), "{with}");
     assert!(!with.contains("g,D"), "{with}");
     let without = tool(r#"{"name_only": false}"#);
-    assert!(
-        without.contains("g,D"),
-        "{without}"
-    );
+    assert!(without.contains("g,D"), "{without}");
 }
 
 #[test]

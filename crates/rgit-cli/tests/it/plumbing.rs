@@ -2013,9 +2013,7 @@ fn diff_renames_config_false_toon_json_show_and_log_stat() {
     git(&dir, &["config", "diff.renames", "false"], &[]);
     let log = toon_out(&dir, &["log", "--stat", "-n", "1"]);
     assert!(
-        log.contains(
-            "    files[2]{path,status,added,removed}:\n      g,D,0,20\n      h,A,20,0\n"
-        ),
+        log.contains("    files[2]{path,status,added,removed}:\n      g,D,0,20\n      h,A,20,0\n"),
         "{log}"
     );
     assert!(!log.contains(",R,"), "{log}");

@@ -2549,7 +2549,9 @@ fn submodule_dirty(sub: &Repository, untracked: bool) -> u8 {
 /// Whether advice is on: `GIT_ADVICE=0` (git's `--no-advice`) turns every
 /// hint off, `advice.statusHints` included.
 fn advice_on() -> bool {
-    std::env::var("GIT_ADVICE").map_or(true, |v| !matches!(v.as_str(), "0" | "false" | "no" | "off"))
+    std::env::var("GIT_ADVICE").map_or(true, |v| {
+        !matches!(v.as_str(), "0" | "false" | "no" | "off")
+    })
 }
 
 /// git's parse_rename_score: `50`, `50%` or `0.5` as a percentage.
