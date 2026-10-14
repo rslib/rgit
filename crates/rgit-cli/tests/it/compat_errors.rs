@@ -243,3 +243,32 @@ fn dash_h_prints_usage_and_exits_129() {
     assert!(String::from_utf8_lossy(&version.stdout).starts_with("rgit version "));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn first_commit_with_nothing_staged_fails_like_git() {
+    let fresh = |bin: &str| {
+        let tag = if bin == RGIT { "rgit" } else { "git" };
+        let dir = std::env::temp_dir().join(format!("rgit-errors-{}-first-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "t@t"]);
+        git(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a"), "a\n").unwrap();
+        dir
+    };
+    let args = ["commit", "-m", "x"];
+    let (gdir, rdir) = (fresh("git"), fresh(RGIT));
+    let (want, got) = (run("git", &gdir, &args), run(RGIT, &rdir, &args));
+    assert!(
+        want.status.code() == got.status.code() && want.stdout == got.stdout,
+        "{}",
+        report(&args, &want, &got)
+    );
+    assert!(
+        !run(RGIT, &rdir, &["rev-parse", "--verify", "-q", "HEAD"]).status.success(),
+        "rgit made a commit"
+    );
+    let empty = ["commit", "--allow-empty", "-m", "x"];
+    assert!(run(RGIT, &rdir, &empty).status.success(), "--allow-empty commits");
+}

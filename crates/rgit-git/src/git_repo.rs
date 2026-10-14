@@ -9055,8 +9055,11 @@ fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(
             crate::notes::copy_for_rewrite(repo, "amend", &[(head.id(), new)])?;
         }
         head => {
-            if !o.allow_empty && !merging && head.as_ref().is_some_and(|p| p.tree_id() == tree_oid)
-            {
+            // A first commit with nothing staged is empty too, as git says.
+            let unchanged = head
+                .as_ref()
+                .map_or(tree.is_empty(), |p| p.tree_id() == tree_oid);
+            if !o.allow_empty && !merging && unchanged {
                 return Err(GitError::NothingToCommit);
             }
             let parents: Vec<&git2::Commit> = head.iter().chain(&merge_heads).collect();
