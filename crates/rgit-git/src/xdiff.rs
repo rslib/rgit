@@ -313,12 +313,9 @@ fn textconv_cmd(repo: &git2::Repository, path: &std::path::Path) -> Option<Strin
 /// Run a textconv filter over `data` as git does: on a temporary file,
 /// through the shell.
 pub(crate) fn textconv(cmd: &str, data: &[u8]) -> Vec<u8> {
-    let dir = std::env::temp_dir().join(format!("rgit-textconv-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let tmp = dir.join(format!("{:x}", std::ptr::from_ref(data).addr()));
-    if std::fs::write(&tmp, data).is_err() {
+    let Ok(tmp) = crate::plumbing::temp_file("rgit-textconv", data) else {
         return data.to_vec();
-    }
+    };
     let out = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!("{cmd} \"$@\""))

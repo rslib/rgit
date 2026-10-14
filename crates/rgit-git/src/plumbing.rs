@@ -1670,6 +1670,31 @@ fn ident_to_worktree(data: &[u8]) -> Result<Vec<u8>, GitError> {
 
 /// A blob through `path`'s `diff.<driver>.textconv` command, or unchanged
 /// without one (`cat-file --textconv`).
+/// Write `data` to a new file under the temp folder whose name no other run
+/// shares, not even a later process with the same reused pid; the caller
+/// removes it.
+pub(crate) fn temp_file(prefix: &str, data: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(data)?;
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 pub(crate) fn textconv(repo: &Repository, path: &str, data: &[u8]) -> Result<Vec<u8>, GitError> {
     let driver = repo
         .get_attr(Path::new(path), "diff", git2::AttrCheckFlags::default())?
@@ -1684,8 +1709,7 @@ pub(crate) fn textconv(repo: &Repository, path: &str, data: &[u8]) -> Result<Vec
     };
     // git hands the command the file as it would be checked out.
     let data = smudge(repo, path, data)?;
-    let tmp = std::env::temp_dir().join(format!("rgit-textconv-{}", std::process::id()));
-    std::fs::write(&tmp, &data)?;
+    let tmp = temp_file("rgit-textconv", &data)?;
     let out = std::process::Command::new("sh")
         .args(["-c", &format!("{cmd} \"$@\""), &cmd])
         .arg(&tmp)
@@ -1892,4 +1916,34 @@ fn check_object(kind: ObjectType, data: &[u8]) -> Result<(), GitError> {
         }
         _ => Ok(()),
     }
+}
+
+#[cfg(test)]
+fn textconv_repo(tag: &str) -> (std::path::PathBuf, Repository) {
+    let dir = std::env::temp_dir().join(format!("rgit-tc-unit-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let repo = Repository::init(&dir).unwrap();
+    std::fs::write(dir.join(".gitattributes"), "c.txt diff=up\n").unwrap();
+    repo.config()
+        .unwrap()
+        .set_str("diff.up.textconv", "sed s/o/0/")
+        .unwrap();
+    (dir, repo)
+}
+
+#[cfg(test)]
+#[test]
+fn textconv_temp_ignores_a_leftover_folder_and_leaves_none() {
+    let old = std::env::temp_dir().join(format!("rgit-textconv-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&old);
+    let fresh = crate::xdiff::textconv("sed s/o/0/", b"foo\n");
+    let left = old.exists();
+    std::fs::create_dir_all(old.join("stale")).unwrap();
+    let (dir, repo) = textconv_repo("leftover");
+    let out = textconv(&repo, "c.txt", b"foo\n");
+    let _ = std::fs::remove_dir_all(&old);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(fresh, b"f0o\n");
+    assert!(!left, "{} was left behind", old.display());
+    assert_eq!(out.unwrap(), b"f0o\n");
 }
