@@ -1,43 +1,72 @@
 # rgit
 
-A magit-style git TUI that also works as a CLI and an MCP server.
+A git client for people and coding agents: a magit-style TUI, a git-compatible CLI and an MCP server.
+
+Status: early (0.0.x).
+Commands and output can change between releases.
+
+## Install
 
 ```sh
 cargo install --locked --git https://github.com/rslib/rgit rgit-cli
-rgit            # open the TUI (without a terminal, print git's usage)
-rgit status     # subcommands print git's human text; an agent harness gets TOON
 ```
 
-## Forge support
+This needs Rust 1.96 or later.
+rgit runs on Linux and macOS.
+Prebuilt binaries for Linux (x86_64 and aarch64) and macOS (aarch64) are on the [releases page](https://github.com/rslib/rgit/releases).
 
-rgit works with GitHub, GitLab and Forgejo.
-Set up a profile once, then use `OWNER/REPO` or `forgejo:OWNER/REPO` targets with any `forge` command.
-See [docs/forgejo.md](docs/forgejo.md) for Forgejo setup.
+## Quickstart
 
-## Change-Id trailers
+Run `rgit` with no arguments in a git repository to open the TUI.
 
-rgit does not add trailers to commit messages by default. For Gerrit-style
-stable change ids, run `git config rgit.changeId true` (add `--global` for
-every repo): commits rgit makes then carry a `Change-Id:` trailer that is kept
-across amend, reword, squash, and rebase.
+Type `rgit` where you would type `git`.
+In your shell, rgit prints the same text as git:
 
-## Using rgit from a coding agent
+```console
+$ rgit status
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   README.md
 
-rgit prints human text in a person's shell, as git does, even when piped. When
-an agent harness runs it (Claude Code, Codex, Gemini CLI, Cursor, OpenCode,
-goose, amp or pi) rgit prints TOON by default: compact, structured lines and
-tables with next-step hints. `--json` gives the same data as JSON, and
-`--human` (or `RGIT_OUTPUT=human`, or config `rgit.output=human`) keeps git's
-text. `--compact` (or `rgit.compact=true`) keeps rgit's short human forms of
-`status`, `diff`, `log`, `show` and `blame`. There are two
-ways to give an agent rgit context, and both rely on the TOON default.
-`rgit agent install` sets up every agent app it finds (Claude Code, Codex,
-OpenCode, pi, omp) with both:
+no changes added to commit (use "git add" and/or "git commit -a")
+```
 
-1. **Session hook.** Each session starts with the repo's live state.
-2. **Agent Skill.** rgit's usage guide, loaded when a task needs it.
-3. **Tools.** rgit's operations as the agent's own tools.
+When a coding agent runs rgit, it prints TOON instead: short structured lines with the next useful commands.
 
-`rgit agent status` shows what each app has.
+```console
+$ rgit --toon status
+branch: main
+changes: "0 staged, 1 unstaged, 0 untracked"
+files[1]{path,staged,unstaged}:
+  README.md,"-",M
+help[2]:
+  Run `rgit diff` to see unstaged changes
+  Run `rgit stage <path>` to stage a file
+```
 
-See [docs/agent-integration.md](docs/agent-integration.md) for details.
+Run `rgit --help` for every command and `rgit <command> --help` for its flags.
+
+## Learn more
+
+- [Use rgit from a coding agent](docs/agent-integration.md): output modes, `rgit agent install` and the MCP tools.
+- [Use rgit with Forgejo](docs/forgejo.md): forge profiles for GitHub, GitLab and Forgejo.
+- [Add Change-Id trailers](docs/change-id.md): stable change ids for Gerrit-style review.
+- [TUI configuration](docs/config.example.toml): every TUI setting with its default.
+
+## Develop
+
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+```
+
+## Help
+
+Report a bug or ask a question in the [issue tracker](https://github.com/rslib/rgit/issues).
+
+## License
+
+MIT.
