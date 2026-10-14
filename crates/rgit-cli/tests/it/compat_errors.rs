@@ -272,3 +272,21 @@ fn first_commit_with_nothing_staged_fails_like_git() {
     let empty = ["commit", "--allow-empty", "-m", "x"];
     assert!(run(RGIT, &rdir, &empty).status.success(), "--allow-empty commits");
 }
+
+#[test]
+fn log_on_a_branch_with_no_commits_fails_like_git() {
+    let dir = std::env::temp_dir().join(format!("rgit-errors-{}-unborn-log", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    for args in [&["log"][..], &["log", "--oneline"]] {
+        let (want, got) = (run("git", &dir, args), run(RGIT, &dir, args));
+        assert!(
+            want.status.code() == got.status.code()
+                && want.stdout == got.stdout
+                && want.stderr == got.stderr,
+            "{}",
+            report(args, &want, &got)
+        );
+    }
+}

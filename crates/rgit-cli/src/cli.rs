@@ -7987,6 +7987,16 @@ fn summary(about: &str) -> String {
     text
 }
 
+/// Whether `log` would walk from HEAD alone while HEAD has no commit yet,
+/// which git refuses.
+fn log_from_unborn_head(backend: &Arc<dyn GitBackend>, command: &Command) -> anyhow::Result<bool> {
+    let opts = log_options(backend, command)?;
+    Ok(opts.revs.is_empty()
+        && !opts.all
+        && opts.globs.is_empty()
+        && backend.rev_parse("HEAD").is_err())
+}
+
 /// Parse a 1-based `START,END` line range (git's -L).
 pub(crate) fn parse_line_range(spec: &str) -> anyhow::Result<(usize, usize)> {
     let bad = || CliError::usage(format!("-L wants START,END line numbers, got {spec:?}"));
@@ -8290,6 +8300,16 @@ fn run_command(
             untracked.as_deref(),
             ignored.as_deref(),
         )?),
+        Command::Log {
+            walk_reflogs: false,
+            ..
+        } if render::text_mode() && log_from_unborn_head(backend, &command)? => {
+            let branch = backend
+                .symbolic_ref("HEAD")?
+                .and_then(|r| r.strip_prefix("refs/heads/").map(str::to_owned))
+                .unwrap_or_else(|| "HEAD".to_owned());
+            anyhow::bail!("fatal: your current branch '{branch}' does not have any commits yet");
+        }
         Command::Log {
             walk_reflogs: true, ..
         } => reflog_log(backend, &command)?,
