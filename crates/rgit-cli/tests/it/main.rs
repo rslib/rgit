@@ -25,6 +25,7 @@ mod stack;
 mod status_untracked;
 mod toon_detail;
 mod tui_refresh;
+mod tui_remotes;
 mod workflow;
 mod workspace;
 mod worktree_ops;

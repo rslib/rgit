@@ -4,11 +4,12 @@ use std::sync::Arc;
 use rgit_git::FileDiff;
 use rgit_git::{
     BlameLine, CommitDetails, GitBackend, GitError, Head, LanesState, LogEntry, LogOptions,
-    OpLogEntry, RefEntry, Remote, RepoState, RepoStatus, ResetMode, SmartlogEntry, Worktree,
+    OpLogEntry, RefEntry, Remote, RemoteOverview, RepoState, RepoStatus, ResetMode, SmartlogEntry,
+    Worktree,
 };
 use rgit_model::{
-    RefTarget, Section, Target, build, build_blame, build_commit, build_diff, build_log,
-    build_refs, build_remotes, build_worktrees,
+    MatrixBranch, NodeKind, RefTarget, Section, Span, Style, Target, build, build_blame,
+    build_commit, build_diff, build_log, build_refs, build_remotes_view, build_worktrees,
 };
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -46,6 +47,12 @@ pub enum ConsoleOp {
     Sync,
     /// Push every branch in the stack and open a pull request per branch.
     Submit,
+    FetchRemote(String),
+    PruneRemote(String),
+    DeleteRemoteBranch {
+        remote: String,
+        branch: String,
+    },
 }
 
 impl ConsoleOp {
@@ -58,6 +65,9 @@ impl ConsoleOp {
             ConsoleOp::RebaseOnto(_) => "rebase",
             ConsoleOp::Sync => "sync",
             ConsoleOp::Submit => "submit",
+            ConsoleOp::FetchRemote(_) => "fetch",
+            ConsoleOp::PruneRemote(_) => "prune",
+            ConsoleOp::DeleteRemoteBranch { .. } => "delete",
         }
     }
 }
@@ -626,7 +636,30 @@ pub enum Msg {
     Refs,
     RefsLoaded(Vec<RefEntry>),
     RemoteMenu,
-    RemotesLoaded(Vec<Remote>),
+    /// `open` is false for a refresh, which applies only while the view is on top.
+    RemotesLoaded {
+        remotes: Vec<RemoteOverview>,
+        open: bool,
+    },
+    /// One remote's background server check ended; `None` means it could not
+    /// be checked. Dropped when `generation` is not the open view's.
+    RemoteServerChecked {
+        generation: u64,
+        name: String,
+        branches: Option<Vec<String>>,
+    },
+    /// Turn the remotes view's local-branch matrix on or off.
+    RemotesMatrixToggle,
+    RemoteFetch,
+    RemotePrune,
+    RemoteBranchCheckout,
+    RemoteBranchUpstream,
+    RemoteBranchDelete,
+    RemoteBranchOpen,
+    RemoteMatrixBuilt {
+        generation: u64,
+        matrix: Vec<MatrixBranch>,
+    },
     /// Remotes loaded specifically to pick a push target.
     PushRemotesLoaded(Vec<Remote>),
     /// Remote names loaded to open the next step of a remote prompt.
@@ -925,6 +958,15 @@ pub enum Mutation {
         lines: Vec<usize>,
     },
     CheckoutBranch(String),
+    /// Check a remote branch out as a local branch that tracks it.
+    TrackRemoteBranch {
+        remote: String,
+        branch: String,
+    },
+    SetUpstream {
+        branch: String,
+        upstream: String,
+    },
     CreateBranch(String),
     CheckoutDetached(String),
     DeleteBranch(String),
@@ -1018,7 +1060,13 @@ pub enum Mutation {
 /// A destructive action awaiting a yes/no answer in the status bar.
 pub struct PendingConfirm {
     pub prompt: String,
-    pub mutation: Mutation,
+    pub action: ConfirmAction,
+}
+
+/// What a confirmed prompt runs.
+pub enum ConfirmAction {
+    Mutate(Mutation),
+    Op(ConsoleOp),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2029,8 +2077,25 @@ pub enum Effect {
         title: &'static str,
         kind: InfoKind,
     },
-    /// Load configured remotes, then push the remotes view.
-    LoadRemotes,
+    /// Load every remote's overview from local data, then open the remotes view.
+    LoadRemotes {
+        open: bool,
+    },
+    /// Ask one remote's server for its branch list, off the UI thread.
+    CheckRemoteServer {
+        generation: u64,
+        name: String,
+    },
+    /// Compare each local branch with every remote's branch of the same name.
+    LoadRemoteMatrix {
+        generation: u64,
+        remotes: Vec<RemoteOverview>,
+    },
+    /// Load the newest commits of a remote branch for the preview pane.
+    LoadRemoteBranchLog {
+        key: PreviewKey,
+        rev: String,
+    },
     /// Load remotes, then open a picker to push the current branch to one.
     LoadPushRemotes,
     /// Load remote names, then open the prompt `pending_remote_prompt` names.
@@ -2165,6 +2230,15 @@ pub enum PreviewKey {
         line: usize,
     },
     Forge,
+    /// A remote row in the remotes view: its URLs and refspecs.
+    Remote {
+        name: String,
+    },
+    /// A branch row in the remotes view: its newest commits.
+    RemoteBranch {
+        remote: String,
+        branch: String,
+    },
 }
 
 /// File diffs with more than this many lines are built off the main thread;
@@ -2177,14 +2251,35 @@ const LOG_BATCH: usize = 300;
 /// How many recent commits a revision picker prompt offers.
 pub const REV_CANDIDATES: usize = 200;
 
+/// The kind of row under the remotes-view cursor, for its footer and keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemotesRow {
+    Remote,
+    Branch,
+    Other,
+}
+
 impl PreviewKey {
+    /// The remote a remotes-view key belongs to; empty for other keys.
+    fn remote(&self) -> String {
+        match self {
+            PreviewKey::Remote { name } => name.clone(),
+            PreviewKey::RemoteBranch { remote, .. } => remote.clone(),
+            _ => String::new(),
+        }
+    }
+
     /// The revision to hand `commit_details` for the async-loaded kinds; `None`
     /// for file diffs, which are built synchronously from the snapshot.
     fn rev(&self) -> Option<String> {
         match self {
             PreviewKey::Commit { id } => Some(id.clone()),
             PreviewKey::Stash { index } => Some(format!("stash@{{{index}}}")),
-            PreviewKey::File { .. } | PreviewKey::Snippet { .. } | PreviewKey::Forge => None,
+            PreviewKey::File { .. }
+            | PreviewKey::Snippet { .. }
+            | PreviewKey::Forge
+            | PreviewKey::Remote { .. }
+            | PreviewKey::RemoteBranch { .. } => None,
         }
     }
 }
@@ -2305,6 +2400,14 @@ pub struct App {
     last_remote_fetch: Option<std::time::Instant>,
     /// Generation of the last applied status read; older results are dropped.
     last_refresh_gen: u64,
+    remotes: Vec<RemoteOverview>,
+    /// Server checks by remote; a missing key is a check still running.
+    remote_server: HashMap<String, Option<Vec<String>>>,
+    /// Bumped each time the remotes view opens or closes, so a check that
+    /// started for an earlier one is dropped.
+    remotes_gen: u64,
+    remotes_matrix_on: bool,
+    remotes_matrix: Option<Vec<MatrixBranch>>,
     /// Last status snapshot, for the adaptive preview pane.
     snapshot: Option<Arc<RepoStatus>>,
     /// What the preview buffer currently holds, so it is rebuilt only when the
@@ -2445,6 +2548,11 @@ impl App {
             forge_tab: crate::forge::ForgeTab::Requests,
             last_remote_fetch: None,
             last_refresh_gen: 0,
+            remotes: Vec::new(),
+            remote_server: HashMap::new(),
+            remotes_gen: 0,
+            remotes_matrix_on: false,
+            remotes_matrix: None,
             forge_open_requested: false,
             forge_detail: None,
             snapshot: None,
@@ -2515,6 +2623,9 @@ impl App {
                 line: h.line,
             });
         }
+        if self.active_kind() == ViewKind::Remotes {
+            return self.remotes_preview_key();
+        }
         match self.buffer().target_at_cursor()? {
             Target::File { path, staged } => Some(PreviewKey::File { path, staged }),
             // A working-tree hunk previews its file; a read-only diff's hunk has
@@ -2535,6 +2646,86 @@ impl App {
             Target::Worktree { .. } => None,
             // A staging heading acts on the whole section; nothing to preview.
             Target::Section { .. } | Target::Jump { .. } => None,
+        }
+    }
+
+    /// What the remotes-view cursor is on, `None` outside the view or on a
+    /// matrix row.
+    fn remotes_cursor(&self) -> Option<PreviewKey> {
+        (self.active_kind() == ViewKind::Remotes)
+            .then(|| self.remotes_preview_key())
+            .flatten()
+    }
+
+    pub fn remotes_row(&self) -> RemotesRow {
+        match self.remotes_cursor() {
+            Some(PreviewKey::Remote { .. }) => RemotesRow::Remote,
+            Some(PreviewKey::RemoteBranch { .. }) => RemotesRow::Branch,
+            _ => RemotesRow::Other,
+        }
+    }
+
+    /// The preview key for a remotes-view row: a branch row previews its log,
+    /// any other row under a remote previews the remote.
+    fn remotes_preview_key(&self) -> Option<PreviewKey> {
+        let id = self.buffer().cursor_id()?;
+        let rest = id.strip_prefix("remote:")?;
+        let remote = rest.split(':').next()?.to_owned();
+        match (self.buffer().target_at_cursor(), id.rsplit_once(":branch:")) {
+            (
+                Some(Target::Ref {
+                    kind: RefTarget::Remote,
+                    ..
+                }),
+                Some((_, branch)),
+            ) => Some(PreviewKey::RemoteBranch {
+                remote,
+                branch: branch.to_owned(),
+            }),
+            _ => Some(PreviewKey::Remote { name: remote }),
+        }
+    }
+
+    fn matrix_load(&self) -> Effect {
+        Effect::LoadRemoteMatrix {
+            generation: self.remotes_gen,
+            remotes: self.remotes.clone(),
+        }
+    }
+
+    /// Forget remote and branch previews; a branch log goes stale when the
+    /// remote branch moves.
+    fn drop_remote_previews(&mut self) {
+        self.preview_cache.retain(|k, _| {
+            !matches!(
+                k,
+                PreviewKey::Remote { .. } | PreviewKey::RemoteBranch { .. }
+            )
+        });
+        self.preview_key = None;
+    }
+
+    /// Rebuild the remotes view in place from the held data, keeping the
+    /// cursor on its row and every fold.
+    fn rebuild_remotes_view(&mut self) {
+        let matrix = self
+            .remotes_matrix_on
+            .then_some(self.remotes_matrix.as_deref())
+            .flatten();
+        let sections = build_remotes_view(&self.remotes, &self.remote_server, matrix, unix_now());
+        let Some(view) = self
+            .views
+            .iter_mut()
+            .rev()
+            .find(|v| v.kind == ViewKind::Remotes)
+        else {
+            return;
+        };
+        let buffer = &mut view.buffer;
+        let id = buffer.cursor_id();
+        buffer.set_content(sections);
+        if let Some(idx) = id.and_then(|id| buffer.rows().position(|r| *r.id == id)) {
+            buffer.set_cursor(idx);
         }
     }
 
@@ -2657,6 +2848,37 @@ impl App {
             return Vec::new();
         }
         match &key {
+            PreviewKey::Remote { name } => {
+                let sections = self
+                    .remotes
+                    .iter()
+                    .find(|r| r.name == *name)
+                    .map(remote_detail)
+                    .unwrap_or_default();
+                self.show_preview(key, sections);
+                Vec::new()
+            }
+            PreviewKey::RemoteBranch { remote, branch } => {
+                let fetched = self
+                    .remotes
+                    .iter()
+                    .find(|r| r.name == *remote)
+                    .is_some_and(|r| r.branches.iter().any(|b| b.name == *branch));
+                if fetched {
+                    let rev = format!("{remote}/{branch}");
+                    self.set_preview_placeholder();
+                    self.preview_key = Some(key.clone());
+                    vec![Effect::LoadRemoteBranchLog { key, rev }]
+                } else {
+                    let sections = vec![Section::leaf(
+                        "remote-preview/not-fetched",
+                        NodeKind::Info,
+                        vec![Span::new("not fetched".to_owned(), Style::Dim)],
+                    )];
+                    self.show_preview(key, sections);
+                    Vec::new()
+                }
+            }
             // A collapsed folder row previews its file listing, loaded
             // off-thread like every other preview.
             PreviewKey::File { path, .. } if path.ends_with('/') => {
@@ -2877,6 +3099,8 @@ impl App {
             Some(PreviewKey::Commit { id }) => id.clone(),
             Some(PreviewKey::Stash { index }) => format!("stash@{{{index}}}"),
             Some(PreviewKey::Forge) => "FORGE".to_owned(),
+            Some(PreviewKey::Remote { name }) => name.clone(),
+            Some(PreviewKey::RemoteBranch { remote, branch }) => format!("{remote}/{branch}"),
             None => String::new(),
         }
     }
@@ -3028,6 +3252,10 @@ impl App {
     pub fn pop_view(&mut self) -> bool {
         if self.views.len() > 1 {
             let popped = self.views.pop().expect("checked len > 1");
+            if popped.kind == ViewKind::Remotes {
+                self.remotes_gen += 1;
+                self.remotes_matrix_on = false;
+            }
             if let Some(finder) = popped.resume_finder {
                 self.code_finder = Some(finder);
             }
@@ -3064,7 +3292,7 @@ impl App {
             ViewKind::Oplog => Some(Effect::LoadOplog),
             ViewKind::Stack => Some(Effect::LoadStack),
             ViewKind::Refs => Some(Effect::LoadRefs),
-            ViewKind::Remotes => Some(Effect::LoadRemotes),
+            ViewKind::Remotes => Some(Effect::LoadRemotes { open: false }),
             ViewKind::Worktrees => Some(Effect::LoadWorktrees),
             ViewKind::Forge => Some(Effect::LoadForge),
             _ => None,
@@ -3195,7 +3423,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             if let Some(Target::File { path, .. }) = app.buffer().target_at_cursor() {
                 app.confirm = Some(PendingConfirm {
                     prompt: format!("Remove {path} from the index and working tree?"),
-                    mutation: Mutation::RemovePath(path),
+                    action: ConfirmAction::Mutate(Mutation::RemovePath(path)),
                 });
             }
         }
@@ -3297,8 +3525,13 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::ConfirmAccept => {
             if let Some(pending) = app.confirm.take() {
-                app.loading = true;
-                return vec![Effect::Mutate(pending.mutation)];
+                return match pending.action {
+                    ConfirmAction::Mutate(mutation) => {
+                        app.loading = true;
+                        vec![Effect::Mutate(mutation)]
+                    }
+                    ConfirmAction::Op(op) => open_op(app, op),
+                };
             }
         }
         Msg::ConfirmCancel => app.confirm = None,
@@ -3565,10 +3798,126 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 masked: false,
             });
         }
-        Msg::RemotesLoaded(remotes) => {
-            let mut buffer = Buffer::default();
-            buffer.set_content(build_remotes(&remotes));
-            app.push_view(ViewKind::Remotes, buffer);
+        Msg::RemotesLoaded { remotes, open } => {
+            let mut effects = Vec::new();
+            if app.active_kind() == ViewKind::Remotes {
+                if app.remotes != remotes {
+                    app.drop_remote_previews();
+                    app.remotes = remotes;
+                    app.rebuild_remotes_view();
+                    if app.remotes_matrix_on {
+                        effects.push(app.matrix_load());
+                    }
+                }
+            } else if open {
+                app.drop_remote_previews();
+                app.remotes_gen += 1;
+                app.remote_server.clear();
+                app.remotes_matrix_on = false;
+                app.remotes_matrix = None;
+                app.remotes = remotes;
+                app.push_view(ViewKind::Remotes, Buffer::default());
+                app.rebuild_remotes_view();
+                let generation = app.remotes_gen;
+                effects.extend(app.remotes.iter().map(|r| Effect::CheckRemoteServer {
+                    generation,
+                    name: r.name.clone(),
+                }));
+            }
+            effects.extend(app.sync_preview());
+            return effects;
+        }
+        Msg::RemoteServerChecked {
+            generation,
+            name,
+            branches,
+        } => {
+            if generation == app.remotes_gen {
+                app.remote_server.insert(name, branches);
+                app.rebuild_remotes_view();
+                return app.sync_preview();
+            }
+        }
+        Msg::RemoteFetch => {
+            if let Some(remote) = app.remotes_cursor().map(|k| k.remote()) {
+                return open_op(app, ConsoleOp::FetchRemote(remote));
+            }
+        }
+        Msg::RemotePrune => {
+            if let Some(remote) = app.remotes_cursor().map(|k| k.remote()) {
+                return open_op(app, ConsoleOp::PruneRemote(remote));
+            }
+        }
+        Msg::RemoteBranchCheckout => {
+            if let Some((remote, branch)) = fetched_remote_branch(app) {
+                app.loading = true;
+                return vec![Effect::Mutate(Mutation::TrackRemoteBranch {
+                    remote,
+                    branch,
+                })];
+            }
+        }
+        Msg::RemoteBranchUpstream => {
+            if let Some((remote, branch)) = fetched_remote_branch(app) {
+                match app.head.as_ref().and_then(|h| h.branch.clone()) {
+                    Some(current) => {
+                        app.loading = true;
+                        return vec![Effect::Mutate(Mutation::SetUpstream {
+                            branch: current,
+                            upstream: format!("{remote}/{branch}"),
+                        })];
+                    }
+                    None => app.push_toast(
+                        ToastKind::Error,
+                        "HEAD is detached; no branch to set the upstream of".to_owned(),
+                    ),
+                }
+            }
+        }
+        Msg::RemoteBranchDelete => {
+            if let Some(PreviewKey::RemoteBranch { remote, branch }) = app.remotes_cursor() {
+                app.confirm = Some(PendingConfirm {
+                    prompt: format!("Delete {remote}/{branch} on the server?"),
+                    action: ConfirmAction::Op(ConsoleOp::DeleteRemoteBranch { remote, branch }),
+                });
+            }
+        }
+        Msg::RemoteBranchOpen => {
+            if let Some(PreviewKey::RemoteBranch { remote, branch }) = app.remotes_cursor() {
+                let url = app
+                    .remotes
+                    .iter()
+                    .find(|r| r.name == remote)
+                    .ok_or_else(|| format!("unknown remote {remote}"))
+                    .and_then(|r| remote_branch_url(&app.forge_selection, &r.fetch_url, &branch));
+                match url {
+                    Ok(url) => {
+                        if let Err(error) = open::that_detached(&url) {
+                            app.push_toast(
+                                ToastKind::Error,
+                                format!("could not open branch: {error}"),
+                            );
+                        }
+                    }
+                    Err(error) => app.push_toast(ToastKind::Error, error),
+                }
+            }
+        }
+        Msg::RemotesMatrixToggle => {
+            if app.active_kind() == ViewKind::Remotes {
+                app.remotes_matrix_on = !app.remotes_matrix_on;
+                app.rebuild_remotes_view();
+                if app.remotes_matrix_on {
+                    return vec![app.matrix_load()];
+                }
+                return app.sync_preview();
+            }
+        }
+        Msg::RemoteMatrixBuilt { generation, matrix } => {
+            if generation == app.remotes_gen && app.remotes_matrix_on {
+                app.remotes_matrix = Some(matrix);
+                app.rebuild_remotes_view();
+            }
         }
         Msg::PushRemotesLoaded(remotes) => {
             if remotes.is_empty() {
@@ -4286,13 +4635,15 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             if let Some(s) = &mut app.search {
                 s.push(c);
             }
-            search_jump(app, app.buffer().cursor(), true);
+            search_jump(app);
+            return app.after_cursor_move();
         }
         Msg::SearchBackspace => {
             if let Some(s) = &mut app.search {
                 s.pop();
             }
-            search_jump(app, app.buffer().cursor(), true);
+            search_jump(app);
+            return app.after_cursor_move();
         }
         Msg::SearchSubmit => {
             if let Some(s) = app.search.take()
@@ -4371,12 +4722,12 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::DragEnd => app.drag_end(),
         Msg::SearchNext => {
-            let from = app.buffer().cursor() + 1;
-            repeat_search(app, from, true);
+            repeat_search(app, true);
+            return app.after_cursor_move();
         }
         Msg::SearchPrev => {
-            let from = app.buffer().cursor().saturating_sub(1);
-            repeat_search(app, from, false);
+            repeat_search(app, false);
+            return app.after_cursor_move();
         }
         Msg::ShowCommitEditor { amend, prefill } => {
             app.commit_editor = Some(CommitEditor::new(amend, &prefill));
@@ -4496,6 +4847,14 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 };
             }
             if ok {
+                if let Some(HookConsole {
+                    net: Some(ConsoleOp::DeleteRemoteBranch { remote, branch }),
+                    ..
+                }) = &app.hook_console
+                    && let Some(Some(listed)) = app.remote_server.get_mut(remote)
+                {
+                    listed.retain(|b| b != branch);
+                }
                 // Succeeded: echo the git-style result and refresh the working
                 // tree. With console_hold the console stays open so all output
                 // is readable (dismiss with q/Esc); otherwise it closes now.
@@ -4745,7 +5104,7 @@ fn discard_at_cursor(app: &mut App) {
 
     app.confirm = Some(PendingConfirm {
         prompt: format!("Discard {what}?"),
-        mutation,
+        action: ConfirmAction::Mutate(mutation),
     });
 }
 
@@ -5124,14 +5483,14 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         PromptAction::RemoveRemote => {
             app.confirm = Some(PendingConfirm {
                 prompt: format!("Remove remote '{value}'?"),
-                mutation: Mutation::RemoveRemote(value),
+                action: ConfirmAction::Mutate(Mutation::RemoveRemote(value)),
             });
             return Vec::new();
         }
         PromptAction::RemoveWorktree => {
             app.confirm = Some(PendingConfirm {
                 prompt: format!("Remove worktree '{value}'?"),
-                mutation: Mutation::RemoveWorktree(value),
+                action: ConfirmAction::Mutate(Mutation::RemoveWorktree(value)),
             });
             return Vec::new();
         }
@@ -5324,7 +5683,7 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
             app.transient = None;
             app.confirm = Some(PendingConfirm {
                 prompt: "Remove all untracked files and directories?".into(),
-                mutation: Mutation::Clean,
+                action: ConfirmAction::Mutate(Mutation::Clean),
             });
             Vec::new()
         }
@@ -5352,7 +5711,7 @@ fn transient_key(app: &mut App, c: char) -> Vec<Effect> {
         }
         ActionKind::RemoteList => {
             app.transient = None;
-            vec![Effect::LoadRemotes]
+            vec![Effect::LoadRemotes { open: true }]
         }
         ActionKind::RemoteAdd => {
             app.transient = None;
@@ -5694,20 +6053,122 @@ fn open_op(app: &mut App, op: ConsoleOp) -> Vec<Effect> {
     vec![Effect::OpConsole(op)]
 }
 
-/// Jump the cursor to the next match of the live search input from `from`.
-fn search_jump(app: &mut App, from: usize, forward: bool) {
+/// The remote branch under the cursor, or a toast when it has no local ref.
+fn fetched_remote_branch(app: &mut App) -> Option<(String, String)> {
+    let Some(PreviewKey::RemoteBranch { remote, branch }) = app.remotes_cursor() else {
+        return None;
+    };
+    let fetched = app
+        .remotes
+        .iter()
+        .find(|r| r.name == remote)
+        .is_some_and(|r| r.branches.iter().any(|b| b.name == branch));
+    if !fetched {
+        app.push_toast(
+            ToastKind::Error,
+            format!("{remote}/{branch}: not fetched, press f first"),
+        );
+        return None;
+    }
+    Some((remote, branch))
+}
+
+/// The web page of a branch on a remote's forge, built from its fetch URL and
+/// the configured forge hosts without touching the network.
+fn remote_branch_url(
+    selection: &rgit_forge::ForgeSelection,
+    fetch_url: &str,
+    branch: &str,
+) -> Result<String, String> {
+    let target =
+        rgit_forge::ForgeTarget::from_remote(selection, fetch_url).map_err(|e| e.to_string())?;
+    let repo = target.repo.ok_or("the remote URL names no repository")?;
+    let tree = match target.provider {
+        rgit_forge::Provider::Gitlab => "-/tree",
+        rgit_forge::Provider::Github => "tree",
+        rgit_forge::Provider::Forgejo => "src/branch",
+    };
+    let mut path = String::new();
+    for byte in branch.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                path.push(char::from(byte));
+            }
+            _ => path.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    Ok(format!("{}/{repo}/{tree}/{path}", target.host))
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// The remotes-view preview of one remote: its URLs and fetch refspecs.
+fn remote_detail(remote: &RemoteOverview) -> Vec<Section> {
+    let line = |id: String, label: &str, value: &str| {
+        Section::leaf(
+            id,
+            NodeKind::Info,
+            vec![
+                Span::new(format!("{label:<8}"), Style::Dim),
+                Span::plain(value.to_owned()),
+            ],
+        )
+    };
+    let mut sections = vec![
+        Section::leaf(
+            "remote-preview/title",
+            NodeKind::HeadField,
+            vec![Span::new(remote.name.clone(), Style::FieldLabel)],
+        ),
+        line("remote-preview/fetch".into(), "fetch", &remote.fetch_url),
+        line(
+            "remote-preview/push".into(),
+            "push",
+            remote.push_url.as_deref().unwrap_or(&remote.fetch_url),
+        ),
+    ];
+    sections.extend(
+        remote
+            .fetch_refspecs
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| line(format!("remote-preview/refspec/{i}"), "refspec", spec)),
+    );
+    sections
+}
+
+/// Jump the cursor to the first match of the live search input at or after it.
+/// Only the remotes view opens folds, to reach branches past the shown 500;
+/// elsewhere a fold holds diff text that search must not open.
+fn search_jump(app: &mut App) {
     let Some(query) = app.search.clone() else {
         return;
     };
-    if let Some(idx) = app.buffer().search(&query, from, forward) {
+    if app.active_kind() == ViewKind::Remotes {
+        app.buffer_mut().search_reveal(&query, true, true);
+    } else if let Some(idx) = app.buffer().search(&query, app.buffer().cursor(), true) {
         app.buffer_mut().set_cursor(idx);
     }
 }
 
 /// Jump to the next/previous match of the last confirmed query (`n` / `N`).
-fn repeat_search(app: &mut App, from: usize, forward: bool) {
+fn repeat_search(app: &mut App, forward: bool) {
     let Some(query) = app.last_search.clone() else {
         return;
+    };
+    if app.active_kind() == ViewKind::Remotes {
+        app.buffer_mut().search_reveal(&query, forward, false);
+        return;
+    }
+    let cursor = app.buffer().cursor();
+    let from = if forward {
+        cursor + 1
+    } else {
+        cursor.saturating_sub(1)
     };
     if let Some(idx) = app.buffer().search(&query, from, forward) {
         app.buffer_mut().set_cursor(idx);
@@ -6960,5 +7421,631 @@ mod tests {
             ),
             "cursor on a file row loads its diff, got {fx:?}"
         );
+    }
+
+    fn remote_branch(name: &str) -> rgit_git::RemoteBranchInfo {
+        rgit_git::RemoteBranchInfo {
+            name: name.into(),
+            oid: "abc".into(),
+            time: 0,
+            subject: "subject".into(),
+            tracked_by: None,
+        }
+    }
+
+    fn overview(name: &str, branches: &[&str]) -> rgit_git::RemoteOverview {
+        rgit_git::RemoteOverview {
+            name: name.into(),
+            fetch_url: format!("https://example.com/{name}.git"),
+            push_url: Some(format!("git@example.com:{name}.git")),
+            head_branch: Some("main".into()),
+            last_fetch: Some(0),
+            fetch_refspecs: vec![format!("+refs/heads/*:refs/remotes/{name}/*")],
+            branches: branches.iter().map(|b| remote_branch(b)).collect(),
+        }
+    }
+
+    fn remotes_app() -> (App, Vec<Effect>) {
+        let mut app = App::new(
+            Arc::new(rgit_git::Git2Backend::discover(".").unwrap()),
+            crate::config::Config::default(),
+        );
+        let fx = update(
+            &mut app,
+            Msg::RemotesLoaded {
+                remotes: vec![
+                    overview("origin", &["main"]),
+                    overview("upstream", &["main"]),
+                ],
+                open: true,
+            },
+        );
+        (app, fx)
+    }
+
+    fn row_ids(app: &App) -> Vec<String> {
+        app.buffer().rows().map(|r| r.id.clone()).collect()
+    }
+
+    fn row_text(app: &App, id: &str) -> String {
+        app.buffer()
+            .rows()
+            .find(|r| r.id == id)
+            .map(|r| r.spans.iter().map(|s| s.text.as_str()).collect())
+            .unwrap_or_default()
+    }
+
+    fn cursor_to(app: &mut App, id: &str) {
+        let idx = row_ids(app)
+            .iter()
+            .position(|r| r == id)
+            .unwrap_or_else(|| panic!("no row {id}"));
+        app.buffer_mut().set_cursor(idx);
+    }
+
+    #[test]
+    fn remotes_view_opens_from_local_data_and_starts_one_check_per_remote() {
+        let (app, fx) = remotes_app();
+        assert_eq!(app.active_kind(), ViewKind::Remotes);
+        let ids = row_ids(&app);
+        assert!(ids.contains(&"remote:origin".to_owned()));
+        assert!(ids.contains(&"remote:upstream".to_owned()));
+        let checks: Vec<&str> = fx
+            .iter()
+            .filter_map(|e| match e {
+                Effect::CheckRemoteServer { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(checks, ["origin", "upstream"]);
+    }
+
+    #[test]
+    fn remotes_view_merges_a_server_result_and_keeps_the_cursor() {
+        let (mut app, _) = remotes_app();
+        cursor_to(&mut app, "remote:upstream");
+        app.buffer_mut().toggle_fold();
+        let generation = app.remotes_gen;
+        update(
+            &mut app,
+            Msg::RemoteServerChecked {
+                generation,
+                name: "origin".into(),
+                branches: Some(vec!["main".into(), "new".into()]),
+            },
+        );
+        let ids = row_ids(&app);
+        assert!(ids.contains(&"remote:origin:branch:new".to_owned()));
+        assert_eq!(app.buffer().cursor_id().as_deref(), Some("remote:upstream"));
+        assert!(!ids.contains(&"remote:upstream:fetch-url".to_owned()));
+        assert!(row_text(&app, "remote:origin:branch:new").contains("not fetched"));
+    }
+
+    #[test]
+    fn remotes_view_marks_a_remote_not_checked_when_its_check_gives_none() {
+        let (mut app, _) = remotes_app();
+        assert!(!row_text(&app, "remote:origin").contains("not checked"));
+        let generation = app.remotes_gen;
+        update(
+            &mut app,
+            Msg::RemoteServerChecked {
+                generation,
+                name: "origin".into(),
+                branches: None,
+            },
+        );
+        assert!(row_text(&app, "remote:origin").contains("not checked"));
+        assert!(!row_text(&app, "remote:upstream").contains("not checked"));
+    }
+
+    #[test]
+    fn remotes_view_drops_a_server_result_from_an_old_generation() {
+        let (mut app, _) = remotes_app();
+        let old = app.remotes_gen;
+        assert!(app.pop_view());
+        update(
+            &mut app,
+            Msg::RemotesLoaded {
+                remotes: vec![overview("origin", &["main"])],
+                open: true,
+            },
+        );
+        assert_ne!(app.remotes_gen, old);
+        update(
+            &mut app,
+            Msg::RemoteServerChecked {
+                generation: old,
+                name: "origin".into(),
+                branches: Some(vec!["main".into(), "stale".into()]),
+            },
+        );
+        assert!(!row_ids(&app).contains(&"remote:origin:branch:stale".to_owned()));
+        let generation = app.remotes_gen;
+        update(
+            &mut app,
+            Msg::RemoteServerChecked {
+                generation,
+                name: "origin".into(),
+                branches: Some(vec!["main".into(), "fresh".into()]),
+            },
+        );
+        assert!(row_ids(&app).contains(&"remote:origin:branch:fresh".to_owned()));
+    }
+
+    #[test]
+    fn remotes_view_preview_shows_urls_for_a_remote_row_and_loads_the_log_for_a_branch_row() {
+        let (mut app, _) = remotes_app();
+        let generation = app.remotes_gen;
+        update(
+            &mut app,
+            Msg::RemoteServerChecked {
+                generation,
+                name: "origin".into(),
+                branches: Some(vec!["main".into(), "new".into()]),
+            },
+        );
+        cursor_to(&mut app, "remote:origin");
+        assert!(app.sync_preview().is_empty());
+        for want in [
+            "https://example.com/origin.git",
+            "git@example.com:origin.git",
+            "+refs/heads/*:refs/remotes/origin/*",
+        ] {
+            assert!(
+                app.preview_buf.search(want, 0, true).is_some(),
+                "remote preview lacks {want}"
+            );
+        }
+
+        cursor_to(&mut app, "remote:origin:fetch-url");
+        assert!(app.sync_preview().is_empty());
+        assert!(
+            app.preview_buf
+                .search("git@example.com:origin.git", 0, true)
+                .is_some()
+        );
+
+        cursor_to(&mut app, "remote:origin:branch:main");
+        let fx = app.sync_preview();
+        assert!(
+            matches!(
+                fx.as_slice(),
+                [Effect::LoadRemoteBranchLog { rev, .. }] if rev == "origin/main"
+            ),
+            "a fetched branch loads its log, got {fx:?}"
+        );
+
+        cursor_to(&mut app, "remote:origin:branch:new");
+        assert!(app.sync_preview().is_empty());
+        assert!(app.preview_buf.search("not fetched", 0, true).is_some());
+    }
+
+    #[test]
+    fn remotes_view_matrix_key_toggles_the_matrix() {
+        let (mut app, _) = remotes_app();
+        let fx = update(&mut app, Msg::RemotesMatrixToggle);
+        let generation = match fx.as_slice() {
+            [Effect::LoadRemoteMatrix { generation, .. }] => *generation,
+            other => panic!("expected one matrix load, got {other:?}"),
+        };
+        update(
+            &mut app,
+            Msg::RemoteMatrixBuilt {
+                generation,
+                matrix: vec![rgit_model::MatrixBranch {
+                    name: "topic".into(),
+                    cells: vec![
+                        rgit_model::MatrixCell {
+                            remote: "origin".into(),
+                            counts: Some((2, 0)),
+                        },
+                        rgit_model::MatrixCell {
+                            remote: "upstream".into(),
+                            counts: None,
+                        },
+                    ],
+                }],
+            },
+        );
+        let ids = row_ids(&app);
+        assert!(ids.contains(&"matrix:topic".to_owned()));
+        assert!(!ids.contains(&"remote:origin".to_owned()));
+
+        update(&mut app, Msg::RemotesMatrixToggle);
+        let ids = row_ids(&app);
+        assert!(ids.contains(&"remote:origin".to_owned()));
+        assert!(!ids.contains(&"matrix:topic".to_owned()));
+    }
+
+    fn matrix_on(app: &mut App) {
+        let fx = update(app, Msg::RemotesMatrixToggle);
+        let [Effect::LoadRemoteMatrix { generation, .. }] = fx.as_slice() else {
+            panic!("expected one matrix load, got {fx:?}");
+        };
+        let generation = *generation;
+        let matrix = ["main", "topic"]
+            .map(|name| rgit_model::MatrixBranch {
+                name: name.into(),
+                cells: Vec::new(),
+            })
+            .to_vec();
+        update(app, Msg::RemoteMatrixBuilt { generation, matrix });
+    }
+
+    #[test]
+    fn remotes_view_refresh_with_the_same_data_keeps_the_matrix_and_cursor() {
+        let (mut app, _) = remotes_app();
+        matrix_on(&mut app);
+        let topic = row_ids(&app)
+            .iter()
+            .position(|id| id == "matrix:topic")
+            .unwrap();
+        app.buffer_mut().set_cursor(topic);
+
+        let remotes = app.remotes.clone();
+        let fx = update(
+            &mut app,
+            Msg::RemotesLoaded {
+                remotes,
+                open: false,
+            },
+        );
+
+        assert!(row_ids(&app).contains(&"matrix:topic".to_owned()));
+        assert_eq!(app.buffer().cursor_id().as_deref(), Some("matrix:topic"));
+        assert!(
+            !fx.iter()
+                .any(|e| matches!(e, Effect::LoadRemoteMatrix { .. }))
+        );
+    }
+
+    #[test]
+    fn remotes_view_refresh_after_leaving_does_not_reopen_or_check() {
+        let (mut app, _) = remotes_app();
+        assert!(app.pop_view());
+
+        let fx = update(
+            &mut app,
+            Msg::RemotesLoaded {
+                remotes: vec![overview("origin", &["main"])],
+                open: false,
+            },
+        );
+
+        assert_ne!(app.active_kind(), ViewKind::Remotes);
+        assert!(
+            !fx.iter()
+                .any(|e| matches!(e, Effect::CheckRemoteServer { .. }))
+        );
+    }
+
+    #[test]
+    fn remotes_view_reopen_drops_a_cached_branch_log() {
+        let (mut app, _) = remotes_app();
+        app.preview_cache.insert(
+            PreviewKey::RemoteBranch {
+                remote: "origin".into(),
+                branch: "main".into(),
+            },
+            Vec::new(),
+        );
+        assert!(app.pop_view());
+
+        update(
+            &mut app,
+            Msg::RemotesLoaded {
+                remotes: vec![overview("origin", &["main"])],
+                open: true,
+            },
+        );
+
+        assert!(
+            !app.preview_cache
+                .keys()
+                .any(|k| matches!(k, PreviewKey::RemoteBranch { .. }))
+        );
+    }
+
+    #[test]
+    fn remotes_view_search_in_other_views_leaves_folds_shut() {
+        let (mut app, _) = remotes_app();
+        assert!(app.pop_view());
+        assert_ne!(app.active_kind(), ViewKind::Remotes);
+        let span = |t: &str| vec![rgit_model::Span::plain(t.to_owned())];
+        app.buffer_mut().rebuild_preserving_selection(vec![
+            Section::branch(
+                "file",
+                NodeKind::Section,
+                span("lib.rs"),
+                vec![Section::leaf(
+                    "file/line",
+                    NodeKind::DiffLine,
+                    span("+needle"),
+                )],
+            )
+            .folded_by_default(),
+            Section::leaf("other", NodeKind::Section, span("needle.txt")),
+        ]);
+
+        update(&mut app, Msg::SearchOpen);
+        for c in "needle".chars() {
+            update(&mut app, Msg::SearchChar(c));
+        }
+
+        assert_eq!(app.buffer().cursor_id().as_deref(), Some("other"));
+    }
+
+    fn action_app() -> App {
+        let (mut app, _) = remotes_app();
+        let generation = app.remotes_gen;
+        update(
+            &mut app,
+            Msg::RemoteServerChecked {
+                generation,
+                name: "origin".into(),
+                branches: Some(vec!["main".into(), "new".into()]),
+            },
+        );
+        app
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "user.name=t"])
+            .args(["-c", "user.email=t@example.com"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    fn fixture_repo(tag: &str) -> (std::path::PathBuf, rgit_git::Git2Backend) {
+        let dir = std::env::temp_dir().join(format!("rgit-tui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_in(&dir, &["init", "-q", "-b", "main"]);
+        git_in(&dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        git_in(
+            &dir,
+            &["remote", "add", "origin", "https://example.com/me/r.git"],
+        );
+        for name in ["topic", "other"] {
+            git_in(
+                &dir,
+                &["update-ref", &format!("refs/remotes/origin/{name}"), "HEAD"],
+            );
+        }
+        let backend = rgit_git::Git2Backend::discover(&dir).unwrap();
+        (dir, backend)
+    }
+
+    #[test]
+    fn remotes_action_fetch_on_a_remote_row_fetches_only_that_remote() {
+        let mut app = action_app();
+        for id in ["remote:upstream", "remote:upstream:fetch-url"] {
+            cursor_to(&mut app, id);
+            app.hook_console = None;
+            let fx = update(&mut app, Msg::RemoteFetch);
+            assert!(
+                matches!(fx.as_slice(), [Effect::OpConsole(ConsoleOp::FetchRemote(name))] if name == "upstream"),
+                "fetch on {id}, got {fx:?}"
+            );
+            assert!(app.hook_console.is_some());
+        }
+    }
+
+    #[test]
+    fn remotes_action_prune_on_a_remote_row() {
+        let mut app = action_app();
+        cursor_to(&mut app, "remote:origin");
+        let fx = update(&mut app, Msg::RemotePrune);
+        assert!(
+            matches!(fx.as_slice(), [Effect::OpConsole(ConsoleOp::PruneRemote(name))] if name == "origin"),
+            "got {fx:?}"
+        );
+        assert!(app.hook_console.is_some());
+    }
+
+    #[test]
+    fn remotes_action_enter_on_a_branch_creates_a_tracking_branch() {
+        let mut app = action_app();
+        cursor_to(&mut app, "remote:origin:branch:main");
+        let fx = update(&mut app, Msg::RemoteBranchCheckout);
+        assert!(
+            matches!(
+                fx.as_slice(),
+                [Effect::Mutate(Mutation::TrackRemoteBranch { remote, branch })]
+                    if remote == "origin" && branch == "main"
+            ),
+            "got {fx:?}"
+        );
+
+        let (dir, backend) = fixture_repo("track");
+        crate::runtime::track_remote_branch(&backend, "origin", "topic").unwrap();
+        assert_eq!(
+            git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "topic"
+        );
+        assert_eq!(
+            git_in(&dir, &["rev-parse", "--abbrev-ref", "topic@{upstream}"]),
+            "origin/topic"
+        );
+
+        git_in(&dir, &["checkout", "-q", "main"]);
+        crate::runtime::track_remote_branch(&backend, "origin", "topic").unwrap();
+        assert_eq!(
+            git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "topic"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remotes_action_enter_when_a_local_branch_tracks_something_else_shows_an_error() {
+        let (dir, backend) = fixture_repo("elsewhere");
+        git_in(&dir, &["branch", "--track", "topic", "origin/other"]);
+        let err = crate::runtime::track_remote_branch(&backend, "origin", "topic")
+            .expect_err("a branch that tracks another remote branch is not touched");
+        assert!(err.to_string().contains("topic"), "got {err}");
+        assert_eq!(git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        assert_eq!(
+            git_in(&dir, &["rev-parse", "--abbrev-ref", "topic@{upstream}"]),
+            "origin/other"
+        );
+
+        git_in(&dir, &["branch", "other"]);
+        assert!(crate::runtime::track_remote_branch(&backend, "origin", "other").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remotes_action_enter_when_checkout_fails_keeps_a_branch_a_retry_can_use() {
+        let (dir, backend) = fixture_repo("clash");
+        git_in(&dir, &["checkout", "-q", "-b", "tmp"]);
+        std::fs::write(dir.join("f"), "remote\n").unwrap();
+        git_in(&dir, &["add", "f"]);
+        git_in(&dir, &["commit", "-q", "-m", "add f"]);
+        git_in(&dir, &["update-ref", "refs/remotes/origin/clash", "HEAD"]);
+        git_in(&dir, &["checkout", "-q", "main"]);
+        git_in(&dir, &["branch", "-q", "-D", "tmp"]);
+        std::fs::write(dir.join("f"), "local\n").unwrap();
+
+        let err = crate::runtime::track_remote_branch(&backend, "origin", "clash")
+            .expect_err("the untracked f blocks the checkout");
+        assert!(err.to_string().contains("created clash"), "got {err}");
+        assert_eq!(
+            git_in(&dir, &["rev-parse", "--abbrev-ref", "clash@{upstream}"]),
+            "origin/clash"
+        );
+
+        std::fs::remove_file(dir.join("f")).unwrap();
+        crate::runtime::track_remote_branch(&backend, "origin", "clash").unwrap();
+        assert_eq!(
+            git_in(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "clash"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remotes_action_set_upstream_of_the_current_branch() {
+        let mut app = action_app();
+        cursor_to(&mut app, "remote:origin:branch:main");
+        app.head = Some(Head {
+            branch: Some("work".to_owned()),
+            ..Head::default()
+        });
+        let fx = update(&mut app, Msg::RemoteBranchUpstream);
+        assert!(
+            matches!(
+                fx.as_slice(),
+                [Effect::Mutate(Mutation::SetUpstream { branch, upstream })]
+                    if branch == "work" && upstream == "origin/main"
+            ),
+            "got {fx:?}"
+        );
+
+        app.head = Some(Head {
+            branch: None,
+            detached: true,
+            ..Head::default()
+        });
+        assert!(update(&mut app, Msg::RemoteBranchUpstream).is_empty());
+        let toast = app.toasts.last().expect("an error toast");
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert!(toast.text.contains("detached"));
+    }
+
+    #[test]
+    fn remotes_action_delete_needs_a_confirm_and_cancel_keeps_the_branch() {
+        let mut app = action_app();
+        cursor_to(&mut app, "remote:origin:branch:new");
+        let fx = update(&mut app, Msg::RemoteBranchDelete);
+        assert!(fx.is_empty());
+        let pending = app.confirm.as_ref().expect("a confirm");
+        assert!(pending.prompt.contains("origin/new"));
+
+        let fx = update(&mut app, Msg::ConfirmCancel);
+        assert!(fx.is_empty());
+        assert!(app.confirm.is_none());
+        assert!(app.hook_console.is_none());
+
+        update(&mut app, Msg::RemoteBranchDelete);
+        let fx = update(&mut app, Msg::ConfirmAccept);
+        assert!(
+            matches!(
+                fx.as_slice(),
+                [Effect::OpConsole(ConsoleOp::DeleteRemoteBranch { remote, branch })]
+                    if remote == "origin" && branch == "new"
+            ),
+            "got {fx:?}"
+        );
+        assert!(app.hook_console.is_some());
+    }
+
+    #[test]
+    fn remotes_action_browser_url_for_github_gitlab_and_an_unsupported_host() {
+        let none = rgit_forge::ForgeSelection::default();
+        assert_eq!(
+            remote_branch_url(&none, "git@github.com:me/r.git", "feature/a b").unwrap(),
+            "https://github.com/me/r/tree/feature/a%20b"
+        );
+        assert_eq!(
+            remote_branch_url(&none, "https://gitlab.com/group/sub/proj.git", "main").unwrap(),
+            "https://gitlab.com/group/sub/proj/-/tree/main"
+        );
+        let err = remote_branch_url(&none, "https://example.com/me/r.git", "main").unwrap_err();
+        assert!(err.contains("example.com"), "got {err}");
+    }
+
+    #[test]
+    fn remotes_action_browser_url_uses_a_configured_forgejo_host() {
+        let forgejo = rgit_forge::ForgeSelection {
+            provider: Some("forgejo".into()),
+            host: Some("codeberg.org".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            remote_branch_url(&forgejo, "https://codeberg.org/me/r.git", "fix/x").unwrap(),
+            "https://codeberg.org/me/r/src/branch/fix/x"
+        );
+    }
+
+    #[test]
+    fn remotes_action_successful_delete_drops_the_branch_from_the_server_list() {
+        let mut app = action_app();
+        app.remote_server
+            .insert("origin".into(), Some(vec!["main".into(), "new".into()]));
+        cursor_to(&mut app, "remote:origin:branch:new");
+        update(&mut app, Msg::RemoteBranchDelete);
+        update(&mut app, Msg::ConfirmAccept);
+
+        update(
+            &mut app,
+            Msg::HookFinished {
+                ok: true,
+                summary: None,
+            },
+        );
+
+        assert_eq!(
+            app.remote_server.get("origin"),
+            Some(&Some(vec!["main".to_owned()]))
+        );
+    }
+
+    #[test]
+    fn remotes_action_not_fetched_branch_refuses_checkout() {
+        let mut app = action_app();
+        cursor_to(&mut app, "remote:origin:branch:new");
+        for msg in [Msg::RemoteBranchCheckout, Msg::RemoteBranchUpstream] {
+            assert!(update(&mut app, msg).is_empty());
+            let toast = app.toasts.last().expect("an error toast");
+            assert_eq!(toast.kind, ToastKind::Error);
+            assert!(toast.text.contains("not fetched, press f first"));
+        }
     }
 }

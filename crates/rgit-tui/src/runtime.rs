@@ -148,6 +148,33 @@ fn resolve_lanes_key(key: crossterm::event::KeyEvent) -> Option<Msg> {
     }
 }
 
+/// Keys local to the remotes view: `a` toggles the matrix, `f` and `p` fetch
+/// and prune the remote under the cursor, `u`, `x` and `o` set the upstream,
+/// delete and open the branch, and Enter checks a branch out. Everything else
+/// falls through to the active profile.
+fn resolve_remotes_key(app: &App, key: crossterm::event::KeyEvent) -> Option<Msg> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('a') => return Some(Msg::RemotesMatrixToggle),
+            KeyCode::Char('f') => return Some(Msg::RemoteFetch),
+            KeyCode::Char('p') => return Some(Msg::RemotePrune),
+            KeyCode::Char('u') => return Some(Msg::RemoteBranchUpstream),
+            KeyCode::Char('x') => return Some(Msg::RemoteBranchDelete),
+            KeyCode::Char('o') => return Some(Msg::RemoteBranchOpen),
+            KeyCode::Enter if app.remotes_row() == crate::app::RemotesRow::Branch => {
+                return Some(Msg::RemoteBranchCheckout);
+            }
+            _ => {}
+        }
+    }
+    if keymap::profile() == keymap::Profile::Vim {
+        keymap::resolve_vim_key(key)
+    } else {
+        resolve_key(key)
+    }
+}
+
 /// A credential prompt that runs on the network task's thread but drives the UI:
 /// it asks the main loop (over `tx`) to open a masked minibuffer and blocks on
 /// the reply the user submits. Returning `None` (cancel) fails the operation.
@@ -488,6 +515,8 @@ async fn event_loop(
                     resolve_session_log_key(key)
                 } else if app.active_kind() == crate::app::ViewKind::Lanes {
                     resolve_lanes_key(key)
+                } else if app.active_kind() == crate::app::ViewKind::Remotes {
+                    resolve_remotes_key(&app, key)
                 } else if keymap::profile() == keymap::Profile::Vim {
                     keymap::resolve_vim_key(key)
                 } else {
@@ -1137,13 +1166,91 @@ async fn run_msg(
                     }
                 });
             }
-            Effect::LoadRemotes => {
+            Effect::LoadRemotes { open } => {
                 let backend = app.backend();
                 let msg_tx = msg_tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    if let Ok(remotes) = backend.remotes() {
-                        let _ = msg_tx.send(Msg::RemotesLoaded(remotes));
+                    if let Ok(remotes) = backend.remote_overview() {
+                        let _ = msg_tx.send(Msg::RemotesLoaded { remotes, open });
                     }
+                });
+            }
+            Effect::CheckRemoteServer { generation, name } => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let branches = backend
+                        .remote_server_branches(&name, std::time::Duration::from_secs(10))
+                        .ok()
+                        .flatten();
+                    let _ = msg_tx.send(Msg::RemoteServerChecked {
+                        generation,
+                        name,
+                        branches,
+                    });
+                });
+            }
+            Effect::LoadRemoteMatrix {
+                generation,
+                remotes,
+            } => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(locals) = backend.local_branches() {
+                        let matrix = locals
+                            .into_iter()
+                            .map(|name| rgit_model::MatrixBranch {
+                                cells: remotes
+                                    .iter()
+                                    .map(|remote| rgit_model::MatrixCell {
+                                        remote: remote.name.clone(),
+                                        counts: remote
+                                            .branches
+                                            .iter()
+                                            .any(|b| b.name == name)
+                                            .then(|| {
+                                                backend
+                                                    .ahead_behind(
+                                                        &format!("refs/heads/{name}"),
+                                                        &format!(
+                                                            "refs/remotes/{}/{name}",
+                                                            remote.name
+                                                        ),
+                                                    )
+                                                    .ok()
+                                            })
+                                            .flatten(),
+                                    })
+                                    .collect(),
+                                name,
+                            })
+                            .collect();
+                        let _ = msg_tx.send(Msg::RemoteMatrixBuilt { generation, matrix });
+                    }
+                });
+            }
+            Effect::LoadRemoteBranchLog { key, rev } => {
+                let backend = app.backend();
+                let msg_tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let opts = rgit_git::LogOptions {
+                        limit: 20,
+                        revs: vec![format!("refs/remotes/{rev}")],
+                        ..Default::default()
+                    };
+                    let sections = match backend.log(&opts) {
+                        Ok(entries) => rgit_model::build_log(&entries),
+                        Err(error) => vec![rgit_model::Section::leaf(
+                            "remote-preview/error",
+                            rgit_model::NodeKind::Info,
+                            vec![rgit_model::Span::new(
+                                format!("log failed: {error}"),
+                                rgit_model::Style::Dim,
+                            )],
+                        )],
+                    };
+                    let _ = msg_tx.send(Msg::PreviewBuilt { key, sections });
                 });
             }
             Effect::LoadPushRemotes => {
@@ -1858,6 +1965,8 @@ async fn op_console(
             let _ = tx.send(Msg::HookProgress { received, total });
         }
     };
+    let note = Arc::new(std::sync::Mutex::new(None::<String>));
+    let note_in = note.clone();
     let result = tokio::task::spawn_blocking(move || match op {
         ConsoleOp::Fetch => backend.fetch(None, &[], &Default::default(), &report),
         ConsoleOp::Pull => backend.pull(None, None, &Default::default(), &report),
@@ -1873,6 +1982,22 @@ async fn op_console(
             set_upstream,
             &report,
         ),
+        ConsoleOp::FetchRemote(name) => {
+            backend.fetch(Some(&name), &[], &Default::default(), &report)
+        }
+        ConsoleOp::PruneRemote(name) => backend.prune_remote(&name).map(|pruned| {
+            let text = match pruned.len() {
+                1 => "pruned 1 stale branch".to_owned(),
+                n => format!("pruned {n} stale branches"),
+            };
+            report(rgit_git::OpProgress::Line(text.clone()));
+            if let Ok(mut note) = note_in.lock() {
+                *note = Some(text);
+            }
+        }),
+        ConsoleOp::DeleteRemoteBranch { remote, branch } => {
+            backend.push_delete(Some(&remote), &branch, &report)
+        }
         ConsoleOp::Merge { rev, no_ff } => backend.merge(&rev, no_ff, false, &report),
         ConsoleOp::RebaseOnto(rev) => backend.rebase_onto(&rev, &report),
         ConsoleOp::Sync => backend.sync(&report).map(drop),
@@ -1890,7 +2015,13 @@ async fn op_console(
     .await;
 
     let (ok, summary) = match result {
-        Ok(Ok(())) => (true, Some(format!("{title} complete"))),
+        Ok(Ok(())) => {
+            let note = note.lock().ok().and_then(|mut n| n.take());
+            (
+                true,
+                Some(note.unwrap_or_else(|| format!("{title} complete"))),
+            )
+        }
         Ok(Err(e)) => {
             tracing::warn!(target: "git", "{title} failed: {e}");
             let _ = msg_tx.send(Msg::HookOutput(e.to_string()));
@@ -2010,6 +2141,35 @@ fn restack_note(outcome: &rgit_git::RestackOutcome) -> Option<String> {
     Some(format!("auto-restack ({})", parts.join("; ")))
 }
 
+/// Check `remote/branch` out as a local branch that tracks it. An existing
+/// local branch of that name is only reused when it already tracks it.
+pub(crate) fn track_remote_branch(
+    backend: &dyn GitBackend,
+    remote: &str,
+    branch: &str,
+) -> Result<(), GitError> {
+    let upstream = format!("{remote}/{branch}");
+    if backend.local_branches()?.iter().any(|b| b == branch) {
+        return match backend.branch_upstream(branch)? {
+            Some((tracked, ..)) if tracked == upstream => backend.checkout_branch(branch),
+            _ => Err(GitError::Other(format!(
+                "local branch {branch} exists and does not track {upstream}"
+            ))),
+        };
+    }
+    backend.create_branch_at(branch, &format!("refs/remotes/{upstream}"), false)?;
+    if let Err(error) = backend.set_upstream(branch, Some(&upstream)) {
+        // A branch that tracks nothing would block every retry.
+        let _ = backend.delete_branch(branch, true);
+        return Err(error);
+    }
+    backend.checkout_branch(branch).map_err(|error| {
+        GitError::Other(format!(
+            "created {branch} tracking {upstream}, but checkout failed: {error}"
+        ))
+    })
+}
+
 fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), GitError> {
     let since = backend.index_second();
     let result = match mutation {
@@ -2039,6 +2199,10 @@ fn apply_mutation(backend: &dyn GitBackend, mutation: &Mutation) -> Result<(), G
             lines,
         } => backend.discard_lines(path, *new_start, lines),
         Mutation::CheckoutBranch(name) => backend.checkout_branch(name),
+        Mutation::TrackRemoteBranch { remote, branch } => {
+            track_remote_branch(backend, remote, branch)
+        }
+        Mutation::SetUpstream { branch, upstream } => backend.set_upstream(branch, Some(upstream)),
         Mutation::CreateBranch(name) => backend.create_branch(name),
         Mutation::CheckoutDetached(name) => backend.checkout_detached(name),
         Mutation::StashPush => backend.stash_push(false).map(drop),

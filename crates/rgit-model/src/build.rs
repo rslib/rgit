@@ -4,8 +4,8 @@ use rayon::prelude::*;
 
 use rgit_git::{
     BlameLine, CommitDetails, CommitRef, Deco, DiffLine, FileDiff, Head, Hunk, LineOrigin,
-    LogEntry, RefEntry, RefKind, Remote, RepoStatus, StatusCode, StatusEntry, Worktree,
-    group_decorations,
+    LogEntry, RefEntry, RefKind, Remote, RemoteBranchInfo, RemoteOverview, RepoStatus, StatusCode,
+    StatusEntry, Worktree, group_decorations,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{
@@ -365,6 +365,284 @@ pub fn build_remotes(remotes: &[Remote]) -> Vec<Section> {
             )
         })
         .collect()
+}
+
+/// The most branches shown under one remote.
+pub const REMOTE_BRANCH_LIMIT: usize = 500;
+
+/// One local branch compared with every remote in the matrix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixBranch {
+    pub name: String,
+    pub cells: Vec<MatrixCell>,
+}
+
+/// A remote's side of a [`MatrixBranch`]: ahead and behind of the local branch
+/// against the remote branch of the same name, or `None` when it lacks one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixCell {
+    pub remote: String,
+    pub counts: Option<(usize, usize)>,
+}
+
+/// A remote branch to draw, from a local ref or only from the server.
+struct BranchRow<'a> {
+    name: &'a str,
+    info: Option<&'a RemoteBranchInfo>,
+}
+
+/// Build the remotes view from local data: a section per remote with its
+/// facts, then its branches folded by prefix. `server` maps a remote name to
+/// the branches its server advertises, or `None` when the server could not be
+/// checked; branches without a local ref show as not fetched and count as
+/// newest. `matrix` replaces the sections with the local-branch matrix. `now`
+/// is unix seconds.
+pub fn build_remotes_view(
+    remotes: &[RemoteOverview],
+    server: &std::collections::HashMap<String, Option<Vec<String>>>,
+    matrix: Option<&[MatrixBranch]>,
+    now: i64,
+) -> Vec<Section> {
+    if remotes.is_empty() {
+        return build_remotes(&[]);
+    }
+    if let Some(matrix) = matrix {
+        return build_matrix(matrix);
+    }
+    remotes
+        .iter()
+        .map(|r| remote_section(r, server.get(&r.name), now))
+        .collect()
+}
+
+/// Ids join parts with `:`, which git allows in neither remote nor branch
+/// names, so `remote:a/b` and `remote:a` never share a row id.
+fn remote_section(
+    remote: &RemoteOverview,
+    check: Option<&Option<Vec<String>>>,
+    now: i64,
+) -> Section {
+    let server = check.and_then(Option::as_deref).unwrap_or(&[]);
+    let id = format!("remote:{}", remote.name);
+    let local: std::collections::HashSet<&str> =
+        remote.branches.iter().map(|b| b.name.as_str()).collect();
+    let mut rows: Vec<BranchRow> = remote
+        .branches
+        .iter()
+        .map(|b| BranchRow {
+            name: &b.name,
+            info: Some(b),
+        })
+        .chain(
+            server
+                .iter()
+                .filter(|n| !local.contains(n.as_str()))
+                .map(|n| BranchRow {
+                    name: n,
+                    info: None,
+                }),
+        )
+        .collect();
+    let total = rows.len();
+    let mut hidden: Vec<BranchRow> = Vec::new();
+    if total > REMOTE_BRANCH_LIMIT {
+        rows.sort_by(|a, b| {
+            let time = |r: &BranchRow| r.info.map_or(i64::MAX, |i| i.time);
+            time(b).cmp(&time(a)).then_with(|| a.name.cmp(b.name))
+        });
+        hidden = rows.split_off(REMOTE_BRANCH_LIMIT);
+        hidden.sort_by(|a, b| a.name.cmp(b.name));
+    }
+    rows.sort_by(|a, b| a.name.cmp(b.name));
+
+    let mut header = vec![
+        Span::new(remote.name.clone(), Style::Branch),
+        Span::new(format!("  {total} branches"), Style::Dim),
+    ];
+    if let Some(head) = &remote.head_branch {
+        header.push(Span::new(format!("  default {head}"), Style::Dim));
+    }
+    header.push(Span::new(
+        match remote.last_fetch {
+            Some(t) if now - t < 60 => "  fetched just now".to_owned(),
+            Some(t) => format!("  fetched {} ago", age(now, t)),
+            None => "  never fetched".to_owned(),
+        },
+        Style::Dim,
+    ));
+    if matches!(check, Some(None)) {
+        header.push(Span::new("  not checked".to_owned(), Style::Dim));
+    }
+
+    let mut children = vec![Section::leaf(
+        format!("{id}:fetch-url"),
+        NodeKind::Info,
+        vec![
+            Span::new("fetch ".to_owned(), Style::Dim),
+            Span::plain(remote.fetch_url.clone()),
+        ],
+    )];
+    if let Some(push) = &remote.push_url {
+        children.push(Section::leaf(
+            format!("{id}:push-url"),
+            NodeKind::Info,
+            vec![
+                Span::new("push  ".to_owned(), Style::Dim),
+                Span::plain(push.clone()),
+            ],
+        ));
+    }
+    children.extend(branch_tree(&remote.name, &id, &rows, now));
+    if !hidden.is_empty() {
+        let hidden_id = format!("{id}:hidden");
+        let tree = branch_tree(&remote.name, &hidden_id, &hidden, now);
+        children.push(
+            Section::branch(
+                hidden_id,
+                NodeKind::Section,
+                vec![Span::new(
+                    format!("{} more branches, older", hidden.len()),
+                    Style::Dim,
+                )],
+                tree,
+            )
+            .folded_by_default(),
+        );
+    }
+    Section::branch(id, NodeKind::Section, header, children)
+}
+
+/// Branches without a `/` first, then one folder per text before the first
+/// `/`, each in name order.
+fn branch_tree(remote: &str, id: &str, rows: &[BranchRow], now: i64) -> Vec<Section> {
+    let mut leaves = Vec::new();
+    let mut folders: Vec<(&str, Vec<Section>)> = Vec::new();
+    for row in rows {
+        match row.name.split_once('/') {
+            None => leaves.push(branch_leaf(remote, id, row, row.name, now)),
+            Some((dir, rest)) => {
+                let leaf = branch_leaf(remote, id, row, rest, now);
+                match folders.last_mut() {
+                    Some((last, items)) if *last == dir => items.push(leaf),
+                    _ => folders.push((dir, vec![leaf])),
+                }
+            }
+        }
+    }
+    leaves.extend(folders.into_iter().map(|(dir, items)| {
+        Section::branch(
+            format!("{id}:folder:{dir}"),
+            NodeKind::Section,
+            vec![Span::new(format!("{dir}/"), Style::Branch)],
+            items,
+        )
+    }));
+    leaves
+}
+
+fn branch_leaf(remote: &str, id: &str, row: &BranchRow, label: &str, now: i64) -> Section {
+    let mut spans = vec![Span::new(label.to_owned(), Style::Branch)];
+    match row.info {
+        Some(info) => {
+            if let Some(t) = &info.tracked_by {
+                spans.push(Span::new(
+                    format!("  {} {}", glyph("\u{2190}", "<-"), t.local),
+                    Style::Branch,
+                ));
+                spans.push(Span::new(
+                    format!(" {}{}", glyph("\u{2191}", "+"), t.ahead),
+                    Style::Added,
+                ));
+                spans.push(Span::new(
+                    format!(" {}{}", glyph("\u{2193}", "-"), t.behind),
+                    Style::Deleted,
+                ));
+            }
+            spans.push(Span::new(format!("  {}", age(now, info.time)), Style::Dim));
+            spans.push(Span::new(format!("  {}", info.subject), Style::Dim));
+        }
+        None => spans.push(Span::new("  not fetched".to_owned(), Style::Dim)),
+    }
+    Section::leaf(format!("{id}:branch:{}", row.name), NodeKind::Commit, spans).with_target(
+        Target::Ref {
+            name: format!("{remote}/{}", row.name),
+            kind: RefTarget::Remote,
+        },
+    )
+}
+
+fn build_matrix(matrix: &[MatrixBranch]) -> Vec<Section> {
+    if matrix.is_empty() {
+        return vec![Section::leaf(
+            "matrix:empty",
+            NodeKind::Info,
+            vec![Span::new("no local branches".to_owned(), Style::Dim)],
+        )];
+    }
+    let width = |text: &str| text.chars().count();
+    let name_width = matrix.iter().map(|b| width(&b.name)).max().unwrap_or(0);
+    let cell_text = |cell: &MatrixCell| match cell.counts {
+        Some((ahead, behind)) => format!(
+            "{} {}{ahead} {}{behind}",
+            cell.remote,
+            glyph("\u{2191}", "+"),
+            glyph("\u{2193}", "-")
+        ),
+        None => format!("{} {}", cell.remote, glyph("\u{2717}", "x")),
+    };
+    let mut cell_widths: Vec<usize> = Vec::new();
+    for b in matrix {
+        for (i, cell) in b.cells.iter().enumerate() {
+            let w = width(&cell_text(cell));
+            match cell_widths.get_mut(i) {
+                Some(max) => *max = (*max).max(w),
+                None => cell_widths.push(w),
+            }
+        }
+    }
+    let rows = matrix
+        .iter()
+        .map(|b| {
+            let pad = name_width - width(&b.name);
+            let mut spans = vec![Span::new(
+                format!("{}{}", b.name, " ".repeat(pad)),
+                Style::Branch,
+            )];
+            for (i, cell) in b.cells.iter().enumerate() {
+                let style = match cell.counts {
+                    Some((0, 0)) | None => Style::Dim,
+                    Some((_, 0)) => Style::Added,
+                    Some(_) => Style::Deleted,
+                };
+                let text = cell_text(cell);
+                let pad = cell_widths[i] - width(&text);
+                spans.push(Span::new(format!("  {text}{}", " ".repeat(pad)), style));
+            }
+            Section::leaf(format!("matrix:{}", b.name), NodeKind::Commit, spans)
+        })
+        .collect();
+    vec![Section::branch(
+        "matrix",
+        NodeKind::Section,
+        vec![Span::new(
+            format!("Matrix ({} branches)", matrix.len()),
+            Style::SectionHeader,
+        )],
+        rows,
+    )]
+}
+
+/// A short age such as `5m`, `3h`, `2d`, `4w` or `1y`.
+fn age(now: i64, then: i64) -> String {
+    let secs = (now - then).max(0);
+    match secs {
+        0..=59 => "now".to_owned(),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        86_400..=604_799 => format!("{}d", secs / 86_400),
+        604_800..=31_535_999 => format!("{}w", secs / 604_800),
+        _ => format!("{}y", secs / 31_536_000),
+    }
 }
 
 /// Build the worktrees view: each linked worktree with its path.
@@ -2025,5 +2303,323 @@ mod graph_tests {
                 .any(|r| r.contains('╯') || r.contains('┴') || r.contains('┼')),
             "a fold-back connector is drawn: {rows:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rgit_git::TrackedBy;
+    use std::collections::HashMap;
+
+    const NOW: i64 = 1_000_000;
+
+    fn branch(name: &str, time: i64) -> RemoteBranchInfo {
+        RemoteBranchInfo {
+            name: name.into(),
+            oid: "0".repeat(40),
+            time,
+            subject: format!("work on {name}"),
+            tracked_by: None,
+        }
+    }
+
+    fn remote(name: &str, branches: Vec<RemoteBranchInfo>) -> RemoteOverview {
+        RemoteOverview {
+            name: name.into(),
+            fetch_url: format!("https://example.com/{name}.git"),
+            push_url: None,
+            head_branch: None,
+            last_fetch: Some(NOW - 7200),
+            fetch_refspecs: Vec::new(),
+            branches,
+        }
+    }
+
+    fn text(section: &Section) -> String {
+        section.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    fn view(remotes: &[RemoteOverview]) -> Vec<Section> {
+        build_remotes_view(remotes, &HashMap::new(), None, NOW)
+    }
+
+    fn child<'a>(section: &'a Section, id: &str) -> &'a Section {
+        section
+            .children
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap_or_else(|| panic!("no child {id}"))
+    }
+
+    #[test]
+    fn remotes_view_shows_both_urls_only_when_they_differ() {
+        let mut origin = remote("origin", vec![]);
+        origin.push_url = Some("git@example.com:me/r.git".into());
+        let upstream = remote("upstream", vec![]);
+
+        let sections = view(&[origin, upstream]);
+
+        let origin = &sections[0];
+        assert!(
+            text(child(origin, "remote:origin:fetch-url"))
+                .contains("https://example.com/origin.git")
+        );
+        assert!(text(child(origin, "remote:origin:push-url")).contains("git@example.com:me/r.git"));
+        let upstream = &sections[1];
+        assert!(
+            upstream
+                .children
+                .iter()
+                .all(|c| !c.id.ends_with("push-url"))
+        );
+        assert!(text(upstream).contains("fetched 2h ago"));
+    }
+
+    #[test]
+    fn remotes_view_marks_a_never_fetched_remote_with_zero_branches() {
+        let mut fork = remote("fork", vec![]);
+        fork.last_fetch = None;
+
+        let sections = view(&[fork]);
+
+        let header = text(&sections[0]);
+        assert!(header.contains("0 branches"), "{header}");
+        assert!(header.contains("never fetched"), "{header}");
+    }
+
+    #[test]
+    fn remotes_view_folds_branches_by_the_text_before_the_first_slash() {
+        let origin = remote(
+            "origin",
+            vec![
+                branch("feature/a", NOW - 60),
+                branch("feature/b", NOW - 120),
+                branch("main", NOW - 10),
+            ],
+        );
+
+        let sections = view(&[origin]);
+
+        let origin = &sections[0];
+        let main = child(origin, "remote:origin:branch:main");
+        assert_eq!(main.spans[0].text, "main");
+        let folder = child(origin, "remote:origin:folder:feature");
+        assert_eq!(text(folder), "feature/");
+        let names: Vec<_> = folder
+            .children
+            .iter()
+            .map(|c| c.spans[0].text.as_str())
+            .collect();
+        assert_eq!(names, ["a", "b"]);
+        assert!(text(&folder.children[0]).contains("1m"));
+        assert!(text(&folder.children[0]).contains("work on feature/a"));
+    }
+
+    #[test]
+    fn remotes_view_names_the_tracking_local_branch_with_counts() {
+        let mut topic = branch("topic", NOW - 60);
+        topic.tracked_by = Some(TrackedBy {
+            local: "topic".into(),
+            ahead: 2,
+            behind: 0,
+        });
+
+        let sections = view(&[remote("origin", vec![topic])]);
+
+        let row = text(child(&sections[0], "remote:origin:branch:topic"));
+        assert!(
+            row.contains(&format!("{} topic", glyph("\u{2190}", "<-"))),
+            "{row}"
+        );
+        assert!(row.contains("2"), "{row}");
+        assert!(
+            row.contains(&format!("{}0", glyph("\u{2193}", "-"))),
+            "{row}"
+        );
+        assert!(
+            row.contains(&format!("{}2", glyph("\u{2191}", "+"))),
+            "{row}"
+        );
+    }
+
+    #[test]
+    fn remotes_view_shows_the_newest_500_and_folds_the_hidden() {
+        // Names run opposite to time: b000 is the newest.
+        let branches = (0..600)
+            .map(|i| branch(&format!("b{i:03}"), NOW - 1000 - i))
+            .collect();
+
+        let sections = view(&[remote("origin", branches)]);
+
+        let origin = &sections[0];
+        let shown: Vec<_> = origin
+            .children
+            .iter()
+            .filter(|c| c.id.starts_with("remote:origin:branch:"))
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(shown.len(), 500);
+        assert!(shown.contains(&"remote:origin:branch:b000"));
+        assert!(!shown.contains(&"remote:origin:branch:b500"));
+        let hidden = child(origin, "remote:origin:hidden");
+        assert!(text(hidden).contains("100 more"), "{}", text(hidden));
+        assert!(hidden.default_folded);
+        assert_eq!(hidden.children.len(), 100);
+        assert_eq!(hidden.children[0].id, "remote:origin:hidden:branch:b500");
+    }
+
+    #[test]
+    fn remotes_view_cap_breaks_time_ties_by_name_and_counts_server_only() {
+        let mut branches: Vec<_> = (0..REMOTE_BRANCH_LIMIT)
+            .map(|i| branch(&format!("b{i:03}"), NOW - 10))
+            .collect();
+        branches.push(branch("zz", NOW - 10));
+        let mut server = HashMap::new();
+        server.insert("origin".to_owned(), Some(vec!["fresh".to_owned()]));
+
+        let sections = build_remotes_view(&[remote("origin", branches)], &server, None, NOW);
+
+        let origin = &sections[0];
+        assert!(text(origin).contains("502 branches"), "{}", text(origin));
+        child(origin, "remote:origin:branch:fresh");
+        let hidden = child(origin, "remote:origin:hidden");
+        let names: Vec<_> = hidden.children.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "remote:origin:hidden:branch:b499",
+                "remote:origin:hidden:branch:zz"
+            ]
+        );
+    }
+
+    #[test]
+    fn remotes_view_ids_are_unique_when_remote_names_hold_a_slash() {
+        let a = remote("a", vec![branch("fetch-url", NOW), branch("hidden", NOW)]);
+        let ab = remote("a/branch", vec![branch("x", NOW)]);
+        let ah = remote("a/hidden", vec![]);
+
+        let sections = view(&[a, ab, ah]);
+
+        fn ids<'a>(section: &'a Section, out: &mut Vec<&'a str>) {
+            out.push(section.id.as_str());
+            for c in &section.children {
+                ids(c, out);
+            }
+        }
+        let mut all = Vec::new();
+        for s in &sections {
+            ids(s, &mut all);
+        }
+        let unique: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), all.len(), "{all:?}");
+    }
+
+    #[test]
+    fn remotes_view_branch_rows_carry_their_remote_ref() {
+        let sections = view(&[remote("team/a", vec![branch("feature/x", NOW)])]);
+
+        let folder = child(&sections[0], "remote:team/a:folder:feature");
+        assert_eq!(
+            folder.children[0].target,
+            Some(Target::Ref {
+                name: "team/a/feature/x".into(),
+                kind: RefTarget::Remote,
+            })
+        );
+    }
+
+    #[test]
+    fn remotes_view_marks_a_remote_whose_server_was_not_checked() {
+        let mut server = HashMap::new();
+        server.insert("origin".to_owned(), None);
+        let remotes = [remote("origin", vec![]), remote("upstream", vec![])];
+
+        let sections = build_remotes_view(&remotes, &server, None, NOW);
+
+        assert!(text(&sections[0]).contains("not checked"));
+        assert!(!text(&sections[1]).contains("not checked"));
+    }
+
+    #[test]
+    fn remotes_view_says_just_now_for_a_fresh_fetch() {
+        let mut origin = remote("origin", vec![]);
+        origin.last_fetch = Some(NOW - 5);
+
+        let header = text(&view(&[origin])[0]);
+
+        assert!(header.contains("fetched just now"), "{header}");
+    }
+
+    #[test]
+    fn remotes_view_marks_server_only_branches_as_not_fetched() {
+        let origin = remote("origin", vec![branch("main", NOW - 10)]);
+        let mut server = HashMap::new();
+        server.insert(
+            "origin".to_owned(),
+            Some(vec!["main".to_owned(), "new".to_owned()]),
+        );
+
+        let sections = build_remotes_view(&[origin], &server, None, NOW);
+
+        let new = child(&sections[0], "remote:origin:branch:new");
+        assert!(text(new).contains("not fetched"));
+        let main = child(&sections[0], "remote:origin:branch:main");
+        assert!(!text(main).contains("not fetched"));
+        assert!(text(&sections[0]).contains("2 branches"));
+    }
+
+    #[test]
+    fn remotes_view_matrix_gives_counts_per_remote_or_a_missing_mark() {
+        let matrix = vec![
+            MatrixBranch {
+                name: "main".into(),
+                cells: vec![
+                    MatrixCell {
+                        remote: "origin".into(),
+                        counts: Some((0, 0)),
+                    },
+                    MatrixCell {
+                        remote: "upstream".into(),
+                        counts: Some((0, 0)),
+                    },
+                ],
+            },
+            MatrixBranch {
+                name: "topic".into(),
+                cells: vec![
+                    MatrixCell {
+                        remote: "origin".into(),
+                        counts: Some((1, 2)),
+                    },
+                    MatrixCell {
+                        remote: "upstream".into(),
+                        counts: None,
+                    },
+                ],
+            },
+        ];
+        let remotes = [remote("origin", vec![]), remote("upstream", vec![])];
+
+        let sections = build_remotes_view(&remotes, &HashMap::new(), Some(&matrix), NOW);
+
+        let topic = text(child(&sections[0], "matrix:topic"));
+        assert!(
+            topic.contains(&format!(
+                "origin {}1 {}2",
+                glyph("\u{2191}", "+"),
+                glyph("\u{2193}", "-")
+            )),
+            "{topic}"
+        );
+        assert!(
+            topic.contains(&format!("upstream {}", glyph("\u{2717}", "x"))),
+            "{topic}"
+        );
+        assert_eq!(sections[0].children.len(), 2);
+        let main = text(child(&sections[0], "matrix:main"));
+        let start = |row: &str| row.find("upstream").unwrap();
+        assert_eq!(start(&main), start(&topic), "{main}\n{topic}");
     }
 }

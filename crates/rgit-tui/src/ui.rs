@@ -8,7 +8,7 @@ use ratatui::widgets::{
 };
 use rgit_model::{Span, Style, Target};
 
-use crate::app::{App, ViewKind};
+use crate::app::{App, RemotesRow, ViewKind};
 use crate::buffer::Row;
 use crate::config::Transparency;
 use crate::theme;
@@ -120,7 +120,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // get the side preview; detail views (Diff, Commit, Blame) fill the width.
     let previewable_view = matches!(
         app.active_kind(),
-        ViewKind::Status | ViewKind::Log | ViewKind::Smartlog | ViewKind::Stack | ViewKind::Refs
+        ViewKind::Status
+            | ViewKind::Log
+            | ViewKind::Smartlog
+            | ViewKind::Stack
+            | ViewKind::Refs
+            | ViewKind::Remotes
     );
     let wide = app.preview_enabled && body.width >= 100 && previewable_view;
     let [nav, prev] =
@@ -1743,7 +1748,24 @@ fn context_hints(app: &App) -> (Option<String>, Vec<(&'static str, &'static str)
                 ("q", "back"),
             ],
         ),
-        ViewKind::Remotes | ViewKind::Worktrees | ViewKind::Review => (None, vec![("q", "back")]),
+        ViewKind::Remotes => {
+            let (label, mut keys) = match app.remotes_row() {
+                RemotesRow::Remote => ("remote", vec![("f", "fetch"), ("p", "prune")]),
+                RemotesRow::Branch => (
+                    "remote branch",
+                    vec![
+                        ("⏎", "checkout"),
+                        ("u", "set upstream"),
+                        ("x", "delete"),
+                        ("o", "open"),
+                    ],
+                ),
+                RemotesRow::Other => ("remotes", Vec::new()),
+            };
+            keys.extend([("a", "matrix"), ("/", "search"), ("q", "back")]);
+            (Some(label.into()), keys)
+        }
+        ViewKind::Worktrees | ViewKind::Review => (None, vec![("q", "back")]),
     }
 }
 

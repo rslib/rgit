@@ -422,6 +422,64 @@ impl Buffer {
             .find(|&idx| texts[idx].to_lowercase().contains(&needle))
     }
 
+    /// Search every row, including those inside folded sections, from the
+    /// cursor row (or the one after or before it when `include_cursor` is
+    /// false), wrapping. A row also matches by the name of its ref target. On a
+    /// hit the folded sections above it are opened and the cursor moves there.
+    pub fn search_reveal(
+        &mut self,
+        query: &str,
+        forward: bool,
+        include_cursor: bool,
+    ) -> Option<usize> {
+        if query.is_empty() || self.visible_len == 0 {
+            return None;
+        }
+        let needle = query.to_lowercase();
+        let mut flat = Vec::new();
+        flatten(&self.root, &self.folded, None, true, &mut flat);
+        let n = flat.len();
+        let cursor = flat
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.visible)
+            .nth(self.cursor)
+            .map_or(0, |(i, _)| i);
+        let start = match (forward, include_cursor) {
+            (_, true) => cursor,
+            (true, false) => cursor + 1,
+            (false, false) => cursor + n - 1,
+        };
+        let hit = (0..n)
+            .map(|step| {
+                if forward {
+                    (start + step) % n
+                } else {
+                    (start + n - step) % n
+                }
+            })
+            .find(|&i| row_matches(flat[i].section, &needle))?;
+        let target = flat[hit].section.id.clone();
+        let mut reopen = Vec::new();
+        let mut parent = flat[hit].parent;
+        while let Some(i) = parent {
+            let section = flat[i].section;
+            if section.default_folded ^ self.folded.contains(&section.id) {
+                reopen.push(section.id.clone());
+            }
+            parent = flat[i].parent;
+        }
+        for id in reopen {
+            if !self.folded.remove(&id) {
+                self.folded.insert(id);
+            }
+        }
+        self.recount();
+        let idx = self.rows().position(|r| *r.id == target)?;
+        self.set_cursor(idx);
+        Some(idx)
+    }
+
     /// Set the viewport height (rows) from the render area; adjusts scroll.
     pub fn set_height(&mut self, height: usize) {
         self.height = height;
@@ -538,6 +596,39 @@ impl Buffer {
         // was known.
         self.scroll = self.scroll.min(self.visible_len.saturating_sub(height));
     }
+}
+
+/// One row of the whole tree, folded or not, for searching.
+struct FlatRow<'a> {
+    section: &'a Section,
+    parent: Option<usize>,
+    visible: bool,
+}
+
+fn flatten<'a>(
+    sections: &'a [Section],
+    folded: &HashSet<SectionId>,
+    parent: Option<usize>,
+    visible: bool,
+    out: &mut Vec<FlatRow<'a>>,
+) {
+    for section in sections {
+        let at = out.len();
+        out.push(FlatRow {
+            section,
+            parent,
+            visible,
+        });
+        let open =
+            section.is_foldable() && !(section.default_folded ^ folded.contains(&section.id));
+        flatten(&section.children, folded, Some(at), visible && open, out);
+    }
+}
+
+fn row_matches(section: &Section, needle: &str) -> bool {
+    let text: String = section.spans.iter().map(|s| s.text.as_str()).collect();
+    text.to_lowercase().contains(needle)
+        || matches!(&section.target, Some(Target::Ref { name, .. }) if name.to_lowercase().contains(needle))
 }
 
 /// The concatenated text of a row's spans, for searching.
@@ -800,6 +891,68 @@ mod tests {
         // backward search
         assert_eq!(b.search("/b", 0, false), Some(2));
         assert_eq!(b.search("zzz", 0, true), None);
+    }
+
+    #[test]
+    fn search_reaches_folded_section() {
+        let hidden = Section::branch(
+            "origin:hidden",
+            NodeKind::Section,
+            vec![Span::plain("2 more branches")],
+            vec![leaf("old-a"), leaf("old-b")],
+        )
+        .folded_by_default();
+        let mut b = buffer(
+            vec![Section::branch(
+                "origin",
+                NodeKind::Section,
+                vec![Span::plain("origin")],
+                vec![leaf("main"), hidden],
+            )],
+            10,
+        );
+        assert_eq!(b.rows().count(), 3);
+        assert_eq!(b.search("old-b", 0, true), None);
+        let idx = b.search_reveal("old-b", true, true).expect("a hit");
+        assert_eq!(b.rows().count(), 5);
+        assert_eq!(b.cursor(), idx);
+        assert_eq!(b.cursor_id().as_deref(), Some("old-b"));
+    }
+
+    #[test]
+    fn search_reaches_folded_rows_by_ref_name_and_repeats_past_the_cursor() {
+        let ref_leaf = |id: &str, label: &str, name: &str| {
+            Section::leaf(id, NodeKind::Commit, vec![Span::plain(label)]).with_target(
+                rgit_model::Target::Ref {
+                    name: name.into(),
+                    kind: rgit_model::RefTarget::Remote,
+                },
+            )
+        };
+        let mut b = buffer(
+            vec![Section::branch(
+                "origin",
+                NodeKind::Section,
+                vec![Span::plain("origin")],
+                vec![
+                    Section::branch(
+                        "origin:hidden",
+                        NodeKind::Section,
+                        vec![Span::plain("more")],
+                        vec![
+                            ref_leaf("x1", "a", "origin/feature/a"),
+                            ref_leaf("x2", "a2", "origin/feature/a2"),
+                        ],
+                    )
+                    .folded_by_default(),
+                ],
+            )],
+            10,
+        );
+        b.search_reveal("feature/a", true, true).expect("first hit");
+        assert_eq!(b.cursor_id().as_deref(), Some("x1"));
+        b.search_reveal("feature/a", true, false).expect("next hit");
+        assert_eq!(b.cursor_id().as_deref(), Some("x2"));
     }
 
     #[test]
