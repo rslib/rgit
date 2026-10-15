@@ -73,6 +73,10 @@ fn run_watcher(
     rx: mpsc::Receiver<WatchMessage>,
     tx: mpsc::Sender<WatchMessage>,
 ) {
+    // Stamp the git state before the watch setup, which can take seconds on
+    // FSEvents: a stamp taken after it would hide a commit made meanwhile.
+    let mut poll = GitStatePoll::new(&roots);
+    let setup = Instant::now();
     let callback_tx = tx.clone();
     let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
         if let Ok(event) = result {
@@ -119,7 +123,19 @@ fn run_watcher(
     }
 
     let mut debounce = Debounce::default();
-    let mut poll = GitStatePoll::new(&roots);
+    tracing::info!(
+        elapsed_ms = setup.elapsed().as_millis() as u64,
+        "file watch ready"
+    );
+    // Worktree changes made during the setup raised no event, so look once.
+    #[cfg(not(target_os = "linux"))]
+    debounce.add(
+        WatchBatch {
+            git_state: false,
+            worktree: vec![roots.workdir.clone()],
+        },
+        Instant::now(),
+    );
     let mut next_poll = Instant::now() + GIT_STATE_POLL;
     loop {
         let wake = debounce.next().map_or(next_poll, |at| at.min(next_poll));
