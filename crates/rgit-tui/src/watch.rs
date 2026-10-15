@@ -16,6 +16,8 @@ pub(crate) const GIT_STATE_WAIT: Duration = Duration::from_millis(150);
 pub(crate) const GIT_STATE_MAX_WAIT: Duration = Duration::from_millis(300);
 pub(crate) const WORKTREE_WAIT: Duration = Duration::from_secs(1);
 pub(crate) const GIT_STATE_POLL: Duration = Duration::from_millis(100);
+#[cfg(not(target_os = "linux"))]
+const FSEVENTS_SETTLE: Duration = Duration::from_secs(3);
 
 pub(crate) struct WatchRoots {
     pub(crate) workdir: PathBuf,
@@ -76,7 +78,6 @@ fn run_watcher(
     // Stamp the git state before the watch setup, which can take seconds on
     // FSEvents: a stamp taken after it would hide a commit made meanwhile.
     let mut poll = GitStatePoll::new(&roots);
-    let setup = Instant::now();
     let callback_tx = tx.clone();
     let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
         if let Ok(event) = result {
@@ -105,37 +106,41 @@ fn run_watcher(
         let _ = walks.send(roots.workdir.clone());
         walks
     });
+    // FSEvents can take a second per watch, so set up on a side thread and
+    // keep the git state poll running meanwhile. A new stream also drops
+    // events for a moment after it starts, so look once at the end of the
+    // setup and once more when the stream has settled.
     #[cfg(not(target_os = "linux"))]
     if let Some(watcher) = watcher.as_ref() {
         let _ = &collapsed;
-        add_watch(watcher, &roots.workdir, RecursiveMode::Recursive);
-        if !roots.git_dir.starts_with(&roots.workdir) {
-            add_watch(watcher, &roots.git_dir, RecursiveMode::NonRecursive);
-        }
-        if !roots.common_dir.starts_with(&roots.workdir) {
-            add_watch(watcher, &roots.common_dir, RecursiveMode::NonRecursive);
-            add_watch(
-                watcher,
-                &roots.common_dir.join("refs"),
-                RecursiveMode::Recursive,
+        let watcher = Arc::clone(watcher);
+        let (workdir, git_dir, common_dir) = (
+            roots.workdir.clone(),
+            roots.git_dir.clone(),
+            roots.common_dir.clone(),
+        );
+        let done = tx.clone();
+        std::thread::spawn(move || {
+            let setup = Instant::now();
+            add_watch(&watcher, &workdir, RecursiveMode::Recursive);
+            if !git_dir.starts_with(&workdir) {
+                add_watch(&watcher, &git_dir, RecursiveMode::NonRecursive);
+            }
+            if !common_dir.starts_with(&workdir) {
+                add_watch(&watcher, &common_dir, RecursiveMode::NonRecursive);
+                add_watch(&watcher, &common_dir.join("refs"), RecursiveMode::Recursive);
+            }
+            tracing::info!(
+                elapsed_ms = setup.elapsed().as_millis() as u64,
+                "file watch ready"
             );
-        }
+            let _ = done.send(WatchMessage::WalkDone(workdir.clone()));
+            std::thread::sleep(FSEVENTS_SETTLE);
+            let _ = done.send(WatchMessage::WalkDone(workdir));
+        });
     }
 
     let mut debounce = Debounce::default();
-    tracing::info!(
-        elapsed_ms = setup.elapsed().as_millis() as u64,
-        "file watch ready"
-    );
-    // Worktree changes made during the setup raised no event, so look once.
-    #[cfg(not(target_os = "linux"))]
-    debounce.add(
-        WatchBatch {
-            git_state: false,
-            worktree: vec![roots.workdir.clone()],
-        },
-        Instant::now(),
-    );
     let mut next_poll = Instant::now() + GIT_STATE_POLL;
     loop {
         let wake = debounce.next().map_or(next_poll, |at| at.min(next_poll));
