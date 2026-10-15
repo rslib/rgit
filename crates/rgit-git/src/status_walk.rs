@@ -136,7 +136,9 @@ impl Opener {
     }
 
     fn open(&self) -> Result<Repository, GitError> {
-        let repo = Repository::open(&self.gitdir)?;
+        // open_bare skips libgit2's guess of the git dir's parent as workdir,
+        // whose owner check fails when that parent is a shared /tmp.
+        let repo = Repository::open_bare(&self.gitdir)?;
         repo.set_workdir(&self.workdir, false)?;
         if let Some(path) = &self.index_file {
             let mut index = git2::Index::open(path)?;
@@ -182,13 +184,15 @@ fn debug_opener(
     workdir: Option<&Path>,
     index_file: Option<&Path>,
 ) -> Result<Opener, GitError> {
-    let probe = Repository::open(gitdir)?;
     let workdir = match workdir {
         Some(path) => path.to_path_buf(),
-        None => probe
-            .workdir()
-            .ok_or_else(|| GitError::Bare(probe.path().to_path_buf()))?
-            .to_path_buf(),
+        None => {
+            let probe = Repository::open(gitdir)?;
+            probe
+                .workdir()
+                .ok_or_else(|| GitError::Bare(probe.path().to_path_buf()))?
+                .to_path_buf()
+        }
     };
     Ok(Opener {
         gitdir: gitdir.to_path_buf(),
