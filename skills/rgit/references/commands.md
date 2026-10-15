@@ -95,6 +95,7 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `stack new`: Create a new branch stacked on the current one. e.g. `rgit stack new <branch>`
   - `stack list`: List the stack containing the current branch. e.g. `rgit stack list`
   - `stack restack`: Rebase every descendant onto its parent's new tip. e.g. `rgit stack restack`
+  - `stack repair`: Fix stack records whose branch or parent no longer exists. e.g. `rgit stack repair`
   - `stack sync`: Retarget the children of merged parents onto the grandparent branch, then restack. e.g. `rgit stack sync`
 - `next`: Check out the branch stacked on this one (move up the stack). e.g. `rgit next`
 - `prev`: Check out this branch's stack parent (move down the stack). e.g. `rgit prev`
@@ -360,3 +361,4 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 - `mcp`: Run the Model Context Protocol server over stdio. e.g. `rgit mcp`
 - `tool`: Run one MCP tool with its arguments as a JSON object on stdin and print its TOON result, as the pi and omp extension does. e.g. `echo '{}' | rgit tool git_status`, `echo '{"limit": 5}' | rgit tool git_log`
 - `serve`: Serve the web viewer for this repository, or a directory of repositories. e.g. `rgit serve`, `rgit serve --port 9000`, `rgit serve --root ~/code --clone-base https://git.example.dev`
+- `settings`: Show rgit's own settings, each with its value and where it came from. e.g. `rgit settings`, `rgit settings output.compact`

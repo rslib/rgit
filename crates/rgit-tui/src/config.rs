@@ -1,21 +1,15 @@
-//! User configuration, loaded once at startup from a TOML file.
+//! User configuration, built once at startup from the layered rgit settings.
 //!
-//! Resolution order for the config path:
-//! 1. `$RGIT_CONFIG` (an explicit file path), else
-//! 2. `$XDG_CONFIG_HOME/rgit/config.toml`, else
-//! 3. `$HOME/.config/rgit/config.toml`.
-//!
-//! A missing file is not an error - defaults apply. A malformed file falls back
-//! to defaults and reports the parse error so startup is never blocked.
+//! A missing file is not an error - defaults apply. A bad file or key is
+//! reported as a warning so startup is never blocked.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-
+use rgit_config::Settings;
 use serde::Deserialize;
+use std::collections::HashMap;
 
 /// The whole config tree. Every field is optional so a partial file is valid.
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     pub theme: ThemeConfig,
     /// Forge account/profile selection. Credentials remain in the OS keychain.
@@ -41,7 +35,7 @@ pub struct Config {
 
 /// One custom profile: a base to inherit from, then its own `[keys.<name>]`.
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ProfileDef {
     /// The profile this one is based on (`"emacs"`/`"magit"`, `"vim"`, or
     /// another custom name). Defaults to magit when omitted.
@@ -91,7 +85,7 @@ impl Config {
 
 /// Commit behavior.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct CommitConfig {
     /// Sign commits (`git commit -S`), honoring the user's git signing config.
     pub gpg_sign: bool,
@@ -112,7 +106,7 @@ impl Default for CommitConfig {
 
 /// Theme selection: a named built-in palette plus per-role color overrides.
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct ThemeConfig {
     /// A built-in palette name (e.g. `"rust"`, `"mono"`). Unknown names use the
     /// default and are otherwise ignored.
@@ -134,7 +128,7 @@ pub struct ThemeConfig {
 
 /// Behavioral toggles.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct UiConfig {
     /// How many commits the log view walks by default.
     pub log_limit: usize,
@@ -215,37 +209,21 @@ impl Default for UiConfig {
     }
 }
 
-/// The resolved config-file path, if any of the candidates exist.
-pub fn config_path() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("RGIT_CONFIG") {
-        let path = PathBuf::from(explicit);
-        return path.exists().then_some(path);
-    }
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    let path = base.join("rgit").join("config.toml");
-    path.exists().then_some(path)
-}
-
-/// Load the config, returning defaults (and an error string) when the file is
-/// absent or malformed. The error is surfaced to the user, not swallowed.
-pub fn load() -> (Config, Option<String>) {
-    let Some(path) = config_path() else {
-        return (Config::default(), None);
-    };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => match toml::from_str::<Config>(&text) {
-            Ok(config) => (config, None),
-            Err(e) => (
-                Config::default(),
-                Some(format!("config {}: {e}", path.display())),
-            ),
-        },
-        Err(e) => (
-            Config::default(),
-            Some(format!("config {}: {e}", path.display())),
-        ),
+impl Config {
+    /// Build the config from the merged settings. The string lists every
+    /// settings warning and a table that does not fit, one per line; a table
+    /// that does not fit gives the defaults.
+    pub fn from_settings(settings: &Settings) -> (Config, Option<String>) {
+        let mut problems: Vec<String> = settings.warnings().iter().map(|w| w.to_string()).collect();
+        let config = match toml::Value::Table(settings.table().clone()).try_into::<Config>() {
+            Ok(config) => config,
+            Err(error) => {
+                problems.push(format!("config: {error}"));
+                Config::default()
+            }
+        };
+        let message = (!problems.is_empty()).then(|| problems.join("\n"));
+        (config, message)
     }
 }
 
@@ -337,9 +315,41 @@ mod tests {
         assert!(!cfg.commit.auto_restack);
         assert!(!cfg.commit.gpg_sign);
     }
+}
+
+#[cfg(test)]
+mod layered_tests {
+    use super::*;
+
+    fn settings(global: &str, private: Option<&str>) -> (tempfile::TempDir, Settings) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        };
+        let files = rgit_config::Files {
+            global: Some(write("global.toml", global)),
+            shared: None,
+            private: private.map(|text| write("private.toml", text)),
+        };
+        let settings = Settings::load_with(files, &|_| None);
+        (dir, settings)
+    }
 
     #[test]
-    fn unknown_keys_are_rejected() {
-        assert!(toml::from_str::<Config>("[theme]\nnope = 1\n").is_err());
+    fn layered_private_file_beats_global() {
+        let (_dir, settings) = settings("[ui]\nlog_limit = 100\n", Some("[ui]\nlog_limit = 50\n"));
+        let (config, error) = Config::from_settings(&settings);
+        assert_eq!(config.ui.log_limit, 50);
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn layered_unknown_key_warns_and_keeps_others() {
+        let (_dir, settings) = settings("[ui]\nnope = 1\nlog_limit = 7\n", None);
+        let (config, error) = Config::from_settings(&settings);
+        assert_eq!(config.ui.log_limit, 7);
+        assert!(error.expect("warning").contains("unknown key ui.nope"));
     }
 }

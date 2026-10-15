@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use rgit_config::{RepoDirs, Settings, Source, WarningKind};
 use serde::Deserialize;
 
 use super::ForgeError;
@@ -19,37 +20,31 @@ pub struct ForgeConfig {
 }
 
 impl ForgeConfig {
-    /// Read `[forge]` from the rgit config file. A file that is not there
-    /// means no profiles; one that cannot be read or parsed is an error.
+    /// Read `[forge]` from the layered rgit settings of the current folder.
+    /// File-level problems are warnings of the settings, not errors here.
     pub fn load() -> Result<Self, ForgeError> {
-        let Some(path) = config_path() else {
-            return Ok(Self::default());
-        };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
-            }
-            Err(error) => {
-                return Err(ForgeError::ConfigRead {
-                    path,
-                    detail: error.to_string(),
-                });
-            }
-        };
-        Self::from_toml(&text).map_err(|error| ForgeError::ConfigParse {
-            path,
-            detail: error.to_string(),
-        })
+        let repo = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| RepoDirs::discover(&cwd));
+        Self::from_settings(&Settings::load(repo.as_ref()))
     }
 
-    fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
-        #[derive(Deserialize, Default)]
-        #[serde(default)]
-        struct File {
-            forge: ForgeConfig,
-        }
-        toml::from_str::<File>(text).map(|file| file.forge)
+    /// Read `[forge]` from already loaded settings. A table that does not fit
+    /// is an error.
+    pub fn from_settings(settings: &Settings) -> Result<Self, ForgeError> {
+        settings.section::<ForgeConfig>("forge").map_err(|warning| {
+            let text = warning.to_string();
+            ForgeError::ConfigParse {
+                path: match &warning.source {
+                    Source::File { path, .. } => path.clone(),
+                    other => PathBuf::from(other.to_string()),
+                },
+                detail: match warning.kind {
+                    WarningKind::Section { message, .. } => message,
+                    _ => text,
+                },
+            }
+        })
     }
 
     pub fn profile(&self, name: &str) -> Option<&ForgeProfile> {
@@ -78,19 +73,6 @@ pub struct ForgeProfile {
     pub provider: Option<String>,
     pub account: Option<String>,
     pub host: Option<String>,
-}
-
-/// The rgit config-file path: `RGIT_CONFIG`, else
-/// `XDG_CONFIG_HOME/rgit/config.toml`, else `$HOME/.config/rgit/config.toml`.
-/// `None` when no location is available.
-fn config_path() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("RGIT_CONFIG") {
-        return Some(PathBuf::from(explicit));
-    }
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    Some(base.join("rgit").join("config.toml"))
 }
 
 /// The selection of a forge account: the flags a command carries, filled in
@@ -286,18 +268,40 @@ mod tests {
         assert!(config.profile("nope").is_none());
     }
 
+    pub(super) fn settings(
+        global: Option<&str>,
+        private: Option<&str>,
+    ) -> (tempfile::TempDir, Settings) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let write = |name: &str, text: Option<&str>| {
+            text.map(|text| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, text).unwrap();
+                path
+            })
+        };
+        let files = rgit_config::Files {
+            global: write("global.toml", global),
+            shared: None,
+            private: write("private.toml", private),
+        };
+        let settings = Settings::load_with(files, &|_| None);
+        (dir, settings)
+    }
+
     #[test]
     fn profiles_are_read_from_the_forge_table() {
-        let config = ForgeConfig::from_toml(
-            r#"
-            [profiles.vim]
-            extends = "vim"
-            [forge.profiles.lab]
-            provider = "forgejo"
-            host = "https://git.rs.ht"
-            "#,
-        )
-        .expect("parsable config");
+        let (_dir, settings) = settings(
+            Some(
+                r#"
+                [forge.profiles.lab]
+                provider = "forgejo"
+                host = "https://git.rs.ht"
+                "#,
+            ),
+            None,
+        );
+        let config = ForgeConfig::from_settings(&settings).expect("parsable config");
         assert_eq!(config.profiles.len(), 1);
         assert_eq!(
             config.hosts(),
@@ -398,5 +402,21 @@ mod tests {
             ForgeTarget::from_remote(&selection, "https://gitlab.example.com/g/p").expect("remote");
         assert_eq!(target.provider, Provider::Gitlab);
         assert_eq!(target.host, "https://gitlab.example.com");
+    }
+}
+
+#[cfg(test)]
+mod layered_tests {
+    use super::tests::settings;
+    use super::*;
+
+    #[test]
+    fn layered_repo_profile_beats_global() {
+        let (_dir, settings) = settings(
+            Some("[forge]\ndefault_profile = \"a\"\n"),
+            Some("[forge]\ndefault_profile = \"b\"\n"),
+        );
+        let config = ForgeConfig::from_settings(&settings).expect("config");
+        assert_eq!(config.default_profile.as_deref(), Some("b"));
     }
 }

@@ -1047,7 +1047,9 @@ fn resolve_create_defaults(
     };
     let base = match base {
         Some(base) => Some(base),
-        None => backend.config_get(&format!("branch.{head}.rgit-stack-parent"))?,
+        None => rgit_git::stack_file::read(&rgit_git::stack_file::dirs_of(&backend))?
+            .remove(&head)
+            .map(|record| record.parent),
     };
     let (title, body) = match (title, body) {
         (Some(title), body) => (title, body),
@@ -1453,10 +1455,13 @@ mod tests {
     #[test]
     fn create_defaults_take_the_stack_parent_as_base() {
         let dir = fresh_repo("stack");
-        git(
-            &dir,
-            &["config", "branch.main.rgit-stack-parent", "develop"],
-        );
+        let backend = rgit_git::Git2Backend::discover(&dir).expect("repo");
+        rgit_git::stack_file::set_parent(
+            &rgit_git::stack_file::dirs_of(&backend),
+            "main",
+            "develop",
+        )
+        .expect("stack file");
         let create = super::resolve_create_defaults(
             &dir,
             Some("Title".to_owned()),

@@ -5,6 +5,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// A config path that never exists, so the user's own file is never read.
+fn no_config() -> PathBuf {
+    std::env::temp_dir().join("rgit-flags-no-config.toml")
+}
+
 fn git(dir: &Path, args: &[&str]) {
     assert!(
         Command::new("git")
@@ -46,6 +51,7 @@ fn rgit(dir: &Path, args: &[&str]) -> (String, String, bool) {
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
         .env("RGIT_OUTPUT", "human")
+        .env("RGIT_CONFIG", no_config())
         .output()
         .unwrap();
     (
@@ -853,6 +859,7 @@ fn fixed(program: &str, dir: &Path, args: &[&str]) -> String {
         .current_dir(dir)
         .env("RGIT_OPLOG", "0")
         .env("RGIT_OUTPUT", "human")
+        .env("RGIT_CONFIG", no_config())
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_DATE", "2024-01-01T00:00:00Z")
@@ -918,21 +925,20 @@ fn compact_flag_and_config_restore_rgit_forms() {
     let log = fixed(rgit, &dir, &["log", "--compact"]);
     assert_eq!(log.lines().count(), 4, "{log}");
     assert!(log.lines().all(|l| !l.starts_with("commit ")), "{log}");
+    assert_ne!(fixed(rgit, &dir, &["log"]), log);
+    let private = dir.join(".git").join("rgit");
+    std::fs::create_dir_all(&private).unwrap();
+    std::fs::write(private.join("config.toml"), "[output]\ncompact = true\n").unwrap();
     for cmd in ["status", "diff", "log", "show", "blame"] {
         let mut args = vec![cmd];
         if cmd == "blame" {
             args.push("f");
         }
         let compact = fixed(rgit, &dir, &[&["--compact"][..], &args].concat());
-        let config = fixed(
-            rgit,
-            &dir,
-            &[&["-c", "rgit.compact=true"][..], &args].concat(),
-        );
+        let config = fixed(rgit, &dir, &args);
         assert_eq!(compact, config, "{cmd}");
         assert_ne!(compact, fixed("git", &dir, &args), "{cmd}");
     }
-    fixed("git", &dir, &["config", "rgit.compact", "true"]);
     assert_eq!(fixed(rgit, &dir, &["log"]), log);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -965,6 +971,7 @@ fn stash_takes_identity_like_git() {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("RGIT_OPLOG", "0")
             .env("RGIT_OUTPUT", "human")
+            .env("RGIT_CONFIG", no_config())
             .env_remove("EMAIL")
             .envs(env.iter().copied())
             .output()

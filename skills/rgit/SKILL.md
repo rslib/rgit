@@ -19,7 +19,7 @@ If `rgit` is not on PATH, install it with `cargo install --locked --git https://
 
 ## Output
 
-- rgit prints TOON by default when an agent harness runs it, so no output flag is needed: structured lines and tables, no color, spinners or prompts, and `help` lines that name the next command. The harness is one of Claude Code, Codex, Gemini CLI, Cursor, OpenCode, goose, amp or pi. `--json` prints the same data as JSON. `--human` (or `RGIT_OUTPUT=human`, or config `rgit.output=human`) prints git's text, as does a shell with no harness marker. Other examples in this skill and its reference omit the output flag; it is already on.
+- rgit prints TOON by default when an agent harness runs it, so no output flag is needed: structured lines and tables, no color, spinners or prompts, and `help` lines that name the next command. The harness is one of Claude Code, Codex, Gemini CLI, Cursor, OpenCode, goose, amp or pi. `--json` prints the same data as JSON. `--human` (or `RGIT_OUTPUT=human`, or `output.format = "human"` in the rgit config file) prints git's text, as does a shell with no harness marker. Other examples in this skill and its reference omit the output flag; it is already on.
 - Use `--toon` or `--axi`, not `--porcelain`. In rgit, as in git, `--porcelain` exists only on `status` and prints git's raw script format, with no counts, hints, or schema.
 - Output ends with `help` lines naming useful next commands, already carrying `--toon` (or `--json`); follow them. Lists include counts (`count: 20 of 65 total`) and say explicitly when they are empty.
 - `--fields a,b` adds table columns; an unknown field lists the valid ones. `--full` disables truncation of patches, commit bodies, and long output.

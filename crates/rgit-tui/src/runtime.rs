@@ -346,7 +346,9 @@ const FRAME_HZ: f64 = 30.0;
 pub async fn run(backend: Arc<dyn GitBackend>, no_preview: bool) -> std::io::Result<()> {
     // Load config before touching the terminal so the theme is in place for the
     // very first frame; a config error is shown in-app, not fatal.
-    let (mut config, config_error) = crate::config::load();
+    let repo = rgit_git::stack_file::dirs_of(backend.as_ref());
+    let settings = rgit_config::Settings::load(Some(&repo));
+    let (mut config, config_error) = crate::config::Config::from_settings(&settings);
     // The CLI flag is a hard override of the config toggle.
     if no_preview {
         config.ui.preview = false;

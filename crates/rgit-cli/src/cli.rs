@@ -50,7 +50,7 @@ pub struct Cli {
     pub human: bool,
 
     /// Print rgit's compact human forms of status, diff, log, show and blame
-    /// instead of git's (config rgit.compact).
+    /// instead of git's (`output.compact` in the rgit config file).
     #[arg(long, global = true)]
     pub compact: bool,
 
@@ -102,16 +102,6 @@ impl Cli {
             Some(OutputMode::Text)
         } else {
             None
-        }
-    }
-
-    /// The mode `RGIT_OUTPUT` or the `rgit.output` config names, if it names one.
-    pub fn parse_output_mode(value: &str) -> Option<OutputMode> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "human" | "text" => Some(OutputMode::Text),
-            "toon" | "axi" | "porcelain" => Some(OutputMode::Porcelain),
-            "json" => Some(OutputMode::Json),
-            _ => None,
         }
     }
 
@@ -2864,6 +2854,11 @@ pub enum Command {
     Tool {
         /// The tool, e.g. git_status.
         name: String,
+    },
+    /// Show rgit's own settings, each with its value and where it came from.
+    Settings {
+        /// Show only this setting, e.g. output.compact.
+        key: Option<String>,
     },
     /// Set agent apps (Claude Code, Codex, OpenCode, pi, omp) up for rgit.
     Agent {
@@ -6471,6 +6466,8 @@ pub enum StackCmd {
     List,
     /// Rebase every descendant onto its parent's new tip.
     Restack,
+    /// Fix stack records whose branch or parent no longer exists.
+    Repair,
     /// Retarget the children of merged parents onto the grandparent branch,
     /// then restack.
     Sync,
@@ -7647,7 +7644,7 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Agent integration and servers",
-        &["agent", "completion", "mcp", "tool", "serve"],
+        &["agent", "completion", "mcp", "tool", "serve", "settings"],
     ),
 ];
 
@@ -7669,7 +7666,7 @@ If `rgit` is not on PATH, install it with `cargo install --locked --git https://
 const SKILL_RULES: &str = r#"
 ## Output
 
-- rgit prints TOON by default when an agent harness runs it, so no output flag is needed: structured lines and tables, no color, spinners or prompts, and `help` lines that name the next command. The harness is one of Claude Code, Codex, Gemini CLI, Cursor, OpenCode, goose, amp or pi. `--json` prints the same data as JSON. `--human` (or `RGIT_OUTPUT=human`, or config `rgit.output=human`) prints git's text, as does a shell with no harness marker. Other examples in this skill and its reference omit the output flag; it is already on.
+- rgit prints TOON by default when an agent harness runs it, so no output flag is needed: structured lines and tables, no color, spinners or prompts, and `help` lines that name the next command. The harness is one of Claude Code, Codex, Gemini CLI, Cursor, OpenCode, goose, amp or pi. `--json` prints the same data as JSON. `--human` (or `RGIT_OUTPUT=human`, or `output.format = "human"` in the rgit config file) prints git's text, as does a shell with no harness marker. Other examples in this skill and its reference omit the output flag; it is already on.
 - Use `--toon` or `--axi`, not `--porcelain`. In rgit, as in git, `--porcelain` exists only on `status` and prints git's raw script format, with no counts, hints, or schema.
 - Output ends with `help` lines naming useful next commands, already carrying `--toon` (or `--json`); follow them. Lists include counts (`count: 20 of 65 total`) and say explicitly when they are empty.
 - `--fields a,b` adds table columns; an unknown field lists the valid ones. `--full` disables truncation of patches, commit bodies, and long output.
@@ -8126,7 +8123,7 @@ pub(crate) fn set_word_diff(backend: &Arc<dyn GitBackend>, command: &Command) {
 }
 
 /// A human `status`, `diff`, `log`, `show` or `blame` with no format asked
-/// for prints git's default format, unless `compact()` (rgit.compact) says to
+/// for prints git's default format, unless `compact()` (`output.compact`) says to
 /// keep rgit's compact form.
 pub fn git_defaults(mut command: Command, compact: impl FnOnce() -> bool) -> Command {
     let wants = match &command {
@@ -8284,6 +8281,7 @@ fn run_command(
     };
     Ok(match command {
         Command::Index { action } => index_cmd(backend, action)?,
+        Command::Settings { key } => crate::settings::text(key.as_deref())?,
         Command::Agent { .. }
         | Command::Tool { .. }
         | Command::Hook {
@@ -10219,6 +10217,7 @@ fn run_command(
             StackCmd::New { name } => crate::stack::new(backend, &name)?,
             StackCmd::List => crate::stack::list(backend)?,
             StackCmd::Restack => crate::stack::restack(backend)?,
+            StackCmd::Repair => crate::stack::repair(backend)?,
             StackCmd::Sync => crate::stack::sync(backend)?,
         },
         Command::Absorb => backend.absorb()?,

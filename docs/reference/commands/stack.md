@@ -70,6 +70,22 @@ rgit stack restack [OPTIONS]
 rgit stack restack
 ```
 
+### rgit stack repair
+
+Fix stack records whose branch or parent no longer exists
+
+#### Usage
+
+```sh
+rgit stack repair [OPTIONS]
+```
+
+#### Examples
+
+```sh
+rgit stack repair
+```
+
 ### rgit stack sync
 
 Retarget the children of merged parents onto the grandparent branch, then restack

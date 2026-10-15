@@ -1,5 +1,5 @@
 //! The default output mode. An agent harness marker picks TOON; the output
-//! flag, `RGIT_OUTPUT` and the repo's `rgit.output` override it. git's own
+//! flag, `RGIT_OUTPUT` and the `output.format` setting override it. git's own
 //! machine formats (`-z`, `--porcelain`, `--format`, `--pretty`) keep git's
 //! bytes under the marker default unless a flag asks for TOON or JSON.
 
@@ -27,7 +27,11 @@ fn base(cmd: &mut Command, dir: &Path) {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CEILING_DIRECTORIES", std::env::temp_dir())
-        .env("RGIT_OPLOG", "0");
+        .env("RGIT_OPLOG", "0")
+        .env(
+            "RGIT_CONFIG",
+            std::env::temp_dir().join("rgit-default-no-config.toml"),
+        );
     for marker in MARKERS {
         cmd.env_remove(marker);
     }
@@ -108,7 +112,7 @@ fn default_output() {
     );
     assert_eq!(out(&codex), want);
 
-    // No marker, no RGIT_OUTPUT and no rgit.output: git's bytes.
+    // No marker, no RGIT_OUTPUT and no output.format: git's bytes.
     let plain = rgit(&dir, &[], &["rev-parse", "HEAD"]);
     assert_eq!(out(&plain), want);
 
@@ -133,16 +137,76 @@ fn default_output() {
     let json = rgit(&dir, &[("RGIT_OUTPUT", "json")], &["rev-parse", "HEAD"]);
     assert!(out(&json).contains("\"result\""), "{}", out(&json));
 
-    // The repo's rgit.output wins over the marker.
-    let set = git(&dir, &["config", "rgit.output", "human"]);
-    assert!(set.status.success());
-    let config = rgit(&dir, &[("CLAUDECODE", "1")], &["rev-parse", "HEAD"]);
-    assert_eq!(out(&config), want);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Write `<repo>/.git/rgit/config.toml`.
+fn private_config(dir: &Path, text: &str) -> PathBuf {
+    let folder = dir.join(".git").join("rgit");
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("config.toml");
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+#[test]
+fn toml_private_file_output_format_beats_marker() {
+    let dir = repo("toml-private");
+    let want = out(&git(&dir, &["rev-parse", "HEAD"]));
+    private_config(&dir, "[output]\nformat = \"human\"\n");
+    let got = rgit(&dir, &[("CLAUDECODE", "1")], &["rev-parse", "HEAD"]);
+    assert_eq!(out(&got), want);
+    private_config(&dir, "[output]\nformat = \"json\"\n");
+    let got = rgit(&dir, &[("CLAUDECODE", "1")], &["rev-parse", "HEAD"]);
+    assert!(out(&got).contains("\"result\""), "{}", out(&got));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn toml_rgit_output_env_beats_file() {
+    let dir = repo("toml-env");
+    let want = out(&git(&dir, &["rev-parse", "HEAD"]));
+    private_config(&dir, "[output]\nformat = \"json\"\n");
+    let got = rgit(&dir, &[("RGIT_OUTPUT", "human")], &["rev-parse", "HEAD"]);
+    assert_eq!(out(&got), want);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn toml_git_config_rgit_output_is_ignored() {
+    let dir = repo("toml-gitconfig");
+    let want = out(&git(&dir, &["rev-parse", "HEAD"]));
     let set = git(&dir, &["config", "rgit.output", "json"]);
     assert!(set.status.success());
-    let config = rgit(&dir, &[("CLAUDECODE", "1")], &["rev-parse", "HEAD"]);
-    assert!(out(&config).contains("\"result\""), "{}", out(&config));
+    let got = rgit(&dir, &[], &["rev-parse", "HEAD"]);
+    assert_eq!(out(&got), want);
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
+#[test]
+fn toml_compact_from_private_file() {
+    let dir = repo("toml-compact");
+    let compact = out(&rgit(&dir, &[], &["log", "--compact"]));
+    assert_ne!(out(&rgit(&dir, &[], &["log"])), compact);
+    private_config(&dir, "[output]\ncompact = true\n");
+    assert_eq!(out(&rgit(&dir, &[], &["log"])), compact);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn toml_bad_file_warns_and_runs() {
+    let dir = repo("toml-bad");
+    let path = private_config(&dir, "output = [");
+    let got = rgit(&dir, &[], &["status"]);
+    assert_eq!(got.status.code(), Some(0), "{got:?}");
+    let stderr = String::from_utf8_lossy(&got.stderr).into_owned();
+    let warnings: Vec<&str> = stderr.lines().filter(|l| l.contains("warning")).collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(
+        warnings[0].contains(&path.display().to_string()),
+        "{stderr}"
+    );
+    assert!(warnings[0].contains("line 1"), "{stderr}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

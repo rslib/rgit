@@ -20,6 +20,7 @@ mod plumbing;
 mod refs_ops;
 mod remote_ops;
 mod sequencer;
+mod settings;
 mod sparse;
 mod stack;
 mod status_untracked;

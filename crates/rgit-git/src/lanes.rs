@@ -139,7 +139,7 @@ pub fn new_lane(repo: &Repository, name: &str) -> Result<(), GitError> {
 }
 
 /// Create a new lane stacked on another: its commits build on the parent lane's
-/// branch instead of the shared fork point. Also records the git stack config on
+/// branch instead of the shared fork point. Also records the stack file entry of
 /// the lane branch so the existing `restack` moves it when the parent advances.
 pub fn stack(repo: &Repository, name: &str, parent: &str) -> Result<(), GitError> {
     if name == parent {
@@ -159,16 +159,18 @@ pub fn stack(repo: &Repository, name: &str, parent: &str) -> Result<(), GitError
         .map(|l| l.branch.clone())
         .ok_or_else(|| other(format!("no such parent lane: {parent}")))?;
 
-    // Record the stack relationship in git config, so `stack`/`restack` see it.
-    let mut cfg = repo.config()?;
-    cfg.set_str(&format!("branch.{name}.rgit-stack-parent"), &parent_branch)?;
-    if let Some(tip) = repo
+    // Record the stack relationship in the stack file, so `stack`/`restack` see it.
+    let tip = repo
         .find_branch(&parent_branch, git2::BranchType::Local)
         .ok()
         .and_then(|b| b.get().target())
-    {
-        cfg.set_str(&format!("branch.{name}.rgit-stack-base"), &tip.to_string())?;
-    }
+        .map(|oid| oid.to_string());
+    crate::stack_file::record(
+        &crate::stack_file::dirs_of_repo(repo),
+        name,
+        &parent_branch,
+        tip.as_deref(),
+    )?;
 
     state.lanes.push(Lane {
         name: name.to_owned(),
@@ -216,11 +218,9 @@ pub fn restack(repo: &Repository) -> Result<crate::RestackOutcome, GitError> {
         let Some(new_base) = tip_of(repo, &parent_branch) else {
             continue; // the parent lane has no commits yet
         };
-        let base_key = format!("branch.{lane_branch}.rgit-stack-base");
         let record_base = |repo: &Repository| {
-            if let Ok(mut c) = repo.config() {
-                let _ = c.set_str(&base_key, &new_base.to_string());
-            }
+            let dirs = crate::stack_file::dirs_of_repo(repo);
+            let _ = crate::stack_file::set_base(&dirs, &lane_branch, &new_base.to_string());
         };
         let Some(lane_tip) = tip_of(repo, &lane_branch) else {
             record_base(repo);

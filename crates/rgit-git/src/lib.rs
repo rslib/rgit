@@ -60,6 +60,7 @@ mod show_branch;
 mod sign;
 mod smart;
 mod sparse;
+pub mod stack_file;
 pub mod status_walk;
 
 pub use status_walk::StatusTriple;

@@ -39,6 +39,7 @@ mod pretty;
 mod prompt;
 mod render;
 mod scalar;
+mod settings;
 mod stack;
 mod toon;
 
@@ -157,6 +158,9 @@ fn main() -> ! {
         let _ = std::io::Write::write_all(&mut std::io::stdout(), &script);
         exit(0);
     }
+    for warning in settings().warnings() {
+        eprintln!("rgit: warning: {warning}");
+    }
     let _ = DEFAULT_MODE.set(output_mode(None, &args));
     let output_mode = output_mode(cli.output_flag(), &args);
     let structured_output = output_mode != OutputMode::Text;
@@ -198,6 +202,7 @@ fn main() -> ! {
         // The MCP server takes over stdio for the process lifetime.
         Some(Command::Mcp { core }) => exit(mcp::serve(discover_or_exit(), core)),
         Some(Command::Agent { cmd }) => finish(agent::run(cmd), &emit),
+        Some(Command::Settings { key }) => finish(settings::run(key.as_deref()), &emit),
         Some(Command::Tool { name }) => exit(mcp::call(discover_or_exit(), &name)),
         // What agent session hooks run: the home view, as TOON, repo or not.
         Some(Command::Hook {
@@ -1393,23 +1398,33 @@ fn forge_output(text: String, list_cmd: Option<&str>, full: bool) -> Output {
     }
 }
 
-/// The output mode for this run: the output flag, then `RGIT_OUTPUT`, then
-/// the repo's `rgit.output`, then an agent marker, then human text. git's own
-/// machine formats (`-z`, `--porcelain`, `--format`, `--pretty`) keep git's
-/// bytes when an agent marker, not a flag, defaulted the mode to TOON.
+/// The settings of this process: the rgit config files and `RGIT_OUTPUT`,
+/// loaded on first use from the folder rgit runs in (after `-C`).
+fn settings() -> &'static rgit_config::Settings {
+    static SETTINGS: std::sync::OnceLock<rgit_config::Settings> = std::sync::OnceLock::new();
+    SETTINGS.get_or_init(|| {
+        let repo = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| rgit_config::RepoDirs::discover(&cwd));
+        rgit_config::Settings::load(repo.as_ref())
+    })
+}
+
+/// The output mode for this run: the output flag, then the `output.format`
+/// setting (the rgit config files, with `RGIT_OUTPUT` over them), then an
+/// agent marker, then human text. git's own machine formats (`-z`,
+/// `--porcelain`, `--format`, `--pretty`) keep git's bytes when an agent
+/// marker, not a flag, defaulted the mode to TOON.
 fn output_mode(flag: Option<OutputMode>, args: &[String]) -> OutputMode {
     if let Some(mode) = flag {
         return mode;
     }
-    if let Some(mode) = std::env::var("RGIT_OUTPUT")
-        .ok()
-        .and_then(|v| Cli::parse_output_mode(&v))
-    {
-        return mode;
-    }
-    if let Some(mode) = rgit_git::config_get("rgit.output").and_then(|v| Cli::parse_output_mode(&v))
-    {
-        return mode;
+    if let Some(format) = settings().core().output_format {
+        return match format {
+            rgit_config::OutputFormat::Human => OutputMode::Text,
+            rgit_config::OutputFormat::Json => OutputMode::Json,
+            rgit_config::OutputFormat::Toon => OutputMode::Porcelain,
+        };
     }
     if Cli::agent_harness() && !git_bytes_format(args) {
         return OutputMode::Porcelain;
@@ -1936,12 +1951,9 @@ const HOME_FILES: usize = 10;
 const HOME_OPS: usize = 3;
 
 /// The no-argument view for agents: who rgit is, then the repo's live state.
-/// `rgit.compact` from the repo's config, when there is a repo.
+/// The `output.compact` setting.
 fn compact_config() -> bool {
-    discover_or_init(false)
-        .ok()
-        .and_then(|b| b.config_get("rgit.compact").ok().flatten())
-        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1"))
+    settings().core().compact
 }
 
 /// The home view is what session hooks show an agent, so it says how the

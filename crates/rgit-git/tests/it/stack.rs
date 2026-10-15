@@ -208,3 +208,98 @@ fn restack_is_non_blocking_across_a_conflict() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn stack_file_text(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join(".git/rgit/stacks.toml")).unwrap()
+}
+
+#[test]
+fn stack_file_stack_new_records_parent_and_base() {
+    let dir = init_repo("file-new");
+    commit(&dir, "f.txt", "v1\n", "A");
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.stack_new("feat").unwrap();
+
+    let records = rgit_git::stack_file::read(&rgit_git::stack_file::dirs_of(&backend)).unwrap();
+    let tip = backend.branch_tip("main").unwrap();
+    let feat = &records["feat"];
+    assert_eq!(feat.parent, "main");
+    assert_eq!(feat.base, tip);
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["config", "--get-regexp", "rgit-stack"])
+        .output()
+        .unwrap();
+    assert!(out.stdout.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stack_file_linked_worktree_sees_the_same_stack() {
+    let dir = init_repo("file-worktree");
+    commit(&dir, "f.txt", "v1\n", "A");
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.stack_new("feat").unwrap();
+    backend.checkout_branch("main").unwrap();
+
+    let linked = scratch("file-worktree-linked");
+    let _ = std::fs::remove_dir_all(&linked);
+    git(
+        &dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "other",
+            linked.to_str().unwrap(),
+        ],
+    );
+    let there = Git2Backend::discover(&linked).unwrap();
+    let parents: std::collections::HashMap<_, _> =
+        there.stack_parents().unwrap().into_iter().collect();
+    assert_eq!(
+        parents.get("feat").cloned().flatten(),
+        Some("main".to_owned())
+    );
+    let _ = std::fs::remove_dir_all(&linked);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stack_file_parallel_writers_keep_every_record() {
+    let dir = init_repo("file-parallel");
+    commit(&dir, "f.txt", "v1\n", "A");
+    let threads: Vec<_> = (0..8)
+        .map(|i| {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let backend = Git2Backend::discover(&dir).unwrap();
+                let dirs = rgit_git::stack_file::dirs_of(&backend);
+                rgit_git::stack_file::record(&dirs, &format!("b{i}"), "main", None).unwrap();
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let backend = Git2Backend::discover(&dir).unwrap();
+    let records = rgit_git::stack_file::read(&rgit_git::stack_file::dirs_of(&backend)).unwrap();
+    assert_eq!(records.len(), 8);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stack_file_keeps_comments() {
+    let dir = init_repo("file-comments");
+    commit(&dir, "f.txt", "v1\n", "A");
+    std::fs::create_dir_all(dir.join(".git/rgit")).unwrap();
+    std::fs::write(dir.join(".git/rgit/stacks.toml"), "# mine\n").unwrap();
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.stack_new("feat/x").unwrap();
+    let text = stack_file_text(&dir);
+    assert!(text.contains("# mine"), "{text}");
+    assert!(text.contains("[branch.\"feat/x\"]"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

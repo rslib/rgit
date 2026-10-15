@@ -92,10 +92,11 @@ In it, `d` or `Enter` shows the details, `C` checks the request out, `a` adds a 
 ## Use vim keys
 
 The `vim` profile moves with `h`, `j`, `k` and `l` and puts each git action behind a `Space` leader.
-Set it in `~/.config/rgit/config.toml`:
+Set it in `~/.config/rgit/config.toml`.
+The same keys also work in the repo files, `.rgit/config.toml` and `.git/rgit/config.toml`.
+[config.example.toml](config.example.toml) lists them all.
 
 ```toml
-[ui]
 profile = "vim"
 ```
 

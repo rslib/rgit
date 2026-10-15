@@ -1548,6 +1548,11 @@ const EXAMPLES: &[Entry] = &[
     ("stack new", &["rgit stack new <branch>"]),
     ("stack list", &["rgit stack list"]),
     ("stack restack", &["rgit stack restack"]),
+    ("stack repair", &["rgit stack repair"]),
+    (
+        "settings",
+        &["rgit settings", "rgit settings output.compact"],
+    ),
     ("stack sync", &["rgit stack sync"]),
     ("lanes", &["rgit lanes"]),
     ("lanes init", &["rgit lanes init"]),
