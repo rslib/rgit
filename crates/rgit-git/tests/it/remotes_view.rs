@@ -277,16 +277,13 @@ fn local_urls_are_the_rewritten_ones() {
 fn local_remote_names_that_share_a_prefix_keep_their_own_branches() {
     let dir = init_repo("rv-prefix");
     commit(&dir, "a.txt", "one");
+    // git 2.55 refuses `remote add team/a` next to `team`, but older repos
+    // still hold such names, so write the config as those repos have it.
     for name in ["origin", "origin2", "team", "team/a"] {
-        git(
-            &dir,
-            &[
-                "remote",
-                "add",
-                name,
-                &format!("https://example.com/{name}.git"),
-            ],
-        );
+        let url = format!("https://example.com/{name}.git");
+        let fetch = format!("+refs/heads/*:refs/remotes/{name}/*");
+        git(&dir, &["config", &format!("remote.{name}.url"), &url]);
+        git(&dir, &["config", &format!("remote.{name}.fetch"), &fetch]);
     }
     remote_ref(&dir, "origin", "x");
     remote_ref(&dir, "origin2", "y");
