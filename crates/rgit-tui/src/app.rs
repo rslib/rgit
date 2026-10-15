@@ -806,6 +806,8 @@ pub enum Msg {
     BisectBad,
     BisectReset,
     AiReview,
+    /// Pick an AI tool, then review the staged diff with it.
+    AiReviewWith,
     AiReviewLoaded(String),
     Undo,
     Redo,
@@ -854,6 +856,8 @@ pub enum Msg {
     CommitEditorCancel,
     CommitEditorEditor,
     CommitEditorGenerate,
+    /// Pick an AI tool, then draft the commit message with it.
+    CommitEditorGenerateWith,
     SetCommitEditorText(String),
     /// A line of output for the operation console (hook or network op).
     HookOutput(String),
@@ -1449,6 +1453,29 @@ fn rev_picker_prompt(app: &mut App, action: PromptAction) -> Vec<Effect> {
     vec![Effect::LoadPromptCandidates(action)]
 }
 
+/// Open a picker of the AI tools the settings define, or say there are none.
+fn ai_tool_picker(app: &mut App, action: PromptAction) {
+    let tools = rgit_ai::tools(&app.ai_settings);
+    if tools.is_empty() {
+        app.push_toast(
+            ToastKind::Error,
+            "no AI tools: set ai.<name>.command in the rgit config".into(),
+        );
+        return;
+    }
+    app.transient = None;
+    app.prompt = Some(Prompt {
+        label: "AI tool".into(),
+        input: String::new(),
+        cursor: 0,
+        candidates: tools,
+        values: Vec::new(),
+        selected: 0,
+        action,
+        masked: false,
+    });
+}
+
 /// The follow-up prompt of a two-step prompt's first step: stash the first
 /// value and open the second, or `None` when `action` is a single-step prompt.
 fn two_step_next(action: PromptAction) -> Option<(&'static str, PromptAction)> {
@@ -1490,6 +1517,8 @@ fn two_step_mutation(app: &mut App, action: PromptAction, value: String) -> Opti
 /// What a submitted [`Prompt`] does with its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptAction {
+    AiDraftTool,
+    AiReviewTool,
     CheckoutBranch,
     CreateBranch,
     RebaseOnto,
@@ -1850,6 +1879,11 @@ pub static PALETTE: &[PaletteEntry] = &[
         make: || Msg::AiReview,
     },
     PaletteEntry {
+        label: "AI: review staged with a chosen tool",
+        keyhint: "",
+        make: || Msg::AiReviewWith,
+    },
+    PaletteEntry {
         label: "Undo last operation",
         keyhint: "",
         make: || Msg::Undo,
@@ -2180,10 +2214,15 @@ pub enum Effect {
     /// Run a network op via libgit2, streaming its git-style progress into the
     /// operation console.
     OpConsole(ConsoleOp),
-    /// Draft a commit message from the staged diff with an LLM.
-    GenerateCommit,
-    /// Run an LLM review over the staged diff.
-    ReviewStaged,
+    /// Draft a commit message from the staged diff with an AI tool (the
+    /// default one when `tool` is `None`).
+    GenerateCommit {
+        tool: Option<String>,
+    },
+    /// Review the staged diff with an AI tool.
+    ReviewStaged {
+        tool: Option<String>,
+    },
     /// Load the commits to rebase, then open the todo editor.
     LoadRebaseTodo {
         base: String,
@@ -2381,6 +2420,7 @@ pub struct App {
     remote_status: Option<RemoteSummary>,
     forge_snapshot: Option<ForgeSnapshot>,
     forge_profiles: Vec<String>,
+    ai_settings: Arc<rgit_config::Settings>,
     forge_profile_index: usize,
     forge_close_armed: Option<(u64, std::time::Instant)>,
     forge_merge_armed: Option<(u64, rgit_forge::MergeMethod, std::time::Instant)>,
@@ -2459,6 +2499,15 @@ pub struct App {
 }
 
 impl App {
+    /// The settings the AI tools are read from.
+    pub fn set_ai_settings(&mut self, settings: Arc<rgit_config::Settings>) {
+        self.ai_settings = settings;
+    }
+
+    pub fn ai_settings(&self) -> Arc<rgit_config::Settings> {
+        self.ai_settings.clone()
+    }
+
     pub fn new(backend: Arc<dyn GitBackend>, config: crate::config::Config) -> Self {
         // libgit2 never signs commits and ignores git's commit.gpgsign, so honor
         // that setting here: sign whenever rgit's own config asks or git config
@@ -2539,6 +2588,10 @@ impl App {
             },
             forge_profiles,
             forge_profile_index,
+            ai_settings: Arc::new(rgit_config::Settings::load_with(
+                rgit_config::Files::default(),
+                &|_| None,
+            )),
             remote_status: None,
             forge_snapshot: None,
             forge_close_armed: None,
@@ -4465,8 +4518,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::BisectReset => return vec![bisect(app, "reset")],
         Msg::AiReview => {
             app.busy = Some("reviewing".into());
-            return vec![Effect::ReviewStaged];
+            return vec![Effect::ReviewStaged { tool: None }];
         }
+        Msg::AiReviewWith => ai_tool_picker(app, PromptAction::AiReviewTool),
         Msg::Undo => {
             // Restore the previous op-log snapshot (HEAD, branch, and the whole
             // working tree), recovering uncommitted work too.
@@ -4816,7 +4870,12 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::CommitEditorGenerate => {
             if app.commit_editor.is_some() {
                 app.busy = Some("generating".into());
-                return vec![Effect::GenerateCommit];
+                return vec![Effect::GenerateCommit { tool: None }];
+            }
+        }
+        Msg::CommitEditorGenerateWith => {
+            if app.commit_editor.is_some() {
+                ai_tool_picker(app, PromptAction::AiDraftTool);
             }
         }
         Msg::SetCommitEditorText(text) => {
@@ -5413,6 +5472,14 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             };
             return vec![Effect::LoadSplitFiles(rev)];
         }
+        PromptAction::AiDraftTool => {
+            app.busy = Some("generating".into());
+            return vec![Effect::GenerateCommit { tool: Some(value) }];
+        }
+        PromptAction::AiReviewTool => {
+            app.busy = Some("reviewing".into());
+            return vec![Effect::ReviewStaged { tool: Some(value) }];
+        }
         // Reword is a two-step prompt: pick the commit, then its new message.
         PromptAction::RewordRev => {
             let rev = if value.trim().is_empty() {
@@ -5444,6 +5511,7 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
         // Handled above via an early return.
         PromptAction::RebaseOnto | PromptAction::MergeBranch => return Vec::new(),
         PromptAction::RebaseInteractive => return Vec::new(),
+        PromptAction::AiDraftTool | PromptAction::AiReviewTool => return Vec::new(),
         PromptAction::DiffRefsTo => return Vec::new(),
         PromptAction::ResetSoft => Mutation::Reset {
             rev: value,
@@ -6415,6 +6483,86 @@ fn build_remote_section(
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn ai_settings(global: &str) -> Arc<rgit_config::Settings> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rgit-tui-ai-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, global).unwrap();
+        Arc::new(rgit_config::Settings::load_with(
+            rgit_config::Files {
+                global: Some(path),
+                ..Default::default()
+            },
+            &|_| None,
+        ))
+    }
+
+    fn ai_app(global: &str) -> App {
+        let mut app = App::new(
+            Arc::new(rgit_git::Git2Backend::discover(".").unwrap()),
+            crate::config::Config::default(),
+        );
+        app.set_ai_settings(ai_settings(global));
+        update(
+            &mut app,
+            Msg::ShowCommitEditor {
+                amend: false,
+                prefill: String::new(),
+            },
+        );
+        app
+    }
+
+    const TWO_TOOLS: &str = "[ai.zed]\ncommand = \"true\"\n[ai.alpha]\ncommand = \"true\"\n";
+
+    #[test]
+    fn ai_tool_generate_uses_default_tool() {
+        let mut app = ai_app(TWO_TOOLS);
+        let fx = update(&mut app, Msg::CommitEditorGenerate);
+        assert!(matches!(
+            fx.as_slice(),
+            [Effect::GenerateCommit { tool: None }]
+        ));
+    }
+
+    #[test]
+    fn ai_tool_picker_lists_tools() {
+        let mut app = ai_app(TWO_TOOLS);
+        update(&mut app, Msg::CommitEditorGenerateWith);
+        let prompt = app.prompt.as_ref().expect("picker is open");
+        assert_eq!(
+            prompt.candidates,
+            vec!["alpha".to_owned(), "zed".to_owned()]
+        );
+    }
+
+    #[test]
+    fn ai_tool_picker_choice_runs_that_tool() {
+        let mut app = ai_app(TWO_TOOLS);
+        update(&mut app, Msg::CommitEditorGenerateWith);
+        app.prompt.as_mut().unwrap().input = "zed".into();
+        let fx = update(&mut app, Msg::PromptSubmit);
+        assert!(
+            matches!(fx.as_slice(), [Effect::GenerateCommit { tool: Some(t) }] if t == "zed"),
+            "{}",
+            fx.len()
+        );
+        update(&mut app, Msg::AiReviewWith);
+        app.prompt.as_mut().unwrap().input = "alpha".into();
+        let fx = update(&mut app, Msg::PromptSubmit);
+        assert!(matches!(fx.as_slice(), [Effect::ReviewStaged { tool: Some(t) }] if t == "alpha"));
+    }
+
+    #[test]
+    fn ai_tool_picker_without_tools_shows_hint() {
+        let mut app = ai_app("");
+        update(&mut app, Msg::CommitEditorGenerateWith);
+        assert!(app.prompt.is_none());
+        assert!(app.toasts.iter().any(|t| t.text.contains("no AI tools")));
+    }
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)

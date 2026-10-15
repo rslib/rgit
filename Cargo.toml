@@ -18,6 +18,7 @@ push = true
 tag-name = "v{{version}}"
 
 [workspace.dependencies]
+rgit-ai = { path = "crates/rgit-ai" }
 rgit-config = { path = "crates/rgit-config" }
 rgit-forge = { path = "crates/rgit-forge" }
 rgit-git = { path = "crates/rgit-git" }

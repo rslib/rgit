@@ -453,6 +453,8 @@ const EXAMPLES: &[Entry] = &[
             "rgit commit --dry-run -a",
             "rgit commit --short",
             "rgit commit -v -e -m \"<message>\"",
+            "rgit commit --draft --no-edit",
+            "rgit commit --draft=claude",
         ],
     ),
     ("extend", &["rgit extend"]),
@@ -1549,6 +1551,25 @@ const EXAMPLES: &[Entry] = &[
     ("stack list", &["rgit stack list"]),
     ("stack restack", &["rgit stack restack"]),
     ("stack repair", &["rgit stack repair"]),
+    (
+        "ai",
+        &["rgit ai draft", "rgit ai review", "rgit ai prompt draft"],
+    ),
+    (
+        "ai draft",
+        &["rgit ai draft", "rgit ai draft --tool claude"],
+    ),
+    (
+        "ai review",
+        &["rgit ai review", "rgit ai review --tool codex"],
+    ),
+    (
+        "ai prompt",
+        &[
+            "rgit ai prompt draft",
+            "rgit ai prompt review --tool claude",
+        ],
+    ),
     (
         "settings",
         &["rgit settings", "rgit settings output.compact"],

@@ -3751,6 +3751,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             sign: Default::default(),
             message: a.str("message").into_iter().collect(),
             file: None,
+            draft: None,
             amend: a.flag("amend"),
             no_edit: a.flag("no_edit"),
             all: a.flag("all"),

@@ -632,7 +632,7 @@ pub fn leader_entries() -> Vec<(char, &'static str)> {
 }
 
 /// Key handling while the in-app commit editor is open. Ctrl-S commits, Ctrl-O
-/// hands off to $EDITOR, Ctrl-G drafts a message; Esc cancels. Every other key
+/// hands off to $EDITOR, Ctrl-G drafts a message with the default AI tool, Ctrl-T with a tool you pick; Esc cancels. Every other key
 /// (including emacs/readline motions like Ctrl-A/E/F/B) edits the text.
 pub fn resolve_commit_key(key: KeyEvent) -> Option<Msg> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -640,6 +640,7 @@ pub fn resolve_commit_key(key: KeyEvent) -> Option<Msg> {
         KeyCode::Char('s') if ctrl => Some(Msg::CommitEditorSubmit),
         KeyCode::Char('o') if ctrl => Some(Msg::CommitEditorEditor),
         KeyCode::Char('g') if ctrl => Some(Msg::CommitEditorGenerate),
+        KeyCode::Char('t') if ctrl => Some(Msg::CommitEditorGenerateWith),
         KeyCode::Esc => Some(Msg::CommitEditorCancel),
         _ => Some(Msg::CommitEditorInput(key)),
     }

@@ -4828,16 +4828,22 @@ impl GitBackend for Git2Backend {
         let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
         let mut opts = DiffOptions::new();
         let diff = repo.diff_tree_to_index(head_tree.as_ref(), None, Some(&mut opts))?;
-        let mut buf = String::new();
-        diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
-            let origin = line.origin();
-            if matches!(origin, '+' | '-' | ' ') {
-                buf.push(origin);
-            }
-            buf.push_str(std::str::from_utf8(line.content()).unwrap_or(""));
-            true
-        })?;
-        Ok(buf)
+        patch_text(&diff)
+    }
+
+    fn commit_patch(
+        &self,
+        all: bool,
+        include: bool,
+        amend: bool,
+        paths: &[String],
+    ) -> Result<String, GitError> {
+        let repo = self.repo();
+        sync_index(&repo)?;
+        let patch = commit_patch_text(&repo, all, include, amend, paths);
+        // Drop the staging done in memory; the index file was never written.
+        sync_index(&repo)?;
+        patch
     }
 
     fn commit_extend(&self) -> Result<(), GitError> {
@@ -9155,7 +9161,7 @@ fn write_commit(repo: &Repository, message: &str, o: &CommitOptions) -> Result<(
     let mut only = if o.paths.is_empty() {
         None
     } else {
-        Some(only_paths_tree(repo, head.as_ref(), &o.paths)?)
+        Some(only_paths_tree(repo, head.as_ref(), &o.paths, true)?)
     };
 
     let mut msg = git2::message_prettify(message, None)?;
@@ -9372,12 +9378,65 @@ fn take_merge_autostash(repo: &Repository) -> Option<Oid> {
     Some(id)
 }
 
+fn patch_text(diff: &git2::Diff) -> Result<String, GitError> {
+    let mut buf = String::new();
+    diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+        let origin = line.origin();
+        if matches!(origin, '+' | '-' | ' ') {
+            buf.push(origin);
+        }
+        buf.push_str(std::str::from_utf8(line.content()).unwrap_or(""));
+        true
+    })?;
+    Ok(buf)
+}
+
+/// The patch a commit with these options would record, staged in memory only.
+fn commit_patch_text(
+    repo: &Repository,
+    all: bool,
+    include: bool,
+    amend: bool,
+    paths: &[String],
+) -> Result<String, GitError> {
+    let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let tree_oid = if !paths.is_empty() && !include && !all {
+        only_paths_tree(repo, head.as_ref(), paths, false)?
+    } else {
+        let mut index = repo.index()?;
+        let mut stage = |specs: &[String]| -> Result<(), GitError> {
+            let skip = crate::sparse::keep_sparse(repo, &index);
+            crate::pathspec::index_walk(specs, skip, |s, cb| index.update_all(s, cb))?;
+            Ok(())
+        };
+        if all {
+            stage(&["*".to_owned()])?;
+        }
+        if include && !paths.is_empty() {
+            stage(&root_dots(paths))?;
+        }
+        index_tree(repo)?
+    };
+    // An amended commit replaces HEAD, so its patch is against HEAD's parent.
+    let base = match head {
+        Some(h) if amend => h.parents().next().map(|p| p.tree()).transpose()?,
+        Some(h) => Some(h.tree()?),
+        None => None,
+    };
+    let tree = repo.find_tree(tree_oid)?;
+    let mut opts = DiffOptions::new();
+    let diff = repo.diff_tree_to_tree(base.as_ref(), Some(&tree), Some(&mut opts))?;
+    patch_text(&diff)
+}
+
 /// The tree for `commit <paths>`: HEAD's tree with `paths` as they are in the
 /// working tree. The index gets the same update, as in git.
+/// With `persist` false the index is only updated in memory, not written.
 fn only_paths_tree(
     repo: &Repository,
     head: Option<&git2::Commit>,
     paths: &[String],
+    persist: bool,
 ) -> Result<Oid, GitError> {
     let paths = &root_dots(paths);
     let head_tree = head.map(|h| h.tree()).transpose()?;
@@ -9387,7 +9446,9 @@ fn only_paths_tree(
     }
     let skip = crate::sparse::keep_skipped(repo, &index);
     crate::pathspec::index_walk(paths, skip, |s, cb| index.update_all(s, cb))?;
-    index.write()?;
+    if persist {
+        index.write()?;
+    }
     let spec = Pathspec::new(paths)?;
     let path_of = |e: &git2::IndexEntry| PathBuf::from(String::from_utf8_lossy(&e.path).as_ref());
     let hit = |e: &git2::IndexEntry| spec.matches_path(&path_of(e));

@@ -13,6 +13,7 @@ use crate::toon::{Node, Obj};
 mod add_interactive;
 mod add_patch;
 mod agent;
+mod ai;
 mod axi;
 mod clean;
 mod cli;
@@ -202,6 +203,10 @@ fn main() -> ! {
         // The MCP server takes over stdio for the process lifetime.
         Some(Command::Mcp { core }) => exit(mcp::serve(discover_or_exit(), core)),
         Some(Command::Agent { cmd }) => finish(agent::run(cmd), &emit),
+        Some(Command::Ai { cmd }) => {
+            let backend = discover_or_exit();
+            finish(ai::run(&backend, cmd), &emit)
+        }
         Some(Command::Settings { key }) => finish(settings::run(key.as_deref()), &emit),
         Some(Command::Tool { name }) => exit(mcp::call(discover_or_exit(), &name)),
         // What agent session hooks run: the home view, as TOON, repo or not.

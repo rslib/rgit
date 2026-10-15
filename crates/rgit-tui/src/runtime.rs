@@ -339,6 +339,40 @@ async fn checkout_pr(
     .unwrap_or_else(|error| Err(format!("forge worker failed: {error}")))
 }
 
+/// Run the AI task off the UI thread; the result arrives as a message.
+fn spawn_ai(
+    app: &App,
+    msg_tx: &tokio::sync::mpsc::UnboundedSender<Msg>,
+    task: rgit_ai::Task,
+    tool: Option<String>,
+) {
+    let backend = app.backend();
+    let settings = app.ai_settings();
+    let msg_tx = msg_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = msg_tx.send(run_ai(backend.as_ref(), &settings, task, tool.as_deref()));
+    });
+}
+
+/// Run the configured tool over the staged diff: the draft for the commit
+/// editor, the review text, or the error to show.
+fn run_ai(
+    backend: &dyn GitBackend,
+    settings: &rgit_config::Settings,
+    task: rgit_ai::Task,
+    tool: Option<&str>,
+) -> Msg {
+    let result = rgit_ai::tool_for(settings, task, tool).and_then(|tool| {
+        let inputs = rgit_ai::inputs(backend, &rgit_ai::Scope::default())?;
+        rgit_ai::run(settings, task, &tool, &inputs)
+    });
+    match (result, task) {
+        (Ok(text), rgit_ai::Task::Draft) => Msg::SetCommitEditorText(text),
+        (Ok(text), rgit_ai::Task::Review) => Msg::AiReviewLoaded(text),
+        (Err(error), _) => Msg::Error(format!("ai: {error}")),
+    }
+}
+
 const TICK_HZ: f64 = 4.0;
 const FRAME_HZ: f64 = 30.0;
 
@@ -349,6 +383,7 @@ pub async fn run(backend: Arc<dyn GitBackend>, no_preview: bool) -> std::io::Res
     let repo = rgit_git::stack_file::dirs_of(backend.as_ref());
     let settings = rgit_config::Settings::load(Some(&repo));
     let (mut config, config_error) = crate::config::Config::from_settings(&settings);
+    let settings = Arc::new(settings);
     // The CLI flag is a hard override of the config toggle.
     if no_preview {
         config.ui.preview = false;
@@ -367,7 +402,7 @@ pub async fn run(backend: Arc<dyn GitBackend>, no_preview: bool) -> std::io::Res
     let mut terminal = ratatui::init();
     enable_mouse_capture();
     install_panic_hook(mouse);
-    let result = event_loop(&mut terminal, backend, config, config_error).await;
+    let result = event_loop(&mut terminal, backend, config, config_error, settings).await;
     if mouse {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     }
@@ -413,8 +448,10 @@ async fn event_loop(
     backend: Arc<dyn GitBackend>,
     config: crate::config::Config,
     config_error: Option<String>,
+    settings: Arc<rgit_config::Settings>,
 ) -> std::io::Result<()> {
     let mut app = App::new(backend, config);
+    app.set_ai_settings(settings);
     app.error = config_error;
     let mut events = Events::new(TICK_HZ, FRAME_HZ);
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
@@ -851,45 +888,11 @@ async fn run_msg(
                 };
                 let _ = msg_tx.send(Msg::ShowCommitEditor { amend, prefill });
             }
-            Effect::GenerateCommit => {
-                let backend = app.backend();
-                let msg_tx = msg_tx.clone();
-                tokio::spawn(async move {
-                    let patch = tokio::task::spawn_blocking(move || backend.staged_patch())
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .unwrap_or_default();
-                    let out = if patch.trim().is_empty() {
-                        Msg::Error("nothing staged to summarize".into())
-                    } else {
-                        match crate::ai::commit_message(&patch).await {
-                            Ok(text) => Msg::SetCommitEditorText(text),
-                            Err(e) => Msg::Error(format!("ai: {e}")),
-                        }
-                    };
-                    let _ = msg_tx.send(out);
-                });
+            Effect::GenerateCommit { tool } => {
+                spawn_ai(app, msg_tx, rgit_ai::Task::Draft, tool);
             }
-            Effect::ReviewStaged => {
-                let backend = app.backend();
-                let msg_tx = msg_tx.clone();
-                tokio::spawn(async move {
-                    let patch = tokio::task::spawn_blocking(move || backend.staged_patch())
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .unwrap_or_default();
-                    let out = if patch.trim().is_empty() {
-                        Msg::Error("nothing staged to review".into())
-                    } else {
-                        match crate::ai::code_review(&patch).await {
-                            Ok(text) => Msg::AiReviewLoaded(text),
-                            Err(e) => Msg::Error(format!("ai: {e}")),
-                        }
-                    };
-                    let _ = msg_tx.send(out);
-                });
+            Effect::ReviewStaged { tool } => {
+                spawn_ai(app, msg_tx, rgit_ai::Task::Review, tool);
             }
             Effect::CommitConsole {
                 amend,
@@ -2726,6 +2729,54 @@ mod tests {
         grep_hits, read_stamped, restack_note, snippet_sections, sort_watch_paths, update,
     };
     use rgit_git::RestackOutcome;
+
+    #[test]
+    fn ai_tool_fixed_output_lands_in_the_commit_editor() {
+        let dir = std::env::temp_dir().join(format!("rgit-tui-ai-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &["config", "user.email", "t@t"],
+            &["config", "user.name", "t"],
+        ] {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(ok.success());
+        }
+        std::fs::write(dir.join("f.txt"), "hi\n").unwrap();
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["add", "f.txt"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let config = dir.join("config.toml");
+        std::fs::write(
+            &config,
+            "[commit.ai]\ndraft = \"fixed\"\n[ai.fixed]\ncommand = \"printf 'feat: fixed\\\\n'\"\n",
+        )
+        .unwrap();
+        let settings = rgit_config::Settings::load_with(
+            rgit_config::Files {
+                global: Some(config),
+                ..Default::default()
+            },
+            &|_| None,
+        );
+        let backend = rgit_git::Git2Backend::discover(&dir).unwrap();
+        let msg = super::run_ai(&backend, &settings, rgit_ai::Task::Draft, None);
+        assert!(matches!(msg, Msg::SetCommitEditorText(t) if t == "feat: fixed"));
+        let msg = super::run_ai(&backend, &settings, rgit_ai::Task::Review, Some("nope"));
+        assert!(matches!(msg, Msg::Error(e) if e.starts_with("ai: ")));
+    }
     use std::time::{Duration, Instant};
 
     #[test]

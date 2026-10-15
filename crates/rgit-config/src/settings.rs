@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::de::DeserializeOwned;
 
-use crate::keys::{KEYS, lookup};
+use crate::keys::{KEYS, lookup, partner};
 use crate::warning::{Warning, WarningKind};
 
 const ENV_CONFIG: &str = "RGIT_CONFIG";
@@ -109,6 +109,7 @@ pub struct Entry {
 pub struct Settings {
     table: toml::Table,
     sources: BTreeMap<String, Source>,
+    home: Option<PathBuf>,
     warnings: Vec<Warning>,
 }
 
@@ -145,6 +146,7 @@ impl Settings {
         let mut settings = Settings {
             table: toml::Table::new(),
             sources: BTreeMap::new(),
+            home: env("HOME").map(PathBuf::from),
             warnings: Vec::new(),
         };
         let layers = [
@@ -192,6 +194,20 @@ impl Settings {
         };
         let mut leaves = Vec::new();
         flatten(&table, "", &mut leaves);
+        let mut dropped = Vec::new();
+        for (key, _) in &leaves {
+            if let Some((other, false)) = partner(key)
+                && leaves.iter().any(|(k, _)| *k == other)
+            {
+                let kind = WarningKind::BothForms {
+                    inline: other,
+                    file: key.clone(),
+                };
+                self.warn(source.clone(), kind);
+                dropped.push(key.clone());
+            }
+        }
+        leaves.retain(|(key, _)| !dropped.contains(key));
         for (key, value) in leaves {
             self.apply_leaf(&key, value, source.clone());
         }
@@ -214,11 +230,26 @@ impl Settings {
             self.warn(source, WarningKind::NotShared(key.to_owned()));
             return;
         }
+        if let Source::File {
+            layer: Layer::Shared,
+            path,
+        } = &source
+            && is_file_key(key)
+            && let Some(text) = value.as_str()
+            && !inside_repo(path, text)
+        {
+            self.warn(source, WarningKind::OutsideRepo(key.to_owned()));
+            return;
+        }
         if !def.kind.accepts(&value) {
             let expected = def.kind.expected();
             let key = key.to_owned();
             self.warn(source, WarningKind::BadValue { key, expected });
             return;
+        }
+        if let Some((other, _)) = partner(key) {
+            remove_path(&mut self.table, &other);
+            self.sources.remove(&other);
         }
         let mut segments = key.split('.').peekable();
         let mut table = &mut self.table;
@@ -281,6 +312,27 @@ impl Settings {
         lookup(key).map(|_| Source::Default)
     }
 
+    /// A path setting resolved against the file that set it: relative to that
+    /// file's folder, `~/` to `$HOME`. Other sources return the value as is.
+    pub fn path(&self, key: &str) -> Option<PathBuf> {
+        let raw = get_path(&self.table, key)?.as_str()?;
+        if let Some(rest) = raw.strip_prefix("~/")
+            && let Some(home) = &self.home
+        {
+            return Some(home.join(rest));
+        }
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            return Some(path);
+        }
+        match self.sources.get(key) {
+            Some(Source::File { path: file, .. }) => {
+                Some(file.parent().map_or(path.clone(), |dir| dir.join(&path)))
+            }
+            _ => Some(path),
+        }
+    }
+
     pub fn core(&self) -> Core {
         let get = |key: &str| {
             let mut value = None;
@@ -336,6 +388,67 @@ impl Settings {
                 });
         }
         entries.into_values().collect()
+    }
+}
+
+fn is_file_key(key: &str) -> bool {
+    partner(key).is_some_and(|(_, is_inline)| !is_inline)
+}
+
+/// Whether `text`, set in the shared file `<root>/.rgit/config.toml`, names a
+/// path inside `<root>`: relative to `.rgit`, no `..` out of `<root>`, no
+/// symlink out of it.
+fn inside_repo(shared: &std::path::Path, text: &str) -> bool {
+    use std::path::Component;
+    if text.starts_with('~') {
+        return false;
+    }
+    let rel = std::path::Path::new(text);
+    // Depth below the repository root; the file's folder is one level down.
+    let mut depth = 1usize;
+    for component in rel.components() {
+        match component {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => match depth.checked_sub(1) {
+                Some(d) => depth = d,
+                None => return false,
+            },
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    let Some(folder) = shared.parent() else {
+        return false;
+    };
+    let Some(root) = folder.parent() else {
+        return false;
+    };
+    let target = folder.join(rel);
+    match (target.canonicalize(), root.canonicalize()) {
+        (Ok(target), Ok(root)) => target.starts_with(root),
+        _ => true,
+    }
+}
+
+fn get_path<'a>(table: &'a toml::Table, key: &str) -> Option<&'a toml::Value> {
+    let mut segments = key.split('.');
+    let mut value = table.get(segments.next()?)?;
+    for segment in segments {
+        value = value.as_table()?.get(segment)?;
+    }
+    Some(value)
+}
+
+fn remove_path(table: &mut toml::Table, key: &str) {
+    match key.split_once('.') {
+        None => {
+            table.remove(key);
+        }
+        Some((head, rest)) => {
+            if let Some(toml::Value::Table(inner)) = table.get_mut(head) {
+                remove_path(inner, rest);
+            }
+        }
     }
 }
 

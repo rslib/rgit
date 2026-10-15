@@ -30,7 +30,11 @@ Every command with what it does and example invocations. Run `rgit <command> --h
 
 ## Commit and rewrite history
 
-- `commit`: Commit the staged changes (runs hooks), or only the given paths. e.g. `rgit commit -m "<message>"`, `rgit commit -a -m "<message>"`, `rgit commit src/lib.rs -m "<message>"`, `rgit commit -m "<subject>" -m "<body>"`, `rgit commit --amend --no-edit`, `rgit commit --fixup <rev>`, `rgit commit -C <rev> --reset-author`, `rgit commit --dry-run -a`, `rgit commit --short`, `rgit commit -v -e -m "<message>"`
+- `commit`: Commit the staged changes (runs hooks), or only the given paths. e.g. `rgit commit -m "<message>"`, `rgit commit -a -m "<message>"`, `rgit commit src/lib.rs -m "<message>"`, `rgit commit -m "<subject>" -m "<body>"`, `rgit commit --amend --no-edit`, `rgit commit --fixup <rev>`, `rgit commit -C <rev> --reset-author`, `rgit commit --dry-run -a`, `rgit commit --short`, `rgit commit -v -e -m "<message>"`, `rgit commit --draft --no-edit`, `rgit commit --draft=claude`
+- `ai`: Draft or review a commit message with an AI tool you configure, or show the prompt it gets. e.g. `rgit ai draft`, `rgit ai review`, `rgit ai prompt draft`
+  - `ai draft`: Draft a commit message for the staged changes. e.g. `rgit ai draft`, `rgit ai draft --tool claude`
+  - `ai review`: Review the staged changes. e.g. `rgit ai review`, `rgit ai review --tool codex`
+  - `ai prompt`: Print the prompt a task would use, with the rules filled in. e.g. `rgit ai prompt draft`, `rgit ai prompt review --tool claude`
 - `extend`: Amend HEAD with the staged changes, keeping its message (no editor). e.g. `rgit extend`
 - `reword`: Change any commit's message and restack its descendants (default HEAD). e.g. `rgit reword -m "<message>"`, `rgit reword -m "<message>" <rev>`
 - `uncommit`: Undo the last commit(s), keeping the changes staged (default 1). e.g. `rgit uncommit`, `rgit uncommit 2`

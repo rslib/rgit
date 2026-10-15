@@ -255,7 +255,119 @@ pub static KEYS: &[KeyDef] = &[
         None,
         "Forge host of a profile",
     )),
+    unshared(key(
+        "ai.*.command",
+        Kind::Str,
+        None,
+        "Shell command for this AI tool; gets the prompt on stdin",
+    )),
+    key(
+        "ai.*.timeout_secs",
+        Kind::Int,
+        Some("120"),
+        "Seconds to wait for this AI tool",
+    ),
+    key(
+        "ai.*.draft_prompt",
+        Kind::Str,
+        None,
+        "Draft prompt text for this AI tool",
+    ),
+    key(
+        "ai.*.draft_prompt_file",
+        Kind::Str,
+        None,
+        "File with the draft prompt for this AI tool",
+    ),
+    key(
+        "ai.*.review_prompt",
+        Kind::Str,
+        None,
+        "Review prompt text for this AI tool",
+    ),
+    key(
+        "ai.*.review_prompt_file",
+        Kind::Str,
+        None,
+        "File with the review prompt for this AI tool",
+    ),
+    key(
+        "commit.ai.draft",
+        Kind::Str,
+        None,
+        "AI tool that drafts commit messages",
+    ),
+    key(
+        "commit.ai.review",
+        Kind::Str,
+        None,
+        "AI tool that reviews commit messages",
+    ),
+    key(
+        "commit.ai.draft_prompt",
+        Kind::Str,
+        None,
+        "Draft prompt text for commit messages",
+    ),
+    key(
+        "commit.ai.draft_prompt_file",
+        Kind::Str,
+        None,
+        "File with the draft prompt for commit messages",
+    ),
+    key(
+        "commit.ai.review_prompt",
+        Kind::Str,
+        None,
+        "Review prompt text for commit messages",
+    ),
+    key(
+        "commit.ai.review_prompt_file",
+        Kind::Str,
+        None,
+        "File with the review prompt for commit messages",
+    ),
+    key(
+        "commit.ai.rules",
+        Kind::Str,
+        None,
+        "Commit message rules text",
+    ),
+    key(
+        "commit.ai.rules_file",
+        Kind::Str,
+        None,
+        "File with the commit message rules",
+    ),
+    key(
+        "commit.ai.max_diff_bytes",
+        Kind::Int,
+        Some("100000"),
+        "Largest diff in bytes sent to an AI tool",
+    ),
 ];
+
+/// Settings that take text inline or from a file: (inline suffix, file suffix).
+/// Both forms are one setting; the later layer wins.
+pub(crate) const PAIRS: &[(&str, &str)] = &[
+    ("draft_prompt", "draft_prompt_file"),
+    ("review_prompt", "review_prompt_file"),
+    ("rules", "rules_file"),
+];
+
+/// The other form of a paired key, and whether `key` is the inline form.
+pub(crate) fn partner(key: &str) -> Option<(String, bool)> {
+    let (head, last) = key.rsplit_once('.')?;
+    PAIRS.iter().find_map(|(inline, file)| {
+        if last == *inline {
+            Some((format!("{head}.{file}"), true))
+        } else if last == *file {
+            Some((format!("{head}.{inline}"), false))
+        } else {
+            None
+        }
+    })
+}
 
 pub(crate) fn lookup(key: &str) -> Option<&'static KeyDef> {
     KEYS.iter().find(|def| def.matches(key))

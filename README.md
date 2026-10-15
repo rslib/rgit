@@ -67,6 +67,7 @@ Run `rgit --help` for every command and `rgit <command> --help` for its flags.
 - [Use rgit from a coding agent](docs/agent-integration.md): output modes, `rgit agent install` and the MCP tools.
 - [Use rgit with Forgejo](docs/forgejo.md): forge profiles for GitHub, GitLab and Forgejo.
 - [Add Change-Id trailers](docs/change-id.md): stable change ids for Gerrit-style review.
+- [Draft commit messages with an AI tool](docs/ai.md): run a tool you choose to draft or review a commit, with your own rules and prompts.
 - [TUI configuration](docs/config.example.toml): every TUI setting with its default.
 
 ## Develop

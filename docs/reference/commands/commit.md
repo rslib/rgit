@@ -21,6 +21,8 @@ rgit commit -C <rev> --reset-author
 rgit commit --dry-run -a
 rgit commit --short
 rgit commit -v -e -m "<message>"
+rgit commit --draft --no-edit
+rgit commit --draft=claude
 ```
 
 ## Arguments
@@ -35,6 +37,7 @@ rgit commit -v -e -m "<message>"
 | --- | --- | --- |
 | `-m, --message` | `MESSAGE` | The commit message; repeat for more paragraphs (prompted for if omitted on a terminal) |
 | `-F, --file` | `FILE` | Read the commit message from a file (`-` for stdin) |
+| `--draft` | `TOOL` | Draft the message with an AI tool (default: commit.ai.draft), then open the editor with it, or commit as is with --no-edit |
 | `--amend` |  | Amend the previous commit instead of creating a new one |
 | `--no-edit` |  | Keep the amended commit's message (with --amend), or -c's without opening the editor |
 | `-e, --edit` |  | Edit the message in the editor before committing (git's -e) |

@@ -5,7 +5,6 @@
 //! into state changes and [`app::Effect`]s; [`runtime`] performs the effects and
 //! draws. Every view is a [`buffer::Buffer`] over a content tree.
 
-mod ai;
 mod app;
 mod buffer;
 mod config;

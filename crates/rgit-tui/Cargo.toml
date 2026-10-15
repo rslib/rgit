@@ -10,13 +10,13 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 notify-debouncer-mini = "0.7.0"
 ratatui = "0.30.2"
 open = "5"
+rgit-ai.workspace = true
 rgit-forge.workspace = true
 rgit-git.workspace = true
 rgit-index.workspace = true
 rgit-model.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-reqwest.workspace = true
 rgit-config.workspace = true
 toml.workspace = true
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "process", "time", "io-util"] }

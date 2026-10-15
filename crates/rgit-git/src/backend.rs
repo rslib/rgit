@@ -232,6 +232,17 @@ pub trait GitBackend: Send + Sync {
     /// The staged changes as a unified patch, e.g. to summarize for a message.
     fn staged_patch(&self) -> Result<String, GitError>;
 
+    /// The patch a commit would record: with `all` the tracked changes are
+    /// taken too, with `include` the given paths on top of the index, else
+    /// only the given paths. With `amend` the patch is against HEAD's parent. Staged in memory; the index file is not written.
+    fn commit_patch(
+        &self,
+        all: bool,
+        include: bool,
+        amend: bool,
+        paths: &[String],
+    ) -> Result<String, GitError>;
+
     /// Amend HEAD with the current index but keep its existing message (no
     /// editor) - magit's "extend".
     fn commit_extend(&self) -> Result<(), GitError>;

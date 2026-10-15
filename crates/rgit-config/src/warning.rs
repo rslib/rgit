@@ -24,6 +24,13 @@ pub enum WarningKind {
     },
     /// The key may not be set in the shared repo file.
     NotShared(String),
+    /// A path the shared repo file sets leaves the repository.
+    OutsideRepo(String),
+    /// One file sets both forms of a setting; the inline form is kept.
+    BothForms {
+        inline: String,
+        file: String,
+    },
     /// A top-level table did not fit the type the caller asked for.
     Section {
         name: String,
@@ -41,6 +48,15 @@ impl fmt::Display for Warning {
             WarningKind::BadValue { key, expected } => write!(f, "{key}: expected {expected}"),
             WarningKind::NotShared(key) => {
                 write!(f, "{key} is not allowed in the shared repo file")
+            }
+            WarningKind::OutsideRepo(key) => {
+                write!(
+                    f,
+                    "{key} must be a path inside the repository in the shared repo file"
+                )
+            }
+            WarningKind::BothForms { inline, file } => {
+                write!(f, "{inline} and {file} are both set; using {inline}")
             }
             WarningKind::Section { name, message } => write!(f, "[{name}]: {message}"),
         }

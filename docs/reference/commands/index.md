@@ -37,6 +37,7 @@ Every rgit command, grouped by task. Options that work with every command are on
 | Command | What it does |
 | --- | --- |
 | [`commit`](commit.md) | Commit the staged changes (runs hooks), or only the given paths |
+| [`ai`](ai.md) | Draft or review a commit message with an AI tool you configure, or show the prompt it gets |
 | [`extend`](extend.md) | Amend HEAD with the staged changes, keeping its message |
 | [`reword`](reword.md) | Change any commit's message and restack its descendants |
 | [`uncommit`](uncommit.md) | Undo the last commit(s), keeping the changes staged |

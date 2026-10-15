@@ -147,3 +147,21 @@ auto_restack = true
 # [keys.mine]
 # stage = "S"
 # set-mark = "M-Spc"
+
+# AI tools: rgit runs a command you define and reads the message from its
+# output. See docs/ai.md. A command can only be set in your own files, never
+# in the committed .rgit/config.toml.
+#
+# [ai.claude]
+# command = "claude -p --model haiku --strict-mcp-config --tools \"\""
+# timeout_secs = 120           # stop the tool after this many seconds
+# draft_prompt_file = "prompts/claude-draft.md"   # or draft_prompt = "..."
+# review_prompt_file = "prompts/claude-review.md" # or review_prompt = "..."
+#
+# [commit.ai]
+# draft = "claude"             # tool for `rgit ai draft` and `commit --draft`
+# review = "claude"            # tool for `rgit ai review`
+# rules_file = "~/.claude/skills/commits/SKILL.md"  # or rules = "..."
+# draft_prompt_file = "prompts/draft.md"            # or draft_prompt = "..."
+# review_prompt_file = "prompts/review.md"          # or review_prompt = "..."
+# max_diff_bytes = 100000      # longest diff sent to the prompt

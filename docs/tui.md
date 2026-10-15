@@ -43,6 +43,8 @@ On a section heading, a key acts on every file in that section.
 5. Press `Ctrl-s` to commit.
 
 Press `Esc` in the message box to cancel, or `Ctrl-o` to write the message in `$EDITOR`.
+Press `Ctrl-g` to draft the message with your default AI tool, or `Ctrl-t` to pick the tool first.
+[Draft commit messages with an AI tool](ai.md) shows how to set the tools up.
 
 ## Look at history
 

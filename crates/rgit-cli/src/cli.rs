@@ -866,6 +866,38 @@ impl PrettyArgs {
     }
 }
 
+/// Subcommands of `rgit ai`.
+#[derive(clap::Subcommand)]
+pub enum AiCmd {
+    /// Draft a commit message for the staged changes.
+    Draft {
+        /// The AI tool to run (default: commit.ai.draft).
+        #[arg(long)]
+        tool: Option<String>,
+    },
+    /// Review the staged changes.
+    Review {
+        /// The AI tool to run (default: commit.ai.review).
+        #[arg(long)]
+        tool: Option<String>,
+    },
+    /// Print the prompt a task would use, with the rules filled in.
+    Prompt {
+        /// The task.
+        #[arg(value_enum)]
+        task: AiTask,
+        /// The AI tool whose prompt to show.
+        #[arg(long)]
+        tool: Option<String>,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+pub enum AiTask {
+    Draft,
+    Review,
+}
+
 /// git's `-S[<keyid>]` / `--no-gpg-sign`.
 #[derive(clap::Args, Default, Clone)]
 pub struct SignArgs {
@@ -1286,6 +1318,17 @@ pub enum Command {
         /// Read the commit message from a file (`-` for stdin).
         #[arg(short = 'F', long, value_name = "FILE", conflicts_with = "message")]
         file: Option<String>,
+        /// Draft the message with an AI tool (default: commit.ai.draft), then
+        /// open the editor with it, or commit as is with --no-edit.
+        #[arg(
+            long,
+            value_name = "TOOL",
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "",
+            conflicts_with_all = ["message", "file", "reuse_message", "reedit_message"]
+        )]
+        draft: Option<String>,
         /// Amend the previous commit instead of creating a new one.
         #[arg(long)]
         amend: bool,
@@ -2857,6 +2900,12 @@ pub enum Command {
     Tool {
         /// The tool, e.g. git_status.
         name: String,
+    },
+    /// Draft or review a commit message with an AI tool you configure, or show
+    /// the prompt it gets.
+    Ai {
+        #[command(subcommand)]
+        cmd: AiCmd,
     },
     /// Show rgit's own settings, each with its value and where it came from.
     Settings {
@@ -7501,6 +7550,7 @@ const SKILL_GROUPS: &[(&str, &[&str])] = &[
         "Commit and rewrite history",
         &[
             "commit",
+            "ai",
             "extend",
             "reword",
             "uncommit",
@@ -8290,6 +8340,7 @@ fn run_command(
     Ok(match command {
         Command::Index { action } => index_cmd(backend, action)?,
         Command::Settings { key } => crate::settings::text(key.as_deref())?,
+        Command::Ai { .. } => unreachable!("handled before dispatch"),
         Command::Agent { .. }
         | Command::Tool { .. }
         | Command::Hook {
@@ -8767,6 +8818,7 @@ fn run_command(
             pathspec_file: _,
             message,
             file,
+            draft,
             amend,
             no_edit,
             all,
@@ -8862,8 +8914,22 @@ fn run_command(
                 return Ok(String::from_utf8_lossy(&report.text).into_owned());
             }
             let reuse = reuse_message.as_ref().or(reedit_message.as_ref());
-            let given = file.is_some() || reuse.is_some() || !message.is_empty();
+            let drafted = draft
+                .as_deref()
+                .map(|tool| {
+                    let scope = crate::ai::Scope {
+                        all,
+                        include: include && !paths.is_empty(),
+                        amend,
+                        paths: &paths,
+                    };
+                    crate::ai::draft_message(backend, (!tool.is_empty()).then_some(tool), &scope)
+                })
+                .transpose()?;
+            let given =
+                file.is_some() || reuse.is_some() || !message.is_empty() || drafted.is_some();
             let mut text = match (file.as_deref(), reuse) {
+                _ if drafted.is_some() => drafted.clone().unwrap_or_default(),
                 (Some("-"), _) => std::io::read_to_string(std::io::stdin())?,
                 (Some(f), _) => std::fs::read_to_string(f)
                     .map_err(|e| anyhow::anyhow!("could not read {f}: {e}"))?,
@@ -8887,6 +8953,7 @@ fn run_command(
             // on a terminal; -c only on a terminal, as git would have no one
             // to edit for.
             let use_editor = edit
+                || (!no_edit && drafted.is_some() && interactive)
                 || (!no_edit && reedit_message.is_some() && interactive)
                 || (!given && !no_edit && !fixing && interactive);
             let git_dir = backend.git_dir();

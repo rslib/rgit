@@ -33,6 +33,7 @@
     "label": "Commit and rewrite history",
     "items": [
       "reference/commands/commit",
+      "reference/commands/ai",
       "reference/commands/extend",
       "reference/commands/reword",
       "reference/commands/uncommit",
