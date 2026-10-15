@@ -85,6 +85,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "git_branches",
     "git_lanes_list",
     "git_stack_list",
+    "git_settings",
     "git_workspace_list",
     "git_flow_status",
     "git_config",
@@ -1754,6 +1755,11 @@ fn tools() -> Vec<Tool> {
             &[("name", "string", true)],
         ),
         tool(
+            "git_settings",
+            "rgit's own settings: a table of key, value, source, layer. `key` shows one setting.",
+            &[("key", "string", false)],
+        ),
+        tool(
             "git_stack_new",
             "Create a new branch stacked on the current one.",
             &[("name", "string", true)],
@@ -1766,6 +1772,11 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_stack_restack",
             "Rebase every stacked branch onto its parent's new tip.",
+            none,
+        ),
+        tool(
+            "git_stack_repair",
+            "Fix stack records whose branch or parent no longer exists.",
             none,
         ),
         tool(
@@ -3170,6 +3181,7 @@ const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
     ("worktree", "git_worktrees", &[]),
     ("workspace", "git_workspace_list", &[]),
     ("stack", "git_stack_list", &[]),
+    ("settings", "git_settings", &["key"]),
     ("notes", "git_notes", &[]),
     ("config", "git_config", &["key"]),
     ("apply", "git_apply", &["patch"]),
@@ -4123,11 +4135,13 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             name: a.req("name")?,
         }),
 
+        "git_settings" => Command::Settings { key: a.str("key") },
         "git_stack_new" => stack(StackCmd::New {
             name: a.req("name")?,
         }),
         "git_stack_list" => stack(StackCmd::List),
         "git_stack_restack" => stack(StackCmd::Restack),
+        "git_stack_repair" => stack(StackCmd::Repair),
 
         "git_lanes_list" => lanes(LanesCmd::List),
         "git_lanes_init" => lanes(LanesCmd::Init),

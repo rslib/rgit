@@ -85,9 +85,10 @@ fn init_gitflow_creates_develop_and_sets_config() {
     let backend = Git2Backend::discover(&dir).unwrap();
     workflow::init(&backend, "gitflow").unwrap();
 
-    assert_eq!(
-        backend.config_get("rgit.workflow").unwrap(),
-        Some("gitflow".to_owned())
+    let private = std::fs::read_to_string(dir.join(".git/rgit/config.toml")).unwrap();
+    assert!(
+        private.contains("[workflow]\npreset = \"gitflow\""),
+        "{private}"
     );
     assert!(backend.branch_exists("develop"));
 
@@ -180,8 +181,28 @@ fn status_without_workflow_set_is_err() {
     commit_file(&dir, "f.txt", "v1\n", "A");
 
     let backend = Git2Backend::discover(&dir).unwrap();
-    // No `workflow::init` call: no preset stored in git config.
+    // No `workflow::init` call: no preset stored in the private rgit config file.
     assert!(workflow::status(&backend).is_err());
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn toml_flow_init_writes_private_file_and_keeps_comments() {
+    let dir = init_repo("toml-init");
+    commit_file(&dir, "f.txt", "v1\n", "A");
+    let folder = dir.join(".git").join("rgit");
+    std::fs::create_dir_all(&folder).unwrap();
+    let file = folder.join("config.toml");
+    std::fs::write(&file, "# mine\n[output]\ncompact = true\n").unwrap();
+
+    let backend = Git2Backend::discover(&dir).unwrap();
+    workflow::init(&backend, "trunk").unwrap();
+
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("# mine"), "{text}");
+    assert!(text.contains("compact = true"), "{text}");
+    assert!(text.contains("[workflow]\npreset = \"trunk\""), "{text}");
+    assert_eq!(backend.config_get("rgit.workflow").unwrap(), None);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -220,7 +220,8 @@
       "reference/commands/completion",
       "reference/commands/mcp",
       "reference/commands/tool",
-      "reference/commands/serve"
+      "reference/commands/serve",
+      "reference/commands/settings"
     ]
   }
 ]

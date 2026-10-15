@@ -1,7 +1,7 @@
 //! Stacked branches: a chain of branches each based on the one below, tracked
-//! with a `branch.<name>.rgit-stack-parent` git config key. The mechanics live
+//! with a `parent` entry in the stack file. The mechanics live
 //! in the backend (`stack_parents`, `restack`) so the TUI shares them; this is
-//! the CLI surface. All real branches and real config, so plain git still works.
+//! the CLI surface. All real branches, so plain git still works.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,40 +24,68 @@ pub fn new(backend: &Arc<dyn GitBackend>, name: &str) -> Result<String> {
 
 /// Show the stack containing the current branch, newest on top.
 pub fn list(backend: &Arc<dyn GitBackend>) -> Result<String> {
-    let parent_of: HashMap<String, String> = backend
-        .stack_parents()?
+    let records = rgit_git::stack_file::read(&rgit_git::stack_file::dirs_of(backend.as_ref()))?;
+    let parent_of: HashMap<String, String> = records
         .into_iter()
-        .filter_map(|(b, p)| p.map(|p| (b, p)))
+        .map(|(branch, record)| (branch, record.parent))
         .collect();
     let current = current_branch(backend).ok();
 
     let mut chain = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut cursor = current.clone();
+    let mut missing = false;
     while let Some(branch) = cursor {
+        if !seen.insert(branch.clone()) {
+            break;
+        }
         let parent = parent_of.get(&branch).cloned();
-        chain.push((branch.clone(), parent.clone()));
+        let gone = parent.as_ref().is_some_and(|p| !backend.branch_exists(p));
+        chain.push((branch.clone(), parent.clone(), gone));
+        if gone {
+            missing = true;
+            break;
+        }
         cursor = parent;
     }
     if chain.len() <= 1 && parent_of.is_empty() {
         return Ok("no stacked branches (use `rgit stack new <name>`)".to_owned());
     }
 
-    let lines = chain
+    let mut lines = chain
         .iter()
-        .map(|(branch, parent)| {
+        .map(|(branch, parent, gone)| {
             let mark = if current.as_deref() == Some(branch) {
                 "*"
             } else {
                 " "
             };
             match parent {
+                Some(p) if *gone => format!("{mark} {branch}  (on {p}, missing)"),
                 Some(p) => format!("{mark} {branch}  (on {p})"),
                 None => format!("{mark} {branch}  (base)"),
             }
         })
         .collect::<Vec<_>>()
         .join("\n");
+    if missing {
+        lines.push_str("\nRun `rgit stack repair` to fix missing parents");
+    }
     Ok(lines)
+}
+
+/// Fix stack records whose branch or parent no longer exists.
+pub fn repair(backend: &Arc<dyn GitBackend>) -> Result<String> {
+    let dirs = rgit_git::stack_file::dirs_of(backend.as_ref());
+    let fixes = rgit_git::stack_file::repair(&dirs, |name| backend.branch_exists(name))?;
+    if fixes.is_empty() {
+        return Ok("nothing to repair".to_owned());
+    }
+    Ok(fixes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// Rebase every stacked branch onto its parent's current tip.
@@ -148,9 +176,12 @@ fn retarget_merged_children(
                     .retarget_pull_request(&repo, child_pr.number, &base)
                     .await?;
             }
-            backend
-                .config_set(&format!("branch.{child}.rgit-stack-parent"), &base)
-                .map_err(|error| anyhow!("{error}"))?;
+            rgit_git::stack_file::set_parent(
+                &rgit_git::stack_file::dirs_of(backend.as_ref()),
+                child,
+                &base,
+            )
+            .map_err(|error| anyhow!("{error}"))?;
             retargeted.push(format!("{child} -> {base}"));
         }
         Ok::<_, anyhow::Error>(())

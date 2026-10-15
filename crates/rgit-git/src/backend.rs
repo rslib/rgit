@@ -1267,7 +1267,7 @@ pub trait GitBackend: Send + Sync {
     fn set_credential_prompt(&self, _prompt: Box<dyn crate::CredentialPrompt>) {}
 
     /// Create a new branch stacked on the current one, recording its parent and
-    /// fork point in git config.
+    /// fork point in the stack file.
     fn stack_new(&self, name: &str) -> Result<String, GitError> {
         let parent = self
             .status()?
@@ -1275,21 +1275,24 @@ pub trait GitBackend: Send + Sync {
             .branch
             .ok_or_else(|| GitError::Other("HEAD is detached; not on a branch".into()))?;
         self.create_branch(name)?;
-        self.config_set(&format!("branch.{name}.rgit-stack-parent"), &parent)?;
-        if let Some(tip) = self.branch_tip(&parent)? {
-            self.config_set(&format!("branch.{name}.rgit-stack-base"), &tip)?;
-        }
+        let tip = self.branch_tip(&parent)?;
+        let dirs = crate::stack_file::dirs(self.workdir(), self.common_dir());
+        crate::stack_file::record(&dirs, name, &parent, tip.as_deref())?;
         Ok(format!("created {name} stacked on {parent}"))
     }
 
     /// Each local branch paired with its recorded stacked-branch parent, if any.
     fn stack_parents(&self) -> Result<Vec<(String, Option<String>)>, GitError> {
-        let mut out = Vec::new();
-        for branch in self.local_branches()? {
-            let parent = self.config_get(&format!("branch.{branch}.rgit-stack-parent"))?;
-            out.push((branch, parent));
-        }
-        Ok(out)
+        let dirs = crate::stack_file::dirs(self.workdir(), self.common_dir());
+        let records = crate::stack_file::read(&dirs)?;
+        Ok(self
+            .local_branches()?
+            .into_iter()
+            .map(|branch| {
+                let parent = records.get(&branch).map(|r| r.parent.clone());
+                (branch, parent)
+            })
+            .collect())
     }
 
     /// Rebase every stacked branch onto its parent's current tip (parents
@@ -1308,6 +1311,8 @@ pub trait GitBackend: Send + Sync {
             return Ok(crate::RestackOutcome::default());
         }
         let start = self.status()?.head.branch;
+        let dirs = crate::stack_file::dirs(self.workdir(), self.common_dir());
+        let records = crate::stack_file::read(&dirs)?;
 
         let mut order: Vec<String> = parents.keys().cloned().collect();
         order.sort_by_key(|b| stack_depth(b, &parents));
@@ -1316,8 +1321,7 @@ pub trait GitBackend: Send + Sync {
         let result = (|| -> Result<(), GitError> {
             for branch in &order {
                 let parent = &parents[branch];
-                let base_key = format!("branch.{branch}.rgit-stack-base");
-                let recorded = self.config_get(&base_key)?;
+                let recorded = records.get(branch).and_then(|r| r.base.clone());
                 let current_tip = self.branch_tip(parent)?;
                 // A conflict self-aborts and leaves us back on `branch`; record
                 // it and carry on, so one snag does not strand the whole stack.
@@ -1336,7 +1340,7 @@ pub trait GitBackend: Send + Sync {
                     None => {}
                     Some(Ok(())) => {
                         if let Some(tip) = &current_tip {
-                            self.config_set(&base_key, tip)?;
+                            crate::stack_file::set_base(&dirs, branch, tip)?;
                         }
                         outcome.restacked.push(format!("{branch} -> {parent}"));
                     }

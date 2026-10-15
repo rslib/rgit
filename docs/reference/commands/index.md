@@ -225,3 +225,4 @@ Every rgit command, grouped by task. Options that work with every command are on
 | [`mcp`](mcp.md) | Run the Model Context Protocol server over stdio |
 | [`tool`](tool.md) | Run one MCP tool with its arguments as a JSON object on stdin and print its TOON result, as the pi and omp extension does |
 | [`serve`](serve.md) | Serve the web viewer for this repository, or a directory of repositories |
+| [`settings`](settings.md) | Show rgit's own settings, each with its value and where it came from |

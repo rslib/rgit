@@ -1,9 +1,9 @@
-//! Stable change identity, jj/Gerrit style. Opt-in with `git config
-//! rgit.changeId true`: commits rgit creates then carry a `Change-Id: I<40 hex>`
-//! trailer that is generated once and kept across amend and rebase, so a
-//! logical change keeps one identity even as its commit oid changes. Off by
-//! default, rgit adds no trailer, but an id a commit already has is still kept
-//! when rgit rewrites it.
+//! Stable change identity, jj/Gerrit style. Opt-in with `commit.change_id =
+//! true` in the rgit config file: commits rgit creates then carry a
+//! `Change-Id: I<40 hex>` trailer that is generated once and kept across amend
+//! and rebase, so a logical change keeps one identity even as its commit oid
+//! changes. Off by default, rgit adds no trailer, but an id a commit already
+//! has is still kept when rgit rewrites it.
 
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,14 +44,12 @@ pub fn extract(message: &str) -> Option<String> {
     })
 }
 
-/// The message with a change-id trailer guaranteed present: unchanged if it
-/// already has one, else a freshly generated id appended.
-/// Whether new commits get a Change-Id: the `rgit.changeId` git config, off
-/// by default.
+/// Whether new commits get a Change-Id: the `commit.change_id` setting of the
+/// rgit config files, off by default.
 pub fn enabled(repo: &git2::Repository) -> bool {
-    repo.config()
-        .and_then(|c| c.get_bool("rgit.changeId"))
-        .unwrap_or(false)
+    rgit_config::Settings::load(Some(&crate::stack_file::dirs_of_repo(repo)))
+        .core()
+        .change_id
 }
 
 /// `message` with a fresh Change-Id appended when enabled and none is present.
@@ -128,16 +126,18 @@ mod tests {
         assert!(a[1..].chars().all(|c| c.is_ascii_hexdigit()));
     }
 
-    /// A throwaway repo with `rgit.changeId` set to `on`.
+    /// A throwaway repo whose private rgit config sets `commit.change_id` to `on`.
     fn repo(name: &str, on: bool) -> git2::Repository {
         let dir =
             std::env::temp_dir().join(format!("rgit-changeid-unit-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let repo = git2::Repository::init(&dir).unwrap();
-        repo.config()
-            .unwrap()
-            .set_bool("rgit.changeId", on)
-            .unwrap();
+        rgit_config::set_private(
+            &crate::stack_file::dirs_of_repo(&repo),
+            "commit.change_id",
+            on,
+        )
+        .unwrap();
         repo
     }
 

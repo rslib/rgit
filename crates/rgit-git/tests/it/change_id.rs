@@ -10,15 +10,29 @@ fn scratch(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("rgit-changeid-{}-{name}", std::process::id()))
 }
 
-/// A repo with Change-Id stamping turned on (`rgit.changeId`).
+/// Write the private rgit config file of the repo in `dir`.
+fn private_config(dir: &Path, text: &str) {
+    let folder = dir.join(".git").join("rgit");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("config.toml"), text).unwrap();
+}
+
+/// A repo with Change-Id stamping turned on (`commit.change_id`).
 fn init_repo(name: &str) -> std::path::PathBuf {
-    let dir = init_repo_default(name);
-    git(&dir, &["config", "rgit.changeId", "true"]);
+    let dir = init_repo_bare(name);
+    private_config(&dir, "[commit]\nchange_id = true\n");
     dir
 }
 
-/// A repo with rgit's defaults: no Change-Id stamping.
+/// A repo with Change-Id stamping explicitly off.
 fn init_repo_default(name: &str) -> std::path::PathBuf {
+    let dir = init_repo_bare(name);
+    private_config(&dir, "[commit]\nchange_id = false\n");
+    dir
+}
+
+/// A repo with no rgit config file of its own.
+fn init_repo_bare(name: &str) -> std::path::PathBuf {
     let dir = scratch(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -218,5 +232,30 @@ fn default_commit_has_no_change_id() {
     commit_via_backend(&dir, "fix: subject only");
     assert_eq!(change_id(&dir, "HEAD"), None);
     assert_eq!(message(&dir, "HEAD").trim_end(), "fix: subject only");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn toml_change_id_from_private_file() {
+    let dir = init_repo_bare("toml-private");
+    private_config(&dir, "[commit]\nchange_id = true\n");
+    std::fs::write(dir.join("a.txt"), "1\n").unwrap();
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.stage_all().unwrap();
+    backend.commit("add a").unwrap();
+    assert!(change_id(&dir, "HEAD").is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn toml_git_config_rgit_change_id_is_ignored() {
+    let dir = init_repo_bare("toml-gitconfig");
+    private_config(&dir, "");
+    git(&dir, &["config", "rgit.changeId", "true"]);
+    std::fs::write(dir.join("a.txt"), "1\n").unwrap();
+    let backend = Git2Backend::discover(&dir).unwrap();
+    backend.stage_all().unwrap();
+    backend.commit("add a").unwrap();
+    assert!(change_id(&dir, "HEAD").is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }

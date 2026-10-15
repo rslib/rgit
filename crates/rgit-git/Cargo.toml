@@ -23,6 +23,7 @@ libz-sys = "1"
 # Over that zlib too, so tgz and zip match git's bytes.
 flate2 = { version = "1", features = ["zlib"] }
 libc = "0.2"
+rgit-config.workspace = true
 grep = "0.4"
 ignore = "0.4"
 rayon = "1"

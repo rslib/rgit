@@ -6,6 +6,8 @@ All `forge` commands then work with `forgejo:OWNER/REPO` targets or with the Git
 ## Point a profile at your host
 
 Add a profile to `~/.config/rgit/config.toml` (`RGIT_CONFIG` overrides the path).
+The same keys also work in the repo files, `.rgit/config.toml` and `.git/rgit/config.toml`.
+[config.example.toml](config.example.toml) lists them all.
 Name `forgejo` as the provider and your host as the host.
 
 ```toml

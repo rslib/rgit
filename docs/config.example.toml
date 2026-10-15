@@ -1,12 +1,33 @@
 # rgit configuration.
 #
-# Copy to one of (first that exists wins):
-#   $RGIT_CONFIG
-#   $XDG_CONFIG_HOME/rgit/config.toml
-#   ~/.config/rgit/config.toml
+# Settings come from layers. The last layer that sets a key wins:
+#   1. The global file, the first of these:
+#        $RGIT_CONFIG
+#        $XDG_CONFIG_HOME/rgit/config.toml
+#        ~/.config/rgit/config.toml
+#   2. The shared repo file, <repo>/.rgit/config.toml. Commit it to share
+#      settings with your team. It cannot set `forge` keys, because a cloned
+#      repo must not choose where your token goes.
+#   3. The private repo file, .git/rgit/config.toml. It is not committed and
+#      linked worktrees share it.
+#   4. The RGIT_OUTPUT environment variable, which sets output.format.
+# Outside a repo only the global file and the environment apply.
 #
-# Every key is optional; omitted keys keep their defaults. Unknown keys are an
-# error (so typos surface instead of being silently ignored).
+# Every key is optional; omitted keys keep their defaults. An unknown key or a
+# file that does not parse prints a warning, and the other keys still apply.
+# Run `rgit settings` to see each value and where it came from.
+
+[output]
+# How commands print: "human" (git's text), "json" or "toon". Unset means TOON
+# under an agent harness and human text elsewhere.
+# format = "human"
+# Print rgit's compact forms of status, diff, log, show and blame.
+# compact = false
+
+[workflow]
+# The branching workflow, set by `rgit flow init <preset>` in the private repo
+# file: gitflow, github, gitlab, trunk or release-flow.
+# preset = "trunk"
 
 [theme]
 # Built-in palette: mono, catppuccin, gruvbox, nord, dracula, tokyonight,
@@ -90,6 +111,8 @@ gpg_sign = false
 # After an amend, reword, or extend, rebase branches stacked on the rewritten
 # commit onto its new tip (jj/Sapling style). Set false to keep amend local.
 auto_restack = true
+# Add a Change-Id trailer to commits that rgit makes. See docs/change-id.md.
+# change_id = false
 
 # Rebind actions PER PROFILE, under [keys.<profile>]. Each profile has its own
 # table, so you can configure emacs and vim independently in one file - only the

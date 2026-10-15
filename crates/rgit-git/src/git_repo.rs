@@ -3321,6 +3321,8 @@ impl GitBackend for Git2Backend {
         self.logged("delete branch", || {
             let repo = self.repo();
             let mut branch = repo.find_branch(name, BranchType::Local)?;
+            let dirs = crate::stack_file::dirs_of_repo(&repo);
+            crate::stack_file::read(&dirs)?;
             if !force {
                 let tip = branch.get().peel_to_commit()?.id();
                 let merged = repo
@@ -3339,7 +3341,7 @@ impl GitBackend for Git2Backend {
                 }
             }
             branch.delete()?;
-            Ok(())
+            crate::stack_file::remove(&dirs, name)
         })
     }
 
@@ -4162,9 +4164,11 @@ impl GitBackend for Git2Backend {
     fn rename_branch(&self, old: &str, new: &str) -> Result<(), GitError> {
         self.logged("rename branch", || {
             let repo = self.repo();
+            let dirs = crate::stack_file::dirs_of_repo(&repo);
+            crate::stack_file::read(&dirs)?;
             repo.find_branch(old, BranchType::Local)?
                 .rename(new, false)?;
-            Ok(())
+            crate::stack_file::rename(&dirs, old, new)
         })
     }
 
@@ -4594,6 +4598,8 @@ impl GitBackend for Git2Backend {
         self.logged("prune", || {
             let repo = self.repo();
             let base_oid = repo.rev_single(base)?.peel_to_commit()?.id();
+            let dirs = crate::stack_file::dirs_of_repo(&repo);
+            crate::stack_file::read(&dirs)?;
             let current_ref: Option<String> = repo
                 .head()
                 .ok()
@@ -4619,6 +4625,7 @@ impl GitBackend for Git2Backend {
                 // Merged when base descends from the branch tip (tip is an ancestor).
                 if repo.graph_descendant_of(base_oid, tip).unwrap_or(false) {
                     branch.delete()?;
+                    crate::stack_file::remove(&dirs, &name)?;
                     deleted.push(name);
                 }
             }

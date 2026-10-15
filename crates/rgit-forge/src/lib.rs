@@ -60,8 +60,6 @@ pub enum ForgeError {
     MissingRepository,
     #[error("forge profile {0:?} is not configured")]
     UnknownProfile(String),
-    #[error("cannot read forge profile config {}: {detail}", path.display())]
-    ConfigRead { path: PathBuf, detail: String },
     #[error("cannot parse forge profile config {}: {detail}", path.display())]
     ConfigParse { path: PathBuf, detail: String },
 }

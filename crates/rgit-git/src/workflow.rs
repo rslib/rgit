@@ -1,9 +1,9 @@
 //! Built-in branching workflows. The user picks a preset (gitflow, github,
 //! gitlab, trunk, release-flow) once; a single verb set (start / finish /
 //! release) then behaves per that preset's policy. The active preset is stored
-//! in git config under `rgit.workflow`, so nothing is forced: ignore these and
-//! rgit is still a plain git tool. Lives in the backend so the CLI and TUI share
-//! it.
+//! in the private rgit config file as `workflow.preset`, so nothing is forced:
+//! ignore these and rgit is still a plain git tool. Lives in the backend so the
+//! CLI and TUI share it.
 
 use crate::backend::GitBackend;
 use crate::error::GitError;
@@ -127,7 +127,8 @@ fn policy(preset: &str, backend: &dyn GitBackend) -> Result<Policy, GitError> {
 }
 
 fn active(backend: &dyn GitBackend) -> Result<Policy, GitError> {
-    match backend.config_get("rgit.workflow")? {
+    let settings = rgit_config::Settings::load(Some(&crate::stack_file::dirs_of(backend)));
+    match settings.core().workflow_preset {
         Some(preset) => policy(&preset, backend),
         None => Err(err("no workflow set; run `rgit flow init <preset>` first")),
     }
@@ -144,7 +145,12 @@ fn current_branch(backend: &dyn GitBackend) -> Result<String, GitError> {
 /// Set the active workflow and prepare any long-lived branches it needs.
 pub fn init(backend: &dyn GitBackend, preset: &str) -> Result<String, GitError> {
     let p = policy(preset, backend)?;
-    backend.config_set("rgit.workflow", p.preset)?;
+    rgit_config::set_private(
+        &crate::stack_file::dirs_of(backend),
+        "workflow.preset",
+        p.preset,
+    )
+    .map_err(|e| err(e.to_string()))?;
 
     let mut notes = vec![format!("workflow set to {}", p.preset)];
     if let Some(dev) = &p.integration

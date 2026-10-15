@@ -14,11 +14,11 @@ people at a terminal.
   already carry an output flag, so following them stays in the same mode.
 - `--toon` (alias `--axi`) picks TOON explicitly and still works; `--json`
   prints the same data as JSON, and its hints carry `--json`.
-- `--human` (or `RGIT_OUTPUT=human`, or config `rgit.output=human`) prints
+- `--human` (or `RGIT_OUTPUT=human`, or `output.format = "human"` in the rgit config file) prints
   git's text, as does a shell no harness marker names.
 - Use `--toon` rather than `--porcelain`, which, as in git, exists only on
   `status` and prints git's raw script format.
-- `--compact` (or `git config rgit.compact true`) prints rgit's older compact
+- `--compact` (or `output.compact = true` in the rgit config file) prints rgit's older compact
   human forms of `status`, `diff`, `log`, `show` and `blame`.
 - `--fields a,b` adds columns to a table (an unknown field lists the valid ones).
 - `--full` prints long text (patches, commit bodies) without truncation.

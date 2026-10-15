@@ -18,7 +18,7 @@ mod theme;
 mod ui;
 mod watch;
 
-pub use config::{Config, load as load_config};
+pub use config::Config;
 pub use runtime::run;
 
 /// The TUI's key table as `(group, [(keys, action)])`, for the docs.

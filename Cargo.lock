@@ -5082,6 +5082,7 @@ dependencies = [
  "open",
  "portable-pty",
  "regex",
+ "rgit-config",
  "rgit-forge",
  "rgit-git",
  "rgit-index",
@@ -5100,6 +5101,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rgit-config"
+version = "0.0.5"
+dependencies = [
+ "serde",
+ "tempfile",
+ "toml",
+ "toml_edit",
+]
+
+[[package]]
 name = "rgit-forge"
 version = "0.0.5"
 dependencies = [
@@ -5109,9 +5120,11 @@ dependencies = [
  "open",
  "rand 0.10.3",
  "reqwest",
+ "rgit-config",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "toml",
@@ -5138,6 +5151,7 @@ dependencies = [
  "rayon",
  "reflink-copy",
  "regex",
+ "rgit-config",
  "russh",
  "sha1",
  "thiserror 2.0.21",
@@ -5193,12 +5207,14 @@ dependencies = [
  "open",
  "ratatui",
  "reqwest",
+ "rgit-config",
  "rgit-forge",
  "rgit-git",
  "rgit-index",
  "rgit-model",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
