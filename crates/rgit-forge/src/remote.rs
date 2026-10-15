@@ -20,13 +20,28 @@ impl RemoteTarget {
     pub fn parse(url: &str, configured: &[(Provider, String)]) -> Result<Self, ForgeError> {
         let value = url.trim().trim_end_matches(".git");
         let (host, path) = split_authority(value)?;
-        let matched = Provider::configured_match(host, configured);
+        // A `host:port` that nothing knows falls back to the bare host.
+        let bare = match host.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                name
+            }
+            _ => host,
+        };
+        let matched = Provider::configured_match(host, configured)
+            .or_else(|| Provider::configured_match(bare, configured));
         let provider = Provider::from_host(host, configured)
+            .or_else(|| Provider::from_host(bare, configured))
             .ok_or_else(|| ForgeError::UnsupportedHost(host.to_owned()))?;
+        // An ssh port is not the web port, so the web host drops it.
+        let web_host = if value.starts_with("ssh://") || !value.contains("://") {
+            bare
+        } else {
+            host
+        };
         let connect_host = match matched {
             Some((_, value)) if value.contains("://") => value.trim_end_matches('/').to_owned(),
             Some((_, value)) => format!("https://{}", value.trim().trim_end_matches('/')),
-            None => format!("https://{host}"),
+            None => format!("https://{web_host}"),
         };
         Ok(Self {
             provider,
@@ -91,6 +106,36 @@ mod tests {
         assert_eq!(target.provider, Provider::Gitlab);
         assert_eq!(target.host, "https://code.example.com:2222");
         assert_eq!(target.repo.to_string(), "group/project");
+    }
+
+    #[test]
+    fn an_ssh_port_does_not_hide_a_known_host() {
+        let target =
+            RemoteTarget::parse("ssh://git@github.com:22/owner/repo.git", &[]).expect("github");
+        assert_eq!(target.provider, Provider::Github);
+        assert_eq!(target.host, "https://github.com");
+        assert_eq!(target.repo.to_string(), "owner/repo");
+
+        let target = RemoteTarget::parse(
+            "ssh://git@code.example.com:2222/group/project.git",
+            &[(Provider::Gitlab, "https://code.example.com".to_owned())],
+        )
+        .expect("configured without the ssh port");
+        assert_eq!(target.provider, Provider::Gitlab);
+        assert_eq!(target.host, "https://code.example.com");
+    }
+
+    #[test]
+    fn an_https_port_stays_in_the_host() {
+        let target = RemoteTarget::parse(
+            "https://code.example.com:8443/group/project.git",
+            &[(Provider::Gitlab, "code.example.com".to_owned())],
+        )
+        .expect("configured host");
+        assert_eq!(target.host, "https://code.example.com");
+        let target = RemoteTarget::parse("https://gitlab.com:8443/group/project.git", &[])
+            .expect("known host with a web port");
+        assert_eq!(target.host, "https://gitlab.com:8443");
     }
 
     #[test]
