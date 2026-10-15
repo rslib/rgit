@@ -1402,3 +1402,38 @@ fn untracked_folder_files_skip_ignored_and_nested_repos() {
     );
     assert_eq!(listing.total, 2);
 }
+
+#[test]
+fn discover_through_a_git_file_keeps_its_folder_as_the_workdir() {
+    let base = scratch("gitfile");
+    std::fs::create_dir_all(base.join("store")).unwrap();
+    let work = base.join("work");
+    git(
+        &base,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            base.join("store/gd").to_str().unwrap(),
+            work.to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir_all(work.join("sub")).unwrap();
+    std::fs::write(work.join("sub/a.txt"), "a\n").unwrap();
+    let work = work.canonicalize().unwrap();
+
+    for start in [work.clone(), work.join("sub")] {
+        let backend = Git2Backend::discover(&start).unwrap();
+        assert_eq!(
+            backend.workdir().canonicalize().unwrap(),
+            work,
+            "from {start:?}"
+        );
+        let status = backend.status().unwrap();
+        assert!(
+            status.entries.iter().any(|e| e.path == "sub/"),
+            "from {start:?}: {:?}",
+            status.entries
+        );
+    }
+}

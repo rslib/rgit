@@ -101,10 +101,15 @@ impl Git2Backend {
         crate::ssh::register();
         crate::config::env_search_paths();
         let start = start.as_ref();
-        let repo = Repository::discover(start).map_err(|e| match e.code() {
-            ErrorCode::NotFound => GitError::NotARepository(start.to_path_buf()),
-            _ => GitError::Git(e),
-        })?;
+        // Not Repository::discover: it reopens the git dir it finds and so
+        // loses the `.git` file link, putting the workdir beside the git dir.
+        // CROSS_FS keeps its search across file systems.
+        let no_ceilings: [&std::ffi::OsStr; 0] = [];
+        let repo = Repository::open_ext(start, git2::RepositoryOpenFlags::CROSS_FS, no_ceilings)
+            .map_err(|e| match e.code() {
+                ErrorCode::NotFound => GitError::NotARepository(start.to_path_buf()),
+                _ => GitError::Git(e),
+            })?;
         Self::from_repo(repo)
     }
 
