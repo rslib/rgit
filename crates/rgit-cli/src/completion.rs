@@ -96,16 +96,34 @@ fn status_paths(
     let up = prefix
         .as_deref()
         .map_or(0, |p| p.split('/').filter(|c| !c.is_empty()).count());
-    let outside_ok = current.to_string_lossy().starts_with("../");
+    let typed = current.to_string_lossy();
+    let outside_ok = typed.starts_with("../");
+    // Status folds an untracked folder into `dir/`. List its files only once
+    // the cwd or the typed path is inside it, as git's completion does.
+    let reaches = |dir: &str| {
+        prefix
+            .as_deref()
+            .is_some_and(|p| p.starts_with(dir) || format!("{p}{typed}").starts_with(dir))
+    };
     let paths = status
         .entries
         .into_iter()
         .filter(|e| wanted(e))
-        .filter_map(|e| {
+        .flat_map(|e| {
+            if e.is_untracked() && e.path.ends_with('/') && reaches(&e.path) {
+                backend
+                    .folder_files(&e.path)
+                    .map(|f| f.files)
+                    .unwrap_or_default()
+            } else {
+                vec![e.path]
+            }
+        })
+        .filter_map(|path| {
             let prefix = prefix.as_deref()?;
-            match e.path.strip_prefix(prefix) {
+            match path.strip_prefix(prefix) {
                 Some(rest) => Some(rest.to_owned()),
-                None if outside_ok => Some(format!("{}{}", "../".repeat(up), e.path)),
+                None if outside_ok => Some(format!("{}{}", "../".repeat(up), path)),
                 None => None,
             }
         });

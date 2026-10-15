@@ -282,6 +282,30 @@ fn values_stage_from_a_subfolder_gives_paths_relative_to_it() {
 }
 
 #[test]
+fn values_stage_offers_an_untracked_folder_then_its_files() {
+    let dir = repo("values-untracked-dir");
+    std::fs::create_dir_all(dir.join("newdir/deep")).unwrap();
+    std::fs::write(dir.join("newdir/a.rs"), "a\n").unwrap();
+    std::fs::write(dir.join("newdir/deep/b.rs"), "b\n").unwrap();
+
+    let top = candidates(&dir, &["stage", ""]);
+    assert!(top.contains(&"newdir/".to_owned()), "{top:?}");
+    assert!(!top.iter().any(|c| c.ends_with(".rs")), "{top:?}");
+
+    let inside = candidates(&dir, &["stage", "newdir/"]);
+    assert!(inside.contains(&"newdir/a.rs".to_owned()), "{inside:?}");
+    assert!(
+        inside.contains(&"newdir/deep/b.rs".to_owned()),
+        "{inside:?}"
+    );
+    assert_eq!(
+        candidates(&dir, &["stage", "newdir/de"]),
+        ["newdir/deep/b.rs"]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn values_numbers_offer_nothing() {
     let dir = repo("values-number");
     git(&dir, &["branch", "feature"]);
