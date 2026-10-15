@@ -362,8 +362,8 @@ fn tag_delete_removes_every_named_tag() {
     assert!(out.contains("nope"), "{out}");
     assert_eq!(git(&dir, &["tag"]), "");
 
-    let out = ok(&dir, &["tag", "-d", "gone", "--toon"]);
-    assert!(out.contains("no-op"), "{out}");
+    let out = fails(&dir, &["tag", "-d", "gone", "--toon"]);
+    assert!(out.contains("tag 'gone' not found."), "{out}");
     fails(&dir, &["tag", "x", "y", "z"]);
 }
 
@@ -528,8 +528,8 @@ fn branch_takes_git_forms() {
         ok(&dir, &["--human", "branch", "--show-current"]).trim(),
         "main"
     );
-    let out = ok(&dir, &["branch", "feat", "--toon"]);
-    assert!(out.contains("no-op"), "{out}");
+    let out = fails(&dir, &["branch", "feat", "--toon"]);
+    assert!(out.contains("already exists"), "{out}");
     fails(&dir, &["--human", "branch", "feat"]);
 
     for filter in [

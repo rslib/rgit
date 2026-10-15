@@ -649,7 +649,8 @@ fn die(error: anyhow::Error, emit: &Emit) -> ! {
         }
         exit(code);
     }
-    let (message, help, code) = output::translate(&error);
+    let (message, help, _) = output::translate(&error);
+    let (_, code) = output::human(&error, emit.command.as_deref());
     fail(message, help, code, emit.mode)
 }
 
@@ -1532,6 +1533,7 @@ fn usage_exit(e: clap::Error, args: &[String]) -> ! {
         exit(code);
     }
 
+    let (_, code) = git_usage_error(&e, args, &cmd, &path);
     if e.kind() == ErrorKind::MissingRequiredArgument {
         let names = missing_argument_names(&e);
         let message = match names.as_slice() {
@@ -1546,7 +1548,7 @@ fn usage_exit(e: clap::Error, args: &[String]) -> ! {
                 format!("usage: {usage}"),
                 format!("Run `{path} --help` for details"),
             ],
-            2,
+            code,
             mode,
         );
     }
@@ -1606,7 +1608,7 @@ fn usage_exit(e: clap::Error, args: &[String]) -> ! {
             help.push(format!("valid flags for `{path}`: {}", flags.join(", ")));
         }
     }
-    fail(message, help, 2, mode)
+    fail(message, help, code, mode)
 }
 
 /// Write `text` to stdout, ignoring a closed pipe (`rgit help | head`).
@@ -1791,6 +1793,9 @@ fn git_usage_error(
                 .filter(|a| a.starts_with('-'))
                 .last()
                 .map_or(arg.as_str(), String::as_str);
+            if typed == "-n" && matches!(sub, "log" | "show" | "whatchanged" | "rev-list") {
+                return ("error: -n requires an argument\n".to_owned(), 128);
+            }
             let text = match typed.strip_prefix("--") {
                 Some(long) => format!("error: option `{long}' requires a value\n"),
                 None => format!(
@@ -1799,6 +1804,13 @@ fn git_usage_error(
                 ),
             };
             (text, 129)
+        }
+        ErrorKind::ValueValidation
+            if matches!(sub, "log" | "show" | "whatchanged" | "rev-list")
+                && first.contains("invalid digit") =>
+        {
+            let value = context(ContextKind::InvalidValue).unwrap_or_default();
+            (format!("fatal: '{value}': not an integer\n"), 128)
         }
         ErrorKind::ArgumentConflict => {
             let other = context(ContextKind::PriorArg)

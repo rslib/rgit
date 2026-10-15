@@ -5673,6 +5673,10 @@ impl GitBackend for Git2Backend {
         crate::plumbing::merge_bases(&self.repo(), a, b, all)
     }
 
+    fn fork_point(&self, refname: &str, commit: &str) -> Result<Option<String>, GitError> {
+        crate::plumbing::fork_point(&self.repo(), refname, commit)
+    }
+
     fn reflog(&self, name: &str) -> Result<Vec<crate::ReflogItem>, GitError> {
         crate::plumbing::reflog(&self.repo(), name)
     }

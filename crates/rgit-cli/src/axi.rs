@@ -31,6 +31,7 @@ pub fn run(
     crate::cli::apply_diff_opts(backend, &command)?;
     let done = done_message(&command);
     let next = next_steps(&command);
+    crate::cli::log_exit_code(backend, &command)?;
     let restores = matches!(&command, Command::Checkout { pathspec, paths, .. }
         if !pathspec.is_empty() || !paths.is_empty());
     let finish = |text: String| {
@@ -180,7 +181,7 @@ pub fn run(
                     anyhow::Error::new(crate::cli::CliError {
                         message: format!("no file {path} in this repository"),
                         help: Some("Run `rgit ls-files` to list tracked files".to_owned()),
-                        code: 1,
+                        code: 128,
                     })
                 }
                 other => other.into(),
@@ -328,7 +329,11 @@ pub fn run(
                 && opts.args.len() == 1
                 && backend.local_branches()?.contains(&opts.args[0]) =>
         {
-            Output::message(format!("branch {} already exists (no-op)", opts.args[0]))
+            return Err(anyhow::Error::new(crate::cli::CliError {
+                message: format!("a branch named '{}' already exists", opts.args[0]),
+                help: None,
+                code: 128,
+            }));
         }
         Command::Branch {
             cmd: Some(BranchCmd::Delete { names, .. }),
@@ -337,17 +342,6 @@ pub fn run(
             "branch {} does not exist (no-op)",
             names.join(", ")
         )),
-        Command::Branch { cmd: None, opts }
-            if (opts.delete || opts.force_delete)
-                && !opts.remotes
-                && !opts.args.is_empty()
-                && !any_branch_exists(backend, &opts.args)? =>
-        {
-            Output::message(format!(
-                "branch {} does not exist (no-op)",
-                opts.args.join(", ")
-            ))
-        }
         Command::Tag { names, opts } if opts.is_listing(&names) && opts.format.is_none() => {
             let tags = crate::cli::tag_list(backend, &names, &opts)?;
             let info: std::collections::HashMap<String, rgit_git::TagInfo> = backend
@@ -395,12 +389,11 @@ pub fn run(
                 && names.len() == 1
                 && tag_exists(backend, &names[0])? =>
         {
-            Output::message(format!("tag {} already exists (no-op)", names[0]))
-        }
-        Command::Tag { names, opts }
-            if opts.delete && !names.is_empty() && !any_tag_exists(backend, &names)? =>
-        {
-            Output::message(format!("tag {} does not exist (no-op)", names.join(", ")))
+            return Err(anyhow::Error::new(crate::cli::CliError {
+                message: format!("tag '{}' already exists", names[0]),
+                help: None,
+                code: 128,
+            }));
         }
         Command::Stash {
             cmd:
@@ -499,12 +492,6 @@ pub fn run(
                     code: 1,
                 }));
             }
-        }
-        Command::Remote {
-            cmd: Some(RemoteCmd::Remove { name }),
-            ..
-        } if !backend.remotes()?.iter().any(|r| r.name == name) => {
-            Output::message(format!("remote {name} does not exist (no-op)"))
         }
         Command::Worktree {
             cmd:

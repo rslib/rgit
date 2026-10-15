@@ -617,6 +617,19 @@ pub(crate) fn list_objects(
     Ok(out)
 }
 
+/// git's `merge-base --fork-point <refname> <commit>`: where `commit` left the
+/// history `refname` has had, by its reflog.
+pub(crate) fn fork_point(
+    repo: &Repository,
+    refname: &str,
+    commit: &str,
+) -> Result<Option<String>, GitError> {
+    let full = repo.resolve_reference_from_short_name(refname)?;
+    let name = full.name().unwrap_or(refname);
+    let head = commit_id(repo, commit)?;
+    Ok(crate::rebase::fork_point(repo, name, head).map(|o| o.to_string()))
+}
+
 pub(crate) fn merge_bases(
     repo: &Repository,
     a: &str,

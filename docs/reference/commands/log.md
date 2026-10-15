@@ -57,6 +57,7 @@ rgit log --merges --cc --oneline
 | `-L` | `RANGE:FILE` | Trace the history of lines `START,END:FILE` (`/regex/`, `+N` allowed) or function `:NAME:FILE`, with their diffs (git's -L) |
 | `-g, --walk-reflogs` |  | Walk reflog entries (of HEAD, or the refs given) instead of history |
 | `--parents` |  | Print each commit's parents after it (the nearest shown ones under path limits) |
+| `--exit-code` |  | Exit 1 when a shown commit changes a file, 0 when none does |
 | `--left-right` |  | Mark each commit with the side of a symmetric range it is on (`&lt;`, `&gt;`) |
 | `--cherry-pick` |  | Leave out commits whose change the other side of a symmetric range has too |
 | `--cherry-mark` |  | Mark commits whose change the other side has too `=`, the others `+` |

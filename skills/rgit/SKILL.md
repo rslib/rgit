@@ -23,13 +23,13 @@ If `rgit` is not on PATH, install it with `cargo install --locked --git https://
 - Use `--toon` or `--axi`, not `--porcelain`. In rgit, as in git, `--porcelain` exists only on `status` and prints git's raw script format, with no counts, hints, or schema.
 - Output ends with `help` lines naming useful next commands, already carrying `--toon` (or `--json`); follow them. Lists include counts (`count: 20 of 65 total`) and say explicitly when they are empty.
 - `--fields a,b` adds table columns; an unknown field lists the valid ones. `--full` disables truncation of patches, commit bodies, and long output.
-- Exit codes: 0 success (including no-ops), 1 error, 2 usage error. With `--toon` or `--json`, errors print `error:` and `help:` on stdout.
+- Exit codes are git's, the same in every output mode: 0 success (including no-ops), 1 no result or error, 128 fatal error, 129 usage error. With `--toon` or `--json`, errors print `error:` and `help:` on stdout.
 - rgit never prompts with `--toon` or `--json`, or when stdin or stdout is not a terminal. Pass every value as a flag or argument.
 
 ## Safety
 
 - Almost every change is recorded in the op-log. `rgit undo` restores HEAD and the working tree (including uncommitted work) from before the last operation; `rgit redo` reverses it; `rgit oplog` lists it.
-- Repeating a change whose result already holds is a no-op (exit 0), for example creating an existing branch or deleting a missing tag.
+- Repeating a change whose result already holds is a no-op (exit 0), for example rgit's own `branch create` and `branch delete`, and the MCP tools that create or delete a branch, tag or remote. The git spellings exit as git does: `branch main` of an existing branch exits 128, and `branch -d`, `tag -d` of a missing name exit 1.
 - Destructive forge operations require `--yes`.
 - rgit runs git's plumbing too (`rgit rev-parse`, `rgit ls-files`, `rgit cat-file`, `rgit for-each-ref`). Use `rgit git <args>` only for a git tool that rgit does not have, such as `git lfs`.
 

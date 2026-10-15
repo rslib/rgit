@@ -3,6 +3,7 @@ mod agent_install;
 mod compat_errors;
 mod completion;
 mod credentials;
+mod exit_codes;
 mod fast_import;
 mod flags;
 mod globals;

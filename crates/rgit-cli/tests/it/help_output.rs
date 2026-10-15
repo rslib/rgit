@@ -191,7 +191,7 @@ fn missing_argument_names() {
 
     // TOON: the missing positional is named, with the usage and the hint.
     let toon = rgit(&dir, &[], &["--toon", "branch", "create"]);
-    assert_eq!(toon.status.code(), Some(2), "{:?}", toon);
+    assert_eq!(toon.status.code(), Some(129), "{:?}", toon);
     let text = stdout(&toon);
     assert!(text.contains("missing required argument: <NAME>"), "{text}");
     assert!(text.contains("usage: rgit branch create"), "{text}");
@@ -202,7 +202,7 @@ fn missing_argument_names() {
 
     // JSON: a missing required flag is named in the error field.
     let json_out = rgit(&dir, &[], &["--json", "reword"]);
-    assert_eq!(json_out.status.code(), Some(2), "{:?}", json_out);
+    assert_eq!(json_out.status.code(), Some(129), "{:?}", json_out);
     let value: serde_json::Value = serde_json::from_str(&stdout(&json_out)).expect("json envelope");
     assert_eq!(
         value["error"],

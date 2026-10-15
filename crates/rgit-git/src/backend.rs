@@ -1454,6 +1454,9 @@ pub trait GitBackend: Send + Sync {
     /// The best common ancestor of two commits, or all of them.
     fn merge_bases(&self, a: &str, b: &str, all: bool) -> Result<Vec<String>, GitError>;
 
+    /// Where `commit` left the history `refname` has had, by its reflog.
+    fn fork_point(&self, refname: &str, commit: &str) -> Result<Option<String>, GitError>;
+
     /// A ref's reflog, newest first.
     fn reflog(&self, name: &str) -> Result<Vec<crate::ReflogItem>, GitError>;
 

@@ -409,7 +409,6 @@ pub fn human(error: &anyhow::Error, command: Option<&str>) -> (String, i32) {
     let git = error.downcast_ref::<GitError>();
     let cli = error.downcast_ref::<CliError>();
     let fatal = |m: &str| (format!("fatal: {m}"), 128);
-    let error_line = |m: &str| (format!("error: {m}"), 1);
     match git {
         Some(GitError::NotARepository(_)) => return fatal(NOT_A_REPO),
         Some(GitError::Bare(_)) => return fatal("this operation must be run in a work tree"),
@@ -522,10 +521,41 @@ pub fn human(error: &anyhow::Error, command: Option<&str>) -> (String, i32) {
     {
         return ambiguous(arg);
     }
-    if let Some((_, rest)) = message.split_once("cannot locate local branch '")
+    if command == Some("branch")
+        && let Some((_, rest)) = message.split_once("cannot locate local branch '")
         && let Some((name, _)) = rest.split_once('\'')
     {
-        return error_line(&format!("branch '{name}' not found"));
+        return fatal(&format!("no branch named '{name}'"));
+    }
+    if let Some(rest) = message.strip_prefix("failed to write reference 'refs/heads/")
+        && let Some((name, why)) = rest.split_once('\'')
+        && why.contains("already exists")
+    {
+        return fatal(&format!("a branch named '{name}' already exists"));
+    }
+    if command == Some("reflog")
+        && let Some(rest) = message.strip_prefix("no reference found for shorthand '")
+        && let Some((name, _)) = rest.split_once('\'')
+    {
+        return ambiguous(name);
+    }
+    if matches!(command, Some("apply" | "hash-object"))
+        && let Some(rest) = message.strip_prefix("cannot read ")
+        && let Some((path, why)) = rest.split_once(": ")
+    {
+        let why = why.split(" (os error").next().unwrap_or(why);
+        return if command == Some("apply") {
+            (format!("error: can't open patch '{path}': {why}"), 128)
+        } else {
+            fatal(&format!("could not open '{path}' for reading: {why}"))
+        };
+    }
+    if command == Some("commit")
+        && let Some(rest) = message.strip_prefix("could not read ")
+        && let Some((path, why)) = rest.split_once(": ")
+    {
+        let why = why.split(" (os error").next().unwrap_or(why);
+        return fatal(&format!("could not read log file '{path}': {why}"));
     }
     if command == Some("stash") && message == "reference 'refs/stash' not found" {
         return ("No stash entries found.".to_owned(), 1);
@@ -546,9 +576,14 @@ pub fn human(error: &anyhow::Error, command: Option<&str>) -> (String, i32) {
         || message.starts_with("invalid reference: ")
         || message.contains(", source=")
         || message.starts_with("no such path '")
-        || message == "Needed a single revision";
+        || message.starts_with("invalid upstream '")
+        || message.starts_with("bad boolean config value")
+        || message.starts_with("could not open '")
+        || message == "tag already exists"
+        || message.starts_with("tag '") && message.ends_with("already exists")
+        || message.starts_with("a branch named '") && message.ends_with("already exists");
     if is_fatal || cli.is_some_and(|c| c.code == 128) {
-        return fatal(&message);
+        return fatal(message.split(" (os error").next().unwrap_or(&message));
     }
     match cli.map(|c| c.code) {
         Some(2) if message.starts_with("usage: ") => (message, 129),
@@ -559,6 +594,8 @@ pub fn human(error: &anyhow::Error, command: Option<&str>) -> (String, i32) {
         {
             (format!("error: {message}"), 129)
         }
+        Some(2) if message == "reference does not exist" => (format!("error: {message}"), 2),
+        Some(2) if message.starts_with("No such remote") => (format!("error: {message}"), 2),
         Some(2) => fatal(&message),
         _ => (format!("error: {message}"), code),
     }

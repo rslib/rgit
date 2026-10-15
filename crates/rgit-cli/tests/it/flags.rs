@@ -504,7 +504,7 @@ fn porcelain_unknown_flag_is_usage_error_on_stdout() {
         .current_dir(&dir)
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(129));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.starts_with("error: "), "{stdout}");
     assert!(stdout.contains("diff --help` for its"), "{stdout}");

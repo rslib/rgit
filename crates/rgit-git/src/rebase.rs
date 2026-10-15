@@ -1431,7 +1431,7 @@ fn patch_id(repo: &Repository, commit: &Commit) -> Option<Oid> {
 
 /// git's `merge-base --fork-point`: the newest commit of `refname`'s reflog
 /// that `head` is built on.
-fn fork_point(repo: &Repository, refname: &str, head: Oid) -> Option<Oid> {
+pub(crate) fn fork_point(repo: &Repository, refname: &str, head: Oid) -> Option<Oid> {
     let reflog = repo.reflog(refname).ok()?;
     let mut tips: Vec<Oid> = reflog.iter().map(|e| e.id_new()).collect();
     tips.extend(repo.refname_to_id(refname));

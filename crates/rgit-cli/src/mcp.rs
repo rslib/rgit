@@ -1955,7 +1955,7 @@ fn tools() -> Vec<Tool> {
         tool(
             "git_tag_create",
             "Create a tag at `rev` (default HEAD; annotated when `message` is given; `force` \
-             replaces one). A no-op when it exists.",
+             replaces one). A no-op when it exists and no `rev` is given.",
             &[
                 ("name", "string", true),
                 ("rev", "string", false),
@@ -3024,6 +3024,46 @@ const GREP_SHOWN: usize = 100;
 const FILES_SHOWN: usize = 200;
 
 /// Run one tool call to the object `rgit --toon` would print for it.
+/// The result of a tag or remote tool that repeats a change whose result
+/// already holds: the CLI's git spellings fail there, the tools succeed.
+fn noop(
+    backend: &Arc<dyn GitBackend>,
+    tool: &str,
+    command: &Command,
+) -> anyhow::Result<Option<crate::output::Output>> {
+    let tags = || -> anyhow::Result<Vec<String>> {
+        Ok(backend.all_tags()?.into_iter().map(|t| t.name).collect())
+    };
+    Ok(match (tool, command) {
+        ("git_tag_create", Command::Tag { names, opts })
+            if !opts.force && names.len() == 1 && tags().is_ok_and(|t| t.contains(&names[0])) =>
+        {
+            Some(crate::output::Output::message(format!(
+                "tag {} already exists (no-op)",
+                names[0]
+            )))
+        }
+        ("git_tag_delete", Command::Tag { names, .. })
+            if !names.is_empty() && !tags()?.iter().any(|t| names.contains(t)) =>
+        {
+            Some(crate::output::Output::message(format!(
+                "tag {} does not exist (no-op)",
+                names.join(", ")
+            )))
+        }
+        (
+            "git_remote_remove",
+            Command::Remote {
+                cmd: Some(RemoteCmd::Remove { name }),
+                ..
+            },
+        ) if !backend.remotes()?.iter().any(|r| &r.name == name) => Some(
+            crate::output::Output::message(format!("remote {name} does not exist (no-op)")),
+        ),
+        _ => None,
+    })
+}
+
 fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> anyhow::Result<Obj> {
     let a = Args { tool: name, args };
     let fields = a.strings("fields")?;
@@ -3031,7 +3071,11 @@ fn dispatch(backend: &Arc<dyn GitBackend>, name: &str, args: &Value) -> anyhow::
     let since = backend.index_second();
     let watch = rgit_git::watch_hooks(&backend.git_dir());
     let output = match command(&a)? {
-        Some(command) => crate::axi::run(backend, command, false),
+        Some(command) => match noop(backend, name, &command) {
+            Ok(Some(done)) => Ok(done),
+            Ok(None) => crate::axi::run(backend, command, false),
+            Err(e) => Err(e),
+        },
         None => local(backend, &a, full),
     };
     let _ = backend.smudge_racy(since);
@@ -3504,6 +3548,7 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             line_ranges: a.strs("line_range").unwrap_or_default(),
             walk_reflogs: false,
             parents: false,
+            exit_code: false,
             walk: WalkArgs {
                 left_right: a.flag("left_right"),
                 cherry_pick: a.flag("cherry_pick"),
@@ -4956,8 +5001,9 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
         "git_merge_base" => Command::Plumbing(Plumbing::MergeBase {
             all: a.flag("all"),
             is_ancestor: a.flag("is_ancestor"),
+            fork_point: false,
             a: a.req("a")?,
-            b: a.req("b")?,
+            b: Some(a.req("b")?),
         }),
         "git_reflog" => Command::Plumbing(Plumbing::Reflog {
             max_count: a.num("max_count")?.map(|n| n as usize),
@@ -5681,6 +5727,59 @@ mod tests {
             "result: v1-dirty"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn noop_tag_delete_missing() {
+        let dir = init_repo("noop-tag-delete");
+        let backend = open(&dir);
+        let out = call(&backend, "git_tag_delete", json!({ "name": "nope" })).unwrap();
+        assert!(out.contains("tag nope does not exist (no-op)"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn noop_tag_create_existing() {
+        let dir = init_repo("noop-tag-create");
+        let backend = open(&dir);
+        call(&backend, "git_tag_create", json!({ "name": "v1" })).unwrap();
+        let out = call(&backend, "git_tag_create", json!({ "name": "v1" })).unwrap();
+        assert!(out.contains("tag v1 already exists (no-op)"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn noop_tag_create_existing_with_rev_errors() {
+        let dir = init_repo("noop-tag-create-rev");
+        let backend = open(&dir);
+        call(&backend, "git_tag_create", json!({ "name": "v1" })).unwrap();
+        std::fs::write(dir.join("f.txt"), "second change\nmore\n").unwrap();
+        git(&dir, &["commit", "-qam", "second"]);
+        let err = call(
+            &backend,
+            "git_tag_create",
+            json!({ "name": "v1", "rev": "HEAD" }),
+        );
+        assert!(err.is_err(), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn noop_remote_remove_missing() {
+        let dir = init_repo("noop-remote-remove");
+        let backend = open(&dir);
+        let out = call(&backend, "git_remote_remove", json!({ "name": "nope" })).unwrap();
+        assert!(out.contains("remote nope does not exist (no-op)"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn noop_branch_delete_missing() {
+        let dir = init_repo("noop-branch-delete");
+        let backend = open(&dir);
+        let out = call(&backend, "git_branch_delete", json!({ "name": "nope" })).unwrap();
+        assert!(out.contains("branch nope does not exist (no-op)"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

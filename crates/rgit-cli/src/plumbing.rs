@@ -86,6 +86,7 @@ fn reflog_change(
             } else if raw {
                 Err(fail(raw, true, ""))
             } else {
+                crate::cli::set_exit_code(1);
                 Ok(Output::new(String::new()).with("exists", false))
             }
         }
@@ -116,6 +117,19 @@ fn fail(raw: bool, quiet: bool, message: impl Into<String>) -> anyhow::Error {
         },
         help: None,
         code: 1,
+    })
+}
+
+/// A failure git reports as fatal (128), or with exit 1 and no text under `-q`.
+fn fail_fatal(raw: bool, quiet: bool, message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(CliError {
+        message: if raw && quiet {
+            String::new()
+        } else {
+            message.into()
+        },
+        help: None,
+        code: if quiet { 1 } else { 128 },
     })
 }
 
@@ -555,8 +569,17 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             if exists {
                 return match backend.resolve_object(&spec) {
                     Ok(_) => Ok(Output::new(String::new()).with("exists", true)),
+                    Err(_)
+                        if !spec.bytes().all(|b| b.is_ascii_hexdigit())
+                            || ![40, 64].contains(&spec.len()) =>
+                    {
+                        Err(fatal(format!("Not a valid object name {spec}")))
+                    }
                     Err(_) if raw => Err(fail(raw, true, "")),
-                    Err(_) => Ok(Output::new(String::new()).with("exists", false)),
+                    Err(_) => {
+                        crate::cli::set_exit_code(1);
+                        Ok(Output::new(String::new()).with("exists", false))
+                    }
                 };
             }
             if kind || size {
@@ -653,7 +676,9 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                         None if p == "HEAD" && !head => {
                             found.push((backend.resolve_object("HEAD")?, "HEAD".to_owned()))
                         }
-                        None => return Err(fail(raw, quiet, format!("'{p}' - not a valid ref"))),
+                        None => {
+                            return Err(fail_fatal(raw, quiet, format!("'{p}' - not a valid ref")));
+                        }
                     }
                 }
             } else {
@@ -670,8 +695,11 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                     }
                 }
             }
-            if found.is_empty() && raw {
-                return Err(fail(raw, true, ""));
+            if found.is_empty() {
+                if raw {
+                    return Err(fail(raw, true, ""));
+                }
+                crate::cli::set_exit_code(1);
             }
             let mut out = Vec::new();
             let mut rows = Vec::new();
@@ -786,13 +814,29 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
         Plumbing::MergeBase {
             all,
             is_ancestor,
+            fork_point,
             a,
             b,
         } => {
+            if fork_point {
+                let commit = b.unwrap_or_else(|| "HEAD".to_owned());
+                return match backend.fork_point(&a, &commit)? {
+                    Some(id) => Ok(lines(format!("{id}\n"))),
+                    None if raw => Err(fail(raw, true, "")),
+                    None => {
+                        crate::cli::set_exit_code(1);
+                        Ok(lines(String::new()))
+                    }
+                };
+            }
+            let b = b.unwrap_or_default();
             if is_ancestor {
                 let yes = backend.is_ancestor(&a, &b)?;
-                if !yes && raw {
-                    return Err(fail(raw, true, ""));
+                if !yes {
+                    if raw {
+                        return Err(fail(raw, true, ""));
+                    }
+                    crate::cli::set_exit_code(1);
                 }
                 return Ok(Output::new(String::new()).with("ancestor", yes));
             }
@@ -992,8 +1036,11 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
                     None => {}
                 }
             }
-            if !any && raw {
-                return Err(fail(raw, true, ""));
+            if !any {
+                if raw {
+                    return Err(fail(raw, true, ""));
+                }
+                crate::cli::set_exit_code(1);
             }
             let text = if quiet {
                 String::new()
@@ -1042,7 +1089,7 @@ pub fn run(backend: &Arc<dyn GitBackend>, command: Plumbing, raw: bool) -> anyho
             match backend.symbolic_ref(&name).ok().flatten() {
                 Some(t) => lines(format!("{}\n", if short { shorten(&t) } else { t })),
                 None => {
-                    return Err(fail(
+                    return Err(fail_fatal(
                         raw,
                         quiet,
                         format!("ref {name} is not a symbolic ref"),
@@ -2493,13 +2540,17 @@ fn var(backend: &Arc<dyn GitBackend>, list: bool, name: Option<String>) -> anyho
         return Ok(lines(terminated(out, false)));
     }
     let Some(name) = name else {
-        return Err(CliError::usage("var needs a variable name, or -l"));
+        return Err(CliError::usage("usage: rgit var (-l | <variable>)"));
     };
     if !GIT_VARS.contains(&name.as_str()) {
-        return Err(CliError::usage(format!(
-            "unknown variable {name}; use one of {}",
-            GIT_VARS.join(", ")
-        )));
+        return Err(anyhow::Error::new(CliError {
+            message: "usage: rgit var (-l | <variable>)".to_owned(),
+            help: Some(format!(
+                "unknown variable {name}; use one of {}",
+                GIT_VARS.join(", ")
+            )),
+            code: 2,
+        }));
     }
     match value(&name) {
         Some(values) => Ok(lines(terminated(values, false))),
@@ -4162,8 +4213,11 @@ pub(crate) fn grep(
             }
         }
     }
-    if rows.is_empty() && raw {
-        return Err(fail(raw, true, ""));
+    if rows.is_empty() {
+        if raw {
+            return Err(fail(raw, true, ""));
+        }
+        crate::cli::set_exit_code(1);
     }
     if quiet {
         text.clear();

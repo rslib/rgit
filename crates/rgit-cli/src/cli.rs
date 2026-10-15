@@ -1007,6 +1007,9 @@ pub enum Command {
         /// path limits).
         #[arg(long)]
         parents: bool,
+        /// Exit 1 when a shown commit changes a file, 0 when none does.
+        #[arg(long = "exit-code")]
+        exit_code: bool,
         #[command(flatten)]
         walk: WalkArgs,
         #[command(flatten)]
@@ -3248,10 +3251,14 @@ pub enum Plumbing {
         /// Exit 0 if the first commit is an ancestor of the second, else 1.
         #[arg(long = "is-ancestor")]
         is_ancestor: bool,
-        /// The first commit.
+        /// Where the commit left the history the ref has had, by its reflog.
+        #[arg(long = "fork-point", conflicts_with_all = ["all", "is_ancestor"])]
+        fork_point: bool,
+        /// The first commit; with --fork-point, the ref.
         a: String,
-        /// The second commit.
-        b: String,
+        /// The second commit (default HEAD with --fork-point).
+        #[arg(required_unless_present = "fork_point")]
+        b: Option<String>,
     },
     /// Show where a ref pointed over time (`git reflog [show] [REF]`), or
     /// `expire [--expire=<date>] [--expire-unreachable=<date>] [--all]
@@ -7415,7 +7422,7 @@ pub const HOME_HELP: [&str; 5] = [
     "Run `rgit smartlog` for local branches and stacks",
 ];
 
-/// An error with a fix to suggest and its own exit code (2 = usage).
+/// An error with a fix to suggest and its own exit code (129 = usage).
 #[derive(Debug)]
 pub struct CliError {
     pub message: String,
@@ -7673,13 +7680,13 @@ const SKILL_RULES: &str = r#"
 - Use `--toon` or `--axi`, not `--porcelain`. In rgit, as in git, `--porcelain` exists only on `status` and prints git's raw script format, with no counts, hints, or schema.
 - Output ends with `help` lines naming useful next commands, already carrying `--toon` (or `--json`); follow them. Lists include counts (`count: 20 of 65 total`) and say explicitly when they are empty.
 - `--fields a,b` adds table columns; an unknown field lists the valid ones. `--full` disables truncation of patches, commit bodies, and long output.
-- Exit codes: 0 success (including no-ops), 1 error, 2 usage error. With `--toon` or `--json`, errors print `error:` and `help:` on stdout.
+- Exit codes are git's, the same in every output mode: 0 success (including no-ops), 1 no result or error, 128 fatal error, 129 usage error. With `--toon` or `--json`, errors print `error:` and `help:` on stdout.
 - rgit never prompts with `--toon` or `--json`, or when stdin or stdout is not a terminal. Pass every value as a flag or argument.
 
 ## Safety
 
 - Almost every change is recorded in the op-log. `rgit undo` restores HEAD and the working tree (including uncommitted work) from before the last operation; `rgit redo` reverses it; `rgit oplog` lists it.
-- Repeating a change whose result already holds is a no-op (exit 0), for example creating an existing branch or deleting a missing tag.
+- Repeating a change whose result already holds is a no-op (exit 0), for example rgit's own `branch create` and `branch delete`, and the MCP tools that create or delete a branch, tag or remote. The git spellings exit as git does: `branch main` of an existing branch exits 128, and `branch -d`, `tag -d` of a missing name exit 1.
 - Destructive forge operations require `--yes`.
 - rgit runs git's plumbing too (`rgit rev-parse`, `rgit ls-files`, `rgit cat-file`, `rgit for-each-ref`). Use `rgit git <args>` only for a git tool that rgit does not have, such as `git lfs`.
 
@@ -8181,6 +8188,7 @@ pub fn run(
     interactive: bool,
 ) -> anyhow::Result<String> {
     let render = apply_diff_opts(backend, &command)?;
+    log_exit_code(backend, &command)?;
     let out = run_command(backend, command, interactive)?;
     let out = crate::diffopts::prefix_lines(&out, &render.line_prefix);
     match render.output {
@@ -9744,6 +9752,9 @@ fn run_command(
                 render_branch_rows(backend, &branch_rows(backend, &opts)?, &opts)?
             }
             None => branch_change(backend, opts, interactive)?,
+            Some(BranchCmd::Create { name, .. }) if backend.local_branches()?.contains(&name) => {
+                format!("branch {name} already exists (no-op)")
+            }
             Some(BranchCmd::Create { name, start: None }) => ok(backend.create_branch(&name))?,
             Some(BranchCmd::Create {
                 name,
@@ -9753,6 +9764,12 @@ fn run_command(
                 ok(backend.checkout_branch(&name))?
             }
             Some(BranchCmd::Checkout { name }) => ok(backend.checkout_branch(&name))?,
+            Some(BranchCmd::Delete { names, .. })
+                if !names.is_empty()
+                    && !backend.local_branches()?.iter().any(|b| names.contains(b)) =>
+            {
+                format!("branch {} does not exist (no-op)", names.join(", "))
+            }
             Some(BranchCmd::Delete { names, force }) if !names.is_empty() => {
                 delete_branches(backend, &names, force)?
             }
@@ -10049,7 +10066,10 @@ fn run_command(
                 }
                 "ok".to_owned()
             }
-            Some(RemoteCmd::Remove { name }) => ok(backend.remove_remote(&name))?,
+            Some(RemoteCmd::Remove { name }) => {
+                no_such_remote(backend, &name, &format!("No such remote: '{name}'"))?;
+                ok(backend.remove_remote(&name))?
+            }
             Some(RemoteCmd::SetUrl {
                 name,
                 url,
@@ -10059,6 +10079,7 @@ fn run_command(
                 delete,
             }) => ok(backend.edit_remote_urls(&name, &url, old.as_deref(), push, add, delete))?,
             Some(RemoteCmd::GetUrl { name, push, all }) => {
+                no_such_remote(backend, &name, &format!("No such remote '{name}'"))?;
                 let urls = backend.remote_urls(&name, push)?;
                 if all {
                     urls.join("\n")
@@ -10095,6 +10116,13 @@ fn run_command(
                 };
                 let mut out = Vec::new();
                 for name in &names {
+                    if !backend.remotes()?.iter().any(|r| &r.name == name) {
+                        return Err(anyhow::Error::new(CliError {
+                            message: format!("'{name}' does not appear to be a git repository"),
+                            help: None,
+                            code: 128,
+                        }));
+                    }
                     out.push(remote_show(backend, name, !no_query)?);
                 }
                 out.join("\n")
@@ -13694,6 +13722,18 @@ fn branch_lines(
     Ok(lines)
 }
 
+/// git's exit 2 for a remote subcommand that names a remote that is not there.
+fn no_such_remote(backend: &Arc<dyn GitBackend>, name: &str, message: &str) -> anyhow::Result<()> {
+    if backend.remotes()?.iter().any(|r| r.name == name) {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(CliError {
+        message: message.to_owned(),
+        help: None,
+        code: 2,
+    }))
+}
+
 /// Delete each of `names`, reporting every failure rather than stopping at
 /// the first.
 fn delete_branches(
@@ -15448,6 +15488,38 @@ fn diff_out_plain(files: &[rgit_git::FileDiff], format: DiffFormat, indent: usiz
     } else {
         render::diffstat(files)
     }
+}
+
+/// `log --exit-code`: exit 1 when a commit the log shows changes a file.
+pub(crate) fn log_exit_code(
+    backend: &Arc<dyn GitBackend>,
+    command: &Command,
+) -> anyhow::Result<()> {
+    let Command::Log {
+        exit_code: true,
+        walk_reflogs: false,
+        ..
+    } = command
+    else {
+        return Ok(());
+    };
+    let opts = log_options(backend, command)?;
+    let mut changed = false;
+    for e in backend.log(&opts)?.iter().filter(|e| e.parents.len() < 2) {
+        changed = !backend
+            .diff(&rgit_git::DiffSpec {
+                from: e.parents.first().cloned(),
+                to: Some(e.oid.clone()),
+                paths: opts.paths.clone(),
+                ..Default::default()
+            })?
+            .is_empty();
+        if changed {
+            break;
+        }
+    }
+    set_exit(changed);
+    Ok(())
 }
 
 /// The log walk a `rgit log` command asks for.
