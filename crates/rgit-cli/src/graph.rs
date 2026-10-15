@@ -5,6 +5,7 @@
 enum State {
     Padding,
     Skip,
+    PreRoot,
     PreCommit,
     Commit,
     PostMerge,
@@ -62,6 +63,16 @@ pub struct Graph {
     /// Each column's color, alongside `columns` and `new_columns`.
     colors: Vec<usize>,
     new_colors: Vec<usize>,
+    /// Whether each column holds a non-first parent of a merge, which the
+    /// merge's edge already connects, alongside `columns` and `new_columns`.
+    merge_parents: Vec<bool>,
+    new_merge_parents: Vec<bool>,
+    commit_in_columns: bool,
+    is_visual_root: bool,
+    visual_root_depth: usize,
+    visual_root_cascade: bool,
+    /// Indent visual roots (git's `--graph-indent`, `log.graphIndent`).
+    pub indent: bool,
     default_color: usize,
     color: bool,
     mapping: Vec<i32>,
@@ -91,6 +102,13 @@ impl Graph {
             new_columns: Vec::new(),
             colors: Vec::new(),
             new_colors: Vec::new(),
+            merge_parents: Vec::new(),
+            new_merge_parents: Vec::new(),
+            commit_in_columns: false,
+            is_visual_root: false,
+            visual_root_depth: 0,
+            visual_root_cascade: false,
+            indent: true,
             default_color: COLORS.len() - 1,
             color: crate::render::color_on(),
             mapping: Vec::new(),
@@ -101,14 +119,51 @@ impl Graph {
     }
 
     /// Move to the next commit; `parents` are its parents that are shown.
-    pub fn update(&mut self, commit: &str, parents: Vec<String>) {
+    /// `root` says whether it could be a visual root: not a boundary and with
+    /// no parent in the log. `ahead` holds the next two commits that will be
+    /// shown, each with that same answer.
+    pub fn update(
+        &mut self,
+        commit: &str,
+        parents: Vec<String>,
+        root: bool,
+        ahead: &[(&str, bool)],
+    ) {
         self.commit = commit.to_owned();
         self.parents = parents;
         self.prev_commit_index = self.commit_index;
         self.update_columns();
+        let next_has_column = ahead
+            .first()
+            .is_some_and(|(c, _)| self.find_new_column(c).is_some());
+        let next_is_root = ahead.len() >= 2 && ahead[0].1;
+        // A merge's edge already connects its later parents, and a commit
+        // with nothing below it, or whose next commit sits in another column,
+        // ends the graph as it is.
+        self.is_visual_root = root
+            && !(self.commit_in_columns && self.merge_parents[self.commit_index])
+            && !ahead.is_empty()
+            && (!next_has_column || self.visual_root_depth > 0);
+        if self.is_visual_root {
+            if self.visual_root_depth == 0 && next_is_root {
+                self.visual_root_cascade = true;
+            }
+            if !next_is_root
+                && self.visual_root_depth > 0
+                && self.visual_root_depth.is_multiple_of(4)
+            {
+                self.visual_root_cascade = false;
+            }
+            self.visual_root_depth += 1;
+        } else {
+            self.visual_root_depth = 0;
+            self.visual_root_cascade = false;
+        }
         self.expansion_row = 0;
         self.state = if self.state != State::Padding {
             State::Skip
+        } else if self.needs_pre_root_line() {
+            State::PreRoot
         } else if self.needs_pre_commit_line() {
             State::PreCommit
         } else {
@@ -130,6 +185,7 @@ impl Graph {
     }
 
     fn insert_into_new_columns(&mut self, commit: &str, idx: i32) {
+        let initial_merge_layout = self.merge_layout;
         let i = match self.find_new_column(commit) {
             Some(i) => i,
             None => {
@@ -140,6 +196,7 @@ impl Graph {
                 };
                 self.new_columns.push(commit.to_owned());
                 self.new_colors.push(color);
+                self.new_merge_parents.push(false);
                 self.new_columns.len() - 1
             }
         };
@@ -166,13 +223,18 @@ impl Graph {
             self.width += 2;
         }
         self.mapping[mapping_idx as usize] = i as i32;
+        if self.num_parents() > 1 && initial_merge_layout >= 0 && idx > -1 {
+            self.new_merge_parents[i] = true;
+        }
     }
 
     fn update_columns(&mut self) {
         std::mem::swap(&mut self.columns, &mut self.new_columns);
         std::mem::swap(&mut self.colors, &mut self.new_colors);
+        std::mem::swap(&mut self.merge_parents, &mut self.new_merge_parents);
         self.new_columns.clear();
         self.new_colors.clear();
+        self.new_merge_parents.clear();
         let max_new = self.columns.len() + self.num_parents();
         if self.mapping.len() < 2 * max_new {
             self.mapping.resize(2 * max_new, -1);
@@ -187,12 +249,14 @@ impl Graph {
         self.edges_added = 0;
 
         let mut seen_this = false;
+        self.commit_in_columns = true;
         let num_columns = self.columns.len();
         for i in 0..=num_columns {
             let col_commit = if i == num_columns {
                 if seen_this {
                     break;
                 }
+                self.commit_in_columns = false;
                 self.commit.clone()
             } else {
                 self.columns[i].clone()
@@ -213,6 +277,11 @@ impl Graph {
                 }
             } else {
                 self.insert_into_new_columns(&col_commit, -1);
+                if self.merge_parents[i]
+                    && let Some(j) = self.find_new_column(&col_commit)
+                {
+                    self.new_merge_parents[j] = true;
+                }
             }
         }
         while self.mapping_size > 1 && self.mapping[self.mapping_size - 1] < 0 {
@@ -228,6 +297,28 @@ impl Graph {
         self.num_parents() >= 3
             && self.commit_index + 1 < self.columns.len()
             && (self.expansion_row as i32) < self.num_dashed_parents() * 2
+    }
+
+    fn needs_pre_root_line(&self) -> bool {
+        self.commit_in_columns
+            && self.is_visual_root
+            && !self.columns.is_empty()
+            && !self.visual_root_cascade
+            && self.indent
+    }
+
+    /// The row that bends the branch line over to an indented visual root.
+    fn pre_root(&mut self, line: &mut Line) {
+        for i in 0..self.columns.len() {
+            if self.columns[i] == self.commit {
+                line.push(' ');
+                line.col('\\', self.colors[i]);
+            } else {
+                line.col('|', self.colors[i]);
+            }
+            line.push(' ');
+        }
+        self.set_state(State::Commit);
     }
 
     fn is_mapping_correct(&self) -> bool {
@@ -316,6 +407,12 @@ impl Graph {
             let color = self.colors.get(i).copied().unwrap_or(COLORS.len());
             if is_commit {
                 seen_this = true;
+                if self.is_visual_root && self.indent {
+                    let shift = self.visual_root_depth - usize::from(self.visual_root_cascade);
+                    let padding = (shift % 4) * 2;
+                    line.push_n(' ', padding);
+                    self.width += padding;
+                }
                 line.push(self.mark);
                 if self.num_parents() > 2 {
                     self.octopus(line);
@@ -490,6 +587,7 @@ impl Graph {
         match self.state {
             State::Padding => self.padding(&mut line),
             State::Skip => self.skip(&mut line),
+            State::PreRoot => self.pre_root(&mut line),
             State::PreCommit => self.pre_commit(&mut line),
             State::Commit => {
                 self.commit_line(&mut line);

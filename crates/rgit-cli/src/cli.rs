@@ -821,6 +821,13 @@ pub struct PrettyArgs {
     /// Draw the commit graph in ASCII, as git does.
     #[arg(long)]
     pub graph: bool,
+    /// Indent a graph commit whose parents are not shown when more commits
+    /// follow it (default: log.graphIndent, else on).
+    #[arg(long, overrides_with = "no_graph_indent")]
+    pub graph_indent: bool,
+    /// Do not indent such graph commits.
+    #[arg(long, overrides_with = "graph_indent")]
+    pub no_graph_indent: bool,
     /// Name the refs at each commit (default: only on a terminal).
     #[arg(
         long,
@@ -855,6 +862,19 @@ pub struct PrettyArgs {
 }
 
 impl PrettyArgs {
+    /// Refuse `--[no-]graph-indent` without `--graph`, as git does.
+    pub(crate) fn check(&self) -> anyhow::Result<()> {
+        if (self.graph_indent || self.no_graph_indent) && !self.graph {
+            return Err(CliError {
+                message: "the option '--[no-]graph-indent' requires '--graph'".to_owned(),
+                help: None,
+                code: 128,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn any(&self) -> bool {
         self.format.is_some()
             || self.pretty.is_some()
@@ -8379,6 +8399,18 @@ fn run_command(
             ..
         } if pretty.any() || !line_ranges.is_empty() => {
             let graph = pretty.graph;
+            pretty.check()?;
+            let indent = if pretty.graph_indent || pretty.no_graph_indent {
+                pretty.graph_indent
+            } else {
+                backend
+                    .config_get("log.graphIndent")
+                    .ok()
+                    .flatten()
+                    .is_none_or(|v| {
+                        !matches!(v.to_lowercase().as_str(), "false" | "no" | "off" | "0")
+                    })
+            };
             let opts = log_options(backend, &command)?;
             if !line_ranges.is_empty() {
                 return line_log(backend, &opts, pretty, line_ranges);
@@ -8451,7 +8483,13 @@ fn run_command(
                             .collect()
                     })
                     .collect();
-                graph_log(&pretty, &commits, &parents, &diffs, format)
+                // git indents a commit with no parent in the log, unless it
+                // is a boundary.
+                let roots: Vec<bool> = entries
+                    .iter()
+                    .map(|e| e.mark != Some('-') && !e.parents.iter().any(|p| shown.contains(p)))
+                    .collect();
+                graph_log(&pretty, &commits, &parents, &roots, indent, &diffs, format)
             } else {
                 pretty_log(&pretty, &commits, &diffs, format)
             }
@@ -16094,10 +16132,13 @@ fn graph_log(
     pretty: &crate::pretty::Pretty,
     commits: &[crate::pretty::Commit],
     parents: &[Vec<String>],
+    roots: &[bool],
+    indent: bool,
     diffs: &[Sections],
     format: DiffFormat,
 ) -> String {
     let mut graph = crate::graph::Graph::new();
+    graph.indent = indent;
     let mut out = String::new();
     let mut missing_newline = false;
     let mut shown = false;
@@ -16105,7 +16146,10 @@ fn graph_log(
         for (k, (from, changes)) in diffs[i].iter().enumerate() {
             // Later `-m` sections of a merge continue below its graph line.
             if k == 0 {
-                graph.update(&c.id, parents[i].clone());
+                let ahead: Vec<(&str, bool)> = (i + 1..commits.len().min(i + 3))
+                    .map(|j| (commits[j].id.as_str(), roots[j]))
+                    .collect();
+                graph.update(&c.id, parents[i].clone(), roots[i], &ahead);
                 graph.mark = pretty.graph_mark(c);
             }
             if shown && !pretty.terminator {
@@ -16540,11 +16584,18 @@ fn blame_git(
         };
         people.insert(&b.id, who);
     }
+    let marks = |b: &rgit_git::BlameLine| {
+        usize::from(b.boundary && !blank && !format.annotate)
+            + usize::from(mark_unblamable && b.unblamable)
+            + usize::from(mark_ignored && b.ignored)
+    };
+    // git widens the column by the most marks any line prints.
+    let widest = lines.iter().map(marks).max().unwrap_or(0);
     let length = match format.abbrev {
         _ if format.long_ids => 40,
         Some(0) => 40,
-        Some(n) => (n.max(4) + 1).min(40),
-        None => abbrev + 1,
+        Some(n) => (n.clamp(4, 40) + widest).min(40),
+        None => (abbrev + widest).min(40),
     };
     let show_name = format.show_name || lines.iter().any(|b| b.orig_path != path);
     let longest_file = lines.iter().map(|b| b.orig_path.len()).max().unwrap_or(0);
@@ -16561,28 +16612,21 @@ fn blame_git(
         let (name, time, offset) = &people[b.id.as_str()];
         let hex = if b.id.is_empty() {
             "0".repeat(40)
+        } else if b.boundary && blank {
+            " ".repeat(40)
         } else {
             b.id.clone()
         };
-        let mut length = length;
-        if b.boundary {
-            if blank {
-                out.push_str(&" ".repeat(length));
-                length = 0;
-            } else if !format.annotate {
-                length -= 1;
-                out.push('^');
-            }
+        if b.boundary && !blank && !format.annotate {
+            out.push('^');
         }
-        if mark_unblamable && b.unblamable && length > 0 {
-            length -= 1;
+        if mark_unblamable && b.unblamable {
             out.push('*');
         }
-        if mark_ignored && b.ignored && length > 0 {
-            length -= 1;
+        if mark_ignored && b.ignored {
             out.push('?');
         }
-        out.push_str(&hex[..length.min(40)]);
+        out.push_str(&hex[..length.saturating_sub(marks(b)).min(40)]);
         let date = if format.raw_time {
             let tz = crate::pretty::format_date(*time, *offset, "raw");
             format!("{time} {}", tz.split(' ').nth(1).unwrap_or("+0000"))

@@ -486,6 +486,84 @@ fn log_walks_like_git() {
         &["log", "-g", "-2", "--format=%gd %gs %h"],
         &["log", "--pretty=medium", "-g", "-1"],
     ];
+    for args in crate::since(2, 56, cases, GRAPH_INDENT) {
+        same(&dir, args);
+    }
+}
+
+/// Graphs that git 2.56 draws with a visual root indented.
+const GRAPH_INDENT: &[&[&str]] = &[
+    &[
+        "log",
+        "--oneline",
+        "--graph",
+        "--left-right",
+        "--cherry-mark",
+        "topic...main",
+    ],
+    &[
+        "log",
+        "--oneline",
+        "--graph",
+        "--no-graph-indent",
+        "--left-right",
+        "--cherry-mark",
+        "topic...main",
+    ],
+    &[
+        "-c",
+        "log.graphIndent=false",
+        "log",
+        "--oneline",
+        "--graph",
+        "--left-right",
+        "--cherry-mark",
+        "topic...main",
+    ],
+];
+
+#[test]
+fn graph_indents_visual_roots_like_git() {
+    if !crate::git_at_least(2, 56) {
+        eprintln!("skipping: git predates 2.56 visual roots");
+        return;
+    }
+    let dir = repo("roots");
+    for (n, name) in (10..).zip(["r1", "r2", "r3", "r4", "r5", "r6"]) {
+        git(&dir, &["checkout", "-q", "--orphan", name]);
+        git(&dir, &["rm", "-rqf", "."]);
+        commit(&dir, n, &[(&format!("{name}.txt"), "r\n")], name);
+    }
+    git(&dir, &["checkout", "-q", "main"]);
+    git_at(
+        &dir,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "--allow-unrelated-histories",
+            "r1",
+            "-m",
+            "Merge r1",
+        ],
+        20,
+    );
+    let cases: &[&[&str]] = &[
+        &["log", "--oneline", "--graph", "--all"],
+        &["log", "--oneline", "--graph", "--all", "--date-order"],
+        &["log", "--oneline", "--graph", "--all", "--no-graph-indent"],
+        &["log", "--oneline", "--graph", "r2", "r3", "main"],
+        &["log", "--oneline", "--graph", "--all", "-5"],
+        &["log", "--graph", "--format=%s%n%b", "--all"],
+        &[
+            "log",
+            "--oneline",
+            "--graph",
+            "--boundary",
+            "main~1..r4",
+            "main",
+        ],
+    ];
     for args in cases {
         same(&dir, args);
     }
@@ -918,53 +996,62 @@ fn blame_follows_git_options() {
     let dir = blame_repo("blame-options");
     let ws = git(&dir, &["rev-parse", "HEAD~3"]);
     std::fs::write(dir.join("ignore-revs"), format!("# spacing\n{ws}")).unwrap();
-    all_same(
-        &dir,
-        &[
-            &["blame", "-t", "a.c"],
-            &["blame", "--root", "a.c"],
-            &["blame", "-w", "-t", "a.c"],
-            &["blame", "-n", "-f", "-t", "d.txt"],
-            &["blame", "-M", "-t", "d.txt"],
-            &["blame", "-M5", "-t", "d.txt"],
-            &["blame", "-C", "-t", "c.txt"],
-            &["blame", "-C", "-C", "-t", "c.txt"],
-            &["blame", "-C", "-C", "-C", "-t", "c.txt"],
-            &["blame", "-C10", "-C", "-n", "-t", "c.txt"],
-            &["blame", "--porcelain", "-M", "d.txt"],
-            &["blame", "--line-porcelain", "-C", "-C", "c.txt"],
-            &["blame", "-L", ":helper", "-t", "a.c"],
-            &["blame", "-L", "/return/,+2", "-t", "a.c"],
-            &["blame", "-L", "1,2", "-L", "5,6", "-t", "a.c"],
-            &["blame", "-L", "5,6", "-L", "/other/", "-t", "a.c"],
-            &["blame", "-L", "^/int/,-1", "-t", "a.c"],
-            &["blame", "-L", "2,1", "--porcelain", "a.c"],
-            &["blame", "HEAD~2..", "-t", "a.c"],
-            &["blame", "--first-parent", "-t", "a.c"],
-            &["blame", "--reverse", "HEAD~4..HEAD~1", "-t", "a.c"],
-            &["blame", "--reverse", "HEAD~4", "-t", "--", "a.c"],
-            &["blame", "--ignore-rev", "HEAD~3", "-t", "a.c"],
-            &["blame", "--ignore-revs-file", "ignore-revs", "-t", "a.c"],
-            &["blame", "-c", "a.c"],
-            &["blame", "-b", "HEAD~1", "--", "a.c"],
-            &["blame", "--date=short", "-e", "a.c"],
-            &["blame", "--date=rfc", "-s", "a.c"],
-            &["blame", "-l", "-t", "a.c"],
-            &["blame", "--abbrev=10", "-t", "a.c"],
-            &["blame", "--show-stats", "-t", "HEAD", "--", "d.txt"],
-        ],
-    );
+    let cases: &[&[&str]] = &[
+        &["blame", "-t", "a.c"],
+        &["blame", "--root", "a.c"],
+        &["blame", "-w", "-t", "a.c"],
+        &["blame", "-n", "-f", "-t", "d.txt"],
+        &["blame", "-M", "-t", "d.txt"],
+        &["blame", "-M5", "-t", "d.txt"],
+        &["blame", "-C", "-t", "c.txt"],
+        &["blame", "-C", "-C", "-t", "c.txt"],
+        &["blame", "-C", "-C", "-C", "-t", "c.txt"],
+        &["blame", "-C10", "-C", "-n", "-t", "c.txt"],
+        &["blame", "--porcelain", "-M", "d.txt"],
+        &["blame", "--line-porcelain", "-C", "-C", "c.txt"],
+        &["blame", "-L", ":helper", "-t", "a.c"],
+        &["blame", "-L", "/return/,+2", "-t", "a.c"],
+        &["blame", "-L", "1,2", "-L", "5,6", "-t", "a.c"],
+        &["blame", "-L", "5,6", "-L", "/other/", "-t", "a.c"],
+        &["blame", "-L", "^/int/,-1", "-t", "a.c"],
+        &["blame", "-L", "2,1", "--porcelain", "a.c"],
+        &["blame", "HEAD~2..", "-t", "a.c"],
+        &["blame", "--first-parent", "-t", "a.c"],
+        &["blame", "--reverse", "HEAD~4..HEAD~1", "-t", "a.c"],
+        &["blame", "--reverse", "HEAD~4", "-t", "--", "a.c"],
+        &["blame", "--ignore-rev", "HEAD~3", "-t", "a.c"],
+        &["blame", "--ignore-revs-file", "ignore-revs", "-t", "a.c"],
+        &["blame", "-c", "a.c"],
+        &["blame", "-b", "HEAD~1", "--", "a.c"],
+        &["blame", "--date=short", "-e", "a.c"],
+        &["blame", "--date=rfc", "-s", "a.c"],
+        &["blame", "-l", "-t", "a.c"],
+        &["blame", "--abbrev=10", "-t", "a.c"],
+        &["blame", "--show-stats", "-t", "HEAD", "--", "d.txt"],
+    ];
+    // git 2.56 widens the id column only when a line prints a mark.
+    let unmarked: &[&[&str]] = &[
+        &["blame", "--root", "a.c"],
+        &["blame", "-C", "-t", "c.txt"],
+        &["blame", "-L", "^/int/,-1", "-t", "a.c"],
+        &["blame", "-c", "a.c"],
+        &["blame", "-b", "HEAD~1", "--", "a.c"],
+    ];
+    all_same(&dir, &crate::since(2, 56, cases, unmarked));
     git(&dir, &["config", "blame.markIgnoredLines", "true"]);
     git(&dir, &["config", "blame.markUnblamableLines", "true"]);
-    all_same(&dir, &[&["blame", "--ignore-rev", "HEAD~1", "-t", "a.c"]]);
-    git(&dir, &["config", "blame.ignoreRevsFile", "ignore-revs"]);
-    all_same(
-        &dir,
-        &[
-            &["blame", "-t", "a.c"],
-            &["blame", "--ignore-revs-file", "", "-t", "a.c"],
-        ],
-    );
+    // The marks widen the id column by two in git 2.56.
+    if crate::git_at_least(2, 56) {
+        all_same(&dir, &[&["blame", "--ignore-rev", "HEAD~1", "-t", "a.c"]]);
+        git(&dir, &["config", "blame.ignoreRevsFile", "ignore-revs"]);
+        all_same(
+            &dir,
+            &[
+                &["blame", "-t", "a.c"],
+                &["blame", "--ignore-revs-file", "", "-t", "a.c"],
+            ],
+        );
+    }
 
     let dir = repo("blame-merges");
     all_same(

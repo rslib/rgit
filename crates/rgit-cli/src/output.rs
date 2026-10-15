@@ -558,7 +558,7 @@ pub fn human(error: &anyhow::Error, command: Option<&str>) -> (String, i32) {
         return fatal(&format!("could not read log file '{path}': {why}"));
     }
     if command == Some("stash") && message == "reference 'refs/stash' not found" {
-        return ("No stash entries found.".to_owned(), 1);
+        return ("No stash entries found.".to_owned(), 128);
     }
     if command == Some("config") && message.ends_with(" is not set") {
         return (String::new(), 1);

@@ -195,6 +195,8 @@ rgit stash list -p
 | `--oneline` |  | git's `&lt;short sha&gt; &lt;subject&gt;` lines |
 | `--date` | `STYLE` | Dates in the formats: default, relative, local, iso, iso-strict, rfc, short, raw, unix or format:&lt;strftime&gt; (`-local` for local time) |
 | `--graph` |  | Draw the commit graph in ASCII, as git does |
+| `--graph-indent` |  | Indent a graph commit whose parents are not shown when more commits follow it (default: log.graphIndent, else on) |
+| `--no-graph-indent` |  | Do not indent such graph commits |
 | `--decorate` | `STYLE` | Name the refs at each commit (default: only on a terminal) |
 | `--no-decorate` |  | Never name refs at commits |
 | `--abbrev-commit` |  | Abbreviate the commit ids in the format's header |

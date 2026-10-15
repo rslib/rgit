@@ -133,6 +133,7 @@ impl Pretty {
         args: &PrettyArgs,
         fallback: Option<&str>,
     ) -> anyhow::Result<Option<Pretty>> {
+        args.check()?;
         let spec = args
             .format
             .as_deref()
