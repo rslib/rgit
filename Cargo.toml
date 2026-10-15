@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.0.5"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/rslib/rgit"
+repository = "https://github.com/rslib/rgits"
 rust-version = "1.96"
 
 # Releases are GitHub-only: the tag push triggers .github/workflows/release.yml,
@@ -31,15 +31,21 @@ serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+syntect = { version = "5", default-features = false, features = [
+  "default-fancy",
+] }
 octocrab = "0.54"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls",
+  "form",
+] }
 toml = "1"
 
 # Release/install builds only (dev debug builds are untouched). A smaller binary
 # makes the one-time macOS code-signature check on first launch - the "slow
 # startup" - noticeably faster, and cuts cold page-in too.
 [profile.release]
-strip = true        # drop symbols
-lto = "fat"         # dead-code elimination + cross-crate inlining
-codegen-units = 1   # smaller, better-optimized code (slower release compile)
+strip = true      # drop symbols
+lto = "fat"       # dead-code elimination + cross-crate inlining
+codegen-units = 1 # smaller, better-optimized code (slower release compile)

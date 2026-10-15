@@ -153,7 +153,7 @@ auto_restack = true
 # in the committed .rgit/config.toml.
 #
 # [ai.claude]
-# command = "claude -p --model haiku --strict-mcp-config --tools \"\""
+# command = "claude -p --model haiku --strict-mcp-config --tools \"\" --setting-sources \"\" --settings '{\"disableAllHooks\":true}' --disable-slash-commands"
 # timeout_secs = 120           # stop the tool after this many seconds
 # draft_prompt_file = "prompts/claude-draft.md"   # or draft_prompt = "..."
 # review_prompt_file = "prompts/claude-review.md" # or review_prompt = "..."

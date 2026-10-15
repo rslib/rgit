@@ -2337,6 +2337,9 @@ pub struct App {
     pub loading: bool,
     /// A labeled in-progress operation (e.g. "pushing"), shown in the status bar.
     pub busy: Option<String>,
+    /// A running AI draft or review. Kept apart from `busy` because a status
+    /// refresh ends `busy`, and the AI result arrives as its own message.
+    pub ai_busy: Option<&'static str>,
     /// A destructive action awaiting confirmation.
     pub confirm: Option<PendingConfirm>,
     /// An active minibuffer prompt.
@@ -2544,6 +2547,7 @@ impl App {
             changed: 0,
             loading: true,
             busy: None,
+            ai_busy: None,
             confirm: None,
             prompt: None,
             transient: None,
@@ -3202,6 +3206,7 @@ impl App {
     pub fn is_animating(&self) -> bool {
         self.loading
             || self.busy.is_some()
+            || self.ai_busy.is_some()
             || self.preview_loading
             || !self.toasts.is_empty()
             || self
@@ -4430,6 +4435,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::Error(e) => {
             app.loading = false;
             app.busy = None;
+            app.ai_busy = None;
             app.error = Some(e);
         }
         Msg::DiffPrompt => return rev_picker_prompt(app, PromptAction::DiffRefs),
@@ -4517,7 +4523,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::BisectBad => return vec![bisect(app, "bad")],
         Msg::BisectReset => return vec![bisect(app, "reset")],
         Msg::AiReview => {
-            app.busy = Some("reviewing".into());
+            app.ai_busy = Some("reviewing");
             return vec![Effect::ReviewStaged { tool: None }];
         }
         Msg::AiReviewWith => ai_tool_picker(app, PromptAction::AiReviewTool),
@@ -4639,7 +4645,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::AiReviewLoaded(text) => {
-            app.busy = None;
+            app.ai_busy = None;
             app.forge_detail = None;
             let mut buffer = Buffer::default();
             let sections: Vec<_> = text
@@ -4869,7 +4875,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::CommitEditorGenerate => {
             if app.commit_editor.is_some() {
-                app.busy = Some("generating".into());
+                app.ai_busy = Some("generating");
                 return vec![Effect::GenerateCommit { tool: None }];
             }
         }
@@ -4879,7 +4885,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::SetCommitEditorText(text) => {
-            app.busy = None;
+            app.ai_busy = None;
             if let Some(editor) = &mut app.commit_editor {
                 editor.set_text(&text);
             }
@@ -5473,11 +5479,11 @@ fn prompt_submit(app: &mut App) -> Vec<Effect> {
             return vec![Effect::LoadSplitFiles(rev)];
         }
         PromptAction::AiDraftTool => {
-            app.busy = Some("generating".into());
+            app.ai_busy = Some("generating");
             return vec![Effect::GenerateCommit { tool: Some(value) }];
         }
         PromptAction::AiReviewTool => {
-            app.busy = Some("reviewing".into());
+            app.ai_busy = Some("reviewing");
             return vec![Effect::ReviewStaged { tool: Some(value) }];
         }
         // Reword is a two-step prompt: pick the commit, then its new message.
@@ -6526,6 +6532,26 @@ mod tests {
             fx.as_slice(),
             [Effect::GenerateCommit { tool: None }]
         ));
+    }
+
+    #[test]
+    fn ai_draft_outlives_status_refresh() {
+        let mut app = ai_app(TWO_TOOLS);
+        update(&mut app, Msg::CommitEditorGenerate);
+        let status = app.backend().status();
+        update(
+            &mut app,
+            Msg::Refreshed {
+                generation: u64::MAX,
+                gated: false,
+                result: Box::new(status),
+            },
+        );
+        assert_eq!(app.ai_busy, Some("generating"));
+        assert!(!app.toasts.iter().any(|t| t.text.contains("generating")));
+        update(&mut app, Msg::SetCommitEditorText("feat: x".into()));
+        assert_eq!(app.ai_busy, None);
+        assert_eq!(app.commit_editor.as_ref().unwrap().message(), "feat: x");
     }
 
     #[test]

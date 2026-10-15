@@ -919,7 +919,7 @@ fn title_badges(app: &App) -> Line<'static> {
             theme::resolve(Style::Modified).add_modifier(Modifier::BOLD),
         ));
     }
-    if let Some(busy) = &app.busy {
+    if let Some(busy) = app.busy.as_deref().or(app.ai_busy) {
         spans.push(RSpan::styled(
             format!("  {} {busy}", spinner_frame(app.tick_count)),
             RStyle::default().fg(theme::accent()),

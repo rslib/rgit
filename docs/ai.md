@@ -12,7 +12,7 @@ Use the private file, `.git/rgit/config.toml`, to set it for one repository.
 
 ```toml
 [ai.claude]
-command = "claude -p --model haiku --strict-mcp-config --tools \"\""
+command = "claude -p --model haiku --strict-mcp-config --tools \"\" --setting-sources \"\" --settings '{\"disableAllHooks\":true}' --disable-slash-commands"
 
 [ai.pi]
 command = "pi -p --no-session --no-tools -ne -ns --model <provider/model> @\"$RGIT_PROMPT_FILE\""
@@ -27,6 +27,9 @@ The tool gets the prompt on standard input.
 It also gets the same prompt in the file `$RGIT_PROMPT_FILE`.
 rgit takes the standard output of the tool as the result.
 A script of your own works the same way.
+
+The `claude` flags keep your own Claude Code setup out of the run.
+Without them, your hooks, skills and `CLAUDE.md` can change the reply, so the draft can come back empty or off topic.
 
 ## Pick the default tools
 
