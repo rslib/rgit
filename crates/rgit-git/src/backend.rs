@@ -1082,6 +1082,23 @@ pub trait GitBackend: Send + Sync {
     /// Configured remotes with their fetch URLs, sorted by name.
     fn remotes(&self) -> Result<Vec<crate::Remote>, GitError>;
 
+    /// Every remote with its URLs, branches and tracking, from local refs and
+    /// config only, sorted by name.
+    fn remote_overview(&self) -> Result<Vec<crate::RemoteOverview>, GitError>;
+
+    /// Branch names `name` advertises on its server, sorted, or `None` when the
+    /// remote could not be checked: it asked for a password the credential
+    /// helper does not have, failed, or gave no answer within `timeout`. Never
+    /// prompts. A check that hangs is left behind on its own thread.
+    fn remote_server_branches(
+        &self,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Vec<String>>, GitError>;
+
+    /// Commits `a` has that `b` lacks, and the reverse, for two revisions.
+    fn ahead_behind(&self, a: &str, b: &str) -> Result<(usize, usize), GitError>;
+
     /// Add a remote named `name` pointing at `url`.
     fn add_remote(&self, name: &str, url: &str) -> Result<(), GitError>;
 

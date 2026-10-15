@@ -3356,6 +3356,143 @@ impl GitBackend for Git2Backend {
         Ok(remotes)
     }
 
+    fn remote_overview(&self) -> Result<Vec<crate::RemoteOverview>, GitError> {
+        let repo = self.repo();
+        let mut names: Vec<String> = repo
+            .remotes()?
+            .iter()
+            .filter_map(|n| n.ok().flatten().map(str::to_owned))
+            .collect();
+        names.sort();
+        let mut overviews = Vec::with_capacity(names.len());
+        for name in &names {
+            // libgit2 applies insteadOf and pushInsteadOf, as git does on use.
+            let found = repo.find_remote(name).ok();
+            let fetch_url = match found.as_ref().and_then(|r| r.url().ok()) {
+                Some(url) => url.to_owned(),
+                None => remote_urls(&repo, name, false)?
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default(),
+            };
+            let push_url = match found.as_ref().and_then(|r| r.pushurl().ok().flatten()) {
+                Some(url) => Some(url.to_owned()),
+                None => match remote_urls(&repo, name, false)?.first() {
+                    Some(raw) => push_instead_of(&repo, raw)?,
+                    None => None,
+                },
+            }
+            .filter(|u| *u != fetch_url);
+            overviews.push(crate::RemoteOverview {
+                name: name.clone(),
+                fetch_url,
+                push_url,
+                head_branch: None,
+                last_fetch: None,
+                fetch_refspecs: config_values(&repo, &format!("remote.{name}.fetch"))?,
+                branches: Vec::new(),
+            });
+        }
+
+        let tracking = branch_tracking(&repo)?;
+        // Longest name first so a remote `team/a` wins over a remote `team`.
+        let mut by_length: Vec<usize> = (0..names.len()).collect();
+        by_length.sort_by_key(|&i| std::cmp::Reverse(names[i].len()));
+        let mut newest_reflog: Vec<Option<i64>> = vec![None; names.len()];
+        let mut ref_names: Vec<Vec<String>> = vec![Vec::new(); names.len()];
+
+        for reference in repo.references_glob("refs/remotes/*")? {
+            let reference = reference?;
+            let Ok(full) = reference.name().map(str::to_owned) else {
+                continue;
+            };
+            let rest = &full["refs/remotes/".len()..];
+            let Some((idx, branch)) = by_length.iter().find_map(|&i| {
+                rest.strip_prefix(names[i].as_str())
+                    .and_then(|r| r.strip_prefix('/'))
+                    .map(|b| (i, b))
+            }) else {
+                continue;
+            };
+            ref_names[idx].push(full.clone());
+            if let Ok(reflog) = repo.reflog(&full)
+                && let Some(entry) = reflog.get(0)
+            {
+                let when = entry.committer().when().seconds();
+                newest_reflog[idx] = newest_reflog[idx].max(Some(when));
+            }
+            let overview = &mut overviews[idx];
+            if branch == "HEAD" {
+                let prefix = format!("refs/remotes/{}/", names[idx]);
+                overview.head_branch = reference
+                    .symbolic_target()
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.strip_prefix(prefix.as_str()))
+                    .map(str::to_owned);
+                continue;
+            }
+            let Ok(commit) = reference.peel_to_commit() else {
+                continue;
+            };
+            let tracked_by = tracking
+                .get(&(names[idx].clone(), branch.to_owned()))
+                .and_then(|locals| {
+                    let local = locals.first()?;
+                    let local_oid = repo.refname_to_id(&format!("refs/heads/{local}")).ok()?;
+                    let (ahead, behind) = repo.graph_ahead_behind(local_oid, commit.id()).ok()?;
+                    Some(crate::TrackedBy {
+                        local: local.clone(),
+                        ahead,
+                        behind,
+                    })
+                });
+            overview.branches.push(crate::RemoteBranchInfo {
+                name: branch.to_owned(),
+                oid: commit.id().to_string(),
+                time: commit.time().seconds(),
+                subject: commit
+                    .summary()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .to_owned(),
+                tracked_by,
+            });
+        }
+
+        for (idx, overview) in overviews.iter_mut().enumerate() {
+            overview.branches.sort_by(|a, b| a.name.cmp(&b.name));
+            overview.last_fetch = newest_reflog[idx].or_else(|| ref_mtime(&repo, &ref_names[idx]));
+        }
+        Ok(overviews)
+    }
+
+    fn remote_server_branches(
+        &self,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Vec<String>>, GitError> {
+        let git_dir = {
+            let repo = self.repo();
+            repo.find_remote(name)?;
+            repo.path().to_owned()
+        };
+        let name = name.to_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(server_branches(&git_dir, &name));
+        });
+        Ok(rx.recv_timeout(timeout).ok().and_then(Result::ok))
+    }
+
+    fn ahead_behind(&self, a: &str, b: &str) -> Result<(usize, usize), GitError> {
+        let repo = self.repo();
+        let a = repo.revparse_single(a)?.peel_to_commit()?.id();
+        let b = repo.revparse_single(b)?.peel_to_commit()?.id();
+        Ok(repo.graph_ahead_behind(a, b)?)
+    }
+
     fn add_remote(&self, name: &str, url: &str) -> Result<(), GitError> {
         let repo = self.repo();
         repo.remote(name, url)?;
@@ -9501,6 +9638,129 @@ fn config_values(repo: &Repository, key: &str) -> Result<Vec<String>, GitError> 
         out.extend(entry?.value().map(str::to_owned));
     }
     Ok(out)
+}
+
+/// The URL git pushes to when only `pushInsteadOf` rewrites `url`. The longest
+/// matching prefix wins, as in git's remote.c.
+fn push_instead_of(repo: &Repository, url: &str) -> Result<Option<String>, GitError> {
+    let config = open_config(repo, ConfigScope::Any, false)?;
+    let mut best: Option<(usize, String)> = None;
+    let mut entries = config.entries(Some(r"^url\..*\.pushinsteadof$"))?;
+    while let Some(entry) = entries.next() {
+        let entry = entry?;
+        let (Ok(name), Ok(prefix)) = (entry.name(), entry.value()) else {
+            continue;
+        };
+        let Some(base) = name
+            .strip_prefix("url.")
+            .and_then(|n| n.strip_suffix(".pushinsteadof"))
+        else {
+            continue;
+        };
+        if url.starts_with(prefix) && best.as_ref().is_none_or(|(len, _)| prefix.len() > *len) {
+            best = Some((prefix.len(), format!("{base}{}", &url[prefix.len()..])));
+        }
+    }
+    Ok(best.map(|(_, url)| url))
+}
+
+/// The branches a remote advertises, asking for credentials only from the
+/// agent and the credential helper, once each, and never from a prompt.
+fn server_branches(git_dir: &Path, name: &str) -> Result<Vec<String>, git2::Error> {
+    let repo = Repository::open(git_dir)?;
+    let mut remote = repo.find_remote(name)?;
+    let mut agent_tried = false;
+    let mut helper_tried = false;
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(move |url, username, allowed| {
+        if allowed.contains(CredentialType::USERNAME) {
+            return Cred::username(username.unwrap_or("git"));
+        }
+        if allowed.contains(CredentialType::SSH_KEY) && !agent_tried {
+            agent_tried = true;
+            return Cred::ssh_key_from_agent(username.unwrap_or("git"));
+        }
+        if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) && !helper_tried {
+            helper_tried = true;
+            let config = crate::config::default_config()
+                .map_err(|e| git2::Error::from_str(&e.to_string()))?;
+            return Cred::credential_helper(&config, url, username);
+        }
+        Err(git2::Error::from_str("no credentials without a prompt"))
+    });
+    let connect = || remote.connect_auth(git2::Direction::Fetch, Some(callbacks), None);
+    #[cfg(feature = "ssh")]
+    let conn = crate::ssh::without_prompt(connect)?;
+    #[cfg(not(feature = "ssh"))]
+    let conn = connect()?;
+    let mut branches: Vec<String> = conn
+        .list()?
+        .iter()
+        .filter_map(|h| h.name().strip_prefix("refs/heads/").map(str::to_owned))
+        .collect();
+    branches.sort();
+    Ok(branches)
+}
+
+/// Local branches by the remote branch they track, as `(remote, branch)`.
+/// Reads the branch config once.
+fn branch_tracking(
+    repo: &Repository,
+) -> Result<std::collections::HashMap<(String, String), Vec<String>>, GitError> {
+    use std::collections::HashMap;
+    let config = open_config(repo, ConfigScope::Any, false)?;
+    let mut remotes: HashMap<String, String> = HashMap::new();
+    let mut merges: HashMap<String, String> = HashMap::new();
+    let mut entries = config.entries(Some(r"^branch\..*\.(remote|merge)$"))?;
+    while let Some(entry) = entries.next() {
+        let entry = entry?;
+        let (Ok(key), Ok(value)) = (entry.name(), entry.value()) else {
+            continue;
+        };
+        let Some((local, field)) = key.strip_prefix("branch.").and_then(|k| k.rsplit_once('.'))
+        else {
+            continue;
+        };
+        match field {
+            "remote" => remotes.insert(local.to_owned(), value.to_owned()),
+            _ => merges.insert(local.to_owned(), value.to_owned()),
+        };
+    }
+    let mut tracking: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for (local, remote) in remotes {
+        let Some(branch) = merges
+            .get(&local)
+            .and_then(|m| m.strip_prefix("refs/heads/"))
+        else {
+            continue;
+        };
+        tracking
+            .entry((remote, branch.to_owned()))
+            .or_default()
+            .push(local);
+    }
+    for locals in tracking.values_mut() {
+        locals.sort();
+    }
+    Ok(tracking)
+}
+
+/// Newest modification time of the loose files behind `refs`, falling back to
+/// `packed-refs` when none is loose. `None` when `refs` is empty.
+fn ref_mtime(repo: &Repository, refs: &[String]) -> Option<i64> {
+    if refs.is_empty() {
+        return None;
+    }
+    let secs = |path: PathBuf| {
+        let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+        let since = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+        i64::try_from(since.as_secs()).ok()
+    };
+    let common = repo.commondir();
+    refs.iter()
+        .filter_map(|r| secs(common.join(r)))
+        .max()
+        .or_else(|| secs(common.join("packed-refs")))
 }
 
 /// A remote's URLs as git uses them: `pushurl`s, else `url`s, for `push`.

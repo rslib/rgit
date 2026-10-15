@@ -149,10 +149,10 @@ pub use model::{
     CommitOverview, CommitRef, Deco, DiffSpec, EmptyCommit, FetchArgs, FileActivity, GrepMatch,
     GrepQuery, Head, HunkRef, InitArgs, Lane, LanesState, LastCommit, LogEntry, LogOptions,
     LogOrder, MergeOptions, OpLogEntry, OpProgress, PickOptions, PullArgs, PushArgs, RawPair,
-    RebaseOptions, RebaseProgress, RefEntry, RefKind, RefUpdate, Remote, RepoState, RepoStatus,
-    ResetMode, RestackOutcome, RmOptions, SmartlogEntry, Stash, StatusCode, StatusEntry,
-    SubmoduleInfo, SubmoduleOp, TagInfo, TreeEntry, Worktree, WorktreeAddArgs, activity_weights,
-    group_decorations,
+    RebaseOptions, RebaseProgress, RefEntry, RefKind, RefUpdate, Remote, RemoteBranchInfo,
+    RemoteOverview, RepoState, RepoStatus, ResetMode, RestackOutcome, RmOptions, SmartlogEntry,
+    Stash, StatusCode, StatusEntry, SubmoduleInfo, SubmoduleOp, TagInfo, TrackedBy, TreeEntry,
+    Worktree, WorktreeAddArgs, activity_weights, group_decorations,
 };
 pub use name_rev::{NameRevOpts, name_rev};
 pub use pack_tools::{

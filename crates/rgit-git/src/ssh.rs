@@ -36,8 +36,28 @@ pub fn set_password_provider(f: impl Fn(&str) -> Option<String> + Send + Sync + 
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(f));
 }
 
+thread_local! {
+    static NO_PROMPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the password prompt off on this thread. libgit2 drives the
+/// ssh transport on its calling thread, so a background check stays silent.
+pub(crate) fn without_prompt<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NO_PROMPT.set(self.0);
+        }
+    }
+    let _restore = Restore(NO_PROMPT.replace(true));
+    f()
+}
+
 /// The installed password prompt, if any.
 fn password_provider() -> Option<PasswordFn> {
+    if NO_PROMPT.get() {
+        return None;
+    }
     PASSWORD_PROVIDER
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1599,6 +1619,19 @@ mod tests {
         assert!(!argv.iter().any(|a| a == "-p"));
         assert!(!argv.iter().any(|a| a == "-l"));
         assert_eq!(argv.last().unwrap(), "h");
+    }
+
+    #[test]
+    fn no_prompt_hides_the_password_provider_on_this_thread_only() {
+        set_password_provider(|_| Some("secret".to_owned()));
+        assert!(without_prompt(|| password_provider().is_none()));
+        assert!(without_prompt(|| {
+            std::thread::spawn(|| password_provider().is_some())
+                .join()
+                .unwrap()
+        }));
+        assert!(password_provider().is_some());
+        set_password_provider(|_| None);
     }
 
     #[cfg(unix)]

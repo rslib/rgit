@@ -466,6 +466,43 @@ pub struct Remote {
     pub url: String,
 }
 
+/// Everything the remotes view shows about one remote, read from local refs
+/// and config only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteOverview {
+    pub name: String,
+    pub fetch_url: String,
+    /// Set only when it differs from `fetch_url`.
+    pub push_url: Option<String>,
+    /// Target of `refs/remotes/<name>/HEAD`, without the remote prefix.
+    pub head_branch: Option<String>,
+    /// Unix seconds of the newest ref update, `None` when never fetched.
+    pub last_fetch: Option<i64>,
+    pub fetch_refspecs: Vec<String>,
+    /// Sorted by name, without the `<remote>/HEAD` pointer.
+    pub branches: Vec<RemoteBranchInfo>,
+}
+
+/// A remote-tracking branch and its tip commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBranchInfo {
+    /// The branch name without the `<remote>/` prefix.
+    pub name: String,
+    pub oid: String,
+    /// Commit time of the tip, in unix seconds.
+    pub time: i64,
+    pub subject: String,
+    pub tracked_by: Option<TrackedBy>,
+}
+
+/// A local branch whose upstream is a remote branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedBy {
+    pub local: String,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
 /// A worktree of the repository (the main one, or a linked worktree), with
 /// enough state to inspect it at a glance.
 #[derive(Debug, Clone, PartialEq, Eq)]

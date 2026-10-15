@@ -6,6 +6,7 @@ mod index_sync;
 mod lanes;
 mod merge;
 mod oplog;
+mod remotes_view;
 mod stack;
 mod stage_paths;
 mod status;
