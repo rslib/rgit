@@ -60,6 +60,12 @@ impl Buffer {
         self.scroll_into_view();
     }
 
+    /// Take the content out, leaving the buffer empty until the next
+    /// [`set_content`](Self::set_content).
+    pub fn take_content(&mut self) -> Vec<Section> {
+        std::mem::take(&mut self.root)
+    }
+
     /// Replace the content while keeping a live selection (e.g. across a
     /// status refresh from the file watcher), clamping its rows and columns
     /// to the new bounds so it cannot point past the end. Use only when the

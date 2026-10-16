@@ -7,7 +7,7 @@ use ratatui::DefaultTerminal;
 use rgit_git::{GitBackend, GitError, RepoStatus};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::{App, Effect, InfoKind, LaneOp, Leader, Msg, Mutation, TextOp, update};
+use crate::app::{App, Effect, InfoKind, LaneOp, Leader, Msg, Mutation, Refresh, TextOp, update};
 use crate::buffer::{gutter_cols, row_prefix_width};
 use crate::events::{Event, Events};
 use crate::keymap::{
@@ -890,7 +890,7 @@ async fn run_msg(
 ) -> std::io::Result<()> {
     if watcher.is_none()
         && let Msg::Refreshed { result, .. } = &msg
-        && let Ok(status) = result.as_ref()
+        && let Ok(Refresh { status, .. }) = result.as_ref()
     {
         let collapsed = crate::watch::collapsed_untracked_dirs(app.backend().workdir(), status);
         *watcher = Some(crate::watch::spawn_watcher(
@@ -978,7 +978,7 @@ async fn run_msg(
                     let _ = tx.send(Msg::Refreshed {
                         generation,
                         gated: false,
-                        result: Box::new(status),
+                        result: Box::new(status.map(Refresh::new)),
                     });
                 });
             }
@@ -1857,7 +1857,7 @@ where
         let _ = msg_tx.send(Msg::Refreshed {
             generation,
             gated: true,
-            result: Box::new(result),
+            result: Box::new(result.map(Refresh::new)),
         });
     });
 }
@@ -2227,7 +2227,7 @@ async fn commit_flow(
         let _ = tx.send(Msg::Refreshed {
             generation,
             gated: false,
-            result: Box::new(status),
+            result: Box::new(status.map(Refresh::new)),
         });
     });
     Ok(())
@@ -3209,13 +3209,13 @@ mod tests {
         Msg::Refreshed {
             generation,
             gated,
-            result: Box::new(Ok(rgit_git::RepoStatus {
+            result: Box::new(Ok(crate::app::Refresh::new(rgit_git::RepoStatus {
                 head: rgit_git::Head {
                     branch: Some(branch.to_owned()),
                     ..Default::default()
                 },
                 ..Default::default()
-            })),
+            }))),
         }
     }
 

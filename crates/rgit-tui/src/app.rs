@@ -400,8 +400,23 @@ impl SplitPicker {
     }
 }
 
+/// A status read with its status sections, built on the reading thread
+/// because building them (diff highlighting) is slow enough to stall input.
+#[derive(Debug)]
+pub struct Refresh {
+    pub status: RepoStatus,
+    pub sections: Vec<Section>,
+}
+
+impl Refresh {
+    pub fn new(status: RepoStatus) -> Self {
+        let sections = build(&status);
+        Self { status, sections }
+    }
+}
+
 /// The result of a background status refresh, delivered back as a [`Msg`].
-pub type RefreshResult = Result<RepoStatus, GitError>;
+pub type RefreshResult = Result<Refresh, GitError>;
 
 /// Which screen a view shows. The status view is always the stack's root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2380,6 +2395,8 @@ pub struct App {
     pub help: bool,
     /// Size, wrap and scroll state of every overlay box.
     pub boxes: Boxes,
+    /// A status refresh held while a text box is open; see `runtime::typing`.
+    pub deferred_refresh: Option<Msg>,
     /// Carries the log transient's `--all` toggle into a follow-up author prompt.
     pending_log_all: bool,
     /// Default number of commits the log view walks (from config).
@@ -2395,8 +2412,6 @@ pub struct App {
     /// The severity filter for the session-log view.
     log_filter: LogFilter,
     /// Number of entries in the op-log view (0 = the empty placeholder row).
-    /// A status refresh held while a text box is open; see `runtime::typing`.
-    pub deferred_refresh: Option<Msg>,
     oplog_len: usize,
     /// Sign commits via git's -S when set.
     gpg_sign: bool,
@@ -2574,6 +2589,7 @@ impl App {
             tick_count: 0,
             help: false,
             boxes: Boxes::default(),
+            deferred_refresh: None,
             pending_log_all: false,
             log_limit: config.ui.log_limit,
             log_options: None,
@@ -2589,7 +2605,6 @@ impl App {
             pending_push: None,
             pending_merge_no_ff: false,
             pending_reorder_rev: None,
-            deferred_refresh: None,
             split_picker: None,
             pending_move_from: None,
             pending_prompt_value: None,
@@ -4193,7 +4208,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 }
             }
             sync_remote_summary(app);
-            rebuild_status(app);
+            rebuild_status(app, None);
             if app.active_kind() == ViewKind::Forge
                 && let Some(snapshot) = app.forge_snapshot.as_ref()
             {
@@ -4235,7 +4250,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.forge_open_requested = false;
             app.forge_snapshot = Some(snapshot);
             sync_remote_summary(app);
-            rebuild_status(app);
+            rebuild_status(app, None);
             if open_view {
                 app.push_view(ViewKind::Forge, buffer);
             } else if app.active_kind() == ViewKind::Forge {
@@ -6295,16 +6310,14 @@ fn refreshed(app: &mut App, generation: u64, result: RefreshResult) -> Vec<Effec
     // A labeled operation that just finished reports its outcome as a toast.
     let finished = app.busy.take();
     match result {
-        Ok(status) => {
+        Ok(Refresh { status, sections }) => {
             app.state = status.state;
             app.changed = status.entries.len();
             // Shared, not cloned: at thousands of changed files the snapshot's
             // diff text makes a deep clone per refresh visible on the UI thread.
             app.head = Some(status.head.clone());
             app.snapshot = Some(Arc::new(status));
-            let started = std::time::Instant::now();
-            rebuild_status(app);
-            tracing::debug!(elapsed_ms = started.elapsed().as_millis(), "rebuild_status");
+            rebuild_status(app, Some(sections));
             app.error = None;
             // The working tree changed, so cached file diffs are stale; commit
             // and stash diffs are immutable and stay cached. Force the current
@@ -6351,11 +6364,18 @@ fn refreshed(app: &mut App, generation: u64, result: RefreshResult) -> Vec<Effec
 
 /// Rebuild the status buffer from the last snapshot plus the REMOTE section,
 /// preserving fold state and cursor.
-fn rebuild_status(app: &mut App) {
-    let Some(status) = app.snapshot.clone() else {
+/// Rebuild the status buffer from `sections`, the snapshot's prebuilt
+/// sections. `None` keeps the current sections and replaces only REMOTE, so
+/// a forge update does not rebuild every diff on the UI thread.
+fn rebuild_status(app: &mut App, sections: Option<Vec<Section>>) {
+    if app.snapshot.is_none() {
         return;
-    };
-    let mut sections = build(&status);
+    }
+    let mut sections = sections.unwrap_or_else(|| {
+        let mut current = app.status_buffer_mut().take_content();
+        current.retain(|s| s.id != REMOTE_SECTION);
+        current
+    });
     if let Some(section) = build_remote_section(
         app.remote_status.as_ref(),
         app.head.as_ref(),
@@ -6401,6 +6421,8 @@ fn sync_remote_summary(app: &mut App) {
             .unwrap_or_default(),
     });
 }
+
+const REMOTE_SECTION: &str = "remote";
 
 /// The REMOTE section: per-remote ahead/behind for the current branch, plus its
 /// open PR and CI rollup once loaded. `None` when there is nothing to show (no
@@ -6502,7 +6524,7 @@ fn build_remote_section(
         return None;
     }
     Some(Section::branch(
-        "remote",
+        REMOTE_SECTION,
         NodeKind::Section,
         vec![Span::new("REMOTE".to_owned(), Style::Dim)],
         children,
@@ -6568,7 +6590,7 @@ mod tests {
             Msg::Refreshed {
                 generation: u64::MAX,
                 gated: false,
-                result: Box::new(status),
+                result: Box::new(status.map(Refresh::new)),
             },
         );
         assert_eq!(app.ai_busy, Some("generating"));
@@ -7534,7 +7556,8 @@ mod tests {
             }],
             ..Default::default()
         }));
-        rebuild_status(&mut app);
+        let sections = build(app.snapshot.as_deref().unwrap());
+        rebuild_status(&mut app, Some(sections));
         let row = (0..app.buffer().len())
             .find(|i| {
                 app.buffer_mut().set_cursor(*i);
@@ -7600,7 +7623,8 @@ mod tests {
             }],
             ..Default::default()
         }));
-        rebuild_status(&mut app);
+        let sections = build(app.snapshot.as_deref().unwrap());
+        rebuild_status(&mut app, Some(sections));
         let row = (0..app.buffer().len())
             .find(|i| {
                 app.buffer_mut().set_cursor(*i);
