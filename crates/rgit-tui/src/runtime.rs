@@ -496,83 +496,124 @@ async fn event_loop(
             Some(msg) = msg_rx.recv() => Incoming::Msg(msg),
         };
 
-        let redraw = match incoming {
-            Incoming::Event(Event::Resize) => true,
-            Incoming::Event(Event::Key(key)) => {
-                // Emacs `C-x o` prefix chord: only in a normal buffer, never while
-                // a text-input overlay owns the keyboard.
-                let text_overlay = app.prompt.is_some()
-                    || app.palette.is_some()
-                    || app.code_finder.is_some()
-                    || app.search.is_some()
-                    || app.commit_editor.is_some();
-                let msg = if app.ctrl_x_pending {
-                    app.ctrl_x_pending = false;
-                    // The follow-up key resolves against the binding map (C-x o).
-                    keymap::resolve_prefixed(key)
-                } else if !text_overlay
-                    && key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL)
-                    && key.code == crossterm::event::KeyCode::Char('x')
-                {
-                    app.ctrl_x_pending = true;
-                    None
-                } else if app.prompt.is_some() {
-                    // A minibuffer prompt is modal input; it takes priority even
-                    // over the operation console (a credential prompt opens while
-                    // a push/pull is running in the console).
-                    resolve_prompt_key(key)
-                } else if app.hook_console.is_some() {
-                    resolve_hook_key(&app, key)
-                } else if app.help {
-                    resolve_help_key(key)
-                } else if app.rebase_todo.is_some() {
-                    resolve_rebase_key(key)
-                } else if app.split_picker.is_some() {
-                    resolve_split_picker_key(key)
-                } else if app.commit_editor.is_some() {
-                    resolve_commit_key(key)
-                } else if app.palette.is_some() {
-                    resolve_palette_key(key)
-                } else if app.code_finder.is_some() {
-                    resolve_finder_key(key)
-                } else if app.search.is_some() {
-                    resolve_search_key(key)
-                } else if app.transient.is_some() {
-                    resolve_transient_key(key)
-                } else if app.confirm.is_some() {
-                    resolve_confirm_key(key)
-                } else if app.leader.is_some() {
-                    resolve_leader(&mut app, key)
-                } else if app.active_kind() == crate::app::ViewKind::Status
-                    && app.buffer().cursor_id().as_deref() == Some("remote/pr")
-                    && key.code == crossterm::event::KeyCode::Enter
-                {
-                    Some(Msg::ForgeBranchDetails)
-                } else if (app.active_kind() == crate::app::ViewKind::Status
-                    && app.buffer().cursor_id().as_deref() == Some("remote/forge")
-                    && key.code == crossterm::event::KeyCode::Enter)
-                    || (key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL)
-                        && key.code == crossterm::event::KeyCode::Char('g'))
-                {
-                    Some(Msg::Forge)
-                } else if app.active_kind() == crate::app::ViewKind::Forge {
-                    resolve_forge_key(key)
-                } else if app.active_kind() == crate::app::ViewKind::SessionLog {
-                    resolve_session_log_key(key)
-                } else if app.active_kind() == crate::app::ViewKind::Lanes {
-                    resolve_lanes_key(key)
-                } else if app.active_kind() == crate::app::ViewKind::Remotes {
-                    resolve_remotes_key(&app, key)
-                } else if keymap::profile() == keymap::Profile::Vim {
-                    keymap::resolve_vim_key(key)
-                } else {
-                    resolve_key(key)
-                };
-                if let Some(msg) = msg {
+        let mut redraw = false;
+        let mut handled = 0;
+        let mut next = Some(incoming);
+        while let Some(incoming) = next.take() {
+            redraw |= match incoming {
+                Incoming::Event(Event::Resize) => true,
+                Incoming::Event(Event::Key(key)) => {
+                    // Emacs `C-x o` prefix chord: only in a normal buffer, never while
+                    // a text-input overlay owns the keyboard.
+                    let text_overlay = app.prompt.is_some()
+                        || app.palette.is_some()
+                        || app.code_finder.is_some()
+                        || app.search.is_some()
+                        || app.commit_editor.is_some();
+                    let msg = if app.ctrl_x_pending {
+                        app.ctrl_x_pending = false;
+                        // The follow-up key resolves against the binding map (C-x o).
+                        keymap::resolve_prefixed(key)
+                    } else if !text_overlay
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                        && key.code == crossterm::event::KeyCode::Char('x')
+                    {
+                        app.ctrl_x_pending = true;
+                        None
+                    } else if app.prompt.is_some() {
+                        // A minibuffer prompt is modal input; it takes priority even
+                        // over the operation console (a credential prompt opens while
+                        // a push/pull is running in the console).
+                        resolve_prompt_key(key)
+                    } else if app.hook_console.is_some() {
+                        resolve_hook_key(&app, key)
+                    } else if app.help {
+                        resolve_help_key(key)
+                    } else if app.rebase_todo.is_some() {
+                        resolve_rebase_key(key)
+                    } else if app.split_picker.is_some() {
+                        resolve_split_picker_key(key)
+                    } else if app.commit_editor.is_some() {
+                        resolve_commit_key(key)
+                    } else if app.palette.is_some() {
+                        resolve_palette_key(key)
+                    } else if app.code_finder.is_some() {
+                        resolve_finder_key(key)
+                    } else if app.search.is_some() {
+                        resolve_search_key(key)
+                    } else if app.transient.is_some() {
+                        resolve_transient_key(key)
+                    } else if app.confirm.is_some() {
+                        resolve_confirm_key(key)
+                    } else if app.leader.is_some() {
+                        resolve_leader(&mut app, key)
+                    } else if app.active_kind() == crate::app::ViewKind::Status
+                        && app.buffer().cursor_id().as_deref() == Some("remote/pr")
+                        && key.code == crossterm::event::KeyCode::Enter
+                    {
+                        Some(Msg::ForgeBranchDetails)
+                    } else if (app.active_kind() == crate::app::ViewKind::Status
+                        && app.buffer().cursor_id().as_deref() == Some("remote/forge")
+                        && key.code == crossterm::event::KeyCode::Enter)
+                        || (key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
+                            && key.code == crossterm::event::KeyCode::Char('g'))
+                    {
+                        Some(Msg::Forge)
+                    } else if app.active_kind() == crate::app::ViewKind::Forge {
+                        resolve_forge_key(key)
+                    } else if app.active_kind() == crate::app::ViewKind::SessionLog {
+                        resolve_session_log_key(key)
+                    } else if app.active_kind() == crate::app::ViewKind::Lanes {
+                        resolve_lanes_key(key)
+                    } else if app.active_kind() == crate::app::ViewKind::Remotes {
+                        resolve_remotes_key(&app, key)
+                    } else if keymap::profile() == keymap::Profile::Vim {
+                        keymap::resolve_vim_key(key)
+                    } else {
+                        resolve_key(key)
+                    };
+                    if let Some(msg) = msg {
+                        run_msg(
+                            &mut app,
+                            msg,
+                            &mut events,
+                            terminal,
+                            &msg_tx,
+                            &gate,
+                            &mut watcher,
+                        )
+                        .await?;
+                    }
+                    true
+                }
+                Incoming::Event(Event::Mouse(m)) => {
+                    if let Some(msg) = mouse_msg(&app, m) {
+                        run_msg(
+                            &mut app,
+                            msg,
+                            &mut events,
+                            terminal,
+                            &msg_tx,
+                            &gate,
+                            &mut watcher,
+                        )
+                        .await?;
+                    }
+                    true
+                }
+                // Redraw a tick only while something animates (and for the one final
+                // tick that clears the last spinner/toast).
+                Incoming::Event(Event::Tick) => {
+                    let was = app.is_animating();
+                    app.tick();
+                    was || app.is_animating()
+                }
+                Incoming::Event(Event::Error) => false,
+                Incoming::Msg(msg) => {
                     run_msg(
                         &mut app,
                         msg,
@@ -583,46 +624,31 @@ async fn event_loop(
                         &mut watcher,
                     )
                     .await?;
+                    true
                 }
-                true
+            };
+            handled += 1;
+            // Handle input that is already waiting before drawing, so a burst
+            // of keys costs one draw instead of one per key.
+            if handled < MAX_BATCH && app.signing == was_signing && !app.should_quit {
+                next = events.try_next().map(Incoming::Event);
             }
-            Incoming::Event(Event::Mouse(m)) => {
-                if let Some(msg) = mouse_msg(&app, m) {
-                    run_msg(
-                        &mut app,
-                        msg,
-                        &mut events,
-                        terminal,
-                        &msg_tx,
-                        &gate,
-                        &mut watcher,
-                    )
-                    .await?;
-                }
-                true
-            }
-            // Redraw a tick only while something animates (and for the one final
-            // tick that clears the last spinner/toast).
-            Incoming::Event(Event::Tick) => {
-                let was = app.is_animating();
-                app.tick();
-                was || app.is_animating()
-            }
-            Incoming::Event(Event::Error) => false,
-            Incoming::Msg(msg) => {
-                run_msg(
-                    &mut app,
-                    msg,
-                    &mut events,
-                    terminal,
-                    &msg_tx,
-                    &gate,
-                    &mut watcher,
-                )
-                .await?;
-                true
-            }
-        };
+        }
+        if !typing(&app)
+            && let Some(msg) = app.deferred_refresh.take()
+        {
+            run_msg(
+                &mut app,
+                msg,
+                &mut events,
+                terminal,
+                &msg_tx,
+                &gate,
+                &mut watcher,
+            )
+            .await?;
+            redraw = true;
+        }
 
         // While a signed commit runs, a tty passphrase prompt may be drawing on
         // the terminal: yield input and the screen to it, then clear and
@@ -841,6 +867,14 @@ fn read_stamped(
 /// Whether `msg` ends the gated refresh, so a queued one runs now. Only a
 /// read the gate started finishes it; mutation and commit results carry
 /// their own status and must not clear another read's inflight flag.
+/// Waiting input events handled before one draw.
+const MAX_BATCH: usize = 64;
+
+/// A text box owns the keyboard, so status rebuilds wait until it closes.
+fn typing(app: &App) -> bool {
+    app.commit_editor.is_some() || app.prompt.is_some() || app.palette.is_some()
+}
+
 fn finish_gated_refresh(msg: &Msg, gate: &RefreshGate) -> bool {
     matches!(msg, Msg::Refreshed { gated: true, .. }) && gate.finish()
 }
@@ -866,6 +900,24 @@ async fn run_msg(
         ));
     }
     let requeue = finish_gated_refresh(&msg, gate);
+    // Rebuilding the status list can take long enough to stall typing, and
+    // the list is dimmed behind a text box anyway, so apply it on close.
+    let msg = match msg {
+        Msg::Refreshed {
+            generation, result, ..
+        } if typing(app) => {
+            app.deferred_refresh = Some(Msg::Refreshed {
+                generation,
+                gated: false,
+                result,
+            });
+            if requeue && gate.start_or_queue() {
+                spawn_read(app, msg_tx, |b| b.status());
+            }
+            return Ok(());
+        }
+        msg => msg,
+    };
     let started = Instant::now();
     let effects = update(app, msg);
     tracing::debug!(elapsed_ms = started.elapsed().as_millis(), "update");

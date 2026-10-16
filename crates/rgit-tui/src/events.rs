@@ -52,6 +52,11 @@ impl Events {
         self.rx.recv().await
     }
 
+    /// An event that is already waiting, without blocking.
+    pub fn try_next(&mut self) -> Option<Event> {
+        self.rx.try_recv().ok()
+    }
+
     /// Stop reading input (freeing stdin for a child process) and pause timers.
     /// Blocks briefly while the input thread finishes its current poll.
     pub fn pause(&mut self) {

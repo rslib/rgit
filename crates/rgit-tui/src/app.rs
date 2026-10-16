@@ -2395,6 +2395,8 @@ pub struct App {
     /// The severity filter for the session-log view.
     log_filter: LogFilter,
     /// Number of entries in the op-log view (0 = the empty placeholder row).
+    /// A status refresh held while a text box is open; see `runtime::typing`.
+    pub deferred_refresh: Option<Msg>,
     oplog_len: usize,
     /// Sign commits via git's -S when set.
     gpg_sign: bool,
@@ -2587,6 +2589,7 @@ impl App {
             pending_push: None,
             pending_merge_no_ff: false,
             pending_reorder_rev: None,
+            deferred_refresh: None,
             split_picker: None,
             pending_move_from: None,
             pending_prompt_value: None,
