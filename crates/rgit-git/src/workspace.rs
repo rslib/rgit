@@ -81,12 +81,16 @@ pub fn create(backend: &dyn GitBackend, name: &str) -> Result<String, GitError> 
     ))
 }
 
-/// List the repo's workspaces with their current branch.
 /// One workspace: its name, checked-out branch (`?` if unreadable), and path.
+/// `ahead` and `behind` count its commits the main repository's branch of the
+/// same name lacks, and the reverse; `None` when that branch does not exist or
+/// the history cannot be compared.
 pub struct WorkspaceInfo {
     pub name: String,
     pub branch: String,
     pub path: PathBuf,
+    pub ahead: Option<usize>,
+    pub behind: Option<usize>,
 }
 
 /// This repo's workspaces, sorted by name.
@@ -108,11 +112,37 @@ pub fn entries(backend: &dyn GitBackend) -> Vec<WorkspaceInfo> {
                 .and_then(|b| b.status().ok())
                 .and_then(|s| s.head.branch)
                 .unwrap_or_else(|| "?".to_owned()),
+            ahead: None,
+            behind: None,
             path,
         })
         .collect();
+    for w in &mut out {
+        (w.ahead, w.behind) = match divergence(backend, &w.path, &w.branch) {
+            Some((ahead, behind)) => (Some(ahead), Some(behind)),
+            None => (None, None),
+        };
+    }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// The workspace's commits that the main repository's `branch` lacks, and the
+/// reverse. The workspace's object store sees the main one through an
+/// in-memory alternate, so commits made on either side since the clone count.
+fn divergence(backend: &dyn GitBackend, ws: &Path, branch: &str) -> Option<(usize, usize)> {
+    let main_tip = git2::Oid::from_str(&backend.branch_tip(branch).ok()??).ok()?;
+    let repo = git2::Repository::open(ws).ok()?;
+    let main = git2::Repository::open(backend.workdir()).ok()?;
+    repo.odb()
+        .ok()?
+        .add_disk_alternate(main.path().join("objects").to_str()?)
+        .ok()?;
+    let tip = repo
+        .find_reference(&format!("refs/heads/{branch}"))
+        .ok()?
+        .target()?;
+    repo.graph_ahead_behind(tip, main_tip).ok()
 }
 
 pub fn list(backend: &dyn GitBackend) -> Result<String, GitError> {
@@ -122,7 +152,15 @@ pub fn list(backend: &dyn GitBackend) -> Result<String, GitError> {
     }
     Ok(list
         .iter()
-        .map(|w| format!("{}  [{}]  {}", w.name, w.branch, w.path.display()))
+        .map(|w| match (w.ahead, w.behind) {
+            (Some(ahead), Some(behind)) => format!(
+                "{}  [{}]  +{ahead} -{behind}  {}",
+                w.name,
+                w.branch,
+                w.path.display()
+            ),
+            _ => format!("{}  [{}]  {}", w.name, w.branch, w.path.display()),
+        })
         .collect::<Vec<_>>()
         .join("\n"))
 }
@@ -172,4 +210,169 @@ fn clone_tree(src: &Path, dst: &Path) -> Result<bool, GitError> {
         }
         Ok(all_reflinked)
     }
+}
+
+/// A workspace sync that moved one branch.
+pub struct Transfer {
+    pub workspace: String,
+    pub branch: String,
+    pub from: String,
+    pub to: String,
+    pub commits: usize,
+}
+
+/// Why a sync did not run: a state the user fixes, or a git failure.
+#[derive(Debug, thiserror::Error)]
+pub enum SyncError {
+    #[error("{message}")]
+    Refused { message: String, help: String },
+    #[error(transparent)]
+    Git(#[from] GitError),
+}
+
+fn open(backend: &dyn GitBackend, name: &str) -> Result<(PathBuf, Git2Backend), SyncError> {
+    let path = workspaces_dir(backend.workdir()).join(name);
+    if !path.is_dir() {
+        return Err(err(format!("no such workspace: {name}")).into());
+    }
+    let ws = Git2Backend::discover(&path)?;
+    Ok((path, ws))
+}
+
+fn current_branch(backend: &dyn GitBackend) -> Result<String, SyncError> {
+    Ok(backend
+        .status()?
+        .head
+        .branch
+        .ok_or(GitError::DetachedHead)?)
+}
+
+/// Fast-forward `from`'s `src_branch` into `to`'s `dst_branch`, creating the
+/// branch when `to` lacks it. `label` names `to`'s side in a refusal and
+/// `retry` is the command that brings `to` up to date.
+struct Sync<'a> {
+    from: &'a dyn GitBackend,
+    from_path: &'a Path,
+    to: &'a dyn GitBackend,
+    src_branch: &'a str,
+    dst_branch: &'a str,
+    workspace: &'a str,
+    to_label: &'a str,
+    from_label: &'a str,
+    retry: String,
+}
+
+impl Sync<'_> {
+    fn run(&self) -> Result<Transfer, SyncError> {
+        let refuse = |message: String, help: String| SyncError::Refused { message, help };
+        let tip = self.from.branch_tip(self.src_branch)?.ok_or_else(|| {
+            err(format!(
+                "no branch {} in the {}",
+                self.src_branch, self.from_label
+            ))
+        })?;
+
+        let checked_out = current_branch(self.to).is_ok_and(|b| b == self.dst_branch);
+        if checked_out && self.to.status()?.entries.iter().any(|e| !e.is_untracked()) {
+            return Err(refuse(
+                format!(
+                    "the {} has uncommitted changes on {}",
+                    self.to_label, self.dst_branch
+                ),
+                "Run `rgit commit` or `rgit stash push` there first".to_owned(),
+            ));
+        }
+
+        let from_path = self
+            .from_path
+            .to_str()
+            .ok_or_else(|| err("workspace path is not UTF-8"))?;
+        self.to.fetch(
+            Some(from_path),
+            &[format!("refs/heads/{}", self.src_branch)],
+            &crate::FetchArgs::default(),
+            &|_| {},
+        )?;
+
+        let current = self.to.branch_tip(self.dst_branch)?;
+        let (commits, old) = match &current {
+            Some(old) => {
+                let (ahead, behind) = self.to.ahead_behind(&tip, old)?;
+                if behind > 0 {
+                    return Err(refuse(
+                        format!(
+                            "{} has {behind} commits the {} does not",
+                            self.dst_branch, self.from_label
+                        ),
+                        format!("{} or rgit merge", self.retry),
+                    ));
+                }
+                (ahead, old.clone())
+            }
+            None => (self.to.ahead_behind(&tip, "HEAD")?.0, "0".repeat(tip.len())),
+        };
+
+        if commits > 0 {
+            let reference = format!("refs/heads/{}", self.dst_branch);
+            match checked_out {
+                true => self.to.merge(&tip, false, true, &|_| {})?,
+                false => self.to.update_ref(
+                    &reference,
+                    Some(&tip),
+                    Some(&old),
+                    false,
+                    Some(&format!("workspace {}: fast-forward", self.workspace)),
+                )?,
+            }
+        }
+        Ok(Transfer {
+            workspace: self.workspace.to_owned(),
+            branch: self.dst_branch.to_owned(),
+            from: old,
+            to: tip,
+            commits,
+        })
+    }
+}
+
+/// Fast-forward the main repository's branch (the workspace's current branch,
+/// or `into`) to the workspace's.
+pub fn pull(
+    backend: &dyn GitBackend,
+    name: &str,
+    into: Option<&str>,
+) -> Result<Transfer, SyncError> {
+    let (path, ws) = open(backend, name)?;
+    let branch = current_branch(&ws)?;
+    Sync {
+        from: &ws,
+        from_path: &path,
+        to: backend,
+        src_branch: &branch,
+        dst_branch: into.unwrap_or(&branch),
+        workspace: name,
+        to_label: "main repository",
+        from_label: "workspace",
+        retry: format!("rgit workspace push {name}"),
+    }
+    .run()
+}
+
+/// Fast-forward the workspace's current branch to the main repository's branch
+/// of the same name.
+pub fn push(backend: &dyn GitBackend, name: &str) -> Result<Transfer, SyncError> {
+    let (_, ws) = open(backend, name)?;
+    let branch = current_branch(&ws)?;
+    Sync {
+        from: backend,
+        from_path: backend.workdir(),
+        to: &ws,
+        src_branch: &branch,
+        dst_branch: &branch,
+        workspace: name,
+        to_label: "workspace",
+        from_label: "main repository",
+        retry: format!("rgit workspace pull {name}"),
+    }
+    .run()
 }

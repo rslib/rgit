@@ -16,8 +16,51 @@ use crate::cli::{
 };
 use crate::output::Output;
 use crate::render;
+use crate::toon::Node;
 
 const BLAME_LINES: usize = 200;
+
+/// The result of `workspace pull` or `push`; a refusal is an error with the
+/// command that fixes it.
+pub fn workspace_sync(
+    result: Result<rgit_git::workspace::Transfer, rgit_git::workspace::SyncError>,
+) -> anyhow::Result<Output> {
+    use rgit_git::workspace::SyncError;
+    let moved = match result {
+        Ok(moved) => moved,
+        Err(SyncError::Refused { message, help }) => {
+            return Err(anyhow::Error::new(crate::cli::CliError {
+                message,
+                help: Some(help),
+                code: 1,
+            }));
+        }
+        Err(SyncError::Git(e)) => return Err(e.into()),
+    };
+    let text = format!(
+        "{} {}: {} -> {} ({} commits)",
+        moved.workspace,
+        moved.branch,
+        &moved.from[..moved.from.len().min(7)],
+        &moved.to[..moved.to.len().min(7)],
+        moved.commits
+    );
+    let help = match moved.commits {
+        0 => "Already up to date".to_owned(),
+        _ => format!(
+            "Run `rgit log {} --limit {}` to see them",
+            moved.branch, moved.commits
+        ),
+    };
+    Ok(Output::new(text)
+        .with("workspace", moved.workspace)
+        .with("branch", moved.branch)
+        .with("from", moved.from)
+        .with("to", moved.to)
+        .with("commits", Node::Int(moved.commits as i64))
+        .help(help)
+        .help("Run `rgit workspace` to see what is still unlanded"))
+}
 
 /// Run a subcommand for the agent output modes.
 pub fn run(
@@ -615,6 +658,8 @@ pub fn run(
                         "name" => w.name,
                         "branch" => w.branch,
                         "path" => w.path.display().to_string(),
+                        "behind" => w.behind.map_or(Node::Null, |n| Node::Int(n as i64)),
+                        "ahead" => w.ahead.map_or(Node::Null, |n| Node::Int(n as i64)),
                     }
                 })
                 .collect();
@@ -623,11 +668,21 @@ pub fn run(
                 .list(
                     "workspaces",
                     rows,
-                    &["name", "branch", "path"],
+                    &["name", "branch", "behind", "ahead", "path"],
                     "0 workspaces",
                 )
                 .help("Run `rgit workspace new <name>` to add a workspace")
         }
+        Command::Workspace {
+            cmd: Some(WorkspaceCmd::Pull { name, into }),
+        } => workspace_sync(rgit_git::workspace::pull(
+            backend.as_ref(),
+            &name,
+            into.as_deref(),
+        ))?,
+        Command::Workspace {
+            cmd: Some(WorkspaceCmd::Push { name }),
+        } => workspace_sync(rgit_git::workspace::push(backend.as_ref(), &name))?,
         Command::Workspace {
             cmd: Some(WorkspaceCmd::New { name }),
         } if rgit_git::workspace::entries(backend.as_ref())

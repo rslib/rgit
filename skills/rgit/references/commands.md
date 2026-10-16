@@ -123,6 +123,8 @@ Every command with what it does and example invocations. Run `rgit <command> --h
   - `workspace new`: Create a copy-on-write clone of the repo on a new branch. e.g. `rgit workspace new <name>`
   - `workspace list`: List this repo's workspaces. e.g. `rgit workspace list`
   - `workspace remove`: Remove a workspace. e.g. `rgit workspace remove <name>`
+  - `workspace pull`: Fast-forward the main repository's branch to the workspace's commits. e.g. `rgit workspace pull <name>`, `rgit workspace pull <name> --into <branch>`
+  - `workspace push`: Fast-forward the workspace to the main repository's branch of the same name. e.g. `rgit workspace push <name>`
 - `worktree`: Worktree management (no subcommand lists worktrees). e.g. `rgit worktree`
   - `worktree add`: Add a linked worktree at PATH, as `git worktree add` does: on BRANCH, on a new branch with -b, detached at a commit or with --detach, or by default on a branch named after PATH's last folder. e.g. `rgit worktree add ../<path> <branch>`, `rgit worktree add -b <new_branch> ../<path> origin/main`, `rgit worktree add --detach ../<path> <rev>`, `rgit worktree add -B <branch> --lock --reason "<reason>" ../<path>`, `rgit worktree add --orphan -b <new_branch> ../<path>`, `rgit worktree add --guess-remote ../<branch>`
   - `worktree list`: List the worktrees, as `git worktree list` prints them. e.g. `rgit worktree list -v`, `rgit worktree list --porcelain`

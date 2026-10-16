@@ -76,4 +76,55 @@ rgit workspace remove <name>
 | --- | --- |
 | `<NAME>` | The workspace name |
 
+### rgit workspace pull
+
+Fast-forward the main repository's branch to the workspace's commits
+
+#### Usage
+
+```sh
+rgit workspace pull [OPTIONS] <NAME>
+```
+
+#### Examples
+
+```sh
+rgit workspace pull <name>
+rgit workspace pull <name> --into <branch>
+```
+
+#### Arguments
+
+| Argument | Description |
+| --- | --- |
+| `<NAME>` | The workspace name |
+
+#### Options
+
+| Option | Value | Description |
+| --- | --- | --- |
+| `--into` | `INTO` | The main repository's branch to advance (default: the workspace's branch) |
+
+### rgit workspace push
+
+Fast-forward the workspace to the main repository's branch of the same name
+
+#### Usage
+
+```sh
+rgit workspace push [OPTIONS] <NAME>
+```
+
+#### Examples
+
+```sh
+rgit workspace push <name>
+```
+
+#### Arguments
+
+| Argument | Description |
+| --- | --- |
+| `<NAME>` | The workspace name |
+
 See the [global options](global-options.md) that every command accepts.

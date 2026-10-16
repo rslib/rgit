@@ -1746,8 +1746,19 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "git_workspace_list",
-            "This repo's copy-on-write workspaces as a table of name, branch, path.",
+            "This repo's copy-on-write workspaces as a table of name, branch, behind, ahead, path.",
             &[FIELDS],
+        ),
+        tool(
+            "git_workspace_pull",
+            "Fast-forward the main repository's branch to a workspace's commits. Refuses when the \
+             branch has commits the workspace lacks or the main repository has uncommitted changes.",
+            &[("name", "string", true), ("into", "string", false)],
+        ),
+        tool(
+            "git_workspace_push",
+            "Fast-forward a workspace's branch to the main repository's branch of the same name.",
+            &[("name", "string", true)],
         ),
         tool(
             "git_workspace_remove",
@@ -3133,6 +3144,8 @@ const CLI_TOOLS: &[(&str, &str, &[&str])] = &[
     ("remote set-url", "git_remote_set_url", &["name", "url"]),
     ("remote show", "git_remote_show", &["name"]),
     ("workspace new", "git_workspace_new", &["name"]),
+    ("workspace pull", "git_workspace_pull", &["name"]),
+    ("workspace push", "git_workspace_push", &["name"]),
     ("stack new", "git_stack_new", &["name"]),
     ("lanes init", "git_lanes_init", &[]),
     ("lanes assign", "git_lanes_assign", &["lane", "path"]),
@@ -4132,6 +4145,13 @@ fn command(a: &Args) -> anyhow::Result<Option<Command>> {
             name: a.req("name")?,
         }),
         "git_workspace_list" => workspace(WorkspaceCmd::List),
+        "git_workspace_pull" => workspace(WorkspaceCmd::Pull {
+            name: a.req("name")?,
+            into: a.str("into"),
+        }),
+        "git_workspace_push" => workspace(WorkspaceCmd::Push {
+            name: a.req("name")?,
+        }),
         "git_workspace_remove" => workspace(WorkspaceCmd::Remove {
             name: a.req("name")?,
         }),

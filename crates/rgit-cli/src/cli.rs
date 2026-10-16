@@ -1535,7 +1535,7 @@ pub enum Command {
     Prev,
     /// Fetch the current branch's remote, or `<repository> [<refspec>...]`.
     Fetch {
-        /// The remote to fetch (defaults to the branch's upstream remote).
+        /// The remote, or a path or URL, to fetch (defaults to the branch's upstream remote).
         #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::remotes))]
         repository: Option<String>,
         /// Refs to fetch, as in git (`main`, `src:dst`); defaults to the remote's.
@@ -1606,7 +1606,7 @@ pub enum Command {
     /// Fetch and integrate the current branch's upstream (merges when it has
     /// diverged, unless `pull.rebase` says otherwise).
     Pull {
-        /// The remote to pull from (defaults to the upstream's remote).
+        /// The remote, or a path or URL, to pull from (defaults to the upstream's remote).
         #[arg(add = clap_complete::ArgValueCompleter::new(crate::completion::remotes))]
         repository: Option<String>,
         /// The remote branch to integrate (defaults to the upstream branch).
@@ -7135,6 +7135,19 @@ pub enum WorkspaceCmd {
         /// The workspace name.
         name: String,
     },
+    /// Fast-forward the main repository's branch to the workspace's commits.
+    Pull {
+        /// The workspace name.
+        name: String,
+        /// The main repository's branch to advance (default: the workspace's branch).
+        #[arg(long, add = clap_complete::ArgValueCompleter::new(crate::completion::branches))]
+        into: Option<String>,
+    },
+    /// Fast-forward the workspace to the main repository's branch of the same name.
+    Push {
+        /// The workspace name.
+        name: String,
+    },
 }
 
 /// Build or query the semantic index for the current repository.
@@ -10358,6 +10371,17 @@ fn run_command(
             WorkspaceCmd::New { name } => rgit_git::workspace::create(backend.as_ref(), &name)?,
             WorkspaceCmd::List => rgit_git::workspace::list(backend.as_ref())?,
             WorkspaceCmd::Remove { name } => rgit_git::workspace::remove(backend.as_ref(), &name)?,
+            WorkspaceCmd::Pull { name, into } => {
+                crate::axi::workspace_sync(rgit_git::workspace::pull(
+                    backend.as_ref(),
+                    &name,
+                    into.as_deref(),
+                ))?
+                .text
+            }
+            WorkspaceCmd::Push { name } => {
+                crate::axi::workspace_sync(rgit_git::workspace::push(backend.as_ref(), &name))?.text
+            }
         },
         Command::Worktree { cmd } => match cmd {
             None => worktree_list(backend, false, false, false)?,

@@ -23,7 +23,7 @@ rgit pull --squash origin feature
 
 | Argument | Description |
 | --- | --- |
-| `[REPOSITORY]` | The remote to pull from (defaults to the upstream's remote) |
+| `[REPOSITORY]` | The remote, or a path or URL, to pull from (defaults to the upstream's remote) |
 | `[BRANCH]` | The remote branch to integrate (defaults to the upstream branch) |
 
 ## Options

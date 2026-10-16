@@ -4906,6 +4906,14 @@ impl GitBackend for Git2Backend {
             (names, true)
         } else {
             match remote {
+                Some(r) if is_location(&repo, r) => {
+                    let temp = TempRemote::new(&repo, r)?;
+                    let given = match refspecs {
+                        [] => &["HEAD".to_owned()][..],
+                        some => some,
+                    };
+                    return self.fetch_remote(&repo, &temp.name, given, args, report, cred);
+                }
                 Some(r) if repo.find_remote(r).is_err() => {
                     let names = expand(r)?;
                     if names.len() > 1 && !refspecs.is_empty() {
@@ -4992,12 +5000,16 @@ impl GitBackend for Git2Backend {
             let autostash = args
                 .autostash
                 .unwrap_or_else(|| config.get_bool(key).unwrap_or(false));
+            let by_location = remote.is_some_and(|r| is_location(&repo, r));
             (
                 remote.map_or(upstream, str::to_owned),
-                branch
-                    .map(str::to_owned)
-                    .or(merge_branch)
-                    .unwrap_or(current),
+                match by_location {
+                    true => branch.unwrap_or("HEAD").to_owned(),
+                    false => branch
+                        .map(str::to_owned)
+                        .or(merge_branch)
+                        .unwrap_or(current),
+                },
                 rebase,
                 ff_only,
                 chosen,
@@ -5006,7 +5018,12 @@ impl GitBackend for Git2Backend {
         };
         self.logged(if rebase { "pull --rebase" } else { "pull" }, || {
             let mut repo = self.repo();
-            {
+            let by_location = is_location(&repo, &remote);
+            let target = {
+                let location = match by_location {
+                    true => Some(TempRemote::new(&repo, &remote)?),
+                    false => None,
+                };
                 let cred_guard = self
                     .cred_prompt
                     .lock()
@@ -5016,7 +5033,7 @@ impl GitBackend for Git2Backend {
                     depth: args.depth,
                     ..Default::default()
                 };
-                let names: Vec<String> = match args.all {
+                let names: Vec<String> = match args.all && location.is_none() {
                     true => repo
                         .remotes()?
                         .iter()
@@ -5026,11 +5043,30 @@ impl GitBackend for Git2Backend {
                         .collect(),
                     false => vec![remote.clone()],
                 };
-                for name in &names {
-                    self.fetch_remote(&repo, name, &[], &fetch, report, cred)?;
+                match &location {
+                    Some(temp) => self.fetch_remote(
+                        &repo,
+                        &temp.name,
+                        std::slice::from_ref(&branch),
+                        &fetch,
+                        report,
+                        cred,
+                    )?,
+                    None => {
+                        for name in &names {
+                            self.fetch_remote(&repo, name, &[], &fetch, report, cred)?;
+                        }
+                    }
                 }
-            }
-            let target = repo.refname_to_id(&format!("refs/remotes/{remote}/{branch}"))?;
+                match location {
+                    Some(_) => fetch_head_tip(&repo)?,
+                    None => repo.refname_to_id(&format!("refs/remotes/{remote}/{branch}"))?,
+                }
+            };
+            let tracking = match by_location {
+                true => target.to_string(),
+                false => format!("refs/remotes/{remote}/{branch}"),
+            };
             let mut status = StatusOptions::new();
             status.include_untracked(false);
             // A rebase keeps its own autostash, restored when it ends.
@@ -5056,17 +5092,19 @@ impl GitBackend for Git2Backend {
                     strategy_option: args.strategy_option.clone(),
                     ..Default::default()
                 };
-                let upstream = format!("refs/remotes/{remote}/{branch}");
-                crate::rebase::start(&mut repo, Some(&upstream), &opts).map(|out| {
+                crate::rebase::start(&mut repo, Some(&tracking), &opts).map(|out| {
                     for line in out.lines() {
                         report(OpProgress::Line(line.to_owned()));
                     }
                 })
             } else {
-                let url = remote_urls(&repo, &remote, false)?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| remote.clone());
+                let url = match by_location {
+                    true => remote.clone(),
+                    false => remote_urls(&repo, &remote, false)?
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| remote.clone()),
+                };
                 let source = repo.find_commit(target)?;
                 let (analysis, _) = repo.merge_analysis(&[&repo.find_annotated_commit(target)?])?;
                 if !chosen && !analysis.is_up_to_date() && !analysis.is_fast_forward() {
@@ -6129,6 +6167,58 @@ fn upstream_remote(repo: &Repository) -> Result<(String, String), GitError> {
         .and_then(|buf| buf.as_str().ok().map(str::to_owned))
         .unwrap_or_else(|| "origin".to_owned());
     Ok((remote, branch))
+}
+
+/// Whether `arg` names a path or URL to fetch from rather than a remote: it is
+/// no configured remote and is an existing directory, holds `://` or `@`, or
+/// starts with `/`, `./` or `../`.
+fn is_location(repo: &Repository, arg: &str) -> bool {
+    repo.find_remote(arg).is_err()
+        && (arg.contains("://")
+            || arg.contains('@')
+            || arg.starts_with('/')
+            || arg.starts_with("./")
+            || arg.starts_with("../")
+            || Path::new(arg).is_dir())
+}
+
+/// A remote that exists only while it is held, so a fetch from a path or URL
+/// runs the same code as a fetch from a configured remote. It has no fetch
+/// refspec: refs land in FETCH_HEAD only, as in git.
+struct TempRemote<'r> {
+    repo: &'r Repository,
+    name: String,
+}
+
+impl<'r> TempRemote<'r> {
+    fn new(repo: &'r Repository, location: &str) -> Result<Self, GitError> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let name = format!(
+            "rgit-location-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        repo.config()?
+            .set_str(&format!("remote.{name}.url"), location)?;
+        Ok(Self { repo, name })
+    }
+}
+
+impl Drop for TempRemote<'_> {
+    fn drop(&mut self) {
+        let _ = self.repo.remote_delete(&self.name);
+    }
+}
+
+/// The commit the first line of FETCH_HEAD names.
+fn fetch_head_tip(repo: &Repository) -> Result<Oid, GitError> {
+    let text = std::fs::read_to_string(repo.path().join("FETCH_HEAD"))?;
+    let id = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().next())
+        .ok_or_else(|| GitError::Other("fetch brought no ref".to_owned()))?;
+    Ok(Oid::from_str(id)?)
 }
 
 /// One fetched ref update: source, destination, old and new id.

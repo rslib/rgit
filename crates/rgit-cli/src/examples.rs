@@ -1350,6 +1350,14 @@ const EXAMPLES: &[Entry] = &[
     ("workspace new", &["rgit workspace new <name>"]),
     ("workspace list", &["rgit workspace list"]),
     ("workspace remove", &["rgit workspace remove <name>"]),
+    (
+        "workspace pull",
+        &[
+            "rgit workspace pull <name>",
+            "rgit workspace pull <name> --into <branch>",
+        ],
+    ),
+    ("workspace push", &["rgit workspace push <name>"]),
     ("flow", &["rgit flow status"]),
     ("flow init", &["rgit flow init gitflow"]),
     ("flow start", &["rgit flow start <name>"]),

@@ -26,7 +26,7 @@ rgit fetch --filter=blob:none origin
 
 | Argument | Description |
 | --- | --- |
-| `[REPOSITORY]` | The remote to fetch (defaults to the branch's upstream remote) |
+| `[REPOSITORY]` | The remote, or a path or URL, to fetch (defaults to the branch's upstream remote) |
 | `[REFSPECS]...` | Refs to fetch, as in git (`main`, `src:dst`); defaults to the remote's |
 
 ## Options

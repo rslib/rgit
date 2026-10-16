@@ -793,6 +793,14 @@ const FREE_TEXT: &[(&str, &str)] = &[
         "a name that does not exist yet, or an identifier of another system",
     ),
     (
+        "workspace pull:name",
+        "a name that does not exist yet, or an identifier of another system",
+    ),
+    (
+        "workspace push:name",
+        "a name that does not exist yet, or an identifier of another system",
+    ),
+    (
         "workspace remove:name",
         "a name that does not exist yet, or an identifier of another system",
     ),
