@@ -12,12 +12,14 @@ use crate::app::{App, RemotesRow, ViewKind};
 use crate::buffer::Row;
 use crate::config::Transparency;
 use crate::theme;
+use crate::widgets::{self, Anchor, BoxId, Boxes, EditorText};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.boxes.begin_frame();
 
     if app.help {
-        render_help(frame, area);
+        render_help(frame, &app.boxes, area);
         return;
     }
 
@@ -68,7 +70,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.buffer_mut().set_height(body.height as usize);
         render_body(frame, app, body);
         if let Some(prompt) = &app.prompt {
-            render_prompt(frame, prompt, list, input);
+            render_prompt(frame, prompt, &app.boxes, list, input);
         }
         return;
     }
@@ -157,33 +159,34 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_action_bar(frame, app, action);
 
     // A pending confirmation floats over the dimmed screen.
+    let boxes = &app.boxes;
     if let Some(confirm) = &app.confirm {
-        render_confirm(frame, confirm, inner);
+        render_confirm(frame, confirm, boxes, inner);
     }
     // The command palette floats above everything else in the body.
     if let Some(palette) = &app.palette {
-        render_palette(frame, palette, inner);
+        render_palette(frame, palette, boxes, inner);
     }
     if let Some(editor) = &app.commit_editor {
-        render_commit_editor(frame, editor, inner);
+        render_commit_editor(frame, editor, boxes, inner);
     }
     if let Some(console) = &app.hook_console {
-        render_hook_console(frame, console, app.tick_count, body);
+        render_hook_console(frame, console, boxes, app.tick_count, body);
     }
     if let Some(todo) = &app.rebase_todo {
-        render_rebase_todo(frame, todo, inner);
+        render_rebase_todo(frame, todo, boxes, inner);
     }
     if let Some(picker) = &app.split_picker {
-        render_split_picker(frame, picker, inner);
+        render_split_picker(frame, picker, boxes, inner);
     }
     if let Some(level) = app.leader {
-        render_which_key(frame, level, inner);
+        render_which_key(frame, level, boxes, inner);
     }
     render_toasts(frame, app, inner);
 }
 
 /// The vim-profile leader (which-key) popup: the keys available after Space.
-fn render_which_key(frame: &mut Frame, level: crate::app::Leader, area: Rect) {
+fn render_which_key(frame: &mut Frame, level: crate::app::Leader, boxes: &Boxes, area: Rect) {
     use crate::app::Leader;
     let (title, entries): (&str, Vec<(char, &str)>) = match level {
         Leader::Root => ("leader", crate::keymap::leader_entries()),
@@ -197,7 +200,15 @@ fn render_which_key(frame: &mut Frame, level: crate::app::Leader, area: Rect) {
     let rows_per_col = entries.len().div_ceil(cols);
     let width = 60.min(area.width.saturating_sub(2));
     let height = (rows_per_col as u16 + 3).min(area.height.saturating_sub(2));
-    let inner = popup_panel(frame, title, width, height, area);
+    let inner = popup_panel(
+        frame,
+        boxes,
+        BoxId::WhichKey,
+        title,
+        None,
+        (width, height),
+        area,
+    );
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
     // Keys read as raised "keycaps"; labels stay dim.
@@ -222,7 +233,7 @@ fn render_which_key(frame: &mut Frame, level: crate::app::Leader, area: Rect) {
     );
 }
 
-fn render_rebase_todo(frame: &mut Frame, todo: &crate::app::RebaseTodo, area: Rect) {
+fn render_rebase_todo(frame: &mut Frame, todo: &crate::app::RebaseTodo, boxes: &Boxes, area: Rect) {
     let width = 82.min(area.width.saturating_sub(2));
     // Grow to the history, but leave room for the frame, title and footer so the
     // list scrolls instead of overflowing the popup for long histories.
@@ -234,7 +245,15 @@ fn render_rebase_todo(frame: &mut Frame, todo: &crate::app::RebaseTodo, area: Re
         todo.cursor + 1,
         todo.entries.len()
     );
-    let inner = popup_panel(frame, &title, width, height, area);
+    let inner = popup_panel(
+        frame,
+        boxes,
+        BoxId::RebaseTodo,
+        &title,
+        None,
+        (width, height),
+        area,
+    );
     let [list, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
     // Scroll so the cursor stays in view (anchored to the bottom when moving down).
@@ -294,7 +313,12 @@ fn render_rebase_todo(frame: &mut Frame, todo: &crate::app::RebaseTodo, area: Re
     frame.render_widget(Paragraph::new(footer_line), footer);
 }
 
-fn render_split_picker(frame: &mut Frame, picker: &crate::app::SplitPicker, area: Rect) {
+fn render_split_picker(
+    frame: &mut Frame,
+    picker: &crate::app::SplitPicker,
+    boxes: &Boxes,
+    area: Rect,
+) {
     let width = 82.min(area.width.saturating_sub(2));
     let cap = (area.height.saturating_sub(6)).max(1) as usize;
     let visible = picker.files.len().clamp(1, cap);
@@ -305,7 +329,15 @@ fn render_split_picker(frame: &mut Frame, picker: &crate::app::SplitPicker, area
         picker.cursor + 1,
         picker.files.len()
     );
-    let inner = popup_panel(frame, &title, width, height, area);
+    let inner = popup_panel(
+        frame,
+        boxes,
+        BoxId::SplitPicker,
+        &title,
+        None,
+        (width, height),
+        area,
+    );
     let [list, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
     let vis = (list.height as usize).max(1);
@@ -352,34 +384,49 @@ fn render_split_picker(frame: &mut Frame, picker: &crate::app::SplitPicker, area
     frame.render_widget(Paragraph::new(footer_line), footer);
 }
 
-fn render_commit_editor(frame: &mut Frame, editor: &crate::app::CommitEditor, area: Rect) {
+fn render_commit_editor(
+    frame: &mut Frame,
+    editor: &crate::app::CommitEditor,
+    boxes: &Boxes,
+    area: Rect,
+) {
+    let id = BoxId::CommitEditor;
     let title = if editor.amend { "amend" } else { "commit" };
-    let width = 66.min(area.width.saturating_sub(2));
-    let height = 12.min(area.height.saturating_sub(2));
-    let inner = popup_panel(frame, title, width, height, area);
+    // Wide enough for a 72-column body line beside the gutter, the scrollbar
+    // and the caret column.
+    let width = 80;
+    let height = (editor.lines.len() as u16 + 4).clamp(12, (area.height * 4 / 5).max(12));
+    let wrap = boxes.wrap(id);
+    let badge = Line::from(vec![
+        RSpan::styled(
+            format!(" {}:{} ", editor.row + 1, editor.col + 1),
+            theme::resolve(Style::Dim),
+        ),
+        RSpan::styled(
+            if wrap { "wrap " } else { "nowrap " },
+            RStyle::default().fg(theme::accent()),
+        ),
+    ]);
+    let inner = popup_panel(frame, boxes, id, title, Some(badge), (width, height), area);
     let [text_area, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
 
-    // The subject line renders as-is; a dim rule separates it from the body.
-    let lines: Vec<Line> = editor
-        .lines
-        .iter()
-        .enumerate()
-        .map(|(i, l)| {
-            if i == 0 {
-                Line::from(RSpan::styled(l.clone(), theme::resolve(Style::Plain)))
-            } else {
-                Line::from(RSpan::styled(l.clone(), theme::resolve(Style::Dim)))
-            }
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), text_area);
-
-    // Place the real terminal cursor at the editor's caret when it is in view.
-    let cy = text_area.y.saturating_add(editor.row as u16);
-    let cx = text_area.x.saturating_add(editor.col as u16);
-    if cy < text_area.bottom() && cx < text_area.right() {
-        frame.set_cursor_position((cx, cy));
+    // The subject line renders as-is; the body is dim.
+    let style_of = |i: usize| {
+        if i == 0 {
+            theme::resolve(Style::Plain)
+        } else {
+            theme::resolve(Style::Dim)
+        }
+    };
+    let text = EditorText {
+        lines: &editor.lines,
+        caret: (editor.row, editor.col),
+        style_of: &style_of,
+        ruler: Some(72),
+    };
+    if let Some(at) = widgets::render_editor(frame, text_area, &text, wrap, boxes.show(id)) {
+        frame.set_cursor_position(at);
     }
 
     let subject = editor.subject_len();
@@ -398,6 +445,10 @@ fn render_commit_editor(frame: &mut Frame, editor: &crate::app::CommitEditor, ar
         RSpan::styled(" generate  ", dim),
         RSpan::styled("^O", accent),
         RSpan::styled(" $EDITOR  ", dim),
+        RSpan::styled("M-z", accent),
+        RSpan::styled(" wrap  ", dim),
+        RSpan::styled("M-m", accent),
+        RSpan::styled(" max  ", dim),
         RSpan::styled("esc", accent),
         RSpan::styled(" cancel", dim),
     ]);
@@ -531,9 +582,11 @@ fn ansi16(n: u16) -> Color {
 fn render_hook_console(
     frame: &mut Frame,
     console: &crate::app::HookConsole,
+    boxes: &Boxes,
     tick: usize,
     area: Rect,
 ) {
+    let id = BoxId::Console;
     use crate::app::HookStatus;
     let name = &console.title;
     let (title, title_style) = match console.status {
@@ -559,12 +612,7 @@ fn render_hook_console(
     let height = (area.height * 2 / 5)
         .clamp(8, 18)
         .min(area.height.saturating_sub(1));
-    let rect = Rect {
-        x: area.x,
-        y: area.y + area.height.saturating_sub(height),
-        width: area.width,
-        height,
-    };
+    let rect = boxes.place(id, (area.width, height), area, Anchor::Bottom);
     frame.render_widget(Clear, rect);
     let border = match console.status {
         HookStatus::Failed => theme::resolve(Style::Deleted),
@@ -575,7 +623,8 @@ fn render_hook_console(
         .border_style(border)
         .style(RStyle::default().bg(theme::overlay_bg()))
         .padding(Padding::horizontal(1))
-        .title_top(RSpan::styled(format!(" {title} "), title_style));
+        .title_top(RSpan::styled(format!(" {title} "), title_style))
+        .title_top(wrap_badge(boxes.wrap(id)).right_aligned());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
@@ -588,23 +637,12 @@ fn render_hook_console(
     ])
     .areas(inner);
 
-    // Follow the tail unless the user scrolled up; then honor their offset.
-    let rows = body.height as usize;
-    let top = if console.follow {
-        console.lines.len().saturating_sub(rows)
+    if console.lines.is_empty() {
+        let starting = RSpan::styled(" starting…", theme::resolve(Style::Dim));
+        frame.render_widget(Paragraph::new(Line::from(starting)), body);
     } else {
-        console.scroll.min(console.lines.len().saturating_sub(1))
-    };
-    let lines: Vec<Line> = if console.lines.is_empty() {
-        vec![Line::from(RSpan::styled(
-            "starting…",
-            theme::resolve(Style::Dim),
-        ))]
-    } else {
-        // Spans were parsed at ingest; the visible window clones them as-is.
-        console.lines[top..].iter().take(rows).cloned().collect()
-    };
-    frame.render_widget(Paragraph::new(lines), body);
+        widgets::render_text(frame, body, &console.lines, boxes.wrap(id), boxes.show(id));
+    }
 
     if let Some((received, total)) = console.progress.filter(|(_, t)| *t > 0) {
         render_transfer_bar(frame, bar, received, total);
@@ -613,7 +651,15 @@ fn render_hook_console(
     let accent = RStyle::default().fg(theme::accent());
     let dim = theme::resolve(Style::Dim);
     let footer_line = match console.status {
-        HookStatus::Running => Line::from(RSpan::styled(" working…", dim)),
+        HookStatus::Running => Line::from(vec![
+            RSpan::styled(" working…   ", dim),
+            RSpan::styled("j/k", accent),
+            RSpan::styled(" scroll  ", dim),
+            RSpan::styled("w", accent),
+            RSpan::styled(" wrap  ", dim),
+            RSpan::styled("m", accent),
+            RSpan::styled(" max", dim),
+        ]),
         // Retry only applies to a failed run; a held success just dismisses.
         HookStatus::Failed => Line::from(vec![
             RSpan::styled(" e ", keycap_style()),
@@ -621,13 +667,21 @@ fn render_hook_console(
             RSpan::styled(" q ", keycap_style()),
             RSpan::styled(" dismiss   ", dim),
             RSpan::styled("j/k", accent),
-            RSpan::styled(" scroll", dim),
+            RSpan::styled(" scroll  ", dim),
+            RSpan::styled("w", accent),
+            RSpan::styled(" wrap  ", dim),
+            RSpan::styled("m", accent),
+            RSpan::styled(" max", dim),
         ]),
         HookStatus::Passed => Line::from(vec![
             RSpan::styled(" q ", keycap_style()),
             RSpan::styled(" close   ", dim),
             RSpan::styled("j/k", accent),
-            RSpan::styled(" scroll", dim),
+            RSpan::styled(" scroll  ", dim),
+            RSpan::styled("w", accent),
+            RSpan::styled(" wrap  ", dim),
+            RSpan::styled("m", accent),
+            RSpan::styled(" max", dim),
         ]),
     };
     frame.render_widget(Paragraph::new(footer_line), footer);
@@ -671,18 +725,26 @@ fn render_code_finder(frame: &mut Frame, app: &App, input_area: Rect, list_area:
     } else {
         format!("  {} hits (text)  Tab: meaning  ^o: editor", f.hits.len())
     };
-    // Split the query at the caret so it renders between the two halves.
-    let chars: Vec<char> = f.input.chars().collect();
-    let at = f.cursor.min(chars.len());
-    let before: String = chars[..at].iter().collect();
-    let after: String = chars[at..].iter().collect();
-    let input_line = Line::from(vec![
-        RSpan::styled("code › ", RStyle::default().fg(theme::accent())),
-        RSpan::raw(before),
-        RSpan::styled("\u{258f}", RStyle::default().fg(theme::accent())),
-        RSpan::raw(after),
-        RSpan::styled(hint, theme::resolve(Style::Dim)),
-    ]);
+    // The hint gives way to the query on a narrow screen.
+    let label = RSpan::styled("code › ", RStyle::default().fg(theme::accent()));
+    let hint_w = hint.chars().count() as u16;
+    let (field_w, hint) = if input_area.width >= hint_w + label.width() as u16 + 20 {
+        (input_area.width - hint_w, hint)
+    } else {
+        (input_area.width, String::new())
+    };
+    let mut input_line = input_line(
+        label,
+        &f.input,
+        f.cursor,
+        false,
+        BoxId::Finder,
+        &app.boxes,
+        field_w,
+    );
+    input_line
+        .spans
+        .push(RSpan::styled(hint, theme::resolve(Style::Dim)));
     frame.render_widget(Paragraph::new(input_line), input_area);
 
     let rows: Vec<Line> = f
@@ -716,27 +778,34 @@ fn render_code_finder(frame: &mut Frame, app: &App, input_area: Rect, list_area:
     frame.render_widget(Paragraph::new(rows), list_area);
 }
 
-fn render_palette(frame: &mut Frame, palette: &crate::app::Palette, area: Rect) {
+fn render_palette(frame: &mut Frame, palette: &crate::app::Palette, boxes: &Boxes, area: Rect) {
     use crate::app::Palette;
     let matches = Palette::matches(&palette.input);
     let width = 52.min(area.width.saturating_sub(2));
     let height = (matches.len().min(8) as u16) + 3;
-    let inner = popup_panel(frame, "run a command", width, height, area);
+    let inner = popup_panel(
+        frame,
+        boxes,
+        BoxId::Palette,
+        "run a command",
+        None,
+        (width, height),
+        area,
+    );
 
     let [input_area, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
 
-    // Split the query at the caret so it renders between the two halves.
-    let pchars: Vec<char> = palette.input.chars().collect();
-    let pat = palette.cursor.min(pchars.len());
-    let pbefore: String = pchars[..pat].iter().collect();
-    let pafter: String = pchars[pat..].iter().collect();
-    let input_line = Line::from(vec![
-        RSpan::styled("› ", RStyle::default().fg(theme::accent())),
-        RSpan::raw(pbefore),
-        RSpan::styled("\u{258f}", RStyle::default().fg(theme::accent())),
-        RSpan::raw(pafter),
-    ]);
+    let label = RSpan::styled("› ", RStyle::default().fg(theme::accent()));
+    let input_line = input_line(
+        label,
+        &palette.input,
+        palette.cursor,
+        false,
+        BoxId::Palette,
+        boxes,
+        input_area.width,
+    );
     frame.render_widget(Paragraph::new(input_line), input_area);
 
     let rows: Vec<Line> = matches
@@ -773,18 +842,6 @@ fn render_palette(frame: &mut Frame, palette: &crate::app::Palette, area: Rect) 
     frame.render_widget(Paragraph::new(rows), list_area);
 }
 
-/// A rect of `width` x `height` centered within `area` (clamped to fit).
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let w = width.min(area.width);
-    let h = height.min(area.height);
-    Rect {
-        x: area.x + (area.width - w) / 2,
-        y: area.y + (area.height - h) / 2,
-        width: w,
-        height: h,
-    }
-}
-
 /// Dim every cell in `area` so a popup drawn over it reads as elevated.
 fn dim_background(frame: &mut Frame, area: Rect) {
     let buf = frame.buffer_mut();
@@ -795,11 +852,21 @@ fn dim_background(frame: &mut Frame, area: Rect) {
     }
 }
 
-/// A centered, shadowed, rounded popup panel titled `title`; returns the inner
-/// content area to render into.
-fn popup_panel(frame: &mut Frame, title: &str, width: u16, height: u16, area: Rect) -> Rect {
+/// A centered, shadowed, rounded popup panel titled `title`, with an
+/// optional badge on the right of its top border. `size` is the size the
+/// content asks for; a border drag or maximize overrides it. Returns the
+/// inner content area to render into.
+fn popup_panel(
+    frame: &mut Frame,
+    boxes: &Boxes,
+    id: BoxId,
+    title: &str,
+    badge: Option<Line<'static>>,
+    size: (u16, u16),
+    area: Rect,
+) -> Rect {
     dim_background(frame, area);
-    let rect = centered_rect(width, height, area);
+    let rect = boxes.place(id, size, area, Anchor::Center);
     draw_shadow(frame, rect);
     frame.render_widget(Clear, rect);
     let block = Block::bordered()
@@ -813,9 +880,39 @@ fn popup_panel(frame: &mut Frame, title: &str, width: u16, height: u16, area: Re
                 .fg(theme::accent())
                 .add_modifier(Modifier::BOLD),
         ));
+    let block = match badge {
+        Some(badge) => block.title_top(badge.right_aligned()),
+        None => block,
+    };
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     inner
+}
+
+/// A badge that says whether a box wraps its text.
+fn wrap_badge(wrap: bool) -> Line<'static> {
+    Line::from(RSpan::styled(
+        if wrap { " wrap " } else { " nowrap " },
+        RStyle::default().fg(theme::accent()),
+    ))
+}
+
+/// A one-line input row: `label`, then the text scrolled sideways to keep
+/// the caret in `width` cells.
+fn input_line(
+    label: RSpan<'static>,
+    text: &str,
+    cursor: usize,
+    masked: bool,
+    id: BoxId,
+    boxes: &Boxes,
+    width: u16,
+) -> Line<'static> {
+    let room = (width as usize).saturating_sub(label.width());
+    let left = &boxes.show(id).left;
+    let mut spans = vec![label];
+    spans.extend(widgets::input_spans(text, cursor, masked, room, left));
+    Line::from(spans)
 }
 
 /// A soft drop-shadow one cell down-right of `rect`.
@@ -832,21 +929,37 @@ fn draw_shadow(frame: &mut Frame, rect: Rect) {
     }
 }
 
-fn render_confirm(frame: &mut Frame, confirm: &crate::app::PendingConfirm, area: Rect) {
-    let width = (confirm.prompt.len() as u16 + 10).clamp(28, area.width.saturating_sub(4));
-    let inner = popup_panel(frame, "confirm", width, 4, area);
-    let lines = vec![
-        Line::from(RSpan::styled(
-            confirm.prompt.clone(),
-            theme::resolve(Style::Plain),
-        )),
-        Line::from(vec![
-            RSpan::styled(" y ", keycap_style()),
-            RSpan::styled(" yes    ", theme::resolve(Style::Dim)),
-            RSpan::styled(" n ", keycap_style()),
-            RSpan::styled(" no", theme::resolve(Style::Dim)),
-        ]),
-    ];
+fn render_confirm(
+    frame: &mut Frame,
+    confirm: &crate::app::PendingConfirm,
+    boxes: &Boxes,
+    area: Rect,
+) {
+    let width = (confirm.prompt.chars().count() as u16 + 10)
+        .clamp(28, 72)
+        .min(area.width.saturating_sub(4));
+    // The frame and padding take four columns; a long prompt wraps.
+    let prompt = Line::from(RSpan::styled(
+        confirm.prompt.clone(),
+        theme::resolve(Style::Plain),
+    ));
+    let mut lines = widgets::wrap_line(&prompt, width.saturating_sub(4) as usize);
+    let height = lines.len() as u16 + 3;
+    let inner = popup_panel(
+        frame,
+        boxes,
+        BoxId::Confirm,
+        "confirm",
+        None,
+        (width, height),
+        area,
+    );
+    lines.extend([Line::from(vec![
+        RSpan::styled(" y ", keycap_style()),
+        RSpan::styled(" yes    ", theme::resolve(Style::Dim)),
+        RSpan::styled(" n ", keycap_style()),
+        RSpan::styled(" no", theme::resolve(Style::Dim)),
+    ])]);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -948,14 +1061,22 @@ fn spinner_frame(tick: usize) -> &'static str {
 /// Stack active toasts in the lower-right corner, newest at the bottom.
 fn render_toasts(frame: &mut Frame, app: &App, area: Rect) {
     use crate::app::ToastKind;
-    for (i, toast) in app.toasts.iter().rev().enumerate() {
-        let text = format!(" {} {} ", toast_glyph(toast.kind), toast.text);
-        let w = (text.chars().count() as u16 + 3).min(area.width.saturating_sub(2));
-        let h = 3;
-        let y = area.bottom().saturating_sub(2 + h * (i as u16 + 1));
-        if y < area.top() {
+    // A long message wraps under itself instead of running off the screen.
+    let max_w = area.width.saturating_sub(4).clamp(1, 72);
+    let mut bottom = area.bottom().saturating_sub(2);
+    for toast in app.toasts.iter().rev() {
+        let chip_text = format!(" {} ", toast_glyph(toast.kind));
+        let chip_w = chip_text.chars().count();
+        let text_room = (max_w as usize).saturating_sub(chip_w + 3).max(1);
+        let body = Line::from(RSpan::raw(format!(" {}", toast.text)));
+        let rows = widgets::wrap_line(&body, text_room);
+        let text_w = rows.iter().map(Line::width).max().unwrap_or(0);
+        let w = (chip_w + text_w + 3) as u16;
+        let h = rows.len() as u16 + 2;
+        let Some(y) = bottom.checked_sub(h).filter(|y| *y >= area.top()) else {
             break;
-        }
+        };
+        bottom = y;
         let rect = Rect {
             x: area.right().saturating_sub(w + 2),
             y,
@@ -982,14 +1103,22 @@ fn render_toasts(frame: &mut Frame, app: &App, area: Rect) {
                 ToastKind::Error => theme::resolve(Style::Deleted).fg.unwrap_or(theme::accent()),
             })
             .add_modifier(Modifier::BOLD);
-        let line = Line::from(vec![
-            RSpan::styled(format!(" {} ", toast_glyph(toast.kind)), chip),
-            RSpan::styled(
-                format!(" {}", toast.text),
-                accent.add_modifier(Modifier::BOLD),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), inner);
+        let text_style = accent.add_modifier(Modifier::BOLD);
+        let lines: Vec<Line> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let lead = if i == 0 {
+                    RSpan::styled(chip_text.clone(), chip)
+                } else {
+                    RSpan::raw(" ".repeat(chip_w))
+                };
+                let mut spans = vec![lead];
+                spans.extend(row.spans.into_iter().map(|sp| sp.style(text_style)));
+                Line::from(spans)
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 }
 
@@ -1052,7 +1181,13 @@ fn render_transient(frame: &mut Frame, t: &crate::app::Transient, area: Rect) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_prompt(frame: &mut Frame, prompt: &crate::app::Prompt, list: Rect, input: Rect) {
+fn render_prompt(
+    frame: &mut Frame,
+    prompt: &crate::app::Prompt,
+    boxes: &Boxes,
+    list: Rect,
+    input: Rect,
+) {
     let filtered = prompt.filtered();
     let rows: Vec<Line> = filtered
         .iter()
@@ -1077,31 +1212,22 @@ fn render_prompt(frame: &mut Frame, prompt: &crate::app::Prompt, list: Rect, inp
         .collect();
     frame.render_widget(Paragraph::new(rows), list);
 
-    // Render the caret as a reversed cell at the cursor's char position. A
-    // masked prompt (a password/passphrase) shows dots instead of the text.
-    let chars: Vec<char> = if prompt.masked {
-        std::iter::repeat_n('\u{2022}', prompt.input.chars().count()).collect()
-    } else {
-        prompt.input.chars().collect()
-    };
-    let cur = prompt.cursor.min(chars.len());
-    let before: String = chars[..cur].iter().collect();
-    let (at, after) = if cur < chars.len() {
-        (chars[cur].to_string(), chars[cur + 1..].iter().collect())
-    } else {
-        (" ".to_string(), String::new())
-    };
-    let line = Line::from(vec![
-        RSpan::styled(
-            format!(" {}: ", prompt.label),
-            RStyle::default()
-                .fg(theme::accent())
-                .add_modifier(Modifier::BOLD),
-        ),
-        RSpan::raw(before),
-        RSpan::styled(at, RStyle::default().add_modifier(Modifier::REVERSED)),
-        RSpan::raw(after),
-    ]);
+    // A masked prompt (a password/passphrase) shows dots instead of the text.
+    let label = RSpan::styled(
+        format!(" {}: ", prompt.label),
+        RStyle::default()
+            .fg(theme::accent())
+            .add_modifier(Modifier::BOLD),
+    );
+    let line = input_line(
+        label,
+        &prompt.input,
+        prompt.cursor,
+        prompt.masked,
+        BoxId::Prompt,
+        boxes,
+        input.width,
+    );
     frame.render_widget(Paragraph::new(line), input);
 }
 
@@ -1246,7 +1372,7 @@ fn row_hl(
 
 /// A thin scrollbar on the right edge of `area`, drawn only when the content
 /// overflows the viewport.
-fn render_scrollbar(frame: &mut Frame, area: Rect, len: usize, pos: usize, page: usize) {
+pub(crate) fn render_scrollbar(frame: &mut Frame, area: Rect, len: usize, pos: usize, page: usize) {
     if len <= page || area.height < 2 {
         return;
     }
@@ -1491,12 +1617,20 @@ fn render_row_cells(row: &Row<'_>, hl: Hl, width: u16) -> Line<'static> {
 /// or a pending confirmation / error when one is active.
 fn render_action_bar(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(query) = &app.search {
-        let line = Line::from(vec![
-            RSpan::styled("/", RStyle::default().fg(theme::accent())),
-            RSpan::raw(query.clone()),
-            RSpan::styled("▏", RStyle::default().fg(theme::accent())),
-            RSpan::styled("   n/N next/prev", theme::resolve(Style::Dim)),
-        ]);
+        let hint = "   n/N next/prev";
+        let label = RSpan::styled("/", RStyle::default().fg(theme::accent()));
+        let field_w = area.width.saturating_sub(hint.len() as u16);
+        let mut line = input_line(
+            label,
+            query,
+            query.chars().count(),
+            false,
+            BoxId::Search,
+            &app.boxes,
+            field_w,
+        );
+        line.spans
+            .push(RSpan::styled(hint, theme::resolve(Style::Dim)));
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
@@ -1887,7 +2021,7 @@ fn help_lines(groups: &[(&str, &[(&str, &str)])]) -> Vec<Line<'static>> {
     lines
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
+fn render_help(frame: &mut Frame, boxes: &Boxes, area: Rect) {
     // Paint a solid ground and a rounded frame titled with the app identity.
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1901,7 +2035,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         )))
         .title_bottom(
             Line::from(RSpan::styled(
-                " press any key to close ",
+                " j/k scroll · any other key closes ",
                 theme::resolve(Style::Dim),
             ))
             .centered(),
@@ -1910,12 +2044,36 @@ fn render_help(frame: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Two columns so the whole legend fits without scrolling.
+    // Two columns when both fit side by side; otherwise one column. Either
+    // way the legend scrolls when it is taller than the screen.
     let mid = HELP_GROUPS.len().div_ceil(2);
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(inner);
-    frame.render_widget(Paragraph::new(help_lines(&HELP_GROUPS[..mid])), left);
-    frame.render_widget(Paragraph::new(help_lines(&HELP_GROUPS[mid..])), right);
+    let left = help_lines(&HELP_GROUPS[..mid]);
+    let right = help_lines(&HELP_GROUPS[mid..]);
+    let col = left
+        .iter()
+        .chain(&right)
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let lines = if (inner.width as usize) >= 2 * col + 2 {
+        let half = (inner.width as usize - 2) / 2;
+        (0..left.len().max(right.len()))
+            .map(|i| {
+                let l = left.get(i).cloned().unwrap_or_default();
+                let pad = half.saturating_sub(l.width());
+                let mut spans = l.spans;
+                spans.push(RSpan::raw(" ".repeat(pad)));
+                spans.extend(right.get(i).cloned().unwrap_or_default().spans);
+                Line::from(spans)
+            })
+            .collect()
+    } else {
+        let mut all = left;
+        all.extend(right);
+        all
+    };
+    widgets::render_text(frame, inner, &lines, true, boxes.show(BoxId::Help));
 }
 
 #[cfg(test)]

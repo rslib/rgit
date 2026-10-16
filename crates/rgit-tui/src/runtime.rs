@@ -83,18 +83,29 @@ fn resolve_leader(app: &mut App, key: crossterm::event::KeyEvent) -> Option<Msg>
     }
 }
 
-/// Route a key while the hook console is open: scroll always; dismiss or retry
-/// only once the run has finished, so a running commit is not abandoned.
+/// Route a key while the hook console is open: scroll, wrap and maximize
+/// always; dismiss or retry only once the run has finished, so a running
+/// commit is not abandoned.
 fn resolve_hook_key(app: &App, key: crossterm::event::KeyEvent) -> Option<Msg> {
     use crate::app::HookStatus;
+    use crate::widgets::{BoxId, ScrollBy};
     use crossterm::event::KeyCode;
     let running = app
         .hook_console
         .as_ref()
         .is_some_and(|c| c.status == HookStatus::Running);
+    let scroll = |by| Some(Msg::BoxScroll(BoxId::Console, by));
     match key.code {
-        KeyCode::Char('j') | KeyCode::Down => Some(Msg::HookScroll(1)),
-        KeyCode::Char('k') | KeyCode::Up => Some(Msg::HookScroll(-1)),
+        KeyCode::Char('j') | KeyCode::Down => scroll(ScrollBy::Rows(1)),
+        KeyCode::Char('k') | KeyCode::Up => scroll(ScrollBy::Rows(-1)),
+        KeyCode::Char('h') | KeyCode::Left => scroll(ScrollBy::Cols(-8)),
+        KeyCode::Char('l') | KeyCode::Right => scroll(ScrollBy::Cols(8)),
+        KeyCode::PageDown | KeyCode::Char(' ') => scroll(ScrollBy::Pages(1)),
+        KeyCode::PageUp => scroll(ScrollBy::Pages(-1)),
+        KeyCode::Char('g') | KeyCode::Home => scroll(ScrollBy::Top),
+        KeyCode::Char('G') | KeyCode::End => scroll(ScrollBy::Bottom),
+        KeyCode::Char('w') => Some(Msg::BoxWrap(BoxId::Console)),
+        KeyCode::Char('m') => Some(Msg::BoxMaximize(BoxId::Console)),
         KeyCode::Char('e') if !running => Some(Msg::HookConsoleRetry),
         KeyCode::Char('q') | KeyCode::Esc if !running => Some(Msg::HookConsoleClose),
         _ => None,
@@ -686,6 +697,51 @@ fn mouse_msg(app: &App, m: crossterm::event::MouseEvent) -> Option<Msg> {
             .saturating_sub(gutter as u16) as usize;
         Some((offset, col))
     };
+
+    // Boxes come first: a press on the top box's border starts a resize, and
+    // the wheel scrolls the box under the pointer.
+    {
+        use crate::widgets::{BoxId, ScrollBy};
+        let wheel_box = || {
+            if app.help {
+                Some(BoxId::Help)
+            } else {
+                app.boxes
+                    .box_at(m.column, m.row)
+                    .filter(|id| matches!(id, BoxId::CommitEditor | BoxId::Console))
+            }
+        };
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if app.boxes.border_at(m.column, m.row).is_some() =>
+            {
+                return Some(Msg::BoxPress {
+                    col: m.column,
+                    row: m.row,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) if app.boxes.dragging() => {
+                return Some(Msg::BoxDrag {
+                    col: m.column,
+                    row: m.row,
+                });
+            }
+            MouseEventKind::Up(MouseButton::Left) if app.boxes.dragging() => {
+                return Some(Msg::BoxRelease);
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                if let Some(id) = wheel_box() {
+                    let rows = if m.kind == MouseEventKind::ScrollDown {
+                        WHEEL
+                    } else {
+                        -WHEEL
+                    };
+                    return Some(Msg::BoxScroll(id, ScrollBy::Rows(rows)));
+                }
+            }
+            _ => {}
+        }
+    }
 
     match m.kind {
         MouseEventKind::ScrollDown if over_preview => Some(Msg::ScrollPreview(WHEEL)),

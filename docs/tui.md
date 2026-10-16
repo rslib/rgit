@@ -46,6 +46,20 @@ Press `Esc` in the message box to cancel, or `Ctrl-o` to write the message in `$
 Press `Ctrl-g` to draft the message with your default AI tool, or `Ctrl-t` to pick the tool first.
 [Draft commit messages with an AI tool](ai.md) shows how to set the tools up.
 
+A long message stays in view.
+The box scrolls to keep the cursor visible, and a long line wraps onto the next row with a `↪` mark at its start.
+Press `Alt-z` to turn wrap off.
+Without wrap, the box scrolls sideways, and `‹` or `›` shows that text is hidden at that edge.
+The top border shows the cursor's line and column and whether wrap is on.
+A tinted column marks column 72, the usual width for a message body.
+
+## Resize a box
+
+Drag the border of a box with the mouse to make it bigger or smaller.
+Press `Alt-m` in the commit message box, or `m` in the operation output box, to fill the screen, and press it again to go back.
+In the operation output box, `w` turns wrap on or off, `j` and `k` scroll and `h` and `l` scroll sideways.
+The mouse wheel scrolls the box under the pointer.
+
 ## Look at history
 
 - `l` opens the log menu, with options such as `--all` and a filter by author.

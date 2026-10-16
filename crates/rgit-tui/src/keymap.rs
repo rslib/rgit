@@ -632,11 +632,19 @@ pub fn leader_entries() -> Vec<(char, &'static str)> {
 }
 
 /// Key handling while the in-app commit editor is open. Ctrl-S commits, Ctrl-O
-/// hands off to $EDITOR, Ctrl-G drafts a message with the default AI tool, Ctrl-T with a tool you pick; Esc cancels. Every other key
-/// (including emacs/readline motions like Ctrl-A/E/F/B) edits the text.
+/// hands off to $EDITOR, Ctrl-G drafts a message with the default AI tool,
+/// Ctrl-T with a tool you pick, Alt-Z toggles wrap, Alt-M maximizes and Esc
+/// cancels. Every other key (including emacs/readline motions like
+/// Ctrl-A/E/F/B) edits the text.
 pub fn resolve_commit_key(key: KeyEvent) -> Option<Msg> {
+    use crate::widgets::{BoxId, ScrollBy};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
+        KeyCode::Char('z') if alt => Some(Msg::BoxWrap(BoxId::CommitEditor)),
+        KeyCode::Char('m') if alt => Some(Msg::BoxMaximize(BoxId::CommitEditor)),
+        KeyCode::PageDown => Some(Msg::BoxScroll(BoxId::CommitEditor, ScrollBy::Pages(1))),
+        KeyCode::PageUp => Some(Msg::BoxScroll(BoxId::CommitEditor, ScrollBy::Pages(-1))),
         KeyCode::Char('s') if ctrl => Some(Msg::CommitEditorSubmit),
         KeyCode::Char('o') if ctrl => Some(Msg::CommitEditorEditor),
         KeyCode::Char('g') if ctrl => Some(Msg::CommitEditorGenerate),
@@ -693,9 +701,25 @@ pub fn resolve_search_key(key: KeyEvent) -> Option<Msg> {
     }
 }
 
-/// Key handling while the help overlay is open: any key dismisses it.
-pub fn resolve_help_key(_key: KeyEvent) -> Option<Msg> {
-    Some(Msg::HelpClose)
+/// Keys while the help overlay is open: scroll keys move the view, any other
+/// key closes it.
+pub fn resolve_help_key(key: KeyEvent) -> Option<Msg> {
+    use crate::widgets::{BoxId, ScrollBy};
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let by = match key.code {
+        KeyCode::Char('j') | KeyCode::Down => ScrollBy::Rows(1),
+        KeyCode::Char('k') | KeyCode::Up => ScrollBy::Rows(-1),
+        KeyCode::Char('n') if ctrl => ScrollBy::Rows(1),
+        KeyCode::Char('p') if ctrl => ScrollBy::Rows(-1),
+        KeyCode::Char('d') if ctrl => ScrollBy::Pages(1),
+        KeyCode::Char('u') if ctrl => ScrollBy::Pages(-1),
+        KeyCode::PageDown | KeyCode::Char(' ') => ScrollBy::Pages(1),
+        KeyCode::PageUp => ScrollBy::Pages(-1),
+        KeyCode::Char('g') | KeyCode::Home => ScrollBy::Top,
+        KeyCode::Char('G') | KeyCode::End => ScrollBy::Bottom,
+        _ => return Some(Msg::HelpClose),
+    };
+    Some(Msg::BoxScroll(BoxId::Help, by))
 }
 
 /// Key handling while the command palette is open.

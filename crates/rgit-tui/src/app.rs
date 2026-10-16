@@ -16,6 +16,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::buffer::Buffer;
 use crate::forge::{self, ForgeSnapshot};
+use crate::widgets::{BoxId, Boxes, ScrollBy};
 
 /// Where a streamed hook run stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,10 +82,6 @@ pub struct HookConsole {
     /// Streamed output, pre-parsed into styled spans (see `ui::ansi_line`).
     pub lines: Vec<ratatui::text::Line<'static>>,
     pub status: HookStatus,
-    /// Top visible line; follows the tail while running unless the user scrolls.
-    pub scroll: usize,
-    /// Whether the view is pinned to the tail (auto-scroll).
-    pub follow: bool,
     /// Object transfer progress `(received, total)`, for the progress bar.
     pub progress: Option<(usize, usize)>,
     /// Commit message and mode, kept so a rejected commit can be edited/retried.
@@ -100,8 +97,6 @@ impl HookConsole {
             title: "commit".to_owned(),
             lines: Vec::new(),
             status: HookStatus::Running,
-            scroll: 0,
-            follow: true,
             progress: None,
             message,
             amend,
@@ -114,8 +109,6 @@ impl HookConsole {
             title: op.title().to_owned(),
             lines: Vec::new(),
             status: HookStatus::Running,
-            scroll: 0,
-            follow: true,
             progress: None,
             message: String::new(),
             amend: false,
@@ -872,8 +865,20 @@ pub enum Msg {
         ok: bool,
         summary: Option<String>,
     },
-    /// Scroll the hook console by a signed number of rows.
-    HookScroll(isize),
+    /// Scroll a box's view (wheel, paging keys).
+    BoxScroll(BoxId, ScrollBy),
+    BoxWrap(BoxId),
+    BoxMaximize(BoxId),
+    /// A left press that may start a box border drag.
+    BoxPress {
+        col: u16,
+        row: u16,
+    },
+    BoxDrag {
+        col: u16,
+        row: u16,
+    },
+    BoxRelease,
     /// Dismiss the hook console (after a pass, or discarding a failed attempt).
     HookConsoleClose,
     /// Reopen the commit editor with the rejected message, to fix and retry.
@@ -2373,6 +2378,8 @@ pub struct App {
     pub tick_count: usize,
     /// Whether the full keybinding help overlay is showing.
     pub help: bool,
+    /// Size, wrap and scroll state of every overlay box.
+    pub boxes: Boxes,
     /// Carries the log transient's `--all` toggle into a follow-up author prompt.
     pending_log_all: bool,
     /// Default number of commits the log view walks (from config).
@@ -2564,6 +2571,7 @@ impl App {
             toasts: Vec::new(),
             tick_count: 0,
             help: false,
+            boxes: Boxes::default(),
             pending_log_all: false,
             log_limit: config.ui.log_limit,
             log_options: None,
@@ -4795,6 +4803,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::CommitEditorInput(key) => {
             if let Some(editor) = &mut app.commit_editor {
                 editor.input(key);
+                app.boxes.view(BoxId::CommitEditor).follow.set(true);
             }
         }
         Msg::CommitEditorCancel => {
@@ -4859,6 +4868,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     // Signing is honored natively: per commit.gpgSign, or forced
                     // as git's -S by the gpg_sign config.
                     app.hook_console = Some(HookConsole::commit(amend, message.clone()));
+                    app.boxes.reset(BoxId::Console);
                     return vec![Effect::CommitConsole {
                         amend,
                         message,
@@ -4888,6 +4898,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.ai_busy = None;
             if let Some(editor) = &mut app.commit_editor {
                 editor.set_text(&text);
+                let view = app.boxes.view(BoxId::CommitEditor);
+                view.scroll(ScrollBy::Top);
+                view.follow.set(true);
             }
         }
         Msg::HookOutput(line) => {
@@ -4933,14 +4946,21 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 return vec![Effect::Refresh];
             }
         }
-        Msg::HookScroll(delta) => {
-            if let Some(console) = &mut app.hook_console {
-                let next = console.scroll.saturating_add_signed(delta);
-                console.scroll = next.min(console.lines.len().saturating_sub(1));
-                // Leaving the tail stops auto-follow; returning to it resumes.
-                console.follow = console.scroll >= console.lines.len().saturating_sub(1);
+        Msg::BoxScroll(id, by) => {
+            let view = app.boxes.view(id);
+            view.scroll(by);
+            // Leaving the tail stops auto-follow; returning to it resumes.
+            if id == BoxId::Console {
+                view.follow.set(view.at_bottom());
             }
         }
+        Msg::BoxWrap(id) => app.boxes.toggle_wrap(id),
+        Msg::BoxMaximize(id) => app.boxes.toggle_maximized(id),
+        Msg::BoxPress { col, row } => {
+            app.boxes.press(col, row);
+        }
+        Msg::BoxDrag { col, row } => app.boxes.drag_to(col, row),
+        Msg::BoxRelease => app.boxes.release(),
         Msg::HookConsoleClose => app.hook_console = None,
         Msg::HookConsoleRetry => {
             if let Some(console) = app.hook_console.take() {
@@ -6124,6 +6144,7 @@ fn build_info(title: &str, text: &Result<String, String>) -> Vec<Section> {
 fn open_op(app: &mut App, op: ConsoleOp) -> Vec<Effect> {
     app.error = None;
     app.hook_console = Some(HookConsole::net(op.clone()));
+    app.boxes.reset(BoxId::Console);
     vec![Effect::OpConsole(op)]
 }
 

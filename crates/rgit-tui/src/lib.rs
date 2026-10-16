@@ -16,6 +16,7 @@ pub mod session_log;
 mod theme;
 mod ui;
 mod watch;
+mod widgets;
 
 pub use config::Config;
 pub use runtime::run;
